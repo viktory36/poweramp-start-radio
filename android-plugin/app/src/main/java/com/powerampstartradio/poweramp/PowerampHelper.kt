@@ -98,13 +98,17 @@ object PowerampHelper {
      */
     fun canAccessData(context: Context): Boolean {
         return try {
-            val filesUri = ROOT_URI.buildUpon().appendEncodedPath("files").build()
+            // Use URI parameter for limit instead of sortOrder
+            val filesUri = ROOT_URI.buildUpon()
+                .appendEncodedPath("files")
+                .appendQueryParameter("lim", "1")
+                .build()
             val cursor = context.contentResolver.query(
                 filesUri,
                 arrayOf("folder_files._id"),
                 null,
                 null,
-                "LIMIT 1"
+                null
             )
             cursor?.close()
             cursor != null
