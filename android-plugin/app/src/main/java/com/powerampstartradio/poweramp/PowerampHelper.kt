@@ -33,6 +33,7 @@ object PowerampHelper {
     const val ACTION_STATUS_CHANGED = "com.maxmpz.audioplayer.STATUS_CHANGED"
     const val ACTION_RELOAD_DATA = "com.maxmpz.audioplayer.ACTION_RELOAD_DATA"
     const val ACTION_OPEN_LIBRARY = "com.maxmpz.audioplayer.ACTION_OPEN_LIBRARY"
+    const val ACTION_OPEN_LIST_AND_PLAY = "com.maxmpz.audioplayer.ACTION_OPEN_LIST_AND_PLAY"
     const val ACTION_ASK_FOR_DATA_PERMISSION = "com.maxmpz.audioplayer.ACTION_ASK_FOR_DATA_PERMISSION"
 
     // Extras
@@ -330,18 +331,18 @@ object PowerampHelper {
 
     /**
      * Start playing from the queue.
+     * Uses ACTION_OPEN_LIST_AND_PLAY to actually switch playback to the queue.
      */
     fun playQueue(context: Context) {
         val queueUri = ROOT_URI.buildUpon().appendEncodedPath("queue").build()
-        // Send as broadcast to ApiReceiver (not activity - that's not exported)
-        val intent = Intent(ACTION_API_COMMAND).apply {
+        val intent = Intent(ACTION_OPEN_LIST_AND_PLAY).apply {
             setPackage(POWERAMP_PACKAGE)
-            putExtra(EXTRA_COMMAND, COMMAND_OPEN_TO_PLAY)
             data = queueUri
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         try {
-            context.sendBroadcast(intent)
-            Log.d(TAG, "Sent play queue broadcast")
+            context.startActivity(intent)
+            Log.d(TAG, "Started playback from queue")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to play queue", e)
         }
