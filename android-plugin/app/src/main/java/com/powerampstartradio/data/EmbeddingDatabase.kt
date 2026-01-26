@@ -82,34 +82,39 @@ class EmbeddingDatabase private constructor(
 
     /**
      * Get a track by its metadata key (primary matching method).
-     * Matches on title first, then fuzzy artist match to handle "Artist1; Artist2" cases
-     * where Poweramp might report just "Artist1".
+     * Tries in order:
+     * 1. Exact artist|album|title match (finds specific rendition)
+     * 2. Artist|title match (ignores album)
+     * 3. Fuzzy artist match (handles "Artist1; Artist2" split tags)
      */
     fun findTrackByMetadataKey(key: String): EmbeddedTrack? {
         val parts = key.split("|")
         if (parts.size >= 3) {
             val artist = parts[0]
+            val album = parts[1]
             val title = parts[2]
 
-            // First try exact artist|title match
-            val exactPattern = "$artist|%|$title|%"
-            val exactCursor = db.rawQuery(
+            // 1. Try exact artist|album|title match
+            val exactPattern = "$artist|$album|$title|%"
+            db.rawQuery(
                 "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE metadata_key LIKE ?",
                 arrayOf(exactPattern)
-            )
-            exactCursor.use {
-                cursorToTrack(it)?.let { return it }
-            }
+            ).use { cursorToTrack(it)?.let { return it } }
 
-            // Fuzzy match: find by title, then check artist overlap
+            // 2. Try artist|title (any album)
+            val artistTitlePattern = "$artist|%|$title|%"
+            db.rawQuery(
+                "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE metadata_key LIKE ?",
+                arrayOf(artistTitlePattern)
+            ).use { cursorToTrack(it)?.let { return it } }
+
+            // 3. Fuzzy: find by title, check artist substring overlap
             val titlePattern = "%|%|$title|%"
-            val cursor = db.rawQuery(
+            db.rawQuery(
                 "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE metadata_key LIKE ?",
                 arrayOf(titlePattern)
-            )
-            cursor.use {
+            ).use {
                 val matches = cursorToTrackList(it)
-                // Find one where artist is substring match (either direction)
                 return matches.find { track ->
                     val embeddedArtist = track.artist?.lowercase() ?: ""
                     artist.isNotEmpty() && (

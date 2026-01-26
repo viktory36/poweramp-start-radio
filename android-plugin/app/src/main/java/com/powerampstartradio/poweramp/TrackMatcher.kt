@@ -103,7 +103,8 @@ class TrackMatcher(
 
     /**
      * Map embedded track IDs to Poweramp file IDs.
-     * Uses title + fuzzy artist matching to handle "Artist1; Artist2" cases.
+     * Tries artist|album|title first, then artist|title, then fuzzy artist.
+     * Deduplicates to avoid same file appearing twice in queue.
      */
     fun mapEmbeddedTracksToFileIds(
         context: Context,
@@ -111,6 +112,7 @@ class TrackMatcher(
     ): List<Long> {
         // Build indexes from Poweramp library
         val powerampFiles = PowerampHelper.getAllFileIds(context)
+        val byArtistAlbumTitle = mutableMapOf<String, Long>()
         val byArtistTitle = mutableMapOf<String, Long>()
         val byTitle = mutableMapOf<String, MutableList<Pair<String, Long>>>() // title -> [(artist, id)]
 
@@ -118,7 +120,9 @@ class TrackMatcher(
             val parts = key.split("|")
             if (parts.size >= 3) {
                 val artist = parts[0]
+                val album = parts[1]
                 val title = parts[2]
+                byArtistAlbumTitle["$artist|$album|$title"] = id
                 byArtistTitle["$artist|$title"] = id
                 byTitle.getOrPut(title) { mutableListOf() }.add(artist to id)
             }
@@ -126,16 +130,24 @@ class TrackMatcher(
         Log.d(TAG, "Indexed ${powerampFiles.size} Poweramp tracks")
 
         val fileIds = mutableListOf<Long>()
+        val seen = mutableSetOf<Long>() // Track seen IDs to avoid duplicates
+
         for (track in embeddedTracks) {
             val parts = track.metadataKey.split("|")
             if (parts.size >= 3) {
                 val embeddedArtist = parts[0]
+                val embeddedAlbum = parts[1]
                 val embeddedTitle = parts[2]
 
-                // Try exact artist|title match first
-                var fileId = byArtistTitle["$embeddedArtist|$embeddedTitle"]
+                // 1. Try exact artist|album|title
+                var fileId = byArtistAlbumTitle["$embeddedArtist|$embeddedAlbum|$embeddedTitle"]
 
-                // Fuzzy: find by title, check artist substring
+                // 2. Try artist|title (any album)
+                if (fileId == null) {
+                    fileId = byArtistTitle["$embeddedArtist|$embeddedTitle"]
+                }
+
+                // 3. Fuzzy: find by title, check artist substring
                 if (fileId == null) {
                     byTitle[embeddedTitle]?.find { (powerampArtist, _) ->
                         embeddedArtist.isNotEmpty() && (
@@ -145,15 +157,17 @@ class TrackMatcher(
                     }?.let { (_, id) -> fileId = id }
                 }
 
-                if (fileId != null) {
+                // Add if found and not a duplicate
+                if (fileId != null && fileId !in seen) {
                     fileIds.add(fileId!!)
-                } else {
+                    seen.add(fileId!!)
+                } else if (fileId == null) {
                     Log.d(TAG, "No Poweramp match for: ${track.artist} - ${track.title}")
                 }
             }
         }
 
-        Log.d(TAG, "Mapped ${fileIds.size} of ${embeddedTracks.size} tracks")
+        Log.d(TAG, "Mapped ${fileIds.size} unique tracks of ${embeddedTracks.size}")
         return fileIds
     }
 }
