@@ -41,19 +41,12 @@ class TrackMatcher(
     fun findMatch(powerampTrack: PowerampTrack): MatchResult? {
         Log.d(TAG, "Finding match for: ${powerampTrack.title} by ${powerampTrack.artist}")
 
-        // Try metadata key match (exact first, then artist|album|title with duration tolerance)
+        // Try metadata match (artist + title)
         val metadataKey = powerampTrack.metadataKey
-        Log.d(TAG, "Trying metadata key: $metadataKey")
+        Log.d(TAG, "Looking for: ${powerampTrack.artist} - ${powerampTrack.title}")
 
         embeddingDb.findTrackByMetadataKey(metadataKey)?.let { track ->
-            val exactMatch = track.metadataKey == metadataKey
-            if (exactMatch) {
-                Log.d(TAG, "Found exact metadata match: ${track.title}")
-            } else {
-                Log.d(TAG, "Found metadata match (duration-tolerant): ${track.title}")
-                Log.d(TAG, "  Poweramp key: $metadataKey")
-                Log.d(TAG, "  Embedded key: ${track.metadataKey}")
-            }
+            Log.d(TAG, "Found match: ${track.title}")
             return MatchResult(track, MatchType.METADATA_EXACT)
         }
 
@@ -110,63 +103,34 @@ class TrackMatcher(
 
     /**
      * Map embedded track IDs to Poweramp file IDs.
-     * This is needed because the embedding database uses different IDs than Poweramp.
+     * Uses artist|title matching - simple and reliable.
      */
     fun mapEmbeddedTracksToFileIds(
         context: Context,
         embeddedTracks: List<EmbeddedTrack>
     ): List<Long> {
-        // Get all Poweramp file IDs indexed by metadata key
+        // Build artist|title -> file ID index from Poweramp
         val powerampFiles = PowerampHelper.getAllFileIds(context)
-        Log.d(TAG, "Loaded ${powerampFiles.size} Poweramp file IDs")
-
-        // Also create indexes for fallback matching
-        val byArtistAlbumTitle = mutableMapOf<String, Long>()
         val byArtistTitle = mutableMapOf<String, Long>()
         for ((key, id) in powerampFiles) {
             val parts = key.split("|")
             if (parts.size >= 3) {
-                val artist = parts[0]
-                val album = parts[1]
-                val title = parts[2]
-                byArtistAlbumTitle["$artist|$album|$title"] = id
-                byArtistTitle["$artist|$title"] = id
+                byArtistTitle["${parts[0]}|${parts[2]}"] = id
             }
         }
+        Log.d(TAG, "Indexed ${byArtistTitle.size} Poweramp tracks by artist|title")
 
         val fileIds = mutableListOf<Long>()
-
         for (track in embeddedTracks) {
-            // Try exact metadata key first
-            var fileId = powerampFiles[track.metadataKey]
-
-            if (fileId == null) {
-                // Try artist|album|title (ignore duration)
-                val parts = track.metadataKey.split("|")
-                if (parts.size >= 3) {
-                    val keyNoDuration = "${parts[0]}|${parts[1]}|${parts[2]}"
-                    fileId = byArtistAlbumTitle[keyNoDuration]
-                }
-            }
-
-            if (fileId == null) {
-                // Try artist|title only (ignore album and duration)
-                val parts = track.metadataKey.split("|")
-                if (parts.size >= 3) {
-                    val keyArtistTitle = "${parts[0]}|${parts[2]}"
-                    fileId = byArtistTitle[keyArtistTitle]
-                }
-            }
-
-            if (fileId != null) {
-                fileIds.add(fileId)
-            } else {
-                Log.d(TAG, "Could not find Poweramp file ID for: ${track.title}")
-                Log.d(TAG, "  Embedded key: ${track.metadataKey}")
+            val parts = track.metadataKey.split("|")
+            if (parts.size >= 3) {
+                val key = "${parts[0]}|${parts[2]}"
+                byArtistTitle[key]?.let { fileIds.add(it) }
+                    ?: Log.d(TAG, "No Poweramp match for: ${track.artist} - ${track.title}")
             }
         }
 
-        Log.d(TAG, "Mapped ${fileIds.size} of ${embeddedTracks.size} tracks to Poweramp file IDs")
+        Log.d(TAG, "Mapped ${fileIds.size} of ${embeddedTracks.size} tracks")
         return fileIds
     }
 }
