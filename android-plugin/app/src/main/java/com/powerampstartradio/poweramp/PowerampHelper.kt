@@ -85,7 +85,12 @@ object PowerampHelper {
             setPackage(POWERAMP_PACKAGE)
             putExtra(EXTRA_PACKAGE, context.packageName)
         }
-        sendIntent(context, intent)
+        // Use implicit intent (don't set explicit component)
+        try {
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to request data permission", e)
+        }
     }
 
     /**
