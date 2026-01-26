@@ -303,7 +303,12 @@ object PowerampHelper {
             putExtra(EXTRA_PACKAGE, context.packageName)
             putExtra(EXTRA_TABLE, table)
         }
-        sendIntent(context, intent)
+        // Send as broadcast, not activity
+        try {
+            context.sendBroadcast(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to send reload broadcast", e)
+        }
     }
 
     /**
@@ -312,9 +317,15 @@ object PowerampHelper {
     fun openQueue(context: Context) {
         val queueUri = ROOT_URI.buildUpon().appendEncodedPath("queue").build()
         val intent = Intent(ACTION_OPEN_LIBRARY).apply {
+            setPackage(POWERAMP_PACKAGE)
             data = queueUri
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        sendIntent(context, intent)
+        try {
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to open queue", e)
+        }
     }
 
     /**
@@ -323,10 +334,16 @@ object PowerampHelper {
     fun playQueue(context: Context) {
         val queueUri = ROOT_URI.buildUpon().appendEncodedPath("queue").build()
         val intent = Intent(ACTION_API_COMMAND).apply {
+            setPackage(POWERAMP_PACKAGE)
             putExtra(EXTRA_COMMAND, COMMAND_OPEN_TO_PLAY)
             data = queueUri
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        sendIntent(context, intent)
+        try {
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to play queue", e)
+        }
     }
 }
 

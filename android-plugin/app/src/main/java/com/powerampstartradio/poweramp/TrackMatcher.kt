@@ -50,13 +50,24 @@ class TrackMatcher(
             return MatchResult(track, MatchType.METADATA_EXACT)
         }
 
-        // Try filename-based match
+        // Try filename-based match (include artist for better precision)
         powerampTrack.path?.let { path ->
             val filename = path.substringAfterLast("/").substringBeforeLast(".")
                 .lowercase()
                 .replace(Regex("\\s*[\\(\\[].*?[\\)\\]]"), "") // Remove parentheticals
                 .replace(Regex("^\\d+[.\\-\\s]+"), "") // Remove track numbers
                 .trim()
+
+            // Try with artist prefix first for more precise matching
+            val artist = powerampTrack.artist?.lowercase()?.trim()
+            if (!artist.isNullOrEmpty()) {
+                val artistFilename = "$artist - ${powerampTrack.title.lowercase().trim()}"
+                Log.d(TAG, "Trying filename key with artist: $artistFilename")
+                embeddingDb.findTrackByFilenameKey(artistFilename)?.let { track ->
+                    Log.d(TAG, "Found filename match with artist: ${track.title}")
+                    return MatchResult(track, MatchType.FILENAME)
+                }
+            }
 
             Log.d(TAG, "Trying filename key: $filename")
 
