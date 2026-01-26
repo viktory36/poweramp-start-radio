@@ -111,6 +111,7 @@ class TrackMatcher(
                 fileIds.add(fileId)
             } else {
                 Log.d(TAG, "Could not find Poweramp file ID for: ${track.title}")
+                Log.d(TAG, "  Embedded key: ${track.metadataKey}")
             }
         }
 

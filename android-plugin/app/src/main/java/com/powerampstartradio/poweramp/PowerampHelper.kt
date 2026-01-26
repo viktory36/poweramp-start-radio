@@ -209,21 +209,22 @@ object PowerampHelper {
             )
 
             cursor?.use {
-                val idIdx = it.getColumnIndex("folder_files._id")
+                val idIdx = it.getColumnIndex("_id")
                 val artistIdx = it.getColumnIndex("artist")
                 val albumIdx = it.getColumnIndex("album")
                 val titleIdx = it.getColumnIndex("title_tag")
-                val durationIdx = it.getColumnIndex("folder_files.duration")
+                val durationIdx = it.getColumnIndex("duration")
 
                 while (it.moveToNext()) {
                     val id = it.getLong(idIdx)
-                    val artist = it.getString(artistIdx) ?: ""
-                    val album = it.getString(albumIdx) ?: ""
-                    val title = it.getString(titleIdx) ?: ""
+                    val artist = (it.getString(artistIdx) ?: "").lowercase().trim()
+                    val album = (it.getString(albumIdx) ?: "").lowercase().trim()
+                    val title = (it.getString(titleIdx) ?: "").lowercase().trim()
                     val durationMs = it.getInt(durationIdx) * 1000
 
-                    // Create metadata key matching desktop indexer format
-                    val key = "${artist.lowercase()}|${album.lowercase()}|${title.lowercase()}|${(durationMs / 100) * 100}"
+                    // Create metadata key matching desktop indexer format (rounds to 100ms)
+                    val durationRounded = (durationMs / 100) * 100
+                    val key = "$artist|$album|$title|$durationRounded"
                     result[key] = id
                 }
             }
