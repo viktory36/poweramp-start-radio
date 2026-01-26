@@ -102,11 +102,44 @@ class TrackMatcher(
         val powerampFiles = PowerampHelper.getAllFileIds(context)
         Log.d(TAG, "Loaded ${powerampFiles.size} Poweramp file IDs")
 
+        // Also create indexes for fallback matching
+        val byArtistAlbumTitle = mutableMapOf<String, Long>()
+        val byArtistTitle = mutableMapOf<String, Long>()
+        for ((key, id) in powerampFiles) {
+            val parts = key.split("|")
+            if (parts.size >= 3) {
+                val artist = parts[0]
+                val album = parts[1]
+                val title = parts[2]
+                byArtistAlbumTitle["$artist|$album|$title"] = id
+                byArtistTitle["$artist|$title"] = id
+            }
+        }
+
         val fileIds = mutableListOf<Long>()
 
         for (track in embeddedTracks) {
-            // Try to find by metadata key
-            val fileId = powerampFiles[track.metadataKey]
+            // Try exact metadata key first
+            var fileId = powerampFiles[track.metadataKey]
+
+            if (fileId == null) {
+                // Try artist|album|title (ignore duration)
+                val parts = track.metadataKey.split("|")
+                if (parts.size >= 3) {
+                    val keyNoDuration = "${parts[0]}|${parts[1]}|${parts[2]}"
+                    fileId = byArtistAlbumTitle[keyNoDuration]
+                }
+            }
+
+            if (fileId == null) {
+                // Try artist|title only (ignore album and duration)
+                val parts = track.metadataKey.split("|")
+                if (parts.size >= 3) {
+                    val keyArtistTitle = "${parts[0]}|${parts[2]}"
+                    fileId = byArtistTitle[keyArtistTitle]
+                }
+            }
+
             if (fileId != null) {
                 fileIds.add(fileId)
             } else {
