@@ -1,0 +1,51 @@
+# References (large external projects)
+references/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Android
+*.iml
+.gradle/
+local.properties
+.idea/
+*.apk
+*.aab
+*.ap_
+*.dex
+/android-plugin/build/
+/android-plugin/app/build/
+/android-plugin/.gradle/
+/android-plugin/app/.cxx/
+/android-plugin/captures/
+.externalNativeBuild/
+.cxx/
+
+# Database files (user-specific)
+*.db
+embeddings.db
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+.claude/*
