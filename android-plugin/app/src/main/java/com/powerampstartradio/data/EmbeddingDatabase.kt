@@ -82,13 +82,47 @@ class EmbeddingDatabase private constructor(
 
     /**
      * Get a track by its metadata key (primary matching method).
+     * Matches on artist|album|title, using duration only as tiebreaker.
+     * This handles the common case where Poweramp and the indexer report slightly different durations.
      */
     fun findTrackByMetadataKey(key: String): EmbeddedTrack? {
-        val cursor = db.rawQuery(
+        // First try exact match
+        val exactCursor = db.rawQuery(
             "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE metadata_key = ?",
             arrayOf(key)
         )
-        return cursor.use { cursorToTrack(it) }
+        exactCursor.use {
+            if (it.moveToFirst()) {
+                return cursorToTrack(it)
+            }
+        }
+
+        // Parse key to match without duration
+        val parts = key.split("|")
+        if (parts.size >= 4) {
+            val artist = parts[0]
+            val album = parts[1]
+            val title = parts[2]
+            val targetDuration = parts[3].toIntOrNull() ?: 0
+
+            // Match on artist|album|title with wildcard for duration
+            val keyPrefix = "$artist|$album|$title|%"
+            val cursor = db.rawQuery(
+                "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE metadata_key LIKE ?",
+                arrayOf(keyPrefix)
+            )
+            cursor.use {
+                val matches = cursorToTrackList(it)
+                if (matches.isNotEmpty()) {
+                    // Return the one with closest duration
+                    return matches.minByOrNull { track ->
+                        kotlin.math.abs(track.durationMs - targetDuration)
+                    }
+                }
+            }
+        }
+
+        return null
     }
 
     /**

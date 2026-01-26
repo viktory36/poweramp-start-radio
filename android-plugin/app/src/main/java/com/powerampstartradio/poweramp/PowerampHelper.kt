@@ -333,14 +333,15 @@ object PowerampHelper {
      */
     fun playQueue(context: Context) {
         val queueUri = ROOT_URI.buildUpon().appendEncodedPath("queue").build()
+        // Send as broadcast to ApiReceiver (not activity - that's not exported)
         val intent = Intent(ACTION_API_COMMAND).apply {
             setPackage(POWERAMP_PACKAGE)
             putExtra(EXTRA_COMMAND, COMMAND_OPEN_TO_PLAY)
             data = queueUri
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         try {
-            context.startActivity(intent)
+            context.sendBroadcast(intent)
+            Log.d(TAG, "Sent play queue broadcast")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to play queue", e)
         }

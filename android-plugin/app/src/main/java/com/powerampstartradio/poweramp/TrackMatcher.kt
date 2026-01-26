@@ -41,12 +41,19 @@ class TrackMatcher(
     fun findMatch(powerampTrack: PowerampTrack): MatchResult? {
         Log.d(TAG, "Finding match for: ${powerampTrack.title} by ${powerampTrack.artist}")
 
-        // Try exact metadata key match first
+        // Try metadata key match (exact first, then artist|album|title with duration tolerance)
         val metadataKey = powerampTrack.metadataKey
         Log.d(TAG, "Trying metadata key: $metadataKey")
 
         embeddingDb.findTrackByMetadataKey(metadataKey)?.let { track ->
-            Log.d(TAG, "Found metadata match: ${track.title}")
+            val exactMatch = track.metadataKey == metadataKey
+            if (exactMatch) {
+                Log.d(TAG, "Found exact metadata match: ${track.title}")
+            } else {
+                Log.d(TAG, "Found metadata match (duration-tolerant): ${track.title}")
+                Log.d(TAG, "  Poweramp key: $metadataKey")
+                Log.d(TAG, "  Embedded key: ${track.metadataKey}")
+            }
             return MatchResult(track, MatchType.METADATA_EXACT)
         }
 
