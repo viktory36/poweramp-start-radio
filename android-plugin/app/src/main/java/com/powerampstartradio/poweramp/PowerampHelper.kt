@@ -67,6 +67,7 @@ object PowerampHelper {
      */
     fun sendIntent(context: Context, intent: Intent) {
         intent.setComponent(ComponentName(POWERAMP_PACKAGE, API_ACTIVITY))
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         try {
             context.startActivity(intent)
         } catch (e: Exception) {
