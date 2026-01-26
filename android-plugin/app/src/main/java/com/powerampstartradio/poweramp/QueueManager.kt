@@ -24,15 +24,14 @@ class QueueManager(
 
     /**
      * Clear the queue and add new tracks for radio playback.
+     * Poweramp will automatically play from queue when current track ends.
      *
-     * @param fileIds Poweramp file IDs to add to the queue
+     * @param fileIds Poweramp file IDs to add to the queue (in similarity order)
      * @param clearExisting Whether to clear the existing queue first
-     * @param startPlayback Whether to start playing after queueing
      */
     fun setQueueAndPlay(
         fileIds: List<Long>,
-        clearExisting: Boolean = true,
-        startPlayback: Boolean = true
+        clearExisting: Boolean = true
     ): QueueResult {
         if (fileIds.isEmpty()) {
             return QueueResult(false, 0, "No tracks to queue")
@@ -41,13 +40,11 @@ class QueueManager(
         Log.d(TAG, "Queueing ${fileIds.size} tracks")
 
         try {
-            // Clear existing queue if requested
             if (clearExisting) {
                 PowerampHelper.clearQueue(context)
                 Log.d(TAG, "Cleared existing queue")
             }
 
-            // Add tracks to queue
             val added = PowerampHelper.addTracksToQueue(context, fileIds)
             Log.d(TAG, "Added $added tracks to queue")
 
@@ -55,17 +52,10 @@ class QueueManager(
                 return QueueResult(false, 0, "Failed to add tracks to queue")
             }
 
-            // Tell Poweramp to reload
             PowerampHelper.reloadData(context)
-            Log.d(TAG, "Sent reload data command")
+            Log.d(TAG, "Queue ready - will play after current track")
 
-            // Start playback if requested
-            if (startPlayback) {
-                PowerampHelper.playQueue(context)
-                Log.d(TAG, "Started playback")
-            }
-
-            return QueueResult(true, added, "Started radio with $added tracks")
+            return QueueResult(true, added, "Queued $added similar tracks")
 
         } catch (e: Exception) {
             Log.e(TAG, "Error setting queue", e)
