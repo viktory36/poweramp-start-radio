@@ -103,30 +103,53 @@ class TrackMatcher(
 
     /**
      * Map embedded track IDs to Poweramp file IDs.
-     * Uses artist|title matching - simple and reliable.
+     * Uses title + fuzzy artist matching to handle "Artist1; Artist2" cases.
      */
     fun mapEmbeddedTracksToFileIds(
         context: Context,
         embeddedTracks: List<EmbeddedTrack>
     ): List<Long> {
-        // Build artist|title -> file ID index from Poweramp
+        // Build indexes from Poweramp library
         val powerampFiles = PowerampHelper.getAllFileIds(context)
         val byArtistTitle = mutableMapOf<String, Long>()
+        val byTitle = mutableMapOf<String, MutableList<Pair<String, Long>>>() // title -> [(artist, id)]
+
         for ((key, id) in powerampFiles) {
             val parts = key.split("|")
             if (parts.size >= 3) {
-                byArtistTitle["${parts[0]}|${parts[2]}"] = id
+                val artist = parts[0]
+                val title = parts[2]
+                byArtistTitle["$artist|$title"] = id
+                byTitle.getOrPut(title) { mutableListOf() }.add(artist to id)
             }
         }
-        Log.d(TAG, "Indexed ${byArtistTitle.size} Poweramp tracks by artist|title")
+        Log.d(TAG, "Indexed ${powerampFiles.size} Poweramp tracks")
 
         val fileIds = mutableListOf<Long>()
         for (track in embeddedTracks) {
             val parts = track.metadataKey.split("|")
             if (parts.size >= 3) {
-                val key = "${parts[0]}|${parts[2]}"
-                byArtistTitle[key]?.let { fileIds.add(it) }
-                    ?: Log.d(TAG, "No Poweramp match for: ${track.artist} - ${track.title}")
+                val embeddedArtist = parts[0]
+                val embeddedTitle = parts[2]
+
+                // Try exact artist|title match first
+                var fileId = byArtistTitle["$embeddedArtist|$embeddedTitle"]
+
+                // Fuzzy: find by title, check artist substring
+                if (fileId == null) {
+                    byTitle[embeddedTitle]?.find { (powerampArtist, _) ->
+                        embeddedArtist.isNotEmpty() && (
+                            powerampArtist.contains(embeddedArtist) ||
+                            embeddedArtist.contains(powerampArtist)
+                        )
+                    }?.let { (_, id) -> fileId = id }
+                }
+
+                if (fileId != null) {
+                    fileIds.add(fileId!!)
+                } else {
+                    Log.d(TAG, "No Poweramp match for: ${track.artist} - ${track.title}")
+                }
             }
         }
 

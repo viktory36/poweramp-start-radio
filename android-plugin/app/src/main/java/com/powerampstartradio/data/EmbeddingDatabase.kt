@@ -82,7 +82,8 @@ class EmbeddingDatabase private constructor(
 
     /**
      * Get a track by its metadata key (primary matching method).
-     * Matches on artist|title only - simple and reliable for personal libraries.
+     * Matches on title first, then fuzzy artist match to handle "Artist1; Artist2" cases
+     * where Poweramp might report just "Artist1".
      */
     fun findTrackByMetadataKey(key: String): EmbeddedTrack? {
         val parts = key.split("|")
@@ -90,13 +91,32 @@ class EmbeddingDatabase private constructor(
             val artist = parts[0]
             val title = parts[2]
 
-            // Match on artist|%|title|% (ignore album and duration)
-            val pattern = "$artist|%|$title|%"
+            // First try exact artist|title match
+            val exactPattern = "$artist|%|$title|%"
+            val exactCursor = db.rawQuery(
+                "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE metadata_key LIKE ?",
+                arrayOf(exactPattern)
+            )
+            exactCursor.use {
+                cursorToTrack(it)?.let { return it }
+            }
+
+            // Fuzzy match: find by title, then check artist overlap
+            val titlePattern = "%|%|$title|%"
             val cursor = db.rawQuery(
                 "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE metadata_key LIKE ?",
-                arrayOf(pattern)
+                arrayOf(titlePattern)
             )
-            return cursor.use { cursorToTrack(it) }
+            cursor.use {
+                val matches = cursorToTrackList(it)
+                // Find one where artist is substring match (either direction)
+                return matches.find { track ->
+                    val embeddedArtist = track.artist?.lowercase() ?: ""
+                    artist.isNotEmpty() && (
+                        embeddedArtist.contains(artist) || artist.contains(embeddedArtist)
+                    )
+                }
+            }
         }
         return null
     }
