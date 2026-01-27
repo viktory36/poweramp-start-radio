@@ -18,10 +18,10 @@ MODEL_CHOICES = ["muq", "clap"]
 DEFAULT_MODEL = "muq"
 
 
-def create_embedding_generator(model: str):
+def create_embedding_generator(model: str, contrast_chunks: int = 2):
     """Create the appropriate embedding generator based on model choice."""
     if model == "muq":
-        return MuQEmbeddingGenerator()
+        return MuQEmbeddingGenerator(contrast_chunks=contrast_chunks)
     elif model == "clap":
         return CLAPEmbeddingGenerator()
     else:
@@ -75,7 +75,12 @@ def cli():
     default=DEFAULT_MODEL,
     help="Embedding model to use (default: muq)"
 )
-def scan(music_path: Path, output: Path, batch_size: int, skip_existing: bool, verbose: bool, model: str):
+@click.option(
+    "--no-contrast",
+    is_flag=True,
+    help="Disable contrast sampling (high/low energy chunks) for A/B testing"
+)
+def scan(music_path: Path, output: Path, batch_size: int, skip_existing: bool, verbose: bool, model: str, no_contrast: bool):
     """Scan a music directory and generate embeddings.
 
     MUSIC_PATH: Path to your music library folder
@@ -114,8 +119,12 @@ def scan(music_path: Path, output: Path, batch_size: int, skip_existing: bool, v
 
     # Initialize embedding generator
     model_name = "MuQ" if model == "muq" else "CLAP"
-    click.echo(f"Loading {model_name} model...")
-    generator = create_embedding_generator(model)
+    contrast_chunks = 0 if no_contrast else 2
+    if no_contrast:
+        click.echo(f"Loading {model_name} model (contrast sampling disabled)...")
+    else:
+        click.echo(f"Loading {model_name} model...")
+    generator = create_embedding_generator(model, contrast_chunks=contrast_chunks)
 
     # Process in batches
     successful = 0
@@ -191,7 +200,12 @@ def scan(music_path: Path, output: Path, batch_size: int, skip_existing: bool, v
     default=None,
     help="Embedding model to use (default: from database or muq)"
 )
-def update(music_path: Path, database: Path, batch_size: int, remove_missing: bool, verbose: bool, model: str):
+@click.option(
+    "--no-contrast",
+    is_flag=True,
+    help="Disable contrast sampling (high/low energy chunks) for A/B testing"
+)
+def update(music_path: Path, database: Path, batch_size: int, remove_missing: bool, verbose: bool, model: str, no_contrast: bool):
     """Incrementally update an existing database.
 
     Adds new files and optionally removes missing ones.
@@ -242,8 +256,12 @@ def update(music_path: Path, database: Path, batch_size: int, remove_missing: bo
 
     # Initialize embedding generator
     model_name = "MuQ" if model == "muq" else "CLAP"
-    click.echo(f"Loading {model_name} model...")
-    generator = create_embedding_generator(model)
+    contrast_chunks = 0 if no_contrast else 2
+    if no_contrast:
+        click.echo(f"Loading {model_name} model (contrast sampling disabled)...")
+    else:
+        click.echo(f"Loading {model_name} model...")
+    generator = create_embedding_generator(model, contrast_chunks=contrast_chunks)
 
     # Process new files
     successful = 0
@@ -354,7 +372,8 @@ def format_track(track: dict) -> str:
 @click.option("--random", "-r", "use_random", is_flag=True, help="Pick a random seed track")
 @click.option("--top", "-n", default=10, help="Number of similar tracks to show")
 @click.option("--model", "-m", type=click.Choice(MODEL_CHOICES), default=None, help="Model for --file embedding (default: from database)")
-def similar(database: Path, query: str, audio_file: Path, use_random: bool, top: int, model: str):
+@click.option("--no-contrast", is_flag=True, help="Disable contrast sampling when using --file")
+def similar(database: Path, query: str, audio_file: Path, use_random: bool, top: int, model: str, no_contrast: bool):
     """Find similar tracks in the database.
 
     DATABASE: Path to embeddings.db
@@ -422,8 +441,9 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
             model = db.get_metadata("model") or DEFAULT_MODEL
 
         model_name = "MuQ" if model == "muq" else "CLAP"
+        contrast_chunks = 0 if no_contrast else 2
         click.echo(f"Generating embedding with {model_name}...")
-        generator = create_embedding_generator(model)
+        generator = create_embedding_generator(model, contrast_chunks=contrast_chunks)
         embeddings = generator.generate_embedding_batch([audio_file])
         generator.unload_model()
 
