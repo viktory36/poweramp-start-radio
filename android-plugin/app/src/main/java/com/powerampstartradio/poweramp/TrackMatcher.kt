@@ -2,6 +2,7 @@ package com.powerampstartradio.poweramp
 
 import android.content.Context
 import android.util.Log
+import com.powerampstartradio.data.EmbeddedTrack
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.similarity.SimilarTrack
 
