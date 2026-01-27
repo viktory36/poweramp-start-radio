@@ -306,7 +306,7 @@ class MuQEmbeddingGenerator:
             logger.error(f"Error loading audio file {filepath.name}: {e}")
             return (filepath, [], 0)
 
-    def _prepare_batch(self, filepaths: list[Path], num_workers: int = 4) -> PreparedBatch:
+    def _prepare_batch(self, filepaths: list[Path], num_workers: int = 8) -> PreparedBatch:
         """
         Prepare a batch of files for GPU inference using parallel loading.
 
@@ -394,7 +394,7 @@ class MuQEmbeddingGenerator:
     def generate_embedding_batch(
         self,
         filepaths: list[Path],
-        num_workers: int = 4
+        num_workers: int = 8
     ) -> list[Optional[list[float]]]:
         """
         Generate embeddings for multiple audio files.
@@ -427,7 +427,7 @@ class MuQEmbeddingGenerator:
         self,
         all_filepaths: list[Path],
         batch_size: int = 8,
-        num_workers: int = 4,
+        num_workers: int = 8,
         prefetch_batches: int = 2
     ):
         """

@@ -28,9 +28,9 @@ def create_embedding_generator(model: str, contrast_chunks: int = 2):
         raise ValueError(f"Unknown model: {model}. Choose from: {MODEL_CHOICES}")
 
 
-# Default prefetch settings
-DEFAULT_PREFETCH_WORKERS = 4
-DEFAULT_PREFETCH_BATCHES = 2
+# Default prefetch settings (aggressive - maximize throughput)
+DEFAULT_PREFETCH_WORKERS = 8
+DEFAULT_PREFETCH_BATCHES = 4
 
 # Configure logging
 logging.basicConfig(
@@ -89,7 +89,7 @@ def cli():
     "--prefetch-workers", "-w",
     type=int,
     default=DEFAULT_PREFETCH_WORKERS,
-    help="Number of parallel file loading threads (default: 4)"
+    help="Number of parallel file loading threads (default: 8)"
 )
 @click.option(
     "--no-prefetch",
@@ -255,7 +255,7 @@ def scan(music_path: Path, output: Path, batch_size: int, skip_existing: bool, v
     "--prefetch-workers", "-w",
     type=int,
     default=DEFAULT_PREFETCH_WORKERS,
-    help="Number of parallel file loading threads (default: 4)"
+    help="Number of parallel file loading threads (default: 8)"
 )
 @click.option(
     "--no-prefetch",
