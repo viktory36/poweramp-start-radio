@@ -2,13 +2,35 @@
 
 import logging
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
+from queue import Queue
+from threading import Thread
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LoadedAudio:
+    """Pre-loaded audio data ready for GPU inference."""
+    filepath: Path
+    waveform: np.ndarray  # Full waveform at target sample rate
+    duration_s: float
+    energy_profile: list[tuple[float, float]]  # [(position_s, rms), ...]
+
+
+@dataclass
+class PreparedBatch:
+    """Batch of audio chunks ready for GPU inference."""
+    filepaths: list[Path]
+    chunks: list[np.ndarray]  # All chunks from all files
+    file_chunk_counts: list[int]  # How many chunks per file
 
 
 class MuQEmbeddingGenerator:
@@ -72,14 +94,86 @@ class MuQEmbeddingGenerator:
         self.model.eval()
         logger.info("Model loaded successfully.")
 
-    def _get_duration(self, filepath: Path) -> Optional[float]:
-        """Get audio duration without loading the file."""
+    def _load_audio_full(self, filepath: Path) -> Optional[LoadedAudio]:
+        """
+        Load audio file once and extract all needed information.
+
+        This consolidates what was previously 3+ file reads into 1:
+        - Duration (from waveform length)
+        - Energy profile (computed from waveform)
+        - The waveform itself (for chunk extraction)
+
+        Returns LoadedAudio with all data needed for chunk selection and extraction.
+        """
         import librosa
+
         try:
-            return librosa.get_duration(path=str(filepath))
+            # Single load at target sample rate
+            waveform, sr = librosa.load(str(filepath), sr=self.target_sr, mono=True)
+            duration_s = len(waveform) / sr
+
+            # Compute energy profile from loaded waveform (no second file read)
+            energy_profile = self._compute_energy_profile(waveform, sr)
+
+            return LoadedAudio(
+                filepath=filepath,
+                waveform=waveform,
+                duration_s=duration_s,
+                energy_profile=energy_profile
+            )
         except Exception as e:
-            logger.error(f"Error getting duration for {filepath.name}: {e}")
+            logger.error(f"Error loading {filepath.name}: {e}")
             return None
+
+    def _compute_energy_profile(self, waveform: np.ndarray, sr: int) -> list[tuple[float, float]]:
+        """
+        Compute RMS energy profile from pre-loaded waveform.
+
+        Returns [(position_in_seconds, rms_value), ...] for each second.
+        """
+        import librosa
+
+        try:
+            # Calculate RMS energy in 1-second windows
+            hop_length = sr  # 1 second hops
+            frame_length = sr  # 1 second frames
+
+            rms = librosa.feature.rms(y=waveform, frame_length=frame_length, hop_length=hop_length)[0]
+
+            # Build profile: (position_in_seconds, rms_value)
+            return [(i, float(rms[i])) for i in range(len(rms))]
+        except Exception as e:
+            logger.debug(f"Energy profile computation failed: {e}")
+            return []
+
+    def _extract_chunks_from_waveform(
+        self,
+        waveform: np.ndarray,
+        positions: list[float]
+    ) -> list[np.ndarray]:
+        """
+        Extract audio chunks from pre-loaded waveform by slicing.
+
+        Much faster than librosa.load() with offset/duration for each chunk.
+        """
+        import librosa
+
+        chunks = []
+        expected_samples = self.chunk_duration_s * self.target_sr
+
+        for pos in positions:
+            start_sample = int(pos * self.target_sr)
+            end_sample = start_sample + expected_samples
+
+            chunk = waveform[start_sample:end_sample]
+
+            # Ensure exact length for torch.stack compatibility
+            if len(chunk) < expected_samples:
+                chunk = librosa.util.fix_length(chunk, size=expected_samples)
+
+            chunks.append(chunk)
+
+        return chunks
 
     def _calculate_num_chunks(self, duration_s: float) -> int:
         """Scale chunk count based on audio duration."""
@@ -101,33 +195,6 @@ class MuQEmbeddingGenerator:
             random.uniform(i * bin_size, min((i + 1) * bin_size, usable))
             for i in range(num_chunks)
         ]
-
-    def _scan_energy_profile(self, filepath: Path, duration_s: float) -> list[tuple[float, float]]:
-        """
-        Quick RMS energy scan. Returns [(position, rms), ...] for each second.
-
-        Uses low sample rate (8kHz) for speed - energy detection doesn't need high fidelity.
-        """
-        import librosa
-
-        try:
-            # Load at low sample rate for speed (~10ms for typical song)
-            scan_sr = 8000
-            y, _ = librosa.load(str(filepath), sr=scan_sr, mono=True)
-
-            # Calculate RMS energy in 1-second windows
-            hop_length = scan_sr  # 1 second hops
-            frame_length = scan_sr  # 1 second frames
-
-            rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
-
-            # Build profile: (position_in_seconds, rms_value)
-            profile = [(i, float(rms[i])) for i in range(len(rms))]
-            return profile
-
-        except Exception as e:
-            logger.debug(f"Energy scan failed for {filepath.name}: {e}")
-            return []
 
     def _select_contrast_positions(
         self,
@@ -188,111 +255,100 @@ class MuQEmbeddingGenerator:
 
         return contrast_positions[:self.contrast_chunks]
 
-    def generate_embedding(self, filepath: Path) -> Optional[list[float]]:
-        """Generate embedding for a single audio file."""
-        results = self.generate_embedding_batch([filepath])
-        return results[0] if results else None
-
-    def generate_embedding_batch(self, filepaths: list[Path]) -> list[Optional[list[float]]]:
+    def _prepare_file(self, filepath: Path) -> tuple[Path, list[np.ndarray], int]:
         """
-        Generate embeddings for multiple audio files.
+        Load a single file and prepare its chunks.
 
-        For each file:
-        1. Get duration without loading
-        2. Scan energy profile (cheap, ~10ms)
-        3. Select stratified positions across full duration
-        4. Select contrast positions (high/low energy) avoiding overlap
-        5. Load each chunk via seeking (memory efficient)
-        6. Generate embeddings and average
-
-        Args:
-            filepaths: List of audio file paths
-
-        Returns:
-            List of embeddings (or None for failed files)
+        Returns (filepath, chunks, chunk_count) tuple.
+        This method is designed to be called from thread pool workers.
         """
-        if not filepaths:
-            return []
+        try:
+            loaded = self._load_audio_full(filepath)
+            if loaded is None:
+                return (filepath, [], 0)
 
-        import librosa
+            if loaded.duration_s < self.chunk_duration_s:
+                logger.warning(
+                    f"File {filepath.name} is too short ({loaded.duration_s:.1f}s) "
+                    f"for even one chunk of {self.chunk_duration_s}s."
+                )
+                return (filepath, [], 0)
 
-        self._load_model_if_needed()
+            # Stratified sampling
+            num_stratified = self._calculate_num_chunks(loaded.duration_s)
+            stratified_positions = self._select_chunk_positions(loaded.duration_s, num_stratified)
 
+            # Contrast sampling (high/low energy)
+            contrast_positions = self._select_contrast_positions(
+                loaded.energy_profile, stratified_positions, loaded.duration_s
+            )
+
+            # Combine positions, respecting max_chunks limit
+            positions = stratified_positions + contrast_positions
+            if len(positions) > self.max_chunks:
+                positions = positions[:self.max_chunks]
+
+            logger.debug(
+                f"{filepath.name}: {len(stratified_positions)} stratified + "
+                f"{len(contrast_positions)} contrast = {len(positions)} chunks"
+            )
+
+            # Extract chunks from pre-loaded waveform (fast array slicing)
+            chunks = self._extract_chunks_from_waveform(loaded.waveform, positions)
+
+            if not chunks:
+                logger.warning(f"No valid chunks generated for {filepath.name}.")
+                return (filepath, [], 0)
+
+            return (filepath, chunks, len(chunks))
+
+        except Exception as e:
+            logger.error(f"Error loading audio file {filepath.name}: {e}")
+            return (filepath, [], 0)
+
+    def _prepare_batch(self, filepaths: list[Path], num_workers: int = 4) -> PreparedBatch:
+        """
+        Prepare a batch of files for GPU inference using parallel loading.
+
+        Uses ThreadPoolExecutor to load multiple files concurrently.
+        librosa releases GIL during I/O, so threads work well here.
+        """
         all_chunks = []
         file_chunk_counts = []
+        results_by_file = {}
 
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(self._prepare_file, fp): fp for fp in filepaths}
+
+            for future in as_completed(futures):
+                filepath, chunks, chunk_count = future.result()
+                results_by_file[filepath] = (chunks, chunk_count)
+
+        # Reassemble in original order
         for filepath in filepaths:
-            try:
-                duration = self._get_duration(filepath)
-                if duration is None:
-                    file_chunk_counts.append(0)
-                    continue
+            chunks, chunk_count = results_by_file.get(filepath, ([], 0))
+            all_chunks.extend(chunks)
+            file_chunk_counts.append(chunk_count)
 
-                if duration < self.chunk_duration_s:
-                    logger.warning(
-                        f"File {filepath.name} is too short ({duration:.1f}s) "
-                        f"for even one chunk of {self.chunk_duration_s}s."
-                    )
-                    file_chunk_counts.append(0)
-                    continue
+        return PreparedBatch(
+            filepaths=filepaths,
+            chunks=all_chunks,
+            file_chunk_counts=file_chunk_counts
+        )
 
-                # Stratified sampling
-                num_stratified = self._calculate_num_chunks(duration)
-                stratified_positions = self._select_chunk_positions(duration, num_stratified)
+    def _infer_batch(self, prepared: PreparedBatch) -> list[Optional[list[float]]]:
+        """
+        Run GPU inference on a prepared batch.
 
-                # Contrast sampling (high/low energy)
-                energy_profile = self._scan_energy_profile(filepath, duration)
-                contrast_positions = self._select_contrast_positions(
-                    energy_profile, stratified_positions, duration
-                )
-
-                # Combine positions, respecting max_chunks limit
-                positions = stratified_positions + contrast_positions
-                if len(positions) > self.max_chunks:
-                    positions = positions[:self.max_chunks]
-
-                logger.debug(
-                    f"{filepath.name}: {len(stratified_positions)} stratified + "
-                    f"{len(contrast_positions)} contrast = {len(positions)} chunks"
-                )
-
-                chunks = []
-                expected_samples = self.chunk_duration_s * self.target_sr
-                for pos in positions:
-                    waveform, _ = librosa.load(
-                        str(filepath),
-                        sr=self.target_sr,
-                        mono=True,
-                        offset=pos,
-                        duration=self.chunk_duration_s
-                    )
-                    # Ensure exact length for torch.stack compatibility
-                    if len(waveform) < expected_samples:
-                        waveform = librosa.util.fix_length(waveform, size=expected_samples)
-                    else:
-                        waveform = waveform[:expected_samples]
-                    chunks.append(waveform)
-
-                if not chunks:
-                    logger.warning(f"No valid chunks generated for {filepath.name}.")
-                    file_chunk_counts.append(0)
-                    continue
-
-                all_chunks.extend(chunks)
-                file_chunk_counts.append(len(chunks))
-
-            except Exception as e:
-                logger.error(f"Error loading audio file {filepath.name}: {e}")
-                file_chunk_counts.append(0)
-
-        if not all_chunks:
-            return [None] * len(filepaths)
+        Takes PreparedBatch with pre-loaded chunks, returns embeddings.
+        """
+        if not prepared.chunks:
+            return [None] * len(prepared.filepaths)
 
         try:
-            # Process all chunks - MuQ takes raw waveform tensors
             # Stack all chunks into a batch tensor (always FP32 for MuQ stability)
             chunk_tensors = [
-                torch.tensor(chunk, dtype=torch.float32) for chunk in all_chunks
+                torch.tensor(chunk, dtype=torch.float32) for chunk in prepared.chunks
             ]
             batch_tensor = torch.stack(chunk_tensors).to(device=self.device)
 
@@ -310,7 +366,7 @@ class MuQEmbeddingGenerator:
             results = []
             chunk_idx = 0
 
-            for chunk_count in file_chunk_counts:
+            for chunk_count in prepared.file_chunk_counts:
                 if chunk_count == 0:
                     results.append(None)
                 else:
@@ -321,13 +377,113 @@ class MuQEmbeddingGenerator:
                     chunk_idx += chunk_count
 
             logger.debug(
-                f"Processed batch of {len(filepaths)} files ({len(all_chunks)} total chunks)"
+                f"Processed batch of {len(prepared.filepaths)} files "
+                f"({len(prepared.chunks)} total chunks)"
             )
             return results
 
         except Exception as e:
             logger.error(f"Error in batch embedding generation: {e}")
-            return [None] * len(filepaths)
+            return [None] * len(prepared.filepaths)
+
+    def generate_embedding(self, filepath: Path) -> Optional[list[float]]:
+        """Generate embedding for a single audio file."""
+        results = self.generate_embedding_batch([filepath])
+        return results[0] if results else None
+
+    def generate_embedding_batch(
+        self,
+        filepaths: list[Path],
+        num_workers: int = 4
+    ) -> list[Optional[list[float]]]:
+        """
+        Generate embeddings for multiple audio files.
+
+        Optimized pipeline:
+        1. Load files in parallel using ThreadPoolExecutor
+        2. For each file: single load, compute energy, select positions, extract chunks
+        3. Run GPU inference on all chunks at once
+        4. Average chunk embeddings per file
+
+        Args:
+            filepaths: List of audio file paths
+            num_workers: Number of parallel file loading threads (default: 4)
+
+        Returns:
+            List of embeddings (or None for failed files)
+        """
+        if not filepaths:
+            return []
+
+        self._load_model_if_needed()
+
+        # Prepare batch (parallel file loading)
+        prepared = self._prepare_batch(filepaths, num_workers=num_workers)
+
+        # Run GPU inference
+        return self._infer_batch(prepared)
+
+    def generate_embeddings_prefetched(
+        self,
+        all_filepaths: list[Path],
+        batch_size: int = 8,
+        num_workers: int = 4,
+        prefetch_batches: int = 2
+    ):
+        """
+        Generator that yields (filepaths, embeddings) with prefetching.
+
+        Double-buffer pattern: loads batch N+1 while GPU processes batch N.
+        This keeps the GPU busy while CPU loads the next batch.
+
+        Args:
+            all_filepaths: All files to process
+            batch_size: Files per GPU batch
+            num_workers: Parallel loading threads
+            prefetch_batches: Number of batches to prefetch (default: 2)
+
+        Yields:
+            (batch_filepaths, batch_embeddings) tuples
+        """
+        if not all_filepaths:
+            return
+
+        self._load_model_if_needed()
+
+        # Split into batches
+        batches = [
+            all_filepaths[i:i + batch_size]
+            for i in range(0, len(all_filepaths), batch_size)
+        ]
+
+        if not batches:
+            return
+
+        # Prefetch queue for prepared batches
+        prefetch_queue: Queue[Optional[PreparedBatch]] = Queue(maxsize=prefetch_batches)
+
+        def prefetch_worker():
+            """Background thread that prepares batches ahead of GPU."""
+            for batch_files in batches:
+                prepared = self._prepare_batch(batch_files, num_workers=num_workers)
+                prefetch_queue.put(prepared)
+            # Signal end
+            prefetch_queue.put(None)
+
+        # Start prefetch thread
+        prefetch_thread = Thread(target=prefetch_worker, daemon=True)
+        prefetch_thread.start()
+
+        # Process batches as they become available
+        while True:
+            prepared = prefetch_queue.get()
+            if prepared is None:
+                break
+
+            embeddings = self._infer_batch(prepared)
+            yield (prepared.filepaths, embeddings)
+
+        prefetch_thread.join()
 
     def unload_model(self):
         """Free GPU memory by unloading the model."""
