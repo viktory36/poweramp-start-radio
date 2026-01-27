@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import com.powerampstartradio.data.EmbeddedTrack
 import com.powerampstartradio.data.EmbeddingDatabase
+import com.powerampstartradio.similarity.SimilarTrack
 
 /**
  * Matches Poweramp tracks to embedded tracks in the database.
@@ -34,6 +35,14 @@ class TrackMatcher(
         ARTIST_TITLE,     // Artist + title only (fuzzy)
         NOT_FOUND
     }
+
+    /**
+     * Result of mapping a similar track to Poweramp.
+     */
+    data class MappedTrack(
+        val similarTrack: SimilarTrack,
+        val fileId: Long?   // null if not found in Poweramp library
+    )
 
     /**
      * Find the best matching embedded track for a Poweramp track.
@@ -169,5 +178,79 @@ class TrackMatcher(
 
         Log.d(TAG, "Mapped ${fileIds.size} unique tracks of ${embeddedTracks.size}")
         return fileIds
+    }
+
+    /**
+     * Map similar tracks to Poweramp file IDs, preserving similarity scores.
+     * Returns all tracks with their mapping status (fileId is null if not found).
+     */
+    fun mapSimilarTracksToFileIds(
+        context: Context,
+        similarTracks: List<SimilarTrack>
+    ): List<MappedTrack> {
+        // Build indexes from Poweramp library
+        val powerampFiles = PowerampHelper.getAllFileIds(context)
+        val byArtistAlbumTitle = mutableMapOf<String, Long>()
+        val byArtistTitle = mutableMapOf<String, Long>()
+        val byTitle = mutableMapOf<String, MutableList<Pair<String, Long>>>()
+
+        for ((key, id) in powerampFiles) {
+            val parts = key.split("|")
+            if (parts.size >= 3) {
+                val artist = parts[0]
+                val album = parts[1]
+                val title = parts[2]
+                byArtistAlbumTitle["$artist|$album|$title"] = id
+                byArtistTitle["$artist|$title"] = id
+                byTitle.getOrPut(title) { mutableListOf() }.add(artist to id)
+            }
+        }
+        Log.d(TAG, "Indexed ${powerampFiles.size} Poweramp tracks")
+
+        val seen = mutableSetOf<Long>()
+        val result = mutableListOf<MappedTrack>()
+
+        for (similarTrack in similarTracks) {
+            val track = similarTrack.track
+            val parts = track.metadataKey.split("|")
+
+            if (parts.size >= 3) {
+                val embeddedArtist = parts[0]
+                val embeddedAlbum = parts[1]
+                val embeddedTitle = parts[2]
+
+                // 1. Try exact artist|album|title
+                var fileId = byArtistAlbumTitle["$embeddedArtist|$embeddedAlbum|$embeddedTitle"]
+
+                // 2. Try artist|title (any album)
+                if (fileId == null) {
+                    fileId = byArtistTitle["$embeddedArtist|$embeddedTitle"]
+                }
+
+                // 3. Fuzzy: find by title, check artist substring
+                if (fileId == null) {
+                    byTitle[embeddedTitle]?.find { (powerampArtist, _) ->
+                        embeddedArtist.isNotEmpty() && (
+                            powerampArtist.contains(embeddedArtist) ||
+                            embeddedArtist.contains(powerampArtist)
+                        )
+                    }?.let { (_, id) -> fileId = id }
+                }
+
+                // Skip duplicates (but still track them)
+                if (fileId != null && fileId in seen) {
+                    result.add(MappedTrack(similarTrack, null))  // Treat duplicate as not found
+                } else {
+                    if (fileId != null) seen.add(fileId!!)
+                    result.add(MappedTrack(similarTrack, fileId))
+                }
+            } else {
+                result.add(MappedTrack(similarTrack, null))
+            }
+        }
+
+        val mapped = result.count { it.fileId != null }
+        Log.d(TAG, "Mapped $mapped of ${similarTracks.size} similar tracks")
+        return result
     }
 }

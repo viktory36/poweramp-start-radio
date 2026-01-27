@@ -1,6 +1,5 @@
 package com.powerampstartradio
 
-import android.content.Intent
 import android.content.IntentFilter
 import android.net.Uri
 import android.os.Bundle
@@ -10,20 +9,32 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.poweramp.PowerampTrack
 import com.powerampstartradio.services.RadioService
+import com.powerampstartradio.ui.DatabaseInfo
+import com.powerampstartradio.ui.MainViewModel
+import com.powerampstartradio.ui.QueueStatus
+import com.powerampstartradio.ui.QueuedTrackResult
+import com.powerampstartradio.ui.RadioResult
+import com.powerampstartradio.ui.RadioUiState
 import com.powerampstartradio.ui.theme.PowerampStartRadioTheme
 import java.io.File
 
@@ -34,14 +45,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private val trackReceiver = PowerampReceiver()
-
-    // Callback to refresh permission state when activity resumes
     private var onResumeCallback: (() -> Unit)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Register for Poweramp broadcasts
         val filter = IntentFilter().apply {
             addAction(PowerampHelper.ACTION_TRACK_CHANGED)
             addAction(PowerampHelper.ACTION_STATUS_CHANGED)
@@ -83,28 +91,29 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(
+    viewModel: MainViewModel = viewModel(),
     onRegisterResumeCallback: ((callback: () -> Unit) -> Unit)? = null
 ) {
     val context = LocalContext.current
 
-    // State
+    // State from ViewModel
+    val radioState by viewModel.radioState.collectAsState()
+    val numTracks by viewModel.numTracks.collectAsState()
+    val databaseInfo by viewModel.databaseInfo.collectAsState()
+    val hasPermission by viewModel.hasPermission.collectAsState()
+
+    // Local UI state
     var currentTrack by remember { mutableStateOf<PowerampTrack?>(PowerampReceiver.currentTrack) }
-    var databaseInfo by remember { mutableStateOf<DatabaseInfo?>(null) }
+    var showSettingsSheet by remember { mutableStateOf(false) }
+    var showMenu by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf("") }
-    var numTracks by remember { mutableStateOf(50f) }
-    var hasPowerampPermission by remember { mutableStateOf(false) }
 
-    // Function to refresh permission state
-    val refreshPermission: () -> Unit = {
-        hasPowerampPermission = PowerampHelper.canAccessData(context)
-        if (hasPowerampPermission) {
-            statusMessage = ""
-        }
-    }
-
-    // Register callback for activity resume
+    // Register resume callback
     LaunchedEffect(Unit) {
-        onRegisterResumeCallback?.invoke(refreshPermission)
+        onRegisterResumeCallback?.invoke {
+            viewModel.checkPermission()
+            viewModel.refreshDatabaseInfo()
+        }
     }
 
     // Track change listener
@@ -113,16 +122,9 @@ fun MainScreen(
             currentTrack = track
         }
         PowerampReceiver.addTrackChangeListener(listener)
-
         onDispose {
             PowerampReceiver.removeTrackChangeListener(listener)
         }
-    }
-
-    // Load database info and check Poweramp permission on launch
-    LaunchedEffect(Unit) {
-        databaseInfo = loadDatabaseInfo(context)
-        hasPowerampPermission = PowerampHelper.canAccessData(context)
     }
 
     // File picker launcher
@@ -134,8 +136,8 @@ fun MainScreen(
             try {
                 val destFile = File(context.filesDir, "embeddings.db")
                 EmbeddingDatabase.importFrom(context, it, destFile).close()
-                databaseInfo = loadDatabaseInfo(context)
-                statusMessage = "Database imported successfully!"
+                viewModel.refreshDatabaseInfo()
+                statusMessage = "Database imported!"
             } catch (e: Exception) {
                 statusMessage = "Import failed: ${e.message}"
                 Log.e("MainActivity", "Import failed", e)
@@ -146,7 +148,40 @@ fun MainScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Poweramp Start Radio") }
+                title = { Text("Start Radio") },
+                actions = {
+                    IconButton(onClick = { showMenu = true }) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "Menu")
+                    }
+                    DropdownMenu(
+                        expanded = showMenu,
+                        onDismissRequest = { showMenu = false }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("Settings") },
+                            onClick = {
+                                showMenu = false
+                                showSettingsSheet = true
+                            }
+                        )
+                    }
+                }
+            )
+        },
+        floatingActionButton = {
+            ExtendedFloatingActionButton(
+                onClick = {
+                    if (currentTrack != null && databaseInfo != null) {
+                        viewModel.startRadio()
+                    } else if (currentTrack == null) {
+                        statusMessage = "Play a song in Poweramp first"
+                    } else {
+                        statusMessage = "Import database in Settings"
+                    }
+                },
+                icon = { Icon(Icons.Default.PlayArrow, contentDescription = null) },
+                text = { Text("Start Radio") },
+                expanded = radioState !is RadioUiState.Loading
             )
         }
     ) { padding ->
@@ -154,222 +189,406 @@ fun MainScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .padding(16.dp)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // Current Track Card
-            Card(
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp)
-                ) {
-                    Text(
-                        text = "Now Playing",
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    if (currentTrack != null) {
-                        Text(
-                            text = currentTrack!!.title,
-                            style = MaterialTheme.typography.bodyLarge
-                        )
-                        Text(
-                            text = currentTrack!!.artist ?: "Unknown Artist",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Text(
-                            text = currentTrack!!.album ?: "",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    } else {
-                        Text(
-                            text = "No track playing",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-            }
+            // Seed Track Section
+            SeedTrackSection(
+                currentTrack = currentTrack,
+                radioResult = (radioState as? RadioUiState.Success)?.result,
+                modifier = Modifier.padding(16.dp)
+            )
 
-            // Start Radio Button
-            Button(
-                onClick = {
-                    if (currentTrack != null && databaseInfo != null) {
-                        RadioService.startRadio(context, numTracks.toInt())
-                        statusMessage = "Starting radio..."
-                    } else if (currentTrack == null) {
-                        statusMessage = "Play a song in Poweramp first"
-                    } else {
-                        statusMessage = "Import an embedding database first"
-                    }
-                },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = currentTrack != null && databaseInfo != null
-            ) {
-                Text("Start Radio")
-            }
+            HorizontalDivider()
 
-            // Number of tracks slider
-            Card(
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp)
-                ) {
-                    Text(
-                        text = "Number of tracks: ${numTracks.toInt()}",
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                    Slider(
-                        value = numTracks,
-                        onValueChange = { numTracks = it },
-                        valueRange = 10f..100f,
-                        steps = 8
+            // Results or Status
+            when (val state = radioState) {
+                is RadioUiState.Idle -> {
+                    IdleContent(
+                        hasPermission = hasPermission,
+                        databaseInfo = databaseInfo,
+                        statusMessage = statusMessage,
+                        onRequestPermission = { viewModel.requestPermission() },
+                        modifier = Modifier.weight(1f)
                     )
                 }
-            }
-
-            // Poweramp Permission Card
-            if (!hasPowerampPermission) {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.errorContainer
-                    )
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp)
+                is RadioUiState.Loading -> {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth(),
+                        contentAlignment = Alignment.Center
                     ) {
-                        Text(
-                            text = "Poweramp Access Required",
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = "This app needs permission to access Poweramp's library to queue similar tracks.",
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Button(
-                            onClick = {
-                                PowerampHelper.requestDataPermission(context)
-                                statusMessage = "Permission requested. Please grant access in Poweramp, then return here."
-                            },
-                            modifier = Modifier.fillMaxWidth()
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            CircularProgressIndicator()
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text("Finding similar tracks...")
+                        }
+                    }
+                }
+                is RadioUiState.Success -> {
+                    ResultsSection(
+                        result = state.result,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                is RadioUiState.Error -> {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Card(
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.errorContainer
+                            )
                         ) {
-                            Text("Grant Poweramp Access")
+                            Text(
+                                text = state.message,
+                                modifier = Modifier.padding(16.dp),
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
                         }
                     }
                 }
             }
+        }
+    }
 
-            // Database Info Card
-            Card(
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp)
-                ) {
-                    Text(
-                        text = "Embedding Database",
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
+    // Settings Bottom Sheet
+    if (showSettingsSheet) {
+        SettingsBottomSheet(
+            numTracks = numTracks,
+            onNumTracksChange = { viewModel.setNumTracks(it) },
+            databaseInfo = databaseInfo,
+            onImportDatabase = {
+                importLauncher.launch(arrayOf("application/octet-stream", "*/*"))
+            },
+            hasPermission = hasPermission,
+            onRequestPermission = { viewModel.requestPermission() },
+            onDismiss = { showSettingsSheet = false }
+        )
+    }
+}
 
-                    if (databaseInfo != null) {
-                        Text("Tracks: ${databaseInfo!!.trackCount}")
-                        Text("Version: ${databaseInfo!!.version ?: "Unknown"}")
-                        Text("Size: ${databaseInfo!!.sizeKb} KB")
-                    } else {
-                        Text(
-                            text = "No database imported",
-                            color = MaterialTheme.colorScheme.error
-                        )
-                    }
+@Composable
+fun SeedTrackSection(
+    currentTrack: PowerampTrack?,
+    radioResult: RadioResult?,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier = modifier) {
+        Text(
+            text = "SEED TRACK",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.primary
+        )
+        Spacer(modifier = Modifier.height(4.dp))
 
-                    Spacer(modifier = Modifier.height(8.dp))
+        if (radioResult != null) {
+            // Show seed track from result
+            Text(
+                text = "\"${radioResult.seedTrack.title}\"",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold
+            )
+            Text(
+                text = "${radioResult.seedTrack.artist ?: "Unknown"} • ${radioResult.seedTrack.album ?: ""}",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = "matched via: ${radioResult.matchType.name}",
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.tertiary
+            )
+        } else if (currentTrack != null) {
+            // Show current playing track
+            Text(
+                text = "\"${currentTrack.title}\"",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold
+            )
+            Text(
+                text = "${currentTrack.artist ?: "Unknown"} • ${currentTrack.album ?: ""}",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        } else {
+            Text(
+                text = "No track playing",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
 
-                    OutlinedButton(
-                        onClick = {
-                            importLauncher.launch(arrayOf("application/octet-stream", "*/*"))
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(if (databaseInfo != null) "Replace Database" else "Import Database")
-                    }
-                }
-            }
+@Composable
+fun ResultsSection(
+    result: RadioResult,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier = modifier) {
+        // Summary header
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                text = "QUEUE RESULTS",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary
+            )
+            Text(
+                text = "${result.queuedCount} queued / ${result.failedCount} failed / ${result.requestedCount} requested",
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = FontFamily.Monospace
+            )
+        }
 
-            // Status message
-            if (statusMessage.isNotEmpty()) {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.secondaryContainer
-                    )
-                ) {
-                    Text(
-                        text = statusMessage,
-                        modifier = Modifier.padding(16.dp),
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                }
-            }
-
-            // Instructions
-            Card(
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp)
-                ) {
-                    Text(
-                        text = "How to Use",
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text("1. Run the desktop indexer on your music library")
-                    Text("2. Copy embeddings.db to your phone")
-                    Text("3. Import the database using the button above")
-                    Text("4. Play a song in Poweramp")
-                    Text("5. Tap 'Start Radio' to find similar tracks")
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Tip: Add the Quick Settings tile for faster access!",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                }
+        // Track list
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+        ) {
+            items(result.tracks) { trackResult ->
+                TrackResultRow(trackResult)
             }
         }
     }
 }
 
-data class DatabaseInfo(
-    val trackCount: Int,
-    val version: String?,
-    val sizeKb: Long
-)
-
-private fun loadDatabaseInfo(context: android.content.Context): DatabaseInfo? {
-    val dbFile = File(context.filesDir, "embeddings.db")
-    if (!dbFile.exists()) return null
-
-    return try {
-        val db = EmbeddingDatabase.open(dbFile)
-        val info = DatabaseInfo(
-            trackCount = db.getTrackCount(),
-            version = db.getMetadata("version"),
-            sizeKb = dbFile.length() / 1024
+@Composable
+fun TrackResultRow(trackResult: QueuedTrackResult) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        // Similarity score
+        Text(
+            text = String.format("%.3f", trackResult.similarity),
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.width(48.dp)
         )
-        db.close()
-        info
-    } catch (e: Exception) {
-        Log.e("MainActivity", "Failed to load database info", e)
-        null
+
+        // Track info
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(horizontal = 8.dp)
+        ) {
+            Text(
+                text = trackResult.track.title ?: "Unknown",
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 1
+            )
+            Text(
+                text = trackResult.track.artist ?: "Unknown",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1
+            )
+        }
+
+        // Status
+        val (statusText, statusColor) = when (trackResult.status) {
+            QueueStatus.QUEUED -> "queued" to MaterialTheme.colorScheme.primary
+            QueueStatus.NOT_IN_LIBRARY -> "not found" to MaterialTheme.colorScheme.error
+            QueueStatus.QUEUE_FAILED -> "failed" to MaterialTheme.colorScheme.error
+        }
+        val statusIcon = if (trackResult.status == QueueStatus.QUEUED) "✓" else "✗"
+
+        Text(
+            text = "$statusIcon $statusText",
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace,
+            color = statusColor
+        )
+    }
+}
+
+@Composable
+fun IdleContent(
+    hasPermission: Boolean,
+    databaseInfo: DatabaseInfo?,
+    statusMessage: String,
+    onRequestPermission: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        // Permission warning
+        if (!hasPermission) {
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.errorContainer
+                )
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "Poweramp Access Required",
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(onClick = onRequestPermission) {
+                        Text("Grant Access")
+                    }
+                }
+            }
+        }
+
+        // Database warning
+        if (databaseInfo == null) {
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.secondaryContainer
+                )
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "No embedding database",
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                    Text(
+                        text = "Import via Settings menu",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+        }
+
+        // Status message
+        if (statusMessage.isNotEmpty()) {
+            Text(
+                text = statusMessage,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        // Ready indicator
+        if (hasPermission && databaseInfo != null) {
+            Text(
+                text = "Ready - tap Start Radio",
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.primary
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SettingsBottomSheet(
+    numTracks: Int,
+    onNumTracksChange: (Int) -> Unit,
+    databaseInfo: DatabaseInfo?,
+    onImportDatabase: () -> Unit,
+    hasPermission: Boolean,
+    onRequestPermission: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(24.dp)
+        ) {
+            Text(
+                text = "Settings",
+                style = MaterialTheme.typography.headlineSmall
+            )
+
+            // Track count slider
+            Column {
+                Text(
+                    text = "Number of tracks: $numTracks",
+                    style = MaterialTheme.typography.titleMedium
+                )
+                Slider(
+                    value = numTracks.toFloat(),
+                    onValueChange = { onNumTracksChange(it.toInt()) },
+                    valueRange = 10f..100f,
+                    steps = 8
+                )
+            }
+
+            HorizontalDivider()
+
+            // Database section
+            Column {
+                Text(
+                    text = "Embedding Database",
+                    style = MaterialTheme.typography.titleMedium
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                if (databaseInfo != null) {
+                    Text("Tracks: ${databaseInfo.trackCount}")
+                    Text("Version: ${databaseInfo.version ?: "Unknown"}")
+                    Text("Size: ${databaseInfo.sizeKb} KB")
+                } else {
+                    Text(
+                        text = "No database imported",
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = onImportDatabase,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(if (databaseInfo != null) "Replace Database" else "Import Database")
+                }
+            }
+
+            HorizontalDivider()
+
+            // Poweramp permission
+            if (!hasPermission) {
+                Column {
+                    Text(
+                        text = "Poweramp Access",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(
+                        onClick = onRequestPermission,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Grant Poweramp Access")
+                    }
+                }
+                HorizontalDivider()
+            }
+
+            // Instructions
+            Column {
+                Text(
+                    text = "How to Use",
+                    style = MaterialTheme.typography.titleMedium
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text("1. Run desktop indexer on your music library", style = MaterialTheme.typography.bodySmall)
+                Text("2. Copy embeddings.db to your phone", style = MaterialTheme.typography.bodySmall)
+                Text("3. Import the database above", style = MaterialTheme.typography.bodySmall)
+                Text("4. Play a song in Poweramp", style = MaterialTheme.typography.bodySmall)
+                Text("5. Tap Start Radio", style = MaterialTheme.typography.bodySmall)
+            }
+
+            Spacer(modifier = Modifier.height(32.dp))
+        }
     }
 }

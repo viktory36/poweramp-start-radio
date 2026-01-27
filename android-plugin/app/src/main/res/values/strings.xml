@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Poweramp Start Radio</string>
-    <string name="tile_label">Start Radio</string>
+    <string name="widget_description">One-tap button to start radio based on current Poweramp track</string>
 </resources>
