@@ -190,10 +190,18 @@ class MuQEmbeddingGenerator:
 
             embedding = torch.mean(features, dim=0)  # Average across chunks
             normalized = F.normalize(embedding, p=2, dim=0)
-            return normalized.cpu().float().numpy().tolist()
+            result = normalized.cpu().float().numpy().tolist()
+
+            # Explicit cleanup
+            del batch, output, features, embedding, normalized
+            return result
 
         except Exception as e:
             logger.error(f"Error in inference: {e}")
+            # Clear CUDA state after error to allow recovery
+            if self.device == "cuda":
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
             return None
 
     def generate_embedding(self, filepath: Path) -> Optional[list[float]]:
@@ -222,8 +230,10 @@ class MuQEmbeddingGenerator:
 
         logger.debug(f"{filepath.name}: {len(positions)} chunks from {duration_s:.1f}s")
 
-        # Extract and infer
+        # Extract chunks then free waveform
         chunks = self._extract_chunks(waveform, positions)
+        del waveform  # Free memory before inference
+
         if not chunks:
             return None
 
