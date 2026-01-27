@@ -197,7 +197,7 @@ fun MainScreen(
                 modifier = Modifier.padding(16.dp)
             )
 
-            HorizontalDivider()
+            Divider()
 
             // Results or Status
             when (val state = radioState) {
@@ -526,7 +526,7 @@ fun SettingsBottomSheet(
                 )
             }
 
-            HorizontalDivider()
+            Divider()
 
             // Database section
             Column {
@@ -554,7 +554,7 @@ fun SettingsBottomSheet(
                 }
             }
 
-            HorizontalDivider()
+            Divider()
 
             // Poweramp permission
             if (!hasPermission) {
@@ -571,7 +571,7 @@ fun SettingsBottomSheet(
                         Text("Grant Poweramp Access")
                     }
                 }
-                HorizontalDivider()
+                Divider()
             }
 
             // Instructions

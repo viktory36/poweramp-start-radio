@@ -23,7 +23,7 @@ import androidx.glance.unit.ColorProvider
 import android.graphics.Color
 import androidx.glance.layout.Spacer
 import androidx.glance.layout.width
-import androidx.glance.unit.dp
+import androidx.compose.ui.unit.dp
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.services.RadioService
