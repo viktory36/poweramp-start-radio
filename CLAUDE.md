@@ -48,7 +48,7 @@ cd android-plugin
 ### Data Flow
 
 ```
-Music Files → scanner.py → fingerprint.py (metadata) → embeddings_*.py (512-dim vectors) → database.py (SQLite)
+Music Files → scanner.py → fingerprint.py (metadata) → embeddings_*.py (1024-dim vectors) → database.py (SQLite)
                                                                                               ↓
 Poweramp ← PowerampHelper ← QueueManager ← SimilarityEngine ← TrackMatcher ← EmbeddingDatabase
 ```
@@ -64,10 +64,10 @@ Poweramp ← PowerampHelper ← QueueManager ← SimilarityEngine ← TrackMatch
 4. Filename-based fallback
 
 **Embedding Models**:
-- MuQ-MuLan (default): 24kHz, better for music
-- CLAP: 48kHz, alternative option
+- MuQ-large-msd-iter (default): 24kHz, 1024-dim, SOTA pure music understanding model
+- CLAP: 48kHz, 512-dim, alternative option
 
-**Sampling Strategy**: Stratified sampling across full audio duration. Chunk count scales with duration (3 chunks for short songs, up to 20 for long DJ sets). Ensures coverage of intro/middle/outro rather than just the first 2 minutes.
+**Sampling Strategy**: Dense stratified sampling across full audio duration. Chunk count scales with duration (10 chunks for standard songs, up to 30 for long DJ sets). Ensures comprehensive coverage of intro/middle/outro sections.
 
 ### Android Integration Points
 

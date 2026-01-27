@@ -30,7 +30,9 @@ class EmbeddingDatabase private constructor(
     private val db: SQLiteDatabase
 ) {
     companion object {
-        private const val EMBEDDING_DIM = 512
+        // Default embedding dimension for MuQ-large-msd-iter model
+        // Note: blobToFloatArray() is dimension-agnostic, so this is just for reference
+        private const val EMBEDDING_DIM = 1024
 
         /**
          * Open the database from a file path.

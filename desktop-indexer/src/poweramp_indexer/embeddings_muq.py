@@ -1,4 +1,4 @@
-"""MuQ-MuLan embedding generation for music similarity search."""
+"""MuQ embedding generation for music similarity search."""
 
 import logging
 import random
@@ -13,19 +13,23 @@ logger = logging.getLogger(__name__)
 
 class MuQEmbeddingGenerator:
     """
-    Generates audio embeddings using Tencent's MuQ-MuLan model.
+    Generates audio embeddings using Tencent's MuQ-large-msd-iter model.
 
-    MuQ-MuLan outperforms CLAP on music understanding benchmarks
-    while maintaining the same 512-dim embedding format.
+    MuQ-large-msd-iter is the SOTA pure music understanding model,
+    trained with self-supervised learning on 160K+ hours of music.
+    Unlike MuQ-MuLan (designed for music-text retrieval), this model
+    is optimized for pure audio similarity tasks.
+
+    Output: 1024-dim embeddings (pooled from temporal features).
     """
 
     def __init__(
         self,
-        model_id: str = "OpenMuQ/MuQ-MuLan-large",
-        target_sr: int = 24000,  # MuQ uses 24kHz (not 48kHz like CLAP)
+        model_id: str = "OpenMuQ/MuQ-large-msd-iter",
+        target_sr: int = 24000,  # MuQ uses 24kHz
         chunk_duration_s: int = 10,
-        base_chunks: int = 3,
-        max_chunks: int = 20,
+        base_chunks: int = 10,  # Denser sampling (was 3)
+        max_chunks: int = 30,   # Allow more for long tracks (was 20)
     ):
         self.model_id = model_id
         self.target_sr = target_sr
@@ -39,11 +43,9 @@ class MuQEmbeddingGenerator:
         # Lazy loading
         self.model = None
 
-        self.use_half = self._can_use_half_precision()
-        if self.use_half:
-            logger.info("Half precision (FP16) is supported and will be used.")
-        else:
-            logger.info("Half precision not supported, using full precision (FP32).")
+        # MuQ-large-msd-iter has known NaN issues with FP16, always use FP32
+        self.use_half = False
+        logger.info("Using full precision (FP32) for MuQ model stability.")
 
     @staticmethod
     def _get_best_device() -> str:
@@ -54,35 +56,17 @@ class MuQEmbeddingGenerator:
             return "mps"
         return "cpu"
 
-    def _can_use_half_precision(self) -> bool:
-        """Check if the device supports half precision."""
-        if self.device == "cuda":
-            return True
-        if self.device == "mps":
-            try:
-                torch.tensor([1.0], dtype=torch.half).to(self.device)
-                return True
-            except RuntimeError:
-                logger.warning("MPS device does not support half precision")
-                return False
-        return False
-
     def _load_model_if_needed(self):
-        """Lazy load the MuQ-MuLan model."""
+        """Lazy load the MuQ model."""
         if self.model is not None:
             return
 
-        from muq import MuQMuLan
+        from muq import MuQ
 
         logger.info(f"Loading model '{self.model_id}' to device '{self.device}'...")
 
-        self.model = MuQMuLan.from_pretrained(self.model_id)
+        self.model = MuQ.from_pretrained(self.model_id)
         self.model = self.model.to(self.device)
-
-        if self.use_half and self.device == "cuda":
-            logger.info("Applying half precision (FP16) to model for CUDA device.")
-            self.model.half()
-
         self.model.eval()
         logger.info("Model loaded successfully.")
 
@@ -202,18 +186,21 @@ class MuQEmbeddingGenerator:
             return [None] * len(filepaths)
 
         try:
-            # Process all chunks - MuQ-MuLan takes raw tensors
-            model_dtype = next(self.model.parameters()).dtype
-
-            # Stack all chunks into a batch tensor
+            # Process all chunks - MuQ takes raw waveform tensors
+            # Stack all chunks into a batch tensor (always FP32 for MuQ stability)
             chunk_tensors = [
                 torch.tensor(chunk, dtype=torch.float32) for chunk in all_chunks
             ]
-            batch_tensor = torch.stack(chunk_tensors).to(device=self.device, dtype=model_dtype)
+            batch_tensor = torch.stack(chunk_tensors).to(device=self.device)
 
             with torch.no_grad():
-                # MuQ-MuLan inference: model(wavs=tensor) -> [batch, 512]
-                audio_features = self.model(wavs=batch_tensor)
+                # MuQ inference: model(wavs=tensor) -> output with last_hidden_state
+                # last_hidden_state shape: [batch, time_frames, hidden_dim]
+                output = self.model(wavs=batch_tensor)
+
+                # Pool temporal dimension to get fixed-size embedding per chunk
+                # Mean pooling over time: [batch, time, hidden] -> [batch, hidden]
+                audio_features = output.last_hidden_state.mean(dim=1)
 
             # Split results back to individual files and compute mean embeddings
             results = []
@@ -253,5 +240,5 @@ class MuQEmbeddingGenerator:
 
     @property
     def embedding_dim(self) -> int:
-        """Return the embedding dimension (512 for MuQ-MuLan)."""
-        return 512
+        """Return the embedding dimension (1024 for MuQ-large-msd-iter)."""
+        return 1024

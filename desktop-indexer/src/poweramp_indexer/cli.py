@@ -113,7 +113,7 @@ def scan(music_path: Path, output: Path, batch_size: int, skip_existing: bool, v
         return
 
     # Initialize embedding generator
-    model_name = "MuQ-MuLan" if model == "muq" else "CLAP"
+    model_name = "MuQ" if model == "muq" else "CLAP"
     click.echo(f"Loading {model_name} model...")
     generator = create_embedding_generator(model)
 
@@ -241,7 +241,7 @@ def update(music_path: Path, database: Path, batch_size: int, remove_missing: bo
         click.echo(f"Using model from database: {model}")
 
     # Initialize embedding generator
-    model_name = "MuQ-MuLan" if model == "muq" else "CLAP"
+    model_name = "MuQ" if model == "muq" else "CLAP"
     click.echo(f"Loading {model_name} model...")
     generator = create_embedding_generator(model)
 
@@ -308,7 +308,7 @@ def info(database: Path):
 
     model = db.get_metadata("model")
     if model:
-        model_name = "MuQ-MuLan" if model == "muq" else "CLAP"
+        model_name = "MuQ" if model == "muq" else "CLAP"
         click.echo(f"Embedding model: {model_name}")
 
     db.close()
@@ -421,7 +421,7 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
         if model is None:
             model = db.get_metadata("model") or DEFAULT_MODEL
 
-        model_name = "MuQ-MuLan" if model == "muq" else "CLAP"
+        model_name = "MuQ" if model == "muq" else "CLAP"
         click.echo(f"Generating embedding with {model_name}...")
         generator = create_embedding_generator(model)
         embeddings = generator.generate_embedding_batch([audio_file])

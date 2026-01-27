@@ -28,7 +28,7 @@ class EmbeddingDatabase:
 
     Schema:
     - tracks: metadata and fingerprint keys
-    - embeddings: 512-dim float32 vectors as BLOBs
+    - embeddings: float32 vectors as BLOBs (dimension depends on model)
     """
 
     SCHEMA = """
@@ -101,7 +101,7 @@ class EmbeddingDatabase:
 
         Args:
             metadata: Track metadata
-            embedding: 512-dim embedding vector
+            embedding: Embedding vector (dimension depends on model)
 
         Returns:
             The track ID
