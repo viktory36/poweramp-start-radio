@@ -1,12 +1,11 @@
 """MuQ embedding generation for music similarity search."""
 
 import logging
+import os
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from queue import Queue
-from threading import Thread
 from typing import Optional
 
 import numpy as np
@@ -394,7 +393,7 @@ class MuQEmbeddingGenerator:
     def generate_embedding_batch(
         self,
         filepaths: list[Path],
-        num_workers: int = 8
+        num_workers: int = None
     ) -> list[Optional[list[float]]]:
         """
         Generate embeddings for multiple audio files.
@@ -407,7 +406,7 @@ class MuQEmbeddingGenerator:
 
         Args:
             filepaths: List of audio file paths
-            num_workers: Number of parallel file loading threads (default: 4)
+            num_workers: Number of parallel file loading threads (default: CPU count)
 
         Returns:
             List of embeddings (or None for failed files)
@@ -417,73 +416,15 @@ class MuQEmbeddingGenerator:
 
         self._load_model_if_needed()
 
+        # Default to CPU count for parallel loading
+        if num_workers is None:
+            num_workers = os.cpu_count() or 8
+
         # Prepare batch (parallel file loading)
         prepared = self._prepare_batch(filepaths, num_workers=num_workers)
 
         # Run GPU inference
         return self._infer_batch(prepared)
-
-    def generate_embeddings_prefetched(
-        self,
-        all_filepaths: list[Path],
-        batch_size: int = 8,
-        num_workers: int = 8,
-        prefetch_batches: int = 2
-    ):
-        """
-        Generator that yields (filepaths, embeddings) with prefetching.
-
-        Double-buffer pattern: loads batch N+1 while GPU processes batch N.
-        This keeps the GPU busy while CPU loads the next batch.
-
-        Args:
-            all_filepaths: All files to process
-            batch_size: Files per GPU batch
-            num_workers: Parallel loading threads
-            prefetch_batches: Number of batches to prefetch (default: 2)
-
-        Yields:
-            (batch_filepaths, batch_embeddings) tuples
-        """
-        if not all_filepaths:
-            return
-
-        self._load_model_if_needed()
-
-        # Split into batches
-        batches = [
-            all_filepaths[i:i + batch_size]
-            for i in range(0, len(all_filepaths), batch_size)
-        ]
-
-        if not batches:
-            return
-
-        # Prefetch queue for prepared batches
-        prefetch_queue: Queue[Optional[PreparedBatch]] = Queue(maxsize=prefetch_batches)
-
-        def prefetch_worker():
-            """Background thread that prepares batches ahead of GPU."""
-            for batch_files in batches:
-                prepared = self._prepare_batch(batch_files, num_workers=num_workers)
-                prefetch_queue.put(prepared)
-            # Signal end
-            prefetch_queue.put(None)
-
-        # Start prefetch thread
-        prefetch_thread = Thread(target=prefetch_worker, daemon=True)
-        prefetch_thread.start()
-
-        # Process batches as they become available
-        while True:
-            prepared = prefetch_queue.get()
-            if prepared is None:
-                break
-
-            embeddings = self._infer_batch(prepared)
-            yield (prepared.filepaths, embeddings)
-
-        prefetch_thread.join()
 
     def unload_model(self):
         """Free GPU memory by unloading the model."""

@@ -28,10 +28,6 @@ def create_embedding_generator(model: str, contrast_chunks: int = 2):
         raise ValueError(f"Unknown model: {model}. Choose from: {MODEL_CHOICES}")
 
 
-# Default prefetch settings (aggressive - maximize throughput)
-DEFAULT_PREFETCH_WORKERS = 8
-DEFAULT_PREFETCH_BATCHES = 4
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -61,8 +57,8 @@ def cli():
 @click.option(
     "--batch-size", "-b",
     type=int,
-    default=8,
-    help="Number of files to process in each batch"
+    default=16,
+    help="Number of files to process in each batch (default: 16)"
 )
 @click.option(
     "--skip-existing/--no-skip-existing",
@@ -85,18 +81,7 @@ def cli():
     is_flag=True,
     help="Disable contrast sampling (high/low energy chunks) for A/B testing"
 )
-@click.option(
-    "--prefetch-workers", "-w",
-    type=int,
-    default=DEFAULT_PREFETCH_WORKERS,
-    help="Number of parallel file loading threads (default: 8)"
-)
-@click.option(
-    "--no-prefetch",
-    is_flag=True,
-    help="Disable prefetch pipeline (use sequential loading)"
-)
-def scan(music_path: Path, output: Path, batch_size: int, skip_existing: bool, verbose: bool, model: str, no_contrast: bool, prefetch_workers: int, no_prefetch: bool):
+def scan(music_path: Path, output: Path, batch_size: int, skip_existing: bool, verbose: bool, model: str, no_contrast: bool):
     """Scan a music directory and generate embeddings.
 
     MUSIC_PATH: Path to your music library folder
@@ -146,57 +131,27 @@ def scan(music_path: Path, output: Path, batch_size: int, skip_existing: bool, v
     successful = 0
     failed = 0
 
-    # Check if we can use prefetched pipeline (MuQ only)
-    use_prefetch = not no_prefetch and model == "muq"
-
-    if use_prefetch:
-        click.echo(f"Using prefetch pipeline ({prefetch_workers} workers)")
-
     with tqdm(total=len(audio_files), desc="Processing", unit="file") as pbar:
-        if use_prefetch:
-            # Prefetched pipeline: loads next batch while GPU processes current
-            for batch_files, batch_embeddings in generator.generate_embeddings_prefetched(
-                audio_files,
-                batch_size=batch_size,
-                num_workers=prefetch_workers,
-                prefetch_batches=DEFAULT_PREFETCH_BATCHES
-            ):
-                # Extract metadata
-                batch_metadata = [extract_metadata(f) for f in batch_files]
+        for i in range(0, len(audio_files), batch_size):
+            batch_files = audio_files[i:i + batch_size]
 
-                # Store results
-                for metadata, embedding in zip(batch_metadata, batch_embeddings):
-                    if embedding is not None:
-                        db.add_track(metadata, embedding)
-                        successful += 1
-                    else:
-                        failed += 1
-                        logger.warning(f"Failed to generate embedding for: {metadata.file_path.name}")
+            # Extract metadata
+            batch_metadata = [extract_metadata(f) for f in batch_files]
 
-                db.commit()
-                pbar.update(len(batch_files))
-        else:
-            # Sequential pipeline (fallback for CLAP or --no-prefetch)
-            for i in range(0, len(audio_files), batch_size):
-                batch_files = audio_files[i:i + batch_size]
+            # Generate embeddings (parallel file loading → GPU inference)
+            batch_embeddings = generator.generate_embedding_batch(batch_files)
 
-                # Extract metadata
-                batch_metadata = [extract_metadata(f) for f in batch_files]
+            # Store results
+            for metadata, embedding in zip(batch_metadata, batch_embeddings):
+                if embedding is not None:
+                    db.add_track(metadata, embedding)
+                    successful += 1
+                else:
+                    failed += 1
+                    logger.warning(f"Failed to generate embedding for: {metadata.file_path.name}")
 
-                # Generate embeddings
-                batch_embeddings = generator.generate_embedding_batch(batch_files)
-
-                # Store results
-                for metadata, embedding in zip(batch_metadata, batch_embeddings):
-                    if embedding is not None:
-                        db.add_track(metadata, embedding)
-                        successful += 1
-                    else:
-                        failed += 1
-                        logger.warning(f"Failed to generate embedding for: {metadata.file_path.name}")
-
-                db.commit()
-                pbar.update(len(batch_files))
+            db.commit()
+            pbar.update(len(batch_files))
 
     # Set metadata
     db.set_metadata("version", __version__)
@@ -227,8 +182,8 @@ def scan(music_path: Path, output: Path, batch_size: int, skip_existing: bool, v
 @click.option(
     "--batch-size", "-b",
     type=int,
-    default=8,
-    help="Number of files to process in each batch"
+    default=16,
+    help="Number of files to process in each batch (default: 16)"
 )
 @click.option(
     "--remove-missing/--no-remove-missing",
@@ -251,18 +206,7 @@ def scan(music_path: Path, output: Path, batch_size: int, skip_existing: bool, v
     is_flag=True,
     help="Disable contrast sampling (high/low energy chunks) for A/B testing"
 )
-@click.option(
-    "--prefetch-workers", "-w",
-    type=int,
-    default=DEFAULT_PREFETCH_WORKERS,
-    help="Number of parallel file loading threads (default: 8)"
-)
-@click.option(
-    "--no-prefetch",
-    is_flag=True,
-    help="Disable prefetch pipeline (use sequential loading)"
-)
-def update(music_path: Path, database: Path, batch_size: int, remove_missing: bool, verbose: bool, model: str, no_contrast: bool, prefetch_workers: int, no_prefetch: bool):
+def update(music_path: Path, database: Path, batch_size: int, remove_missing: bool, verbose: bool, model: str, no_contrast: bool):
     """Incrementally update an existing database.
 
     Adds new files and optionally removes missing ones.
@@ -324,48 +268,23 @@ def update(music_path: Path, database: Path, batch_size: int, remove_missing: bo
     successful = 0
     failed = 0
 
-    # Check if we can use prefetched pipeline (MuQ only)
-    use_prefetch = not no_prefetch and model == "muq"
-
-    if use_prefetch:
-        click.echo(f"Using prefetch pipeline ({prefetch_workers} workers)")
-
     with tqdm(total=len(new_files), desc="Processing", unit="file") as pbar:
-        if use_prefetch:
-            # Prefetched pipeline: loads next batch while GPU processes current
-            for batch_files, batch_embeddings in generator.generate_embeddings_prefetched(
-                new_files,
-                batch_size=batch_size,
-                num_workers=prefetch_workers,
-                prefetch_batches=DEFAULT_PREFETCH_BATCHES
-            ):
-                batch_metadata = [extract_metadata(f) for f in batch_files]
+        for i in range(0, len(new_files), batch_size):
+            batch_files = new_files[i:i + batch_size]
+            batch_metadata = [extract_metadata(f) for f in batch_files]
 
-                for metadata, embedding in zip(batch_metadata, batch_embeddings):
-                    if embedding is not None:
-                        db.add_track(metadata, embedding)
-                        successful += 1
-                    else:
-                        failed += 1
+            # Generate embeddings (parallel file loading → GPU inference)
+            batch_embeddings = generator.generate_embedding_batch(batch_files)
 
-                db.commit()
-                pbar.update(len(batch_files))
-        else:
-            # Sequential pipeline (fallback for CLAP or --no-prefetch)
-            for i in range(0, len(new_files), batch_size):
-                batch_files = new_files[i:i + batch_size]
-                batch_metadata = [extract_metadata(f) for f in batch_files]
-                batch_embeddings = generator.generate_embedding_batch(batch_files)
+            for metadata, embedding in zip(batch_metadata, batch_embeddings):
+                if embedding is not None:
+                    db.add_track(metadata, embedding)
+                    successful += 1
+                else:
+                    failed += 1
 
-                for metadata, embedding in zip(batch_metadata, batch_embeddings):
-                    if embedding is not None:
-                        db.add_track(metadata, embedding)
-                        successful += 1
-                    else:
-                        failed += 1
-
-                db.commit()
-                pbar.update(len(batch_files))
+            db.commit()
+            pbar.update(len(batch_files))
 
     # Update metadata
     db.set_metadata("version", __version__)
