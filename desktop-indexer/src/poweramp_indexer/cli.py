@@ -55,12 +55,6 @@ def cli():
     help="Output database file path"
 )
 @click.option(
-    "--batch-size", "-b",
-    type=int,
-    default=16,
-    help="Number of files to process in each batch (default: 16)"
-)
-@click.option(
     "--skip-existing/--no-skip-existing",
     default=True,
     help="Skip files already in the database"
@@ -79,9 +73,9 @@ def cli():
 @click.option(
     "--no-contrast",
     is_flag=True,
-    help="Disable contrast sampling (high/low energy chunks) for A/B testing"
+    help="Disable contrast sampling (high/low energy chunks)"
 )
-def scan(music_path: Path, output: Path, batch_size: int, skip_existing: bool, verbose: bool, model: str, no_contrast: bool):
+def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, model: str, no_contrast: bool):
     """Scan a music directory and generate embeddings.
 
     MUSIC_PATH: Path to your music library folder
@@ -121,37 +115,32 @@ def scan(music_path: Path, output: Path, batch_size: int, skip_existing: bool, v
     # Initialize embedding generator
     model_name = "MuQ" if model == "muq" else "CLAP"
     contrast_chunks = 0 if no_contrast else 2
-    if no_contrast:
-        click.echo(f"Loading {model_name} model (contrast sampling disabled)...")
-    else:
-        click.echo(f"Loading {model_name} model...")
+    click.echo(f"Loading {model_name} model...")
     generator = create_embedding_generator(model, contrast_chunks=contrast_chunks)
 
-    # Process in batches
+    # Process files sequentially
     successful = 0
     failed = 0
 
     with tqdm(total=len(audio_files), desc="Processing", unit="file") as pbar:
-        for i in range(0, len(audio_files), batch_size):
-            batch_files = audio_files[i:i + batch_size]
+        for filepath in audio_files:
+            metadata = extract_metadata(filepath)
+            embedding = generator.generate_embedding(filepath)
 
-            # Extract metadata
-            batch_metadata = [extract_metadata(f) for f in batch_files]
+            if embedding is not None:
+                db.add_track(metadata, embedding)
+                successful += 1
+            else:
+                failed += 1
+                logger.warning(f"Failed: {metadata.file_path.name}")
 
-            # Generate embeddings (parallel file loading → GPU inference)
-            batch_embeddings = generator.generate_embedding_batch(batch_files)
+            # Commit every 10 files
+            if (successful + failed) % 10 == 0:
+                db.commit()
 
-            # Store results
-            for metadata, embedding in zip(batch_metadata, batch_embeddings):
-                if embedding is not None:
-                    db.add_track(metadata, embedding)
-                    successful += 1
-                else:
-                    failed += 1
-                    logger.warning(f"Failed to generate embedding for: {metadata.file_path.name}")
+            pbar.update(1)
 
-            db.commit()
-            pbar.update(len(batch_files))
+    db.commit()
 
     # Set metadata
     db.set_metadata("version", __version__)
@@ -180,12 +169,6 @@ def scan(music_path: Path, output: Path, batch_size: int, skip_existing: bool, v
     help="Database file to update"
 )
 @click.option(
-    "--batch-size", "-b",
-    type=int,
-    default=16,
-    help="Number of files to process in each batch (default: 16)"
-)
-@click.option(
     "--remove-missing/--no-remove-missing",
     default=True,
     help="Remove tracks whose files no longer exist"
@@ -204,9 +187,9 @@ def scan(music_path: Path, output: Path, batch_size: int, skip_existing: bool, v
 @click.option(
     "--no-contrast",
     is_flag=True,
-    help="Disable contrast sampling (high/low energy chunks) for A/B testing"
+    help="Disable contrast sampling (high/low energy chunks)"
 )
-def update(music_path: Path, database: Path, batch_size: int, remove_missing: bool, verbose: bool, model: str, no_contrast: bool):
+def update(music_path: Path, database: Path, remove_missing: bool, verbose: bool, model: str, no_contrast: bool):
     """Incrementally update an existing database.
 
     Adds new files and optionally removes missing ones.
@@ -258,33 +241,31 @@ def update(music_path: Path, database: Path, batch_size: int, remove_missing: bo
     # Initialize embedding generator
     model_name = "MuQ" if model == "muq" else "CLAP"
     contrast_chunks = 0 if no_contrast else 2
-    if no_contrast:
-        click.echo(f"Loading {model_name} model (contrast sampling disabled)...")
-    else:
-        click.echo(f"Loading {model_name} model...")
+    click.echo(f"Loading {model_name} model...")
     generator = create_embedding_generator(model, contrast_chunks=contrast_chunks)
 
-    # Process new files
+    # Process new files sequentially
     successful = 0
     failed = 0
 
     with tqdm(total=len(new_files), desc="Processing", unit="file") as pbar:
-        for i in range(0, len(new_files), batch_size):
-            batch_files = new_files[i:i + batch_size]
-            batch_metadata = [extract_metadata(f) for f in batch_files]
+        for filepath in new_files:
+            metadata = extract_metadata(filepath)
+            embedding = generator.generate_embedding(filepath)
 
-            # Generate embeddings (parallel file loading → GPU inference)
-            batch_embeddings = generator.generate_embedding_batch(batch_files)
+            if embedding is not None:
+                db.add_track(metadata, embedding)
+                successful += 1
+            else:
+                failed += 1
 
-            for metadata, embedding in zip(batch_metadata, batch_embeddings):
-                if embedding is not None:
-                    db.add_track(metadata, embedding)
-                    successful += 1
-                else:
-                    failed += 1
+            # Commit every 10 files
+            if (successful + failed) % 10 == 0:
+                db.commit()
 
-            db.commit()
-            pbar.update(len(batch_files))
+            pbar.update(1)
+
+    db.commit()
 
     # Update metadata
     db.set_metadata("version", __version__)
@@ -418,7 +399,7 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
         if len(matches) > 1:
             click.echo(f"Found {len(matches)} matches, using first:")
             for i, track in enumerate(matches[:5]):
-                marker = "→" if i == 0 else " "
+                marker = ">" if i == 0 else " "
                 click.echo(f"  {marker} {format_track(track)}")
             if len(matches) > 5:
                 click.echo(f"  ... and {len(matches) - 5} more")
@@ -447,15 +428,13 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
         contrast_chunks = 0 if no_contrast else 2
         click.echo(f"Generating embedding with {model_name}...")
         generator = create_embedding_generator(model, contrast_chunks=contrast_chunks)
-        embeddings = generator.generate_embedding_batch([audio_file])
+        seed_embedding = generator.generate_embedding(audio_file)
         generator.unload_model()
 
-        if not embeddings or embeddings[0] is None:
+        if seed_embedding is None:
             click.echo(f"Failed to generate embedding for: {audio_file}")
             db.close()
             return
-
-        seed_embedding = embeddings[0]
 
     # Display seed
     if seed_track:
