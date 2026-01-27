@@ -194,9 +194,10 @@ class MuQEmbeddingGenerator:
             batch_tensor = torch.stack(chunk_tensors).to(device=self.device)
 
             with torch.no_grad():
-                # MuQ inference: model(wavs=tensor) -> output with last_hidden_state
+                # MuQ inference: model(tensor) -> output with last_hidden_state
+                # Note: MuQ uses positional arg, not wavs= keyword
                 # last_hidden_state shape: [batch, time_frames, hidden_dim]
-                output = self.model(wavs=batch_tensor)
+                output = self.model(batch_tensor)
 
                 # Pool temporal dimension to get fixed-size embedding per chunk
                 # Mean pooling over time: [batch, time, hidden] -> [batch, hidden]
