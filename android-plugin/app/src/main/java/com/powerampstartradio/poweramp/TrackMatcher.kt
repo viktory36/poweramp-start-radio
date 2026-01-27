@@ -2,7 +2,6 @@ package com.powerampstartradio.poweramp
 
 import android.content.Context
 import android.util.Log
-import com.powerampstartradio.data.EmbeddedTrack
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.similarity.SimilarTrack
 
@@ -108,76 +107,6 @@ class TrackMatcher(
 
         Log.d(TAG, "No match found")
         return null
-    }
-
-    /**
-     * Map embedded track IDs to Poweramp file IDs.
-     * Tries artist|album|title first, then artist|title, then fuzzy artist.
-     * Deduplicates to avoid same file appearing twice in queue.
-     */
-    fun mapEmbeddedTracksToFileIds(
-        context: Context,
-        embeddedTracks: List<EmbeddedTrack>
-    ): List<Long> {
-        // Build indexes from Poweramp library
-        val powerampFiles = PowerampHelper.getAllFileIds(context)
-        val byArtistAlbumTitle = mutableMapOf<String, Long>()
-        val byArtistTitle = mutableMapOf<String, Long>()
-        val byTitle = mutableMapOf<String, MutableList<Pair<String, Long>>>() // title -> [(artist, id)]
-
-        for ((key, id) in powerampFiles) {
-            val parts = key.split("|")
-            if (parts.size >= 3) {
-                val artist = parts[0]
-                val album = parts[1]
-                val title = parts[2]
-                byArtistAlbumTitle["$artist|$album|$title"] = id
-                byArtistTitle["$artist|$title"] = id
-                byTitle.getOrPut(title) { mutableListOf() }.add(artist to id)
-            }
-        }
-        Log.d(TAG, "Indexed ${powerampFiles.size} Poweramp tracks")
-
-        val fileIds = mutableListOf<Long>()
-        val seen = mutableSetOf<Long>() // Track seen IDs to avoid duplicates
-
-        for (track in embeddedTracks) {
-            val parts = track.metadataKey.split("|")
-            if (parts.size >= 3) {
-                val embeddedArtist = parts[0]
-                val embeddedAlbum = parts[1]
-                val embeddedTitle = parts[2]
-
-                // 1. Try exact artist|album|title
-                var fileId = byArtistAlbumTitle["$embeddedArtist|$embeddedAlbum|$embeddedTitle"]
-
-                // 2. Try artist|title (any album)
-                if (fileId == null) {
-                    fileId = byArtistTitle["$embeddedArtist|$embeddedTitle"]
-                }
-
-                // 3. Fuzzy: find by title, check artist substring
-                if (fileId == null) {
-                    byTitle[embeddedTitle]?.find { (powerampArtist, _) ->
-                        embeddedArtist.isNotEmpty() && (
-                            powerampArtist.contains(embeddedArtist) ||
-                            embeddedArtist.contains(powerampArtist)
-                        )
-                    }?.let { (_, id) -> fileId = id }
-                }
-
-                // Add if found and not a duplicate
-                if (fileId != null && fileId !in seen) {
-                    fileIds.add(fileId!!)
-                    seen.add(fileId!!)
-                } else if (fileId == null) {
-                    Log.d(TAG, "No Poweramp match for: ${track.artist} - ${track.title}")
-                }
-            }
-        }
-
-        Log.d(TAG, "Mapped ${fileIds.size} unique tracks of ${embeddedTracks.size}")
-        return fileIds
     }
 
     /**
