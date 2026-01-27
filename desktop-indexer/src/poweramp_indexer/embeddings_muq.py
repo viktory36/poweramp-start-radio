@@ -177,31 +177,42 @@ class MuQEmbeddingGenerator:
 
         return chunks
 
-    def _infer(self, chunks: list[np.ndarray]) -> Optional[list[float]]:
-        """Run GPU inference on chunks and return averaged, normalized embedding."""
+    def _infer(self, chunks: list[np.ndarray], max_batch: int = 5) -> Optional[list[float]]:
+        """
+        Run GPU inference on chunks and return averaged, normalized embedding.
+
+        Processes in sub-batches of max_batch to avoid OOM on long tracks.
+        """
         try:
-            batch = torch.stack([
-                torch.tensor(c, dtype=torch.float32) for c in chunks
-            ]).to(self.device)
+            all_features = []
 
-            with torch.no_grad():
-                output = self.model(batch)
-                features = output.last_hidden_state.mean(dim=1)  # Pool time dimension
+            # Process in sub-batches to avoid OOM
+            for i in range(0, len(chunks), max_batch):
+                batch_chunks = chunks[i:i + max_batch]
+                batch = torch.stack([
+                    torch.tensor(c, dtype=torch.float32) for c in batch_chunks
+                ]).to(self.device)
 
-            embedding = torch.mean(features, dim=0)  # Average across chunks
+                with torch.no_grad():
+                    output = self.model(batch)
+                    features = output.last_hidden_state.mean(dim=1)  # Pool time dimension
+                    all_features.append(features.cpu())
+
+                # Cleanup between sub-batches
+                del batch, output, features
+                if self.device == "cuda":
+                    torch.cuda.empty_cache()
+
+            # Average across all chunks
+            all_features = torch.cat(all_features, dim=0)
+            embedding = torch.mean(all_features, dim=0)
             normalized = F.normalize(embedding, p=2, dim=0)
-            result = normalized.cpu().float().numpy().tolist()
-
-            # Explicit cleanup
-            del batch, output, features, embedding, normalized
-            return result
+            return normalized.float().numpy().tolist()
 
         except Exception as e:
             logger.error(f"Error in inference: {e}")
-            # Clear CUDA state after error to allow recovery
             if self.device == "cuda":
                 torch.cuda.empty_cache()
-                torch.cuda.synchronize()
             return None
 
     def generate_embedding(self, filepath: Path) -> Optional[list[float]]:
