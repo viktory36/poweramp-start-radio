@@ -160,6 +160,8 @@ class DualEmbeddingGenerator:
                     all_features.append(features.cpu())
 
                 del batch, output, features
+                if self.device == "cuda":
+                    torch.cuda.empty_cache()
 
             # Average across all chunks: [total_chunks, 1024] -> [1024]
             all_features = torch.cat(all_features, dim=0)
@@ -205,6 +207,8 @@ class DualEmbeddingGenerator:
                     all_features.append(audio_embeds.cpu())
 
                 del batch, audio_embeds
+                if self.device == "cuda":
+                    torch.cuda.empty_cache()
 
             # Average across all chunks: [total_chunks, 512] -> [512]
             all_features = torch.cat(all_features, dim=0)
