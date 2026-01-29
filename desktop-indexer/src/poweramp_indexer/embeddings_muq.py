@@ -28,13 +28,11 @@ class MuQEmbeddingGenerator:
         model_id: str = "OpenMuQ/MuQ-large-msd-iter",
         target_sr: int = 24000,  # MuQ uses 24kHz
         chunk_duration_s: int = 30,  # MuQ optimal input length
-        contrast_chunks: int = 0,  # Disabled by default (use --no-contrast to enable legacy)
         max_chunks: int = 30,   # 30 min coverage (1 chunk per minute)
     ):
         self.model_id = model_id
         self.target_sr = target_sr
         self.chunk_duration_s = chunk_duration_s
-        self.contrast_chunks = contrast_chunks
         self.max_chunks = max_chunks
 
         self.device = self._get_best_device()
@@ -70,25 +68,18 @@ class MuQEmbeddingGenerator:
         self.model.eval()
         logger.info("Model loaded successfully.")
 
-    def _load_audio(self, filepath: Path) -> Optional[tuple[np.ndarray, float, list]]:
+    def _load_audio(self, filepath: Path) -> Optional[tuple[np.ndarray, float]]:
         """
-        Load audio file and compute energy profile.
+        Load audio file.
 
-        Returns (waveform, duration_s, energy_profile) or None on failure.
+        Returns (waveform, duration_s) or None on failure.
         """
         import librosa
 
         try:
             waveform, sr = librosa.load(str(filepath), sr=self.target_sr, mono=True)
             duration_s = len(waveform) / sr
-
-            # Compute energy profile (RMS per second)
-            hop_length = sr
-            frame_length = sr
-            rms = librosa.feature.rms(y=waveform, frame_length=frame_length, hop_length=hop_length)[0]
-            energy_profile = [(i, float(rms[i])) for i in range(len(rms))]
-
-            return waveform, duration_s, energy_profile
+            return waveform, duration_s
         except Exception as e:
             logger.error(f"Error loading {filepath.name}: {e}")
             return None
@@ -107,50 +98,6 @@ class MuQEmbeddingGenerator:
             return [usable / 2]  # Center of usable range
         # Evenly spaced positions
         return [usable * i / (num_chunks - 1) for i in range(num_chunks)]
-
-    def _select_contrast_positions(
-        self,
-        energy_profile: list[tuple[float, float]],
-        existing_positions: list[float],
-        duration_s: float,
-    ) -> list[float]:
-        """
-        Find highest and lowest energy positions not overlapping existing samples.
-
-        Returns up to contrast_chunks positions (typically 2: one high, one low energy).
-        """
-        if not energy_profile or self.contrast_chunks == 0:
-            return []
-
-        usable = duration_s - self.chunk_duration_s
-        if usable <= 0:
-            return []
-
-        valid_profile = [(pos, energy) for pos, energy in energy_profile if pos <= usable]
-        if not valid_profile:
-            return []
-
-        def overlaps(pos: float, used: list[float]) -> bool:
-            return any(abs(pos - p) < self.chunk_duration_s for p in used)
-
-        sorted_by_energy = sorted(valid_profile, key=lambda x: x[1])
-        contrast_positions = []
-        used = list(existing_positions)
-
-        # Lowest energy
-        for pos, _ in sorted_by_energy:
-            if not overlaps(pos, used):
-                contrast_positions.append(float(pos))
-                used.append(pos)
-                break
-
-        # Highest energy
-        for pos, _ in reversed(sorted_by_energy):
-            if not overlaps(pos, used):
-                contrast_positions.append(float(pos))
-                break
-
-        return contrast_positions[:self.contrast_chunks]
 
     def _extract_chunks(self, waveform: np.ndarray, positions: list[float]) -> list[np.ndarray]:
         """Extract audio chunks from waveform by slicing."""
@@ -218,17 +165,15 @@ class MuQEmbeddingGenerator:
         result = self._load_audio(filepath)
         if result is None:
             return None
-        waveform, duration_s, energy_profile = result
+        waveform, duration_s = result
 
         if duration_s < self.chunk_duration_s:
             logger.warning(f"{filepath.name}: too short ({duration_s:.1f}s)")
             return None
 
-        # Select positions (stratified + contrast)
+        # Select stratified positions
         num_chunks = self._calculate_num_chunks(duration_s)
         positions = self._select_chunk_positions(duration_s, num_chunks)
-        contrast = self._select_contrast_positions(energy_profile, positions, duration_s)
-        positions = (positions + contrast)[:self.max_chunks]
 
         logger.debug(f"{filepath.name}: {len(positions)} chunks from {duration_s:.1f}s")
 

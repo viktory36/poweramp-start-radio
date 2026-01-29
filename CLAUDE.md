@@ -33,7 +33,7 @@ poweramp-indexer similar embeddings.db --file /path/to/song.mp3
 poweramp-indexer similar embeddings.db --random
 ```
 
-Options: `--model muq|clap` (default: muq), `--batch-size N`, `--verbose`
+Options: `--dual` (generate both MuQ and MuLan), `--verbose`
 
 ### Android Plugin
 
@@ -65,7 +65,7 @@ Poweramp ← PowerampHelper ← QueueManager ← SimilarityEngine ← TrackMatch
 
 **Embedding Models**:
 - MuQ-large-msd-iter (default): 24kHz, 1024-dim, SOTA pure music understanding model
-- CLAP: 48kHz, 512-dim, alternative option
+- MuQ-MuLan-large (via `--dual`): 24kHz, 512-dim, music-text retrieval model for text search
 
 **Sampling Strategy**: Dense stratified sampling across full audio duration. Chunk count scales with duration (10 chunks for standard songs, up to 30 for long DJ sets). Ensures comprehensive coverage of intro/middle/outro sections.
 
@@ -87,6 +87,7 @@ Poweramp API uses:
 |---------|------|
 | CLI entry point | `desktop-indexer/src/poweramp_indexer/cli.py` |
 | MuQ embedding generation | `desktop-indexer/src/poweramp_indexer/embeddings_muq.py` |
+| Dual MuQ+MuLan embeddings | `desktop-indexer/src/poweramp_indexer/embeddings_dual.py` |
 | SQLite database schema | `desktop-indexer/src/poweramp_indexer/database.py` |
 | Poweramp API wrapper | `android-plugin/.../poweramp/PowerampHelper.kt` |
 | Similarity search | `android-plugin/.../similarity/SimilarityEngine.kt` |

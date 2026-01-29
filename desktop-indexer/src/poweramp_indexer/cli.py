@@ -8,25 +8,15 @@ from tqdm import tqdm
 
 from . import __version__
 from .database import EmbeddingDatabase
-from .embeddings_clap import CLAPEmbeddingGenerator
 from .embeddings_dual import DualEmbeddingGenerator
 from .embeddings_muq import MuQEmbeddingGenerator
 from .fingerprint import extract_metadata
 from .scanner import scan_music_directory
 
-# Model choices
-MODEL_CHOICES = ["muq", "clap"]
-DEFAULT_MODEL = "muq"
 
-
-def create_embedding_generator(model: str, contrast_chunks: int = 2):
-    """Create the appropriate embedding generator based on model choice."""
-    if model == "muq":
-        return MuQEmbeddingGenerator(contrast_chunks=contrast_chunks)
-    elif model == "clap":
-        return CLAPEmbeddingGenerator()
-    else:
-        raise ValueError(f"Unknown model: {model}. Choose from: {MODEL_CHOICES}")
+def create_embedding_generator():
+    """Create the MuQ embedding generator."""
+    return MuQEmbeddingGenerator()
 
 
 # Configure logging
@@ -66,22 +56,11 @@ def cli():
     help="Enable verbose logging"
 )
 @click.option(
-    "--model", "-m",
-    type=click.Choice(MODEL_CHOICES),
-    default=DEFAULT_MODEL,
-    help="Embedding model to use (default: muq)"
-)
-@click.option(
-    "--no-contrast",
-    is_flag=True,
-    help="Disable contrast sampling (high/low energy chunks)"
-)
-@click.option(
     "--dual",
     is_flag=True,
     help="Generate both MuQ and MuLan embeddings (outputs embeddings_muq.db and embeddings_mulan.db)"
 )
-def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, model: str, no_contrast: bool, dual: bool):
+def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, dual: bool):
     """Scan a music directory and generate embeddings.
 
     MUSIC_PATH: Path to your music library folder
@@ -106,11 +85,11 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, mod
     if dual:
         _scan_dual(music_path, output, skip_existing, audio_files)
     else:
-        _scan_single(music_path, output, skip_existing, audio_files, model, no_contrast)
+        _scan_single(music_path, output, skip_existing, audio_files)
 
 
-def _scan_single(music_path: Path, output: Path, skip_existing: bool, audio_files: list[Path], model: str, no_contrast: bool):
-    """Single-model scan (original behavior)."""
+def _scan_single(music_path: Path, output: Path, skip_existing: bool, audio_files: list[Path]):
+    """Single-model scan."""
     click.echo(f"Output: {output}")
 
     # Initialize database
@@ -131,10 +110,8 @@ def _scan_single(music_path: Path, output: Path, skip_existing: bool, audio_file
         return
 
     # Initialize embedding generator
-    model_name = "MuQ" if model == "muq" else "CLAP"
-    contrast_chunks = 0 if no_contrast else 2
-    click.echo(f"Loading {model_name} model...")
-    generator = create_embedding_generator(model, contrast_chunks=contrast_chunks)
+    click.echo("Loading MuQ model...")
+    generator = create_embedding_generator()
 
     # Process files sequentially
     successful = 0
@@ -164,7 +141,7 @@ def _scan_single(music_path: Path, output: Path, skip_existing: bool, audio_file
     db.set_metadata("version", __version__)
     db.set_metadata("source_path", str(music_path))
     db.set_metadata("embedding_dim", str(generator.embedding_dim))
-    db.set_metadata("model", model)
+    db.set_metadata("model", "muq")
 
     # Final stats
     total_tracks = db.count_tracks()
@@ -282,18 +259,7 @@ def _scan_dual(music_path: Path, output: Path, skip_existing: bool, audio_files:
     is_flag=True,
     help="Enable verbose logging"
 )
-@click.option(
-    "--model", "-m",
-    type=click.Choice(MODEL_CHOICES),
-    default=None,
-    help="Embedding model to use (default: from database or muq)"
-)
-@click.option(
-    "--no-contrast",
-    is_flag=True,
-    help="Disable contrast sampling (high/low energy chunks)"
-)
-def update(music_path: Path, database: Path, remove_missing: bool, verbose: bool, model: str, no_contrast: bool):
+def update(music_path: Path, database: Path, remove_missing: bool, verbose: bool):
     """Incrementally update an existing database.
 
     Adds new files and optionally removes missing ones.
@@ -337,16 +303,17 @@ def update(music_path: Path, database: Path, remove_missing: bool, verbose: bool
 
     click.echo(f"Found {len(new_files)} new files to index")
 
-    # Determine which model to use (prefer database's model for consistency)
-    if model is None:
-        model = db.get_metadata("model") or DEFAULT_MODEL
-        click.echo(f"Using model from database: {model}")
+    # Check database model compatibility
+    db_model = db.get_metadata("model")
+    if db_model == "clap":
+        click.echo("Error: This database was created with CLAP embeddings, which are no longer supported.")
+        click.echo("Please re-scan your library to create a new MuQ database.")
+        db.close()
+        return
 
     # Initialize embedding generator
-    model_name = "MuQ" if model == "muq" else "CLAP"
-    contrast_chunks = 0 if no_contrast else 2
-    click.echo(f"Loading {model_name} model...")
-    generator = create_embedding_generator(model, contrast_chunks=contrast_chunks)
+    click.echo("Loading MuQ model...")
+    generator = create_embedding_generator()
 
     # Process new files sequentially
     successful = 0
@@ -374,7 +341,7 @@ def update(music_path: Path, database: Path, remove_missing: bool, verbose: bool
     # Update metadata
     db.set_metadata("version", __version__)
     db.set_metadata("source_path", str(music_path))
-    db.set_metadata("model", model)
+    db.set_metadata("model", "muq")
 
     # Vacuum and close
     db.vacuum()
@@ -414,7 +381,7 @@ def info(database: Path):
 
     model = db.get_metadata("model")
     if model:
-        model_names = {"muq": "MuQ", "clap": "CLAP", "mulan": "MuLan"}
+        model_names = {"muq": "MuQ", "mulan": "MuLan"}
         model_name = model_names.get(model, model)
         click.echo(f"Embedding model: {model_name}")
 
@@ -460,9 +427,7 @@ def format_track(track: dict) -> str:
 @click.option("--file", "-f", "audio_file", type=click.Path(exists=True, path_type=Path), help="Audio file to find similar tracks for")
 @click.option("--random", "-r", "use_random", is_flag=True, help="Pick a random seed track")
 @click.option("--top", "-n", default=10, help="Number of similar tracks to show")
-@click.option("--model", "-m", type=click.Choice(MODEL_CHOICES), default=None, help="Model for --file embedding (default: from database)")
-@click.option("--no-contrast", is_flag=True, help="Disable contrast sampling when using --file")
-def similar(database: Path, query: str, audio_file: Path, use_random: bool, top: int, model: str, no_contrast: bool):
+def similar(database: Path, query: str, audio_file: Path, use_random: bool, top: int):
     """Find similar tracks in the database.
 
     DATABASE: Path to embeddings.db
@@ -526,13 +491,12 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
 
     elif audio_file:
         # Generate embedding for external file
-        if model is None:
-            model = db.get_metadata("model") or DEFAULT_MODEL
+        db_model = db.get_metadata("model")
+        if db_model == "mulan":
+            click.echo("Warning: Database uses MuLan embeddings (different dimensions). Results may be poor.")
 
-        model_name = "MuQ" if model == "muq" else "CLAP"
-        contrast_chunks = 0 if no_contrast else 2
-        click.echo(f"Generating embedding with {model_name}...")
-        generator = create_embedding_generator(model, contrast_chunks=contrast_chunks)
+        click.echo("Generating embedding with MuQ...")
+        generator = create_embedding_generator()
         seed_embedding = generator.generate_embedding(audio_file)
         generator.unload_model()
 

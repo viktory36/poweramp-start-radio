@@ -1,6 +1,6 @@
 # Poweramp Start Radio - Desktop Indexer
 
-CLI tool that scans a local music library, generates CLAP embeddings, and
+CLI tool that scans a local music library, generates MuQ embeddings, and
 stores them in an SQLite database for use by the Android plugin.
 
 ## Install (editable)
