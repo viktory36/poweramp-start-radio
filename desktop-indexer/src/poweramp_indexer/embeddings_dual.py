@@ -222,24 +222,14 @@ class DualEmbeddingGenerator:
                 torch.cuda.empty_cache()
             return None
 
-    def generate_from_audio(
-        self, waveform: np.ndarray, duration_s: float, filename: str = "<audio>"
-    ) -> tuple[Optional[list[float]], Optional[list[float]]]:
-        """
-        Generate embeddings from a pre-loaded waveform using both models.
-
-        Use this with load_audio() for prefetching (load next file while
-        GPU processes current one).
-
-        Returns:
-            Tuple of (muq_embedding, mulan_embedding).
-            Either may be None if that model's inference fails.
-        """
+    def _prepare_chunks(
+        self, waveform: np.ndarray, duration_s: float, filename: str
+    ) -> Optional[list[np.ndarray]]:
+        """Extract chunks from waveform for inference. Returns None if audio is unsuitable."""
         if duration_s < self.chunk_duration_s:
             logger.warning(f"{filename}: too short ({duration_s:.1f}s < 30s)")
-            return None, None
+            return None
 
-        # Select positions and extract chunks
         num_chunks = self._calculate_num_chunks(duration_s)
         positions = self._select_chunk_positions(duration_s, num_chunks)
         chunks = self._extract_chunks(waveform, positions)
@@ -248,14 +238,43 @@ class DualEmbeddingGenerator:
 
         if not chunks:
             logger.warning(f"{filename}: no chunks extracted")
+            return None
+        return chunks
+
+    def generate_muq_from_audio(
+        self, waveform: np.ndarray, duration_s: float, filename: str = "<audio>"
+    ) -> Optional[list[float]]:
+        """Generate MuQ embedding only from pre-loaded waveform."""
+        chunks = self._prepare_chunks(waveform, duration_s, filename)
+        if chunks is None:
+            return None
+        return self._infer_muq(chunks)
+
+    def generate_mulan_from_audio(
+        self, waveform: np.ndarray, duration_s: float, filename: str = "<audio>"
+    ) -> Optional[list[float]]:
+        """Generate MuLan embedding only from pre-loaded waveform."""
+        chunks = self._prepare_chunks(waveform, duration_s, filename)
+        if chunks is None:
+            return None
+        return self._infer_mulan(chunks)
+
+    def generate_from_audio(
+        self, waveform: np.ndarray, duration_s: float, filename: str = "<audio>"
+    ) -> tuple[Optional[list[float]], Optional[list[float]]]:
+        """
+        Generate embeddings from a pre-loaded waveform using both models.
+
+        Returns:
+            Tuple of (muq_embedding, mulan_embedding).
+            Either may be None if that model's inference fails.
+        """
+        chunks = self._prepare_chunks(waveform, duration_s, filename)
+        if chunks is None:
             return None, None
 
-        # MuQ inference (full 30s chunks)
         muq_embedding = self._infer_muq(chunks)
-
-        # MuLan inference (MuLan internally splits 30s -> 3x10s clips)
         mulan_embedding = self._infer_mulan(chunks)
-
         del chunks
 
         return muq_embedding, mulan_embedding

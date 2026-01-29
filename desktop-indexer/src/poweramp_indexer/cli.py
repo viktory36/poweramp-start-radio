@@ -89,40 +89,29 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, dua
         _scan_single(music_path, output, skip_existing, audio_files)
 
 
-def _scan_single(music_path: Path, output: Path, skip_existing: bool, audio_files: list[Path]):
-    """Single-model scan."""
-    click.echo(f"Output: {output}")
+def _process_files(audio_files, load_audio_fn, infer_fn, db, desc):
+    """Process files with prefetching and write embeddings to database.
 
-    # Initialize database
-    db = EmbeddingDatabase(output)
+    Prefetches the next file's audio in a background thread while the GPU
+    runs inference on the current file (both librosa and CUDA release the GIL).
 
-    # Get existing paths if skipping
-    existing_paths = db.get_existing_paths() if skip_existing else set()
+    Args:
+        audio_files: Paths to process.
+        load_audio_fn: Callable(path) -> (waveform, duration) or None.
+        infer_fn: Callable(waveform, duration, filename) -> embedding or None.
+        db: Database to write results to.
+        desc: tqdm progress bar description.
 
-    # Filter to new files
-    if existing_paths:
-        new_files = [f for f in audio_files if str(f) not in existing_paths]
-        click.echo(f"Skipping {len(audio_files) - len(new_files)} existing files")
-        audio_files = new_files
-
-    if not audio_files:
-        click.echo("All files already indexed. Use --no-skip-existing to reindex.")
-        db.close()
-        return
-
-    # Initialize embedding generator
-    click.echo("Loading MuQ model...")
-    generator = create_embedding_generator()
-
-    # Process files with prefetching: load next file's audio on CPU
-    # while GPU processes current file (librosa and CUDA both release the GIL)
+    Returns:
+        (successful, failed) counts.
+    """
     successful = 0
     failed = 0
 
     def _prefetch(fp):
-        return extract_metadata(fp), generator.load_audio(fp)
+        return extract_metadata(fp), load_audio_fn(fp)
 
-    with tqdm(total=len(audio_files), desc="Processing", unit="file") as pbar:
+    with tqdm(total=len(audio_files), desc=desc, unit="file") as pbar:
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(_prefetch, audio_files[0])
 
@@ -136,9 +125,7 @@ def _scan_single(music_path: Path, output: Path, skip_existing: bool, audio_file
                 filepath = audio_files[i]
                 if audio is not None:
                     waveform, duration_s = audio
-                    embedding = generator.generate_from_audio(
-                        waveform, duration_s, filepath.name
-                    )
+                    embedding = infer_fn(waveform, duration_s, filepath.name)
                     del waveform
                 else:
                     embedding = None
@@ -150,21 +137,44 @@ def _scan_single(music_path: Path, output: Path, skip_existing: bool, audio_file
                     failed += 1
                     logger.warning(f"Failed: {filepath.name}")
 
-                # Commit every 10 files
                 if (successful + failed) % 10 == 0:
                     db.commit()
 
                 pbar.update(1)
 
     db.commit()
+    return successful, failed
 
-    # Set metadata
+
+def _scan_single(music_path: Path, output: Path, skip_existing: bool, audio_files: list[Path]):
+    """Single-model scan."""
+    click.echo(f"Output: {output}")
+
+    db = EmbeddingDatabase(output)
+
+    existing_paths = db.get_existing_paths() if skip_existing else set()
+    if existing_paths:
+        new_files = [f for f in audio_files if str(f) not in existing_paths]
+        click.echo(f"Skipping {len(audio_files) - len(new_files)} existing files")
+        audio_files = new_files
+
+    if not audio_files:
+        click.echo("All files already indexed. Use --no-skip-existing to reindex.")
+        db.close()
+        return
+
+    click.echo("Loading MuQ model...")
+    generator = create_embedding_generator()
+
+    successful, failed = _process_files(
+        audio_files, generator.load_audio, generator.generate_from_audio, db, "Processing"
+    )
+
     db.set_metadata("version", __version__)
     db.set_metadata("source_path", str(music_path))
     db.set_metadata("embedding_dim", str(generator.embedding_dim))
     db.set_metadata("model", "muq")
 
-    # Final stats
     total_tracks = db.count_tracks()
     click.echo(f"\nComplete!")
     click.echo(f"  Successfully indexed: {successful}")
@@ -177,8 +187,7 @@ def _scan_single(music_path: Path, output: Path, skip_existing: bool, audio_file
 
 
 def _scan_dual(music_path: Path, output: Path, skip_existing: bool, audio_files: list[Path]):
-    """Dual-model scan generating both MuQ and MuLan embeddings."""
-    # Determine output paths
+    """Dual-model scan — two passes, one model at a time to halve VRAM usage."""
     output_dir = output.parent
     output_muq = output_dir / "embeddings_muq.db"
     output_mulan = output_dir / "embeddings_mulan.db"
@@ -186,98 +195,75 @@ def _scan_dual(music_path: Path, output: Path, skip_existing: bool, audio_files:
     click.echo(f"Output (MuQ): {output_muq}")
     click.echo(f"Output (MuLan): {output_mulan}")
 
-    # Initialize databases
     db_muq = EmbeddingDatabase(output_muq)
     db_mulan = EmbeddingDatabase(output_mulan)
 
-    # Get existing paths if skipping (use MuQ db as reference)
-    existing_paths = db_muq.get_existing_paths() if skip_existing else set()
+    # Each model tracks its own progress independently (safe to ctrl+c between passes)
+    muq_existing = db_muq.get_existing_paths() if skip_existing else set()
+    mulan_existing = db_mulan.get_existing_paths() if skip_existing else set()
+    muq_files = [f for f in audio_files if str(f) not in muq_existing]
+    mulan_files = [f for f in audio_files if str(f) not in mulan_existing]
 
-    # Filter to new files
-    if existing_paths:
-        new_files = [f for f in audio_files if str(f) not in existing_paths]
-        click.echo(f"Skipping {len(audio_files) - len(new_files)} existing files")
-        audio_files = new_files
+    if muq_existing or mulan_existing:
+        click.echo(
+            f"MuQ: {len(muq_files)} to process, "
+            f"{len(audio_files) - len(muq_files)} already indexed"
+        )
+        click.echo(
+            f"MuLan: {len(mulan_files)} to process, "
+            f"{len(audio_files) - len(mulan_files)} already indexed"
+        )
 
-    if not audio_files:
+    if not muq_files and not mulan_files:
         click.echo("All files already indexed. Use --no-skip-existing to reindex.")
         db_muq.close()
         db_mulan.close()
         return
 
-    # Initialize dual generator
-    click.echo("Loading MuQ and MuLan models...")
     generator = DualEmbeddingGenerator()
 
-    # Process files with prefetching: load next file's audio on CPU
-    # while GPU processes current file (librosa and CUDA both release the GIL)
-    successful = 0
-    failed = 0
+    # Pass 1: MuQ only (~2GB VRAM instead of ~4.2GB with both)
+    muq_ok, muq_fail = 0, 0
+    if muq_files:
+        click.echo(f"\nPass 1/2: MuQ ({len(muq_files)} files)")
+        muq_ok, muq_fail = _process_files(
+            muq_files, generator.load_audio,
+            generator.generate_muq_from_audio, db_muq, "MuQ"
+        )
+    else:
+        click.echo("\nPass 1/2: MuQ — all files already indexed")
+    generator.unload_muq()
 
-    def _prefetch(fp):
-        return extract_metadata(fp), generator.load_audio(fp)
+    # Pass 2: MuLan only (~2GB VRAM)
+    mulan_ok, mulan_fail = 0, 0
+    if mulan_files:
+        click.echo(f"\nPass 2/2: MuLan ({len(mulan_files)} files)")
+        mulan_ok, mulan_fail = _process_files(
+            mulan_files, generator.load_audio,
+            generator.generate_mulan_from_audio, db_mulan, "MuLan"
+        )
+    else:
+        click.echo("\nPass 2/2: MuLan — all files already indexed")
+    generator.unload_mulan()
 
-    with tqdm(total=len(audio_files), desc="Processing", unit="file") as pbar:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_prefetch, audio_files[0])
-
-            for i in range(len(audio_files)):
-                metadata, audio = future.result()
-
-                # Start loading next file while we run inference on this one
-                if i + 1 < len(audio_files):
-                    future = executor.submit(_prefetch, audio_files[i + 1])
-
-                filepath = audio_files[i]
-                if audio is not None:
-                    waveform, duration_s = audio
-                    muq_emb, mulan_emb = generator.generate_from_audio(
-                        waveform, duration_s, filepath.name
-                    )
-                    del waveform
-                else:
-                    muq_emb, mulan_emb = None, None
-
-                if muq_emb is not None and mulan_emb is not None:
-                    db_muq.add_track(metadata, muq_emb)
-                    db_mulan.add_track(metadata, mulan_emb)
-                    successful += 1
-                else:
-                    failed += 1
-                    logger.warning(f"Failed: {filepath.name}")
-
-                # Commit every 10 files
-                if (successful + failed) % 10 == 0:
-                    db_muq.commit()
-                    db_mulan.commit()
-
-                pbar.update(1)
-
-    db_muq.commit()
-    db_mulan.commit()
-
-    # Set metadata for MuQ db
+    # Set metadata
     db_muq.set_metadata("version", __version__)
     db_muq.set_metadata("source_path", str(music_path))
     db_muq.set_metadata("embedding_dim", str(generator.muq_embedding_dim))
     db_muq.set_metadata("model", "muq")
 
-    # Set metadata for MuLan db
     db_mulan.set_metadata("version", __version__)
     db_mulan.set_metadata("source_path", str(music_path))
     db_mulan.set_metadata("embedding_dim", str(generator.mulan_embedding_dim))
     db_mulan.set_metadata("model", "mulan")
 
     # Final stats
-    total_tracks = db_muq.count_tracks()
     click.echo(f"\nComplete!")
-    click.echo(f"  Successfully indexed: {successful}")
-    click.echo(f"  Failed: {failed}")
-    click.echo(f"  Total tracks in database: {total_tracks}")
-    click.echo(f"  MuQ database size: {output_muq.stat().st_size / 1024 / 1024:.1f} MB")
-    click.echo(f"  MuLan database size: {output_mulan.stat().st_size / 1024 / 1024:.1f} MB")
+    click.echo(f"  MuQ: {muq_ok} indexed, {muq_fail} failed ({db_muq.count_tracks()} total)")
+    click.echo(f"  MuLan: {mulan_ok} indexed, {mulan_fail} failed ({db_mulan.count_tracks()} total)")
+    click.echo(f"  MuQ database: {output_muq.stat().st_size / 1024 / 1024:.1f} MB")
+    click.echo(f"  MuLan database: {output_mulan.stat().st_size / 1024 / 1024:.1f} MB")
 
-    generator.unload_models()
     db_muq.close()
     db_mulan.close()
 
