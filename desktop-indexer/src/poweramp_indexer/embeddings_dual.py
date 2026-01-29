@@ -27,7 +27,7 @@ class DualEmbeddingGenerator:
     def __init__(
         self,
         muq_model_id: str = "OpenMuQ/MuQ-large-msd-iter",
-        mulan_model_id: str = "OpenMuQ/MuQ-MuLan",
+        mulan_model_id: str = "OpenMuQ/MuQ-MuLan-large",
         target_sr: int = 24000,  # Both models use 24kHz
         chunk_duration_30s: int = 30,  # For MuQ
         chunk_duration_10s: int = 10,  # For MuLan
@@ -74,17 +74,17 @@ class DualEmbeddingGenerator:
         if self.mulan_model is not None:
             return
 
-        from muq import MuQ
+        from muq import MuQMuLan
 
         logger.info(f"Loading MuLan model '{self.mulan_model_id}'...")
-        self.mulan_model = MuQ.from_pretrained(self.mulan_model_id)
+        self.mulan_model = MuQMuLan.from_pretrained(self.mulan_model_id)
         self.mulan_model = self.mulan_model.to(self.device)
         self.mulan_model.eval()
         logger.info("MuLan model loaded successfully.")
 
     def _load_audio(self, filepath: Path) -> Optional[tuple[np.ndarray, float]]:
         """
-        Load audio file.
+        Load audio file at 24kHz mono.
 
         Returns (waveform, duration_s) or None on failure.
         """
@@ -145,7 +145,16 @@ class DualEmbeddingGenerator:
         return chunks_10s
 
     def _infer_muq(self, chunks: list[np.ndarray], max_batch: int = 5) -> Optional[list[float]]:
-        """Run MuQ inference on 30s chunks, return averaged 1024-dim embedding."""
+        """
+        Run MuQ inference on 30s chunks, return averaged 1024-dim embedding.
+
+        MuQ API: output = muq(wavs) where wavs is [batch, samples]
+        Returns output.last_hidden_state of shape [batch, time, 1024]
+        """
+        if not chunks:
+            logger.warning("No chunks to process for MuQ")
+            return None
+
         self._load_muq_if_needed()
 
         try:
@@ -153,12 +162,14 @@ class DualEmbeddingGenerator:
 
             for i in range(0, len(chunks), max_batch):
                 batch_chunks = chunks[i : i + max_batch]
+                # MuQ expects [batch, samples] tensor
                 batch = torch.stack(
                     [torch.tensor(c, dtype=torch.float32) for c in batch_chunks]
                 ).to(self.device)
 
                 with torch.no_grad():
                     output = self.muq_model(batch)
+                    # Pool over time dimension: [batch, time, 1024] -> [batch, 1024]
                     features = output.last_hidden_state.mean(dim=1)
                     all_features.append(features.cpu())
 
@@ -166,6 +177,7 @@ class DualEmbeddingGenerator:
                 if self.device == "cuda":
                     torch.cuda.empty_cache()
 
+            # Average across all chunks: [total_chunks, 1024] -> [1024]
             all_features = torch.cat(all_features, dim=0)
             embedding = torch.mean(all_features, dim=0)
             normalized = F.normalize(embedding, p=2, dim=0)
@@ -180,7 +192,16 @@ class DualEmbeddingGenerator:
     def _infer_mulan(
         self, chunks: list[np.ndarray], max_batch: int = 10
     ) -> Optional[list[float]]:
-        """Run MuLan inference on 10s chunks, return averaged 512-dim embedding."""
+        """
+        Run MuLan inference on 10s chunks, return averaged 512-dim embedding.
+
+        MuLan API: audio_embeds = mulan(wavs=wavs) where wavs is [batch, samples]
+        Returns embedding tensor of shape [batch, 512]
+        """
+        if not chunks:
+            logger.warning("No chunks to process for MuLan")
+            return None
+
         self._load_mulan_if_needed()
 
         try:
@@ -188,18 +209,21 @@ class DualEmbeddingGenerator:
 
             for i in range(0, len(chunks), max_batch):
                 batch_chunks = chunks[i : i + max_batch]
+                # MuLan expects wavs=[batch, samples] tensor
                 batch = torch.stack(
                     [torch.tensor(c, dtype=torch.float32) for c in batch_chunks]
                 ).to(self.device)
 
                 with torch.no_grad():
-                    output = self.mulan_model.get_audio_embedding(batch)
-                    all_features.append(output.cpu())
+                    # MuLan API: mulan(wavs=tensor) returns audio embeddings
+                    audio_embeds = self.mulan_model(wavs=batch)
+                    all_features.append(audio_embeds.cpu())
 
-                del batch, output
+                del batch, audio_embeds
                 if self.device == "cuda":
                     torch.cuda.empty_cache()
 
+            # Average across all chunks: [total_chunks, 512] -> [512]
             all_features = torch.cat(all_features, dim=0)
             embedding = torch.mean(all_features, dim=0)
             normalized = F.normalize(embedding, p=2, dim=0)
@@ -217,16 +241,22 @@ class DualEmbeddingGenerator:
         """
         Generate embeddings for a single audio file using both models.
 
+        Hot path - called for every file during scan. Optimized for:
+        - Single audio load (shared between models)
+        - Memory cleanup between inference calls
+        - Graceful error handling
+
         Returns:
             Tuple of (muq_embedding, mulan_embedding).
             Either may be None if that model's inference fails.
         """
-        # Load audio
+        # Load audio once for both models
         result = self._load_audio(filepath)
         if result is None:
             return None, None
         waveform, duration_s = result
 
+        # Minimum 30s required for a single chunk
         if duration_s < self.chunk_duration_30s:
             logger.warning(f"{filepath.name}: too short ({duration_s:.1f}s < 30s)")
             return None, None
@@ -240,21 +270,34 @@ class DualEmbeddingGenerator:
             f"{filepath.name}: {len(chunks_30s)} x 30s chunks from {duration_s:.1f}s"
         )
 
-        # Free waveform memory
+        # Free waveform memory before inference
         del waveform
+
+        if not chunks_30s:
+            logger.warning(f"{filepath.name}: no chunks extracted")
+            return None, None
 
         # MuQ inference (full 30s chunks)
         muq_embedding = self._infer_muq(chunks_30s)
 
         # Split to 10s and run MuLan inference
         chunks_10s = self._split_to_10s(chunks_30s)
+
+        # Free 30s chunks before MuLan inference
+        del chunks_30s
+
         mulan_embedding = self._infer_mulan(chunks_10s)
+
+        # Free 10s chunks
+        del chunks_10s
 
         return muq_embedding, mulan_embedding
 
     def embed_text(self, text: str) -> Optional[list[float]]:
         """
         Generate text embedding using MuLan for text-to-music search.
+
+        MuLan API: text_embeds = mulan(texts=["query"]) returns [1, 512]
 
         Args:
             text: Query text (e.g., "sufi music", "upbeat electronic")
@@ -266,8 +309,11 @@ class DualEmbeddingGenerator:
 
         try:
             with torch.no_grad():
-                embedding = self.mulan_model.get_text_embedding([text])
-                normalized = F.normalize(embedding[0], p=2, dim=0)
+                # MuLan API: mulan(texts=list) returns text embeddings
+                text_embeds = self.mulan_model(texts=[text])
+                # text_embeds shape: [1, 512] -> [512]
+                embedding = text_embeds[0]
+                normalized = F.normalize(embedding, p=2, dim=0)
                 return normalized.cpu().float().numpy().tolist()
 
         except Exception as e:
