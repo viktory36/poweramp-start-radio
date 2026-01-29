@@ -1,7 +1,6 @@
 """MuQ embedding generation for music similarity search."""
 
 import logging
-import random
 from pathlib import Path
 from typing import Optional
 
@@ -28,15 +27,13 @@ class MuQEmbeddingGenerator:
         self,
         model_id: str = "OpenMuQ/MuQ-large-msd-iter",
         target_sr: int = 24000,  # MuQ uses 24kHz
-        chunk_duration_s: int = 10,
-        base_chunks: int = 3,   # Stratified samples across duration
-        contrast_chunks: int = 2,  # High/low energy samples
-        max_chunks: int = 20,   # Long tracks (DJ sets): up to 200s coverage
+        chunk_duration_s: int = 30,  # MuQ optimal input length
+        contrast_chunks: int = 0,  # Disabled by default (use --no-contrast to enable legacy)
+        max_chunks: int = 30,   # 30 min coverage (1 chunk per minute)
     ):
         self.model_id = model_id
         self.target_sr = target_sr
         self.chunk_duration_s = chunk_duration_s
-        self.base_chunks = base_chunks
         self.contrast_chunks = contrast_chunks
         self.max_chunks = max_chunks
 
@@ -97,25 +94,19 @@ class MuQEmbeddingGenerator:
             return None
 
     def _calculate_num_chunks(self, duration_s: float) -> int:
-        """Scale chunk count based on audio duration."""
-        if duration_s < 60:
-            return max(1, min(int(duration_s // self.chunk_duration_s), self.base_chunks))
-        if duration_s <= 180:
-            return self.base_chunks
-        if duration_s <= 600:
-            return max(self.base_chunks, int(duration_s // 60))
-        return min(self.max_chunks, int(duration_s // 120))
+        """1 chunk per minute, max 30 (covers 30 min)."""
+        minutes = duration_s / 60
+        return max(1, min(int(minutes), self.max_chunks))
 
     def _select_chunk_positions(self, duration_s: float, num_chunks: int) -> list[float]:
-        """Stratified random sampling - one random position per bin across full duration."""
+        """Stratified sampling - evenly spaced positions across full duration."""
         usable = duration_s - self.chunk_duration_s
         if usable <= 0:
             return [0.0]
-        bin_size = usable / num_chunks
-        return [
-            random.uniform(i * bin_size, min((i + 1) * bin_size, usable))
-            for i in range(num_chunks)
-        ]
+        if num_chunks == 1:
+            return [usable / 2]  # Center of usable range
+        # Evenly spaced positions
+        return [usable * i / (num_chunks - 1) for i in range(num_chunks)]
 
     def _select_contrast_positions(
         self,

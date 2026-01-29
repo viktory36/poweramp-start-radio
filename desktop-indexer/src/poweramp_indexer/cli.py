@@ -9,6 +9,7 @@ from tqdm import tqdm
 from . import __version__
 from .database import EmbeddingDatabase
 from .embeddings_clap import CLAPEmbeddingGenerator
+from .embeddings_dual import DualEmbeddingGenerator
 from .embeddings_muq import MuQEmbeddingGenerator
 from .fingerprint import extract_metadata
 from .scanner import scan_music_directory
@@ -52,7 +53,7 @@ def cli():
     "--output", "-o",
     type=click.Path(path_type=Path),
     default=Path("embeddings.db"),
-    help="Output database file path"
+    help="Output database file path (or base name for --dual mode)"
 )
 @click.option(
     "--skip-existing/--no-skip-existing",
@@ -75,16 +76,23 @@ def cli():
     is_flag=True,
     help="Disable contrast sampling (high/low energy chunks)"
 )
-def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, model: str, no_contrast: bool):
+@click.option(
+    "--dual",
+    is_flag=True,
+    help="Generate both MuQ and MuLan embeddings (outputs embeddings_muq.db and embeddings_mulan.db)"
+)
+def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, model: str, no_contrast: bool, dual: bool):
     """Scan a music directory and generate embeddings.
 
     MUSIC_PATH: Path to your music library folder
+
+    Use --dual to generate both MuQ (for audio similarity) and MuLan (for text search)
+    embeddings from the same audio, enabling A/B comparison and hybrid workflows.
     """
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
     click.echo(f"Scanning: {music_path}")
-    click.echo(f"Output: {output}")
 
     # Collect all audio files
     click.echo("Discovering audio files...")
@@ -94,6 +102,16 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, mod
     if not audio_files:
         click.echo("No audio files found. Exiting.")
         return
+
+    if dual:
+        _scan_dual(music_path, output, skip_existing, audio_files)
+    else:
+        _scan_single(music_path, output, skip_existing, audio_files, model, no_contrast)
+
+
+def _scan_single(music_path: Path, output: Path, skip_existing: bool, audio_files: list[Path], model: str, no_contrast: bool):
+    """Single-model scan (original behavior)."""
+    click.echo(f"Output: {output}")
 
     # Initialize database
     db = EmbeddingDatabase(output)
@@ -158,6 +176,92 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, mod
 
     generator.unload_model()
     db.close()
+
+
+def _scan_dual(music_path: Path, output: Path, skip_existing: bool, audio_files: list[Path]):
+    """Dual-model scan generating both MuQ and MuLan embeddings."""
+    # Determine output paths
+    output_dir = output.parent
+    output_muq = output_dir / "embeddings_muq.db"
+    output_mulan = output_dir / "embeddings_mulan.db"
+
+    click.echo(f"Output (MuQ): {output_muq}")
+    click.echo(f"Output (MuLan): {output_mulan}")
+
+    # Initialize databases
+    db_muq = EmbeddingDatabase(output_muq)
+    db_mulan = EmbeddingDatabase(output_mulan)
+
+    # Get existing paths if skipping (use MuQ db as reference)
+    existing_paths = db_muq.get_existing_paths() if skip_existing else set()
+
+    # Filter to new files
+    if existing_paths:
+        new_files = [f for f in audio_files if str(f) not in existing_paths]
+        click.echo(f"Skipping {len(audio_files) - len(new_files)} existing files")
+        audio_files = new_files
+
+    if not audio_files:
+        click.echo("All files already indexed. Use --no-skip-existing to reindex.")
+        db_muq.close()
+        db_mulan.close()
+        return
+
+    # Initialize dual generator
+    click.echo("Loading MuQ and MuLan models...")
+    generator = DualEmbeddingGenerator()
+
+    # Process files sequentially
+    successful = 0
+    failed = 0
+
+    with tqdm(total=len(audio_files), desc="Processing", unit="file") as pbar:
+        for filepath in audio_files:
+            metadata = extract_metadata(filepath)
+            muq_emb, mulan_emb = generator.generate_embeddings(filepath)
+
+            if muq_emb is not None and mulan_emb is not None:
+                db_muq.add_track(metadata, muq_emb)
+                db_mulan.add_track(metadata, mulan_emb)
+                successful += 1
+            else:
+                failed += 1
+                logger.warning(f"Failed: {metadata.file_path.name}")
+
+            # Commit every 10 files
+            if (successful + failed) % 10 == 0:
+                db_muq.commit()
+                db_mulan.commit()
+
+            pbar.update(1)
+
+    db_muq.commit()
+    db_mulan.commit()
+
+    # Set metadata for MuQ db
+    db_muq.set_metadata("version", __version__)
+    db_muq.set_metadata("source_path", str(music_path))
+    db_muq.set_metadata("embedding_dim", str(generator.muq_embedding_dim))
+    db_muq.set_metadata("model", "muq")
+
+    # Set metadata for MuLan db
+    db_mulan.set_metadata("version", __version__)
+    db_mulan.set_metadata("source_path", str(music_path))
+    db_mulan.set_metadata("embedding_dim", str(generator.mulan_embedding_dim))
+    db_mulan.set_metadata("model", "mulan")
+
+    # Final stats
+    total_tracks = db_muq.count_tracks()
+    click.echo(f"\nComplete!")
+    click.echo(f"  Successfully indexed: {successful}")
+    click.echo(f"  Failed: {failed}")
+    click.echo(f"  Total tracks in database: {total_tracks}")
+    click.echo(f"  MuQ database size: {output_muq.stat().st_size / 1024 / 1024:.1f} MB")
+    click.echo(f"  MuLan database size: {output_mulan.stat().st_size / 1024 / 1024:.1f} MB")
+
+    generator.unload_models()
+    db_muq.close()
+    db_mulan.close()
 
 
 @cli.command()
@@ -310,7 +414,8 @@ def info(database: Path):
 
     model = db.get_metadata("model")
     if model:
-        model_name = "MuQ" if model == "muq" else "CLAP"
+        model_names = {"muq": "MuQ", "clap": "CLAP", "mulan": "MuLan"}
+        model_name = model_names.get(model, model)
         click.echo(f"Embedding model: {model_name}")
 
     db.close()
@@ -458,6 +563,60 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
         if track:
             click.echo(f"  {rank:2}. [{score:.3f}] {format_track(track)}")
 
+    db.close()
+
+
+@cli.command()
+@click.argument("database", type=click.Path(exists=True, path_type=Path))
+@click.argument("query")
+@click.option("--top", "-n", default=10, help="Number of results to show")
+def search(database: Path, query: str, top: int):
+    """Search for tracks using text queries (requires MuLan embeddings).
+
+    DATABASE: Path to embeddings_mulan.db (must be created with --dual)
+    QUERY: Text query describing the music you want (e.g., "sufi music", "upbeat electronic")
+
+    Examples:
+
+      poweramp-indexer search embeddings_mulan.db "sufi"
+      poweramp-indexer search embeddings_mulan.db "upbeat electronic dance"
+      poweramp-indexer search embeddings_mulan.db "sad piano ballad"
+    """
+    db = EmbeddingDatabase(database)
+
+    # Verify this is a MuLan database
+    model = db.get_metadata("model")
+    if model != "mulan":
+        click.echo(f"Warning: Database was created with model '{model}', not 'mulan'.")
+        click.echo("Text search works best with MuLan embeddings (use --dual to create).")
+
+    # Generate text embedding
+    click.echo(f"Searching for: {query}")
+    generator = DualEmbeddingGenerator()
+    text_embedding = generator.embed_text(query)
+
+    if text_embedding is None:
+        click.echo("Failed to generate text embedding.")
+        generator.unload_models()
+        db.close()
+        return
+
+    # Load all embeddings and find similar
+    click.echo("Loading embeddings...")
+    all_embeddings = db.get_all_embeddings()
+    click.echo(f"Searching {len(all_embeddings)} tracks...")
+    click.echo()
+
+    similar_tracks = find_similar(all_embeddings, text_embedding, top)
+
+    # Display results
+    click.echo("Results:")
+    for rank, (track_id, score) in enumerate(similar_tracks, 1):
+        track = db.get_track_by_id(track_id)
+        if track:
+            click.echo(f"  {rank:2}. [{score:.3f}] {format_track(track)}")
+
+    generator.unload_models()
     db.close()
 
 
