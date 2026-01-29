@@ -67,19 +67,22 @@ class MuQEmbeddingGenerator:
         self.model.eval()
         logger.info("Model loaded successfully.")
 
-    def load_audio(self, filepath: Path) -> Optional[tuple[np.ndarray, float]]:
+    def load_audio(self, filepath: Path) -> Optional[tuple[np.ndarray, float, int]]:
         """
-        Load and resample audio file to 24kHz mono.
+        Load audio file at native sample rate (no resampling).
+
+        Resampling to 24kHz is deferred to _extract_chunks so only the
+        chunks we need are resampled, not the entire file.
 
         Safe to call from a background thread (librosa releases the GIL).
-        Returns (waveform, duration_s) or None on failure.
+        Returns (waveform, duration_s, native_sr) or None on failure.
         """
         import librosa
 
         try:
-            waveform, sr = librosa.load(str(filepath), sr=self.target_sr, mono=True)
+            waveform, sr = librosa.load(str(filepath), sr=None, mono=True)
             duration_s = len(waveform) / sr
-            return waveform, duration_s
+            return waveform, duration_s, sr
         except Exception as e:
             logger.error(f"Error loading {filepath.name}: {e}")
             return None
@@ -99,18 +102,23 @@ class MuQEmbeddingGenerator:
         # Evenly spaced positions
         return [usable * i / (num_chunks - 1) for i in range(num_chunks)]
 
-    def _extract_chunks(self, waveform: np.ndarray, positions: list[float]) -> list[np.ndarray]:
-        """Extract audio chunks from waveform by slicing."""
+    def _extract_chunks(
+        self, waveform: np.ndarray, positions: list[float], native_sr: int
+    ) -> list[np.ndarray]:
+        """Extract 30s chunks at native SR, then resample each to 24kHz."""
         import librosa
 
         chunks = []
-        expected_samples = self.chunk_duration_s * self.target_sr
+        native_samples = self.chunk_duration_s * native_sr
+        target_samples = self.chunk_duration_s * self.target_sr
 
         for pos in positions:
-            start = int(pos * self.target_sr)
-            chunk = waveform[start:start + expected_samples]
-            if len(chunk) < expected_samples:
-                chunk = librosa.util.fix_length(chunk, size=expected_samples)
+            start = int(pos * native_sr)
+            chunk = waveform[start:start + native_samples]
+            if len(chunk) < native_samples:
+                chunk = librosa.util.fix_length(chunk, size=native_samples)
+            if native_sr != self.target_sr:
+                chunk = librosa.resample(chunk, orig_sr=native_sr, target_sr=self.target_sr)
             chunks.append(chunk)
 
         return chunks
@@ -153,7 +161,8 @@ class MuQEmbeddingGenerator:
             return None
 
     def generate_from_audio(
-        self, waveform: np.ndarray, duration_s: float, filename: str = "<audio>"
+        self, waveform: np.ndarray, duration_s: float, native_sr: int,
+        filename: str = "<audio>"
     ) -> Optional[list[float]]:
         """
         Generate embedding from a pre-loaded waveform.
@@ -173,7 +182,7 @@ class MuQEmbeddingGenerator:
         # Select stratified positions
         num_chunks = self._calculate_num_chunks(duration_s)
         positions = self._select_chunk_positions(duration_s, num_chunks)
-        chunks = self._extract_chunks(waveform, positions)
+        chunks = self._extract_chunks(waveform, positions, native_sr)
 
         logger.debug(f"{filename}: {len(chunks)} chunks from {duration_s:.1f}s")
 
@@ -193,8 +202,8 @@ class MuQEmbeddingGenerator:
         result = self.load_audio(filepath)
         if result is None:
             return None
-        waveform, duration_s = result
-        return self.generate_from_audio(waveform, duration_s, filepath.name)
+        waveform, duration_s, native_sr = result
+        return self.generate_from_audio(waveform, duration_s, native_sr, filepath.name)
 
     def unload_model(self):
         """Free GPU memory by unloading the model."""

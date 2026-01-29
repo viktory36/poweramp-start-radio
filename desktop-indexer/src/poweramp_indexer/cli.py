@@ -97,8 +97,8 @@ def _process_files(audio_files, load_audio_fn, infer_fn, db, desc):
 
     Args:
         audio_files: Paths to process.
-        load_audio_fn: Callable(path) -> (waveform, duration) or None.
-        infer_fn: Callable(waveform, duration, filename) -> embedding or None.
+        load_audio_fn: Callable(path) -> (waveform, duration, native_sr) or None.
+        infer_fn: Callable(waveform, duration, native_sr, filename) -> embedding or None.
         db: Database to write results to.
         desc: tqdm progress bar description.
 
@@ -124,8 +124,8 @@ def _process_files(audio_files, load_audio_fn, infer_fn, db, desc):
 
                 filepath = audio_files[i]
                 if audio is not None:
-                    waveform, duration_s = audio
-                    embedding = infer_fn(waveform, duration_s, filepath.name)
+                    waveform, duration_s, native_sr = audio
+                    embedding = infer_fn(waveform, duration_s, native_sr, filepath.name)
                     del waveform
                 else:
                     embedding = None
