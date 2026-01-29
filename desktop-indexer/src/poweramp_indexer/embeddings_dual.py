@@ -19,7 +19,7 @@ class DualEmbeddingGenerator:
     - 1 x 30s chunk per minute of audio (stratified across duration)
     - Cap at 30 chunks (covers 30 min of content)
     - MuQ processes full 30s chunks -> 1024-dim embedding
-    - MuLan processes 3 x 10s slices per chunk -> 512-dim embedding
+    - MuLan receives 30s chunks, internally splits to 10s clips -> 512-dim embedding
 
     This enables A/B comparison between models using identical audio content.
     """
@@ -29,16 +29,14 @@ class DualEmbeddingGenerator:
         muq_model_id: str = "OpenMuQ/MuQ-large-msd-iter",
         mulan_model_id: str = "OpenMuQ/MuQ-MuLan-large",
         target_sr: int = 24000,  # Both models use 24kHz
-        chunk_duration_30s: int = 30,  # For MuQ
-        chunk_duration_10s: int = 10,  # For MuLan
-        max_chunks_30s: int = 30,  # 30 min coverage
+        chunk_duration_s: int = 30,  # MuQ optimal; MuLan internally splits to 10s
+        max_chunks: int = 30,  # 30 min coverage
     ):
         self.muq_model_id = muq_model_id
         self.mulan_model_id = mulan_model_id
         self.target_sr = target_sr
-        self.chunk_duration_30s = chunk_duration_30s
-        self.chunk_duration_10s = chunk_duration_10s
-        self.max_chunks_30s = max_chunks_30s
+        self.chunk_duration_s = chunk_duration_s
+        self.max_chunks = max_chunks
 
         self.device = self._get_best_device()
         logger.info(f"Selected device: {self.device}")
@@ -101,11 +99,11 @@ class DualEmbeddingGenerator:
     def _calculate_num_chunks(self, duration_s: float) -> int:
         """1 chunk per minute, max 30 (covers 30 min)."""
         minutes = duration_s / 60
-        return max(1, min(int(minutes), self.max_chunks_30s))
+        return max(1, min(int(minutes), self.max_chunks))
 
     def _select_chunk_positions(self, duration_s: float, num_chunks: int) -> list[float]:
         """Stratified sampling - evenly spaced positions across full duration."""
-        usable = duration_s - self.chunk_duration_30s
+        usable = duration_s - self.chunk_duration_s
         if usable <= 0:
             return [0.0]
         if num_chunks == 1:
@@ -113,14 +111,14 @@ class DualEmbeddingGenerator:
         # Evenly spaced positions
         return [usable * i / (num_chunks - 1) for i in range(num_chunks)]
 
-    def _extract_30s_chunks(
+    def _extract_chunks(
         self, waveform: np.ndarray, positions: list[float]
     ) -> list[np.ndarray]:
         """Extract 30s audio chunks from waveform."""
         import librosa
 
         chunks = []
-        expected_samples = self.chunk_duration_30s * self.target_sr
+        expected_samples = self.chunk_duration_s * self.target_sr
 
         for pos in positions:
             start = int(pos * self.target_sr)
@@ -130,19 +128,6 @@ class DualEmbeddingGenerator:
             chunks.append(chunk)
 
         return chunks
-
-    def _split_to_10s(self, chunks_30s: list[np.ndarray]) -> list[np.ndarray]:
-        """Split each 30s chunk into 3 x 10s chunks for MuLan."""
-        chunks_10s = []
-        samples_10s = self.chunk_duration_10s * self.target_sr
-
-        for chunk in chunks_30s:
-            for i in range(3):
-                start = i * samples_10s
-                end = start + samples_10s
-                chunks_10s.append(chunk[start:end])
-
-        return chunks_10s
 
     def _infer_muq(self, chunks: list[np.ndarray], max_batch: int = 5) -> Optional[list[float]]:
         """
@@ -190,12 +175,13 @@ class DualEmbeddingGenerator:
             return None
 
     def _infer_mulan(
-        self, chunks: list[np.ndarray], max_batch: int = 10
+        self, chunks: list[np.ndarray], max_batch: int = 5
     ) -> Optional[list[float]]:
         """
-        Run MuLan inference on 10s chunks, return averaged 512-dim embedding.
+        Run MuLan inference on 30s chunks, return averaged 512-dim embedding.
 
-        MuLan API: audio_embeds = mulan(wavs=wavs) where wavs is [batch, samples]
+        MuLan internally splits each chunk into 10s clips via _get_all_clips().
+        API: audio_embeds = mulan(wavs=wavs) where wavs is [batch, samples]
         Returns embedding tensor of shape [batch, 512]
         """
         if not chunks:
@@ -257,39 +243,33 @@ class DualEmbeddingGenerator:
         waveform, duration_s = result
 
         # Minimum 30s required for a single chunk
-        if duration_s < self.chunk_duration_30s:
+        if duration_s < self.chunk_duration_s:
             logger.warning(f"{filepath.name}: too short ({duration_s:.1f}s < 30s)")
             return None, None
 
         # Select positions and extract 30s chunks
         num_chunks = self._calculate_num_chunks(duration_s)
         positions = self._select_chunk_positions(duration_s, num_chunks)
-        chunks_30s = self._extract_30s_chunks(waveform, positions)
+        chunks = self._extract_chunks(waveform, positions)
 
         logger.debug(
-            f"{filepath.name}: {len(chunks_30s)} x 30s chunks from {duration_s:.1f}s"
+            f"{filepath.name}: {len(chunks)} x 30s chunks from {duration_s:.1f}s"
         )
 
         # Free waveform memory before inference
         del waveform
 
-        if not chunks_30s:
+        if not chunks:
             logger.warning(f"{filepath.name}: no chunks extracted")
             return None, None
 
         # MuQ inference (full 30s chunks)
-        muq_embedding = self._infer_muq(chunks_30s)
+        muq_embedding = self._infer_muq(chunks)
 
-        # Split to 10s and run MuLan inference
-        chunks_10s = self._split_to_10s(chunks_30s)
+        # MuLan inference (MuLan internally splits 30s -> 3x10s clips)
+        mulan_embedding = self._infer_mulan(chunks)
 
-        # Free 30s chunks before MuLan inference
-        del chunks_30s
-
-        mulan_embedding = self._infer_mulan(chunks_10s)
-
-        # Free 10s chunks
-        del chunks_10s
+        del chunks
 
         return muq_embedding, mulan_embedding
 

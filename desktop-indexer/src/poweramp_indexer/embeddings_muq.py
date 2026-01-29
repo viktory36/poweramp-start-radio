@@ -15,10 +15,10 @@ class MuQEmbeddingGenerator:
     """
     Generates audio embeddings using Tencent's MuQ-large-msd-iter model.
 
-    MuQ-large-msd-iter is the SOTA pure music understanding model,
-    trained with self-supervised learning on 160K+ hours of music.
-    Unlike MuQ-MuLan (designed for music-text retrieval), this model
-    is optimized for pure audio similarity tasks.
+    MuQ-large-msd-iter is a music understanding model trained with
+    self-supervised learning on the Million Song Dataset. Unlike
+    MuQ-MuLan (designed for music-text retrieval), this model is
+    optimized for pure audio similarity tasks.
 
     Output: 1024-dim embeddings (pooled from temporal features).
     """
@@ -42,7 +42,6 @@ class MuQEmbeddingGenerator:
         self.model = None
 
         # MuQ-large-msd-iter has known NaN issues with FP16, always use FP32
-        self.use_half = False
         logger.info("Using full precision (FP32) for MuQ model stability.")
 
     @staticmethod
