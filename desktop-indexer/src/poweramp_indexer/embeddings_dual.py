@@ -80,10 +80,11 @@ class DualEmbeddingGenerator:
         self.mulan_model.eval()
         logger.info("MuLan model loaded successfully.")
 
-    def _load_audio(self, filepath: Path) -> Optional[tuple[np.ndarray, float]]:
+    def load_audio(self, filepath: Path) -> Optional[tuple[np.ndarray, float]]:
         """
-        Load audio file at 24kHz mono.
+        Load and resample audio file to 24kHz mono.
 
+        Safe to call from a background thread (librosa releases the GIL).
         Returns (waveform, duration_s) or None on failure.
         """
         import librosa
@@ -221,46 +222,32 @@ class DualEmbeddingGenerator:
                 torch.cuda.empty_cache()
             return None
 
-    def generate_embeddings(
-        self, filepath: Path
+    def generate_from_audio(
+        self, waveform: np.ndarray, duration_s: float, filename: str = "<audio>"
     ) -> tuple[Optional[list[float]], Optional[list[float]]]:
         """
-        Generate embeddings for a single audio file using both models.
+        Generate embeddings from a pre-loaded waveform using both models.
 
-        Hot path - called for every file during scan. Optimized for:
-        - Single audio load (shared between models)
-        - Memory cleanup between inference calls
-        - Graceful error handling
+        Use this with load_audio() for prefetching (load next file while
+        GPU processes current one).
 
         Returns:
             Tuple of (muq_embedding, mulan_embedding).
             Either may be None if that model's inference fails.
         """
-        # Load audio once for both models
-        result = self._load_audio(filepath)
-        if result is None:
-            return None, None
-        waveform, duration_s = result
-
-        # Minimum 30s required for a single chunk
         if duration_s < self.chunk_duration_s:
-            logger.warning(f"{filepath.name}: too short ({duration_s:.1f}s < 30s)")
+            logger.warning(f"{filename}: too short ({duration_s:.1f}s < 30s)")
             return None, None
 
-        # Select positions and extract 30s chunks
+        # Select positions and extract chunks
         num_chunks = self._calculate_num_chunks(duration_s)
         positions = self._select_chunk_positions(duration_s, num_chunks)
         chunks = self._extract_chunks(waveform, positions)
 
-        logger.debug(
-            f"{filepath.name}: {len(chunks)} x 30s chunks from {duration_s:.1f}s"
-        )
-
-        # Free waveform memory before inference
-        del waveform
+        logger.debug(f"{filename}: {len(chunks)} x 30s chunks from {duration_s:.1f}s")
 
         if not chunks:
-            logger.warning(f"{filepath.name}: no chunks extracted")
+            logger.warning(f"{filename}: no chunks extracted")
             return None, None
 
         # MuQ inference (full 30s chunks)
@@ -272,6 +259,22 @@ class DualEmbeddingGenerator:
         del chunks
 
         return muq_embedding, mulan_embedding
+
+    def generate_embeddings(
+        self, filepath: Path
+    ) -> tuple[Optional[list[float]], Optional[list[float]]]:
+        """
+        Generate embeddings for a single audio file using both models.
+
+        Convenience method that loads audio then generates embeddings.
+        For better throughput during scanning, use load_audio() +
+        generate_from_audio() with prefetching instead.
+        """
+        result = self.load_audio(filepath)
+        if result is None:
+            return None, None
+        waveform, duration_s = result
+        return self.generate_from_audio(waveform, duration_s, filepath.name)
 
     def embed_text(self, text: str) -> Optional[list[float]]:
         """

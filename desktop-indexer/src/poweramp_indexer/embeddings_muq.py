@@ -67,10 +67,11 @@ class MuQEmbeddingGenerator:
         self.model.eval()
         logger.info("Model loaded successfully.")
 
-    def _load_audio(self, filepath: Path) -> Optional[tuple[np.ndarray, float]]:
+    def load_audio(self, filepath: Path) -> Optional[tuple[np.ndarray, float]]:
         """
-        Load audio file.
+        Load and resample audio file to 24kHz mono.
 
+        Safe to call from a background thread (librosa releases the GIL).
         Returns (waveform, duration_s) or None on failure.
         """
         import librosa
@@ -152,38 +153,49 @@ class MuQEmbeddingGenerator:
                 torch.cuda.empty_cache()
             return None
 
-    def generate_embedding(self, filepath: Path) -> Optional[list[float]]:
+    def generate_from_audio(
+        self, waveform: np.ndarray, duration_s: float, filename: str = "<audio>"
+    ) -> Optional[list[float]]:
         """
-        Generate embedding for a single audio file.
+        Generate embedding from a pre-loaded waveform.
 
-        Pipeline: load audio -> select chunk positions -> extract chunks -> GPU inference
+        Use this with load_audio() for prefetching (load next file while
+        GPU processes current one).
+
+        Returns:
+            1024-dim normalized embedding or None on failure.
         """
         self._load_model_if_needed()
 
-        # Load audio
-        result = self._load_audio(filepath)
-        if result is None:
-            return None
-        waveform, duration_s = result
-
         if duration_s < self.chunk_duration_s:
-            logger.warning(f"{filepath.name}: too short ({duration_s:.1f}s)")
+            logger.warning(f"{filename}: too short ({duration_s:.1f}s)")
             return None
 
         # Select stratified positions
         num_chunks = self._calculate_num_chunks(duration_s)
         positions = self._select_chunk_positions(duration_s, num_chunks)
-
-        logger.debug(f"{filepath.name}: {len(positions)} chunks from {duration_s:.1f}s")
-
-        # Extract chunks then free waveform
         chunks = self._extract_chunks(waveform, positions)
-        del waveform  # Free memory before inference
+
+        logger.debug(f"{filename}: {len(chunks)} chunks from {duration_s:.1f}s")
 
         if not chunks:
             return None
 
         return self._infer(chunks)
+
+    def generate_embedding(self, filepath: Path) -> Optional[list[float]]:
+        """
+        Generate embedding for a single audio file.
+
+        Convenience method that loads audio then generates embedding.
+        For better throughput during scanning, use load_audio() +
+        generate_from_audio() with prefetching instead.
+        """
+        result = self.load_audio(filepath)
+        if result is None:
+            return None
+        waveform, duration_s = result
+        return self.generate_from_audio(waveform, duration_s, filepath.name)
 
     def unload_model(self):
         """Free GPU memory by unloading the model."""

@@ -1,6 +1,7 @@
 """Command-line interface for the Poweramp indexer."""
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import click
@@ -113,27 +114,47 @@ def _scan_single(music_path: Path, output: Path, skip_existing: bool, audio_file
     click.echo("Loading MuQ model...")
     generator = create_embedding_generator()
 
-    # Process files sequentially
+    # Process files with prefetching: load next file's audio on CPU
+    # while GPU processes current file (librosa and CUDA both release the GIL)
     successful = 0
     failed = 0
 
+    def _prefetch(fp):
+        return extract_metadata(fp), generator.load_audio(fp)
+
     with tqdm(total=len(audio_files), desc="Processing", unit="file") as pbar:
-        for filepath in audio_files:
-            metadata = extract_metadata(filepath)
-            embedding = generator.generate_embedding(filepath)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_prefetch, audio_files[0])
 
-            if embedding is not None:
-                db.add_track(metadata, embedding)
-                successful += 1
-            else:
-                failed += 1
-                logger.warning(f"Failed: {metadata.file_path.name}")
+            for i in range(len(audio_files)):
+                metadata, audio = future.result()
 
-            # Commit every 10 files
-            if (successful + failed) % 10 == 0:
-                db.commit()
+                # Start loading next file while we run inference on this one
+                if i + 1 < len(audio_files):
+                    future = executor.submit(_prefetch, audio_files[i + 1])
 
-            pbar.update(1)
+                filepath = audio_files[i]
+                if audio is not None:
+                    waveform, duration_s = audio
+                    embedding = generator.generate_from_audio(
+                        waveform, duration_s, filepath.name
+                    )
+                    del waveform
+                else:
+                    embedding = None
+
+                if embedding is not None:
+                    db.add_track(metadata, embedding)
+                    successful += 1
+                else:
+                    failed += 1
+                    logger.warning(f"Failed: {filepath.name}")
+
+                # Commit every 10 files
+                if (successful + failed) % 10 == 0:
+                    db.commit()
+
+                pbar.update(1)
 
     db.commit()
 
@@ -188,29 +209,49 @@ def _scan_dual(music_path: Path, output: Path, skip_existing: bool, audio_files:
     click.echo("Loading MuQ and MuLan models...")
     generator = DualEmbeddingGenerator()
 
-    # Process files sequentially
+    # Process files with prefetching: load next file's audio on CPU
+    # while GPU processes current file (librosa and CUDA both release the GIL)
     successful = 0
     failed = 0
 
+    def _prefetch(fp):
+        return extract_metadata(fp), generator.load_audio(fp)
+
     with tqdm(total=len(audio_files), desc="Processing", unit="file") as pbar:
-        for filepath in audio_files:
-            metadata = extract_metadata(filepath)
-            muq_emb, mulan_emb = generator.generate_embeddings(filepath)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_prefetch, audio_files[0])
 
-            if muq_emb is not None and mulan_emb is not None:
-                db_muq.add_track(metadata, muq_emb)
-                db_mulan.add_track(metadata, mulan_emb)
-                successful += 1
-            else:
-                failed += 1
-                logger.warning(f"Failed: {metadata.file_path.name}")
+            for i in range(len(audio_files)):
+                metadata, audio = future.result()
 
-            # Commit every 10 files
-            if (successful + failed) % 10 == 0:
-                db_muq.commit()
-                db_mulan.commit()
+                # Start loading next file while we run inference on this one
+                if i + 1 < len(audio_files):
+                    future = executor.submit(_prefetch, audio_files[i + 1])
 
-            pbar.update(1)
+                filepath = audio_files[i]
+                if audio is not None:
+                    waveform, duration_s = audio
+                    muq_emb, mulan_emb = generator.generate_from_audio(
+                        waveform, duration_s, filepath.name
+                    )
+                    del waveform
+                else:
+                    muq_emb, mulan_emb = None, None
+
+                if muq_emb is not None and mulan_emb is not None:
+                    db_muq.add_track(metadata, muq_emb)
+                    db_mulan.add_track(metadata, mulan_emb)
+                    successful += 1
+                else:
+                    failed += 1
+                    logger.warning(f"Failed: {filepath.name}")
+
+                # Commit every 10 files
+                if (successful + failed) % 10 == 0:
+                    db_muq.commit()
+                    db_mulan.commit()
+
+                pbar.update(1)
 
     db_muq.commit()
     db_mulan.commit()
