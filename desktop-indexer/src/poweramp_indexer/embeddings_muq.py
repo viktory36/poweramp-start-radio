@@ -136,10 +136,7 @@ class MuQEmbeddingGenerator:
                     features = output.last_hidden_state.mean(dim=1)  # Pool time dimension
                     all_features.append(features.cpu())
 
-                # Cleanup between sub-batches
                 del batch, output, features
-                if self.device == "cuda":
-                    torch.cuda.empty_cache()
 
             # Average across all chunks
             all_features = torch.cat(all_features, dim=0)
