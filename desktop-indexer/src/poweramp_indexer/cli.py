@@ -234,6 +234,9 @@ def _scan_dual(music_path: Path, output: Path, skip_existing: bool, audio_files:
         click.echo("\nPass 1/2: MuQ — all files already indexed")
     generator.unload_muq()
 
+    # MuLan alone fits comfortably in VRAM — skip empty_cache() churn
+    generator.flush_cache = False
+
     # Pass 2: MuLan only (~2GB VRAM)
     mulan_ok, mulan_fail = 0, 0
     if mulan_files:

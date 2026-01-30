@@ -41,6 +41,12 @@ class DualEmbeddingGenerator:
         self.device = self._get_best_device()
         logger.info(f"Selected device: {self.device}")
 
+        # When True, calls torch.cuda.empty_cache() between sub-batches to
+        # keep VRAM in dedicated memory.  Turn off when the model fits
+        # comfortably in VRAM (e.g. MuLan-only pass at ~2.9 GB on a 6 GB card)
+        # to avoid unnecessary allocator churn.
+        self.flush_cache = True
+
         # Lazy loading
         self.muq_model = None
         self.mulan_model = None
@@ -160,7 +166,7 @@ class DualEmbeddingGenerator:
                     all_features.append(features.cpu())
 
                 del batch, output, features
-                if self.device == "cuda":
+                if self.flush_cache and self.device == "cuda":
                     torch.cuda.empty_cache()
 
             # Average across all chunks: [total_chunks, 1024] -> [1024]
@@ -207,7 +213,7 @@ class DualEmbeddingGenerator:
                     all_features.append(audio_embeds.cpu())
 
                 del batch, audio_embeds
-                if self.device == "cuda":
+                if self.flush_cache and self.device == "cuda":
                     torch.cuda.empty_cache()
 
             # Average across all chunks: [total_chunks, 512] -> [512]
