@@ -93,6 +93,30 @@ Poweramp API uses:
 | Similarity search | `android-plugin/.../similarity/SimilarityEngine.kt` |
 | Track matching | `android-plugin/.../poweramp/TrackMatcher.kt` |
 
+## Development Workflow
+
+- The user develops in WSL and tests on the Windows host where their music library, pyenv, and Android Studio live. Don't expect to run the indexer in WSL — commit and push so they can pull on Windows and test.
+- Always commit and push when confident in changes.
+- The user is evaluating both MuQ and MuLan models. They plan a hybrid workflow: MuLan for text queries ("sufi", "upbeat electronic") to find a seed track, then MuQ for audio similarity to build a radio queue from that seed.
+- Both models must process identical audio chunks for valid A/B comparison. Chunk selection is deterministic (based on file duration), so two-pass processing preserves this guarantee.
+
+## GPU/Performance Notes (RTX 2060 Max-Q, 6GB VRAM)
+
+- **Two-pass dual scan**: `--dual` mode processes all files through MuQ first, unloads it, then processes all files through MuLan. This halves VRAM usage (~2GB per model instead of ~4.2GB with both loaded). Each pass tracks progress independently in its own database — safe to ctrl+c between or during passes.
+- **empty_cache() is required**: `torch.cuda.empty_cache()` between sub-batches prevents inference from spilling into shared GPU memory (system RAM over PCIe, ~18x slower than GDDR6). Without it, PyTorch's caching allocator holds ~5.8GB dedicated + 0.9GB shared. With it, VRAM spikes to ~4.6GB but stays in dedicated. The allocation churn (visible as "Copy" load in Task Manager) is cheaper than the shared memory penalty.
+- **Prefetching audio has no measurable impact**: A background thread loading the next file while the GPU processes the current one was tried and showed no improvement, suggesting GPU inference (not CPU audio loading) is the bottleneck. The prefetch code remains in place but is not the source of any speedup.
+- **Chunk-only resampling is slower**: Loading at native SR and resampling individual chunks (instead of `librosa.load(sr=24000)` on the full file) was tested and regressed to 2.42s/file. The per-chunk `librosa.resample()` startup overhead outweighs savings for single-chunk songs. Stick with full-file resampling.
+- **MuQ requires FP32**: MuQ-large-msd-iter has known NaN issues with FP16. Always use full precision.
+
+## MuQ Model Reference
+
+- **muq package**: `from muq import MuQ, MuQMuLan`. Depends on torch, librosa, transformers (transitive), einops, nnAudio, easydict, x_clip.
+- **MuQ API**: `model(batch)` returns `BaseModelOutput` with `last_hidden_state` shape `[batch, time, 1024]`. Does NOT L2-normalize.
+- **MuLan API**: `model(wavs=batch)` returns tensor `[batch, 512]`. `model(texts=["query"])` for text. L2-normalizes internally. `forward()` iterates over batch items serially via `extract_audio_latents()`.
+- **MuLan internal chunking**: `_get_all_clips()` splits audio into consecutive 10s clips, pads last clip by wrapping. Pass 30s chunks directly — MuLan handles the splitting.
+- **License**: CC-BY-NC 4.0 on model weights (non-commercial only).
+- **Training**: Open-source weights trained on Million Song Dataset (~1K hours), not the full 160K hours from the paper.
+
 ## Development Notes
 
 - Android builds require AGP 8.13+ and Java 17
