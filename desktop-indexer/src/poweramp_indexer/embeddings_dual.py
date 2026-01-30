@@ -80,22 +80,19 @@ class DualEmbeddingGenerator:
         self.mulan_model.eval()
         logger.info("MuLan model loaded successfully.")
 
-    def load_audio(self, filepath: Path) -> Optional[tuple[np.ndarray, float, int]]:
+    def load_audio(self, filepath: Path) -> Optional[tuple[np.ndarray, float]]:
         """
-        Load audio file at native sample rate (no resampling).
-
-        Resampling to 24kHz is deferred to _extract_chunks so only the
-        chunks we need are resampled, not the entire file.
+        Load and resample audio file to 24kHz mono.
 
         Safe to call from a background thread (librosa releases the GIL).
-        Returns (waveform, duration_s, native_sr) or None on failure.
+        Returns (waveform, duration_s) or None on failure.
         """
         import librosa
 
         try:
-            waveform, sr = librosa.load(str(filepath), sr=None, mono=True)
+            waveform, sr = librosa.load(str(filepath), sr=self.target_sr, mono=True)
             duration_s = len(waveform) / sr
-            return waveform, duration_s, sr
+            return waveform, duration_s
         except Exception as e:
             logger.error(f"Error loading {filepath.name}: {e}")
             return None
@@ -116,22 +113,19 @@ class DualEmbeddingGenerator:
         return [usable * i / (num_chunks - 1) for i in range(num_chunks)]
 
     def _extract_chunks(
-        self, waveform: np.ndarray, positions: list[float], native_sr: int
+        self, waveform: np.ndarray, positions: list[float]
     ) -> list[np.ndarray]:
-        """Extract 30s chunks at native SR, then resample each to 24kHz."""
+        """Extract 30s audio chunks from waveform."""
         import librosa
 
         chunks = []
-        native_samples = self.chunk_duration_s * native_sr
-        target_samples = self.chunk_duration_s * self.target_sr
+        expected_samples = self.chunk_duration_s * self.target_sr
 
         for pos in positions:
-            start = int(pos * native_sr)
-            chunk = waveform[start : start + native_samples]
-            if len(chunk) < native_samples:
-                chunk = librosa.util.fix_length(chunk, size=native_samples)
-            if native_sr != self.target_sr:
-                chunk = librosa.resample(chunk, orig_sr=native_sr, target_sr=self.target_sr)
+            start = int(pos * self.target_sr)
+            chunk = waveform[start : start + expected_samples]
+            if len(chunk) < expected_samples:
+                chunk = librosa.util.fix_length(chunk, size=expected_samples)
             chunks.append(chunk)
 
         return chunks
@@ -229,7 +223,7 @@ class DualEmbeddingGenerator:
             return None
 
     def _prepare_chunks(
-        self, waveform: np.ndarray, duration_s: float, native_sr: int, filename: str
+        self, waveform: np.ndarray, duration_s: float, filename: str
     ) -> Optional[list[np.ndarray]]:
         """Extract chunks from waveform for inference. Returns None if audio is unsuitable."""
         if duration_s < self.chunk_duration_s:
@@ -238,7 +232,7 @@ class DualEmbeddingGenerator:
 
         num_chunks = self._calculate_num_chunks(duration_s)
         positions = self._select_chunk_positions(duration_s, num_chunks)
-        chunks = self._extract_chunks(waveform, positions, native_sr)
+        chunks = self._extract_chunks(waveform, positions)
 
         logger.debug(f"{filename}: {len(chunks)} x 30s chunks from {duration_s:.1f}s")
 
@@ -248,28 +242,25 @@ class DualEmbeddingGenerator:
         return chunks
 
     def generate_muq_from_audio(
-        self, waveform: np.ndarray, duration_s: float, native_sr: int,
-        filename: str = "<audio>"
+        self, waveform: np.ndarray, duration_s: float, filename: str = "<audio>"
     ) -> Optional[list[float]]:
         """Generate MuQ embedding only from pre-loaded waveform."""
-        chunks = self._prepare_chunks(waveform, duration_s, native_sr, filename)
+        chunks = self._prepare_chunks(waveform, duration_s, filename)
         if chunks is None:
             return None
         return self._infer_muq(chunks)
 
     def generate_mulan_from_audio(
-        self, waveform: np.ndarray, duration_s: float, native_sr: int,
-        filename: str = "<audio>"
+        self, waveform: np.ndarray, duration_s: float, filename: str = "<audio>"
     ) -> Optional[list[float]]:
         """Generate MuLan embedding only from pre-loaded waveform."""
-        chunks = self._prepare_chunks(waveform, duration_s, native_sr, filename)
+        chunks = self._prepare_chunks(waveform, duration_s, filename)
         if chunks is None:
             return None
         return self._infer_mulan(chunks)
 
     def generate_from_audio(
-        self, waveform: np.ndarray, duration_s: float, native_sr: int,
-        filename: str = "<audio>"
+        self, waveform: np.ndarray, duration_s: float, filename: str = "<audio>"
     ) -> tuple[Optional[list[float]], Optional[list[float]]]:
         """
         Generate embeddings from a pre-loaded waveform using both models.
@@ -278,7 +269,7 @@ class DualEmbeddingGenerator:
             Tuple of (muq_embedding, mulan_embedding).
             Either may be None if that model's inference fails.
         """
-        chunks = self._prepare_chunks(waveform, duration_s, native_sr, filename)
+        chunks = self._prepare_chunks(waveform, duration_s, filename)
         if chunks is None:
             return None, None
 
@@ -301,8 +292,8 @@ class DualEmbeddingGenerator:
         result = self.load_audio(filepath)
         if result is None:
             return None, None
-        waveform, duration_s, native_sr = result
-        return self.generate_from_audio(waveform, duration_s, native_sr, filepath.name)
+        waveform, duration_s = result
+        return self.generate_from_audio(waveform, duration_s, filepath.name)
 
     def embed_text(self, text: str) -> Optional[list[float]]:
         """
