@@ -10,6 +10,7 @@ from tqdm import tqdm
 from . import __version__
 from .database import EmbeddingDatabase
 from .embeddings_dual import DualEmbeddingGenerator
+from .embeddings_flamingo import FlamingoEmbeddingGenerator
 from .embeddings_muq import MuQEmbeddingGenerator
 from .fingerprint import extract_metadata
 from .scanner import scan_music_directory
@@ -18,6 +19,11 @@ from .scanner import scan_music_directory
 def create_embedding_generator():
     """Create the MuQ embedding generator."""
     return MuQEmbeddingGenerator()
+
+
+def create_flamingo_generator():
+    """Create the Flamingo embedding generator."""
+    return FlamingoEmbeddingGenerator()
 
 
 # Configure logging
@@ -61,14 +67,26 @@ def cli():
     is_flag=True,
     help="Generate both MuQ and MuLan embeddings into a single database"
 )
-def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, dual: bool):
+@click.option(
+    "--model",
+    type=click.Choice(["muq", "flamingo"]),
+    default=None,
+    help="Embedding model (default: muq, use --dual for MuQ+MuLan)"
+)
+def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, dual: bool,
+         model: str):
     """Scan a music directory and generate embeddings.
 
     MUSIC_PATH: Path to your music library folder
 
     Use --dual to generate both MuQ (for audio similarity) and MuLan (for text search)
     embeddings from the same audio, enabling A/B comparison and hybrid workflows.
+
+    Use --model flamingo to generate AF-Whisper embeddings from Audio Flamingo 3.
     """
+    if dual and model:
+        raise click.UsageError("--dual and --model are mutually exclusive")
+
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
@@ -85,6 +103,8 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, dua
 
     if dual:
         _scan_dual(music_path, output, skip_existing, audio_files)
+    elif model == "flamingo":
+        _scan_flamingo(music_path, output, skip_existing, audio_files)
     else:
         _scan_single(music_path, output, skip_existing, audio_files)
 
@@ -182,6 +202,55 @@ def _scan_single(music_path: Path, output: Path, skip_existing: bool, audio_file
     db.set_metadata("source_path", str(music_path))
     db.set_metadata("embedding_dim", str(generator.embedding_dim))
     db.set_metadata("model", "muq")
+
+    total_tracks = db.count_tracks()
+    click.echo(f"\nComplete!")
+    click.echo(f"  Successfully indexed: {successful}")
+    click.echo(f"  Failed: {failed}")
+    click.echo(f"  Total tracks in database: {total_tracks}")
+    click.echo(f"  Database size: {output.stat().st_size / 1024 / 1024:.1f} MB")
+
+    generator.unload_model()
+    db.close()
+
+
+def _scan_flamingo(music_path: Path, output: Path, skip_existing: bool, audio_files: list[Path]):
+    """Single-model scan with AF-Whisper (Flamingo) encoder."""
+    click.echo(f"Output: {output}")
+
+    db = EmbeddingDatabase(output, models=["flamingo"])
+
+    existing_paths = db.get_existing_paths(model="flamingo") if skip_existing else set()
+    if existing_paths:
+        new_files = [f for f in audio_files if str(f) not in existing_paths]
+        click.echo(f"Skipping {len(audio_files) - len(new_files)} existing files")
+        audio_files = new_files
+
+    if not audio_files:
+        click.echo("All files already indexed. Use --no-skip-existing to reindex.")
+        db.close()
+        return
+
+    click.echo("Loading AF-Whisper encoder...")
+    generator = create_flamingo_generator()
+
+    def store_track(filepath, metadata, embedding):
+        db.add_track(metadata, embedding, model="flamingo")
+        if (store_track.count % 10) == 0:
+            db.commit()
+        store_track.count += 1
+    store_track.count = 0
+
+    successful, failed = _process_files(
+        audio_files, generator.load_audio, generator.generate_from_audio,
+        store_track, "Flamingo"
+    )
+    db.commit()
+
+    db.set_metadata("version", __version__)
+    db.set_metadata("source_path", str(music_path))
+    db.set_metadata("embedding_dim", str(generator.embedding_dim))
+    db.set_metadata("model", "flamingo")
 
     total_tracks = db.count_tracks()
     click.echo(f"\nComplete!")
@@ -484,7 +553,7 @@ def info(database: Path):
     # Show available models and counts
     available = db.get_available_models()
     if available:
-        model_names = {"muq": "MuQ", "mulan": "MuLan"}
+        model_names = {"muq": "MuQ", "mulan": "MuLan", "flamingo": "Flamingo"}
         parts = []
         for m in available:
             name = model_names.get(m, m)
@@ -495,7 +564,7 @@ def info(database: Path):
         # Fallback to metadata
         model = db.get_metadata("model")
         if model:
-            model_names = {"muq": "MuQ", "mulan": "MuLan"}
+            model_names = {"muq": "MuQ", "mulan": "MuLan", "flamingo": "Flamingo"}
             click.echo(f"Embedding model: {model_names.get(model, model)}")
 
     dim = db.get_metadata("embedding_dim")
@@ -544,7 +613,7 @@ def format_track(track: dict) -> str:
 @click.option("--file", "-f", "audio_file", type=click.Path(exists=True, path_type=Path), help="Audio file to find similar tracks for")
 @click.option("--random", "-r", "use_random", is_flag=True, help="Pick a random seed track")
 @click.option("--top", "-n", default=10, help="Number of similar tracks to show")
-@click.option("--model", "-m", type=click.Choice(["muq", "mulan"]), default=None, help="Show results from a single model only")
+@click.option("--model", "-m", type=click.Choice(["muq", "mulan", "flamingo"]), default=None, help="Show results from a single model only")
 def similar(database: Path, query: str, audio_file: Path, use_random: bool, top: int, model: str):
     """Find similar tracks in the database.
 
@@ -618,9 +687,16 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
         exclude_id = seed_track["id"]
 
     elif audio_file:
-        # Generate embedding for external file — use MuQ
-        click.echo("Generating embedding with MuQ...")
-        generator = create_embedding_generator()
+        # Generate embedding for external file using the appropriate model
+        if model == "flamingo":
+            click.echo("Generating embedding with AF-Whisper (Flamingo)...")
+            generator = create_flamingo_generator()
+            file_model = "flamingo"
+        else:
+            click.echo("Generating embedding with MuQ...")
+            generator = create_embedding_generator()
+            file_model = "muq"
+
         seed_embedding = generator.generate_embedding(audio_file)
         generator.unload_model()
 
@@ -632,14 +708,16 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
         click.echo(f"Seed: {audio_file}")
         click.echo()
 
-        # For external file, only show MuQ results (we only have MuQ embedding)
+        model_names = {"muq": "MuQ", "mulan": "MuLan", "flamingo": "Flamingo"}
+        label = model_names.get(file_model, file_model)
+
         click.echo("Loading embeddings...")
-        all_embeddings = db.get_all_embeddings(model="muq")
+        all_embeddings = db.get_all_embeddings(model=file_model)
         click.echo(f"Searching {len(all_embeddings)} tracks...")
         click.echo()
 
         similar_tracks = find_similar(all_embeddings, seed_embedding, top)
-        click.echo("Similar tracks (MuQ):")
+        click.echo(f"Similar tracks ({label}):")
         for rank, (track_id, score) in enumerate(similar_tracks, 1):
             track = db.get_track_by_id(track_id)
             if track:
@@ -668,7 +746,7 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
 
         similar_tracks = find_similar(all_embeddings, seed_embedding, top, exclude_id)
 
-        model_names = {"muq": "MuQ", "mulan": "MuLan"}
+        model_names = {"muq": "MuQ", "mulan": "MuLan", "flamingo": "Flamingo"}
         label = model_names.get(m, m)
         click.echo(f"{label} similar tracks:")
         for rank, (track_id, score) in enumerate(similar_tracks, 1):
