@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.IBinder
 import android.util.Log
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import com.powerampstartradio.MainActivity
 import com.powerampstartradio.R
@@ -110,6 +111,7 @@ class RadioService : Service() {
                 if (currentTrack == null) {
                     _uiState.value = RadioUiState.Error("No track playing in Poweramp")
                     updateNotification("No track playing in Poweramp")
+                    Toast.makeText(this@RadioService, "No track playing in Poweramp", Toast.LENGTH_SHORT).show()
                     Log.e(TAG, "No current track")
                     stopSelfDelayed()
                     return@launch
@@ -123,6 +125,7 @@ class RadioService : Service() {
                 if (db == null) {
                     _uiState.value = RadioUiState.Error("No embedding database found")
                     updateNotification("No embedding database found")
+                    Toast.makeText(this@RadioService, "No embedding database found", Toast.LENGTH_SHORT).show()
                     Log.e(TAG, "No database")
                     stopSelfDelayed()
                     return@launch
@@ -135,6 +138,7 @@ class RadioService : Service() {
                 if (matchResult == null) {
                     _uiState.value = RadioUiState.Error("Track not found in database")
                     updateNotification("Track not found in database")
+                    Toast.makeText(this@RadioService, "Track not found in database", Toast.LENGTH_SHORT).show()
                     Log.e(TAG, "No match found for: ${currentTrack.title}")
                     stopSelfDelayed()
                     return@launch
@@ -172,6 +176,7 @@ class RadioService : Service() {
                 if (orderedTracks.isEmpty()) {
                     _uiState.value = RadioUiState.Error("No similar tracks found")
                     updateNotification("No similar tracks found")
+                    Toast.makeText(this@RadioService, "No similar tracks found", Toast.LENGTH_SHORT).show()
                     stopSelfDelayed()
                     return@launch
                 }
@@ -185,6 +190,7 @@ class RadioService : Service() {
                 if (fileIds.isEmpty()) {
                     _uiState.value = RadioUiState.Error("Could not find tracks in Poweramp library")
                     updateNotification("Could not find tracks in Poweramp library")
+                    Toast.makeText(this@RadioService, "Could not find tracks in Poweramp library", Toast.LENGTH_SHORT).show()
                     stopSelfDelayed()
                     return@launch
                 }
@@ -234,6 +240,7 @@ class RadioService : Service() {
                 val message = "${radioResult.queuedCount} queued / ${radioResult.failedCount} failed$modeLabel"
                 updateNotification(message)
                 Log.d(TAG, "Queue result: $message")
+                Toast.makeText(this@RadioService, message, Toast.LENGTH_LONG).show()
 
                 // Stop after a short delay
                 stopSelfDelayed()
@@ -242,6 +249,7 @@ class RadioService : Service() {
                 Log.e(TAG, "Error starting radio", e)
                 _uiState.value = RadioUiState.Error("Error: ${e.message}")
                 updateNotification("Error: ${e.message}")
+                Toast.makeText(this@RadioService, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
                 stopSelfDelayed()
             }
         }
