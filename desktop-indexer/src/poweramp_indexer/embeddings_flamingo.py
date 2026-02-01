@@ -82,8 +82,8 @@ class FlamingoEmbeddingGenerator:
         self.model = None
         self.feature_extractor = None
 
-        # FP32 required — BF16 has known dtype mismatch bugs (GitHub #42259)
-        logger.info("Using full precision (FP32) for Music Flamingo encoder stability.")
+        # BF16 causes dtype mismatch (GitHub #42259); FP16 is fine on Turing+
+        logger.info("Using FP16 for Music Flamingo encoder (Turing tensor cores).")
 
     @staticmethod
     def _get_best_device() -> str:
@@ -105,7 +105,7 @@ class FlamingoEmbeddingGenerator:
         encoder_path = self.encoder_path or get_flamingo_encoder_path()
         logger.info(f"Loading Music Flamingo encoder from '{encoder_path}'...")
         self.model = MusicFlamingoEncoder.from_pretrained(str(encoder_path))
-        self.model = self.model.float().to(self.device)
+        self.model = self.model.half().to(self.device)
         self.model.eval()
 
         logger.info(f"Loading WhisperFeatureExtractor from '{self.processor_id}'...")
@@ -187,7 +187,7 @@ class FlamingoEmbeddingGenerator:
                     sampling_rate=self.target_sr,
                     return_tensors="pt",
                 )
-                input_features = inputs.input_features.to(self.device)
+                input_features = inputs.input_features.to(device=self.device, dtype=torch.float16)
 
                 # All-ones mask for full 30s chunks (no padding)
                 input_features_mask = torch.ones(
@@ -206,7 +206,7 @@ class FlamingoEmbeddingGenerator:
                     for pos in batch_positions
                 ]).to(self.device)
 
-                with torch.no_grad():
+                with torch.inference_mode():
                     output = self.model(
                         input_features,
                         input_features_mask=input_features_mask,
@@ -217,8 +217,6 @@ class FlamingoEmbeddingGenerator:
                     all_features.append(features.cpu())
 
                 del input_features, input_features_mask, audio_times, output, features
-                if self.device == "cuda":
-                    torch.cuda.empty_cache()
 
             # Average across all chunks
             all_features = torch.cat(all_features, dim=0)
