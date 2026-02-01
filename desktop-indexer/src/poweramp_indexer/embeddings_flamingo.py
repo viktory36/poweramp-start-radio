@@ -105,7 +105,7 @@ class FlamingoEmbeddingGenerator:
         encoder_path = self.encoder_path or get_flamingo_encoder_path()
         logger.info(f"Loading Music Flamingo encoder from '{encoder_path}'...")
         self.model = MusicFlamingoEncoder.from_pretrained(str(encoder_path))
-        self.model = self.model.to(self.device)
+        self.model = self.model.float().to(self.device)
         self.model.eval()
 
         logger.info(f"Loading WhisperFeatureExtractor from '{self.processor_id}'...")
