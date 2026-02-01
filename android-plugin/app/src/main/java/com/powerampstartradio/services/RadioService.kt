@@ -54,6 +54,7 @@ class RadioService : Service() {
 
         const val EXTRA_NUM_TRACKS = "num_tracks"
         const val EXTRA_SHUFFLE = "shuffle"
+        const val EXTRA_SHOW_TOASTS = "show_toasts"
 
         const val DEFAULT_NUM_TRACKS = 50
 
@@ -61,12 +62,18 @@ class RadioService : Service() {
         private val _uiState = MutableStateFlow<RadioUiState>(RadioUiState.Idle)
         val uiState: StateFlow<RadioUiState> = _uiState.asStateFlow()
 
-        fun startRadio(context: Context, numTracks: Int = DEFAULT_NUM_TRACKS, shuffle: Boolean = true) {
+        fun startRadio(
+            context: Context,
+            numTracks: Int = DEFAULT_NUM_TRACKS,
+            shuffle: Boolean = true,
+            showToasts: Boolean = false
+        ) {
             _uiState.value = RadioUiState.Loading
             val intent = Intent(context, RadioService::class.java).apply {
                 action = ACTION_START_RADIO
                 putExtra(EXTRA_NUM_TRACKS, numTracks)
                 putExtra(EXTRA_SHUFFLE, shuffle)
+                putExtra(EXTRA_SHOW_TOASTS, showToasts)
             }
             context.startForegroundService(intent)
         }
@@ -79,6 +86,7 @@ class RadioService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var embeddingDb: EmbeddingDatabase? = null
     private var similarityEngine: SimilarityEngine? = null
+    private var showToasts: Boolean = false
 
     override fun onCreate() {
         super.onCreate()
@@ -90,6 +98,7 @@ class RadioService : Service() {
             ACTION_START_RADIO -> {
                 val numTracks = intent.getIntExtra(EXTRA_NUM_TRACKS, DEFAULT_NUM_TRACKS)
                 val shuffle = intent.getBooleanExtra(EXTRA_SHUFFLE, true)
+                showToasts = intent.getBooleanExtra(EXTRA_SHOW_TOASTS, false)
 
                 startForeground(NOTIFICATION_ID, createNotification("Starting radio..."))
                 startRadio(numTracks, shuffle)
@@ -106,12 +115,14 @@ class RadioService : Service() {
     private fun startRadio(numTracks: Int, shuffle: Boolean) {
         serviceScope.launch {
             try {
+                toast("Starting radio…")
+
                 // Get current track
                 val currentTrack = PowerampReceiver.currentTrack
                 if (currentTrack == null) {
                     _uiState.value = RadioUiState.Error("No track playing in Poweramp")
                     updateNotification("No track playing in Poweramp")
-                    Toast.makeText(this@RadioService, "No track playing in Poweramp", Toast.LENGTH_SHORT).show()
+                    toast("No track playing in Poweramp")
                     Log.e(TAG, "No current track")
                     stopSelfDelayed()
                     return@launch
@@ -125,7 +136,7 @@ class RadioService : Service() {
                 if (db == null) {
                     _uiState.value = RadioUiState.Error("No embedding database found")
                     updateNotification("No embedding database found")
-                    Toast.makeText(this@RadioService, "No embedding database found", Toast.LENGTH_SHORT).show()
+                    toast("No embedding database found")
                     Log.e(TAG, "No database")
                     stopSelfDelayed()
                     return@launch
@@ -138,7 +149,7 @@ class RadioService : Service() {
                 if (matchResult == null) {
                     _uiState.value = RadioUiState.Error("Track not found in database")
                     updateNotification("Track not found in database")
-                    Toast.makeText(this@RadioService, "Track not found in database", Toast.LENGTH_SHORT).show()
+                    toast("Track not found in database")
                     Log.e(TAG, "No match found for: ${currentTrack.title}")
                     stopSelfDelayed()
                     return@launch
@@ -176,7 +187,7 @@ class RadioService : Service() {
                 if (orderedTracks.isEmpty()) {
                     _uiState.value = RadioUiState.Error("No similar tracks found")
                     updateNotification("No similar tracks found")
-                    Toast.makeText(this@RadioService, "No similar tracks found", Toast.LENGTH_SHORT).show()
+                    toast("No similar tracks found")
                     stopSelfDelayed()
                     return@launch
                 }
@@ -190,7 +201,7 @@ class RadioService : Service() {
                 if (fileIds.isEmpty()) {
                     _uiState.value = RadioUiState.Error("Could not find tracks in Poweramp library")
                     updateNotification("Could not find tracks in Poweramp library")
-                    Toast.makeText(this@RadioService, "Could not find tracks in Poweramp library", Toast.LENGTH_SHORT).show()
+                    toast("Could not find tracks in Poweramp library")
                     stopSelfDelayed()
                     return@launch
                 }
@@ -240,7 +251,7 @@ class RadioService : Service() {
                 val message = "${radioResult.queuedCount} queued / ${radioResult.failedCount} failed$modeLabel"
                 updateNotification(message)
                 Log.d(TAG, "Queue result: $message")
-                Toast.makeText(this@RadioService, message, Toast.LENGTH_LONG).show()
+                toast(message)
 
                 // Stop after a short delay
                 stopSelfDelayed()
@@ -249,7 +260,7 @@ class RadioService : Service() {
                 Log.e(TAG, "Error starting radio", e)
                 _uiState.value = RadioUiState.Error("Error: ${e.message}")
                 updateNotification("Error: ${e.message}")
-                Toast.makeText(this@RadioService, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
+                toast("Error: ${e.message}")
                 stopSelfDelayed()
             }
         }
@@ -275,6 +286,12 @@ class RadioService : Service() {
     private fun getOrCreateEngine(db: EmbeddingDatabase): SimilarityEngine {
         similarityEngine?.let { return it }
         return SimilarityEngine(db).also { similarityEngine = it }
+    }
+
+    private fun toast(message: String) {
+        if (showToasts) {
+            Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun stopSelfDelayed() {
