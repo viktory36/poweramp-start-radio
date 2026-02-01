@@ -19,13 +19,15 @@ data class SimilarTrack(
  * Engine for computing audio similarity using pre-computed embeddings.
  *
  * Since embeddings are L2-normalized, cosine similarity is just the dot product.
- * Supports multiple embedding models with per-model caches and interleaved results.
+ * Supports multiple embedding models. Only one model's embeddings are held in
+ * memory at a time to stay within Android heap limits (~300-400 MB).
  */
 class SimilarityEngine(
     private val database: EmbeddingDatabase
 ) {
-    // Per-model cache of embeddings
-    private val caches = mutableMapOf<EmbeddingModel, Map<Long, FloatArray>>()
+    // Only one model's cache in memory at a time
+    private var cachedModel: EmbeddingModel? = null
+    private var embeddingsCache: Map<Long, FloatArray>? = null
 
     /**
      * Compute cosine similarity between two L2-normalized vectors.
@@ -41,10 +43,15 @@ class SimilarityEngine(
 
     /**
      * Load embeddings for a specific model into memory.
+     * Evicts any previously loaded model's cache first.
      */
     suspend fun loadEmbeddings(model: EmbeddingModel = EmbeddingModel.MUQ) = withContext(Dispatchers.IO) {
-        if (model !in caches) {
-            caches[model] = database.getAllEmbeddings(model)
+        if (cachedModel != model) {
+            // Evict previous cache to free memory before loading new one
+            embeddingsCache = null
+            cachedModel = null
+            embeddingsCache = database.getAllEmbeddings(model)
+            cachedModel = model
         }
     }
 
@@ -63,12 +70,10 @@ class SimilarityEngine(
         excludeSeed: Boolean = true,
         model: EmbeddingModel = EmbeddingModel.MUQ
     ): List<SimilarTrack> = withContext(Dispatchers.Default) {
-        // Ensure embeddings are loaded
-        if (model !in caches) {
-            loadEmbeddings(model)
-        }
+        // Ensure correct model is loaded
+        loadEmbeddings(model)
 
-        val embeddings = caches[model] ?: return@withContext emptyList()
+        val embeddings = embeddingsCache ?: return@withContext emptyList()
         val seedEmbedding = embeddings[seedTrackId] ?: return@withContext emptyList()
 
         // Compute similarities
@@ -94,8 +99,10 @@ class SimilarityEngine(
     /**
      * Find similar tracks using both models and interleave results.
      *
-     * Fetches top N from each available model, then interleaves:
-     * MuQ#1, MuLan#1, MuQ#2, MuLan#2, ...
+     * Processes one model at a time to stay within heap limits:
+     * 1. Load MuQ cache, compute top-N, free cache
+     * 2. Load MuLan cache, compute top-N, free cache
+     * 3. Interleave: MuQ#1, MuLan#1, MuQ#2, MuLan#2, ...
      * Skips duplicates (same track from different models).
      * Falls back to single-model if seed has no embedding for one model.
      *
@@ -109,19 +116,9 @@ class SimilarityEngine(
     ): List<SimilarTrack> = withContext(Dispatchers.Default) {
         val availableModels = database.getAvailableModels()
 
-        // Load caches for all available models
-        for (model in availableModels) {
-            if (model !in caches) {
-                loadEmbeddings(model)
-            }
-        }
-
-        // Get results from each model that has the seed track
+        // Get results from each model sequentially (one cache at a time)
         val perModelResults = mutableMapOf<EmbeddingModel, List<SimilarTrack>>()
         for (model in availableModels) {
-            val cache = caches[model] ?: continue
-            if (seedTrackId !in cache) continue
-
             val results = findSimilarTracks(
                 seedTrackId = seedTrackId,
                 topN = requestedCount,
@@ -131,7 +128,12 @@ class SimilarityEngine(
             if (results.isNotEmpty()) {
                 perModelResults[model] = results
             }
+            // findSimilarTracks calls loadEmbeddings which evicts the previous cache,
+            // so only one model's data is in memory at any time.
         }
+
+        // Free the last model's cache now that we have our result lists
+        clearCache()
 
         if (perModelResults.isEmpty()) {
             return@withContext emptyList()
@@ -174,11 +176,9 @@ class SimilarityEngine(
         topN: Int = 50,
         model: EmbeddingModel = EmbeddingModel.MUQ
     ): List<SimilarTrack> = withContext(Dispatchers.Default) {
-        if (model !in caches) {
-            loadEmbeddings(model)
-        }
+        loadEmbeddings(model)
 
-        val embeddings = caches[model] ?: return@withContext emptyList()
+        val embeddings = embeddingsCache ?: return@withContext emptyList()
 
         val similarities = mutableListOf<Pair<Long, Float>>()
         for ((trackId, trackEmbedding) in embeddings) {
@@ -197,14 +197,15 @@ class SimilarityEngine(
     }
 
     /**
-     * Clear all embeddings caches to free memory.
+     * Clear the embeddings cache to free memory.
      */
     fun clearCache() {
-        caches.clear()
+        embeddingsCache = null
+        cachedModel = null
     }
 
     /**
-     * Get the total number of embeddings across all cached models.
+     * Get the number of embeddings in the current cache.
      */
-    fun getCacheSize(): Int = caches.values.sumOf { it.size }
+    fun getCacheSize(): Int = embeddingsCache?.size ?: 0
 }
