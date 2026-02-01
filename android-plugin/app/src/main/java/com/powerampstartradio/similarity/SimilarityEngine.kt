@@ -168,35 +168,6 @@ class SimilarityEngine(
     }
 
     /**
-     * Find similar tracks to a given embedding vector.
-     * Useful when the seed track isn't in the database.
-     */
-    suspend fun findSimilarToEmbedding(
-        embedding: FloatArray,
-        topN: Int = 50,
-        model: EmbeddingModel = EmbeddingModel.MUQ
-    ): List<SimilarTrack> = withContext(Dispatchers.Default) {
-        loadEmbeddings(model)
-
-        val embeddings = embeddingsCache ?: return@withContext emptyList()
-
-        val similarities = mutableListOf<Pair<Long, Float>>()
-        for ((trackId, trackEmbedding) in embeddings) {
-            val similarity = cosineSimilarity(embedding, trackEmbedding)
-            similarities.add(trackId to similarity)
-        }
-
-        similarities.sortByDescending { it.second }
-        val topSimilar = similarities.take(topN)
-
-        topSimilar.mapNotNull { (trackId, similarity) ->
-            database.getTrackById(trackId)?.let { track ->
-                SimilarTrack(track, similarity, model)
-            }
-        }
-    }
-
-    /**
      * Clear the embeddings cache to free memory.
      */
     fun clearCache() {

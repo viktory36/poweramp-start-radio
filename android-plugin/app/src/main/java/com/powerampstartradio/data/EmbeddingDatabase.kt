@@ -287,17 +287,6 @@ class EmbeddingDatabase private constructor(
     }
 
     /**
-     * Get all tracks.
-     */
-    fun getAllTracks(): List<EmbeddedTrack> {
-        val cursor = db.rawQuery(
-            "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks",
-            null
-        )
-        return cursor.use { cursorToTrackList(it) }
-    }
-
-    /**
      * Get database metadata value.
      */
     fun getMetadata(key: String): String? {

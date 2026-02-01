@@ -211,13 +211,6 @@ class EmbeddingDatabase:
         self.add_embedding(track_id, model, embedding)
         return track_id
 
-    def track_exists(self, file_path: Path) -> bool:
-        """Check if a track already exists in the database by file path."""
-        row = self.conn.execute(
-            "SELECT 1 FROM tracks WHERE file_path = ?", (str(file_path),)
-        ).fetchone()
-        return row is not None
-
     def get_existing_paths(self, model: str | None = None) -> set[str]:
         """Get file paths in the database.
 
@@ -336,50 +329,6 @@ class EmbeddingDatabase:
             params
         ).fetchall()
         return [dict(row) for row in rows]
-
-    def find_track(self, artist: str = None, title: str = None, file_path: str = None) -> Optional[dict]:
-        """
-        Find a specific track by exact artist+title or file path.
-        This is what the Android app should use.
-
-        Args:
-            artist: Exact artist name (case-insensitive)
-            title: Exact title (case-insensitive)
-            file_path: Exact file path or filename
-
-        Returns:
-            Track dictionary or None
-        """
-        # Try exact file path first
-        if file_path:
-            row = self.conn.execute(
-                "SELECT id, artist, album, title, file_path FROM tracks WHERE file_path = ?",
-                (file_path,)
-            ).fetchone()
-            if row:
-                return dict(row)
-
-            # Try matching just the filename
-            row = self.conn.execute(
-                "SELECT id, artist, album, title, file_path FROM tracks WHERE file_path LIKE ?",
-                (f"%{file_path.split('/')[-1].split(chr(92))[-1]}",)  # handle both / and \
-            ).fetchone()
-            if row:
-                return dict(row)
-
-        # Try artist + title
-        if artist and title:
-            row = self.conn.execute(
-                """
-                SELECT id, artist, album, title, file_path FROM tracks
-                WHERE LOWER(artist) = LOWER(?) AND LOWER(title) = LOWER(?)
-                """,
-                (artist, title)
-            ).fetchone()
-            if row:
-                return dict(row)
-
-        return None
 
     def get_random_track(self) -> Optional[dict]:
         """Pick a random track from the database."""

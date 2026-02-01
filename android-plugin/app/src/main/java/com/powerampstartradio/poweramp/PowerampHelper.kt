@@ -28,24 +28,16 @@ object PowerampHelper {
     val ROOT_URI: Uri = Uri.parse("content://$AUTHORITY")
 
     // Actions
-    const val ACTION_API_COMMAND = "com.maxmpz.audioplayer.API_COMMAND"
     const val ACTION_TRACK_CHANGED = "com.maxmpz.audioplayer.TRACK_CHANGED"
     const val ACTION_STATUS_CHANGED = "com.maxmpz.audioplayer.STATUS_CHANGED"
     const val ACTION_RELOAD_DATA = "com.maxmpz.audioplayer.ACTION_RELOAD_DATA"
-    const val ACTION_OPEN_LIBRARY = "com.maxmpz.audioplayer.ACTION_OPEN_LIBRARY"
-    const val ACTION_OPEN_LIST_AND_PLAY = "com.maxmpz.audioplayer.ACTION_OPEN_LIST_AND_PLAY"
     const val ACTION_ASK_FOR_DATA_PERMISSION = "com.maxmpz.audioplayer.ACTION_ASK_FOR_DATA_PERMISSION"
 
     // Extras
-    const val EXTRA_COMMAND = "cmd"
     const val EXTRA_TRACK = "track"
     const val EXTRA_PACKAGE = "pak"
     const val EXTRA_TABLE = "table"
     const val EXTRA_STATE = "state"
-
-    // Commands
-    const val COMMAND_OPEN_TO_PLAY = 20
-    const val COMMAND_TOGGLE_PLAY_PAUSE = 1
 
     // Track extras
     const val TRACK_REAL_ID = "realId"
@@ -312,42 +304,6 @@ object PowerampHelper {
         }
     }
 
-    /**
-     * Open the Poweramp queue UI.
-     */
-    fun openQueue(context: Context) {
-        val queueUri = ROOT_URI.buildUpon().appendEncodedPath("queue").build()
-        val intent = Intent(ACTION_OPEN_LIBRARY).apply {
-            setPackage(POWERAMP_PACKAGE)
-            data = queueUri
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        try {
-            context.startActivity(intent)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to open queue", e)
-        }
-    }
-
-    /**
-     * Start playing from the queue.
-     * Sends OPEN_TO_PLAY command via the API activity with explicit component.
-     */
-    fun playQueue(context: Context) {
-        val queueUri = ROOT_URI.buildUpon().appendEncodedPath("queue").build()
-        val intent = Intent(ACTION_API_COMMAND).apply {
-            setComponent(ComponentName(POWERAMP_PACKAGE, API_ACTIVITY))
-            putExtra(EXTRA_COMMAND, COMMAND_OPEN_TO_PLAY)
-            data = queueUri
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        try {
-            context.startActivity(intent)
-            Log.d(TAG, "Started playback from queue")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to play queue", e)
-        }
-    }
 }
 
 /**
