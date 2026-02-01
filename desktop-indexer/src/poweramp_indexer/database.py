@@ -26,12 +26,12 @@ class EmbeddingDatabase:
     """
     SQLite database for storing track metadata and embeddings.
 
-    Schema:
-    - tracks: metadata and fingerprint keys
-    - embeddings: float32 vectors as BLOBs (dimension depends on model)
+    Supports multiple embedding models via per-model tables (embeddings_muq,
+    embeddings_mulan, etc.). Legacy databases with a single 'embeddings' table
+    are detected and mapped to 'muq' transparently.
     """
 
-    SCHEMA = """
+    BASE_SCHEMA = """
     CREATE TABLE IF NOT EXISTS tracks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         metadata_key TEXT NOT NULL,
@@ -44,14 +44,9 @@ class EmbeddingDatabase:
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
-    CREATE TABLE IF NOT EXISTS embeddings (
-        track_id INTEGER PRIMARY KEY,
-        embedding BLOB NOT NULL,
-        FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
-    );
-
     CREATE INDEX IF NOT EXISTS idx_tracks_metadata_key ON tracks(metadata_key);
     CREATE INDEX IF NOT EXISTS idx_tracks_filename_key ON tracks(filename_key);
+    CREATE INDEX IF NOT EXISTS idx_tracks_file_path ON tracks(file_path);
 
     CREATE TABLE IF NOT EXISTS metadata (
         key TEXT PRIMARY KEY,
@@ -59,22 +54,107 @@ class EmbeddingDatabase:
     );
     """
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, models: list[str] | None = None):
         """
         Initialize or open an embedding database.
 
         Args:
             db_path: Path to the SQLite database file
+            models: List of model names to create embedding tables for
+                    (e.g. ["muq"] or ["muq", "mulan"]). If None, only base
+                    tables are created and existing embedding tables are used.
         """
         self.db_path = db_path
         self.conn = sqlite3.connect(str(db_path))
         self.conn.row_factory = sqlite3.Row
-        self._init_schema()
+        self._init_schema(models)
 
-    def _init_schema(self):
-        """Create tables if they don't exist."""
-        self.conn.executescript(self.SCHEMA)
+    def _init_schema(self, models: list[str] | None):
+        """Create base tables and per-model embedding tables."""
+        self.conn.executescript(self.BASE_SCHEMA)
+        if models:
+            for model in models:
+                table = f"embeddings_{model}"
+                self.conn.execute(f"""
+                    CREATE TABLE IF NOT EXISTS [{table}] (
+                        track_id INTEGER PRIMARY KEY,
+                        embedding BLOB NOT NULL,
+                        FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
+                    )
+                """)
         self.conn.commit()
+
+    def _table_name(self, model: str) -> str:
+        """Get the embedding table name for a model, with legacy fallback.
+
+        If 'embeddings_muq' doesn't exist but legacy 'embeddings' does,
+        returns 'embeddings' for backward compatibility.
+        """
+        preferred = f"embeddings_{model}"
+        row = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (preferred,)
+        ).fetchone()
+        if row:
+            return preferred
+
+        # Legacy fallback: old DBs have a single 'embeddings' table
+        if model == "muq":
+            row = self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='embeddings'"
+            ).fetchone()
+            if row:
+                return "embeddings"
+
+        return preferred  # table may not exist yet
+
+    def get_available_models(self) -> list[str]:
+        """Return list of model names that have embedding tables with rows.
+
+        Legacy 'embeddings' table (without _muq suffix) is reported as 'muq'.
+        """
+        models = []
+
+        # Check for embeddings_* tables
+        rows = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'embeddings_%'"
+        ).fetchall()
+        for row in rows:
+            table_name = row["name"]
+            # Check it has rows
+            count = self.conn.execute(f"SELECT COUNT(*) as c FROM [{table_name}]").fetchone()["c"]
+            if count > 0:
+                # Strip 'embeddings_' prefix to get model name
+                model = table_name[len("embeddings_"):]
+                models.append(model)
+
+        # Legacy fallback: check bare 'embeddings' table
+        if "muq" not in models:
+            legacy = self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='embeddings'"
+            ).fetchone()
+            if legacy:
+                count = self.conn.execute("SELECT COUNT(*) as c FROM embeddings").fetchone()["c"]
+                if count > 0:
+                    models.insert(0, "muq")
+
+        return models
+
+    def get_track_id_by_path(self, file_path: str) -> Optional[int]:
+        """Look up a track ID by its file path."""
+        row = self.conn.execute(
+            "SELECT id FROM tracks WHERE file_path = ?", (file_path,)
+        ).fetchone()
+        return row["id"] if row else None
+
+    def add_embedding(self, track_id: int, model: str, embedding: list[float]):
+        """Insert an embedding into the model-specific table."""
+        table = f"embeddings_{model}"
+        blob = float_list_to_blob(embedding)
+        self.conn.execute(
+            f"INSERT OR REPLACE INTO [{table}] (track_id, embedding) VALUES (?, ?)",
+            (track_id, blob)
+        )
 
     def set_metadata(self, key: str, value: str):
         """Set a metadata key-value pair."""
@@ -94,7 +174,8 @@ class EmbeddingDatabase:
     def add_track(
         self,
         metadata: TrackMetadata,
-        embedding: list[float]
+        embedding: list[float],
+        model: str = "muq"
     ) -> int:
         """
         Add a track and its embedding to the database.
@@ -102,6 +183,7 @@ class EmbeddingDatabase:
         Args:
             metadata: Track metadata
             embedding: Embedding vector (dimension depends on model)
+            model: Model name for embedding table (default: "muq")
 
         Returns:
             The track ID
@@ -122,13 +204,7 @@ class EmbeddingDatabase:
             )
         )
         track_id = cursor.lastrowid
-
-        embedding_blob = float_list_to_blob(embedding)
-        self.conn.execute(
-            "INSERT INTO embeddings (track_id, embedding) VALUES (?, ?)",
-            (track_id, embedding_blob)
-        )
-
+        self.add_embedding(track_id, model, embedding)
         return track_id
 
     def track_exists(self, file_path: Path) -> bool:
@@ -138,9 +214,19 @@ class EmbeddingDatabase:
         ).fetchone()
         return row is not None
 
-    def get_existing_paths(self) -> set[str]:
-        """Get all file paths currently in the database."""
-        rows = self.conn.execute("SELECT file_path FROM tracks").fetchall()
+    def get_existing_paths(self, model: str | None = None) -> set[str]:
+        """Get file paths in the database.
+
+        When model is specified, only returns paths that have an embedding
+        for that model (via JOIN). Otherwise returns all track paths.
+        """
+        if model is None:
+            rows = self.conn.execute("SELECT file_path FROM tracks").fetchall()
+        else:
+            table = self._table_name(model)
+            rows = self.conn.execute(
+                f"SELECT t.file_path FROM tracks t INNER JOIN [{table}] e ON t.id = e.track_id"
+            ).fetchall()
         return {row["file_path"] for row in rows}
 
     def remove_missing_tracks(self, existing_paths: set[str]):
@@ -162,6 +248,15 @@ class EmbeddingDatabase:
         row = self.conn.execute("SELECT COUNT(*) as count FROM tracks").fetchone()
         return row["count"]
 
+    def count_embeddings(self, model: str) -> int:
+        """Return the number of embeddings for a given model."""
+        table = self._table_name(model)
+        try:
+            row = self.conn.execute(f"SELECT COUNT(*) as count FROM [{table}]").fetchone()
+            return row["count"]
+        except sqlite3.OperationalError:
+            return 0
+
     def commit(self):
         """Commit any pending changes."""
         self.conn.commit()
@@ -174,22 +269,24 @@ class EmbeddingDatabase:
         """Reclaim unused space in the database."""
         self.conn.execute("VACUUM")
 
-    def get_all_embeddings(self) -> dict[int, list[float]]:
+    def get_all_embeddings(self, model: str = "muq") -> dict[int, list[float]]:
         """
-        Load all embeddings from the database.
+        Load all embeddings from the database for a given model.
 
         Returns:
             Dictionary mapping track_id to embedding vector
         """
+        table = self._table_name(model)
         rows = self.conn.execute(
-            "SELECT track_id, embedding FROM embeddings"
+            f"SELECT track_id, embedding FROM [{table}]"
         ).fetchall()
         return {row["track_id"]: blob_to_float_list(row["embedding"]) for row in rows}
 
-    def get_embedding_by_id(self, track_id: int) -> Optional[list[float]]:
+    def get_embedding_by_id(self, track_id: int, model: str = "muq") -> Optional[list[float]]:
         """Get the embedding for a specific track."""
+        table = self._table_name(model)
         row = self.conn.execute(
-            "SELECT embedding FROM embeddings WHERE track_id = ?", (track_id,)
+            f"SELECT embedding FROM [{table}] WHERE track_id = ?", (track_id,)
         ).fetchone()
         return blob_to_float_list(row["embedding"]) if row else None
 

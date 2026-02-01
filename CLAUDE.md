@@ -21,8 +21,14 @@ python -m pip install -e .
 # Scan library (creates new database)
 poweramp-indexer scan /path/to/music -o embeddings.db
 
+# Dual scan — both MuQ and MuLan into a single DB
+poweramp-indexer scan /path/to/music -o embeddings.db --dual
+
 # Incremental update (adds new, optionally removes missing)
 poweramp-indexer update /path/to/music -d embeddings.db --remove-missing
+
+# Merge separate MuQ and MuLan DBs into one combined DB
+poweramp-indexer merge embeddings_muq.db embeddings_mulan.db -o embeddings.db
 
 # Database info
 poweramp-indexer info embeddings.db
@@ -31,9 +37,13 @@ poweramp-indexer info embeddings.db
 poweramp-indexer similar embeddings.db "artist title"
 poweramp-indexer similar embeddings.db --file /path/to/song.mp3
 poweramp-indexer similar embeddings.db --random
+poweramp-indexer similar embeddings.db --random --model muq
+
+# Text search (requires MuLan embeddings)
+poweramp-indexer search embeddings.db "sufi music"
 ```
 
-Options: `--dual` (generate both MuQ and MuLan), `--verbose`
+Options: `--dual` (generate both MuQ and MuLan into single DB), `--verbose`, `--model muq|mulan`
 
 ### Android Plugin
 
@@ -102,7 +112,7 @@ Poweramp API uses:
 
 ## GPU/Performance Notes (RTX 2060 Max-Q, 6GB VRAM)
 
-- **Two-pass dual scan**: `--dual` mode processes all files through MuQ first, unloads it, then processes all files through MuLan. This halves VRAM usage (~2GB per model instead of ~4.2GB with both loaded). Each pass tracks progress independently in its own database — safe to ctrl+c between or during passes.
+- **Two-pass dual scan**: `--dual` mode processes all files through MuQ first, unloads it, then processes all files through MuLan into a single combined database. This halves VRAM usage (~2GB per model instead of ~4.2GB with both loaded). Each pass tracks progress independently via per-model embedding tables — safe to ctrl+c between or during passes.
 - **empty_cache() is required**: `torch.cuda.empty_cache()` between sub-batches prevents inference from spilling into shared GPU memory (system RAM over PCIe, ~18x slower than GDDR6). Without it, PyTorch's caching allocator holds ~5.8GB dedicated + 0.9GB shared. With it, VRAM spikes to ~4.6GB but stays in dedicated. The allocation churn (visible as "Copy" load in Task Manager) is cheaper than the shared memory penalty.
 - **Prefetching audio has no measurable impact**: A background thread loading the next file while the GPU processes the current one was tried and showed no improvement, suggesting GPU inference (not CPU audio loading) is the bottleneck. The prefetch code remains in place but is not the source of any speedup.
 - **Chunk-only resampling is slower**: Loading at native SR and resampling individual chunks (instead of `librosa.load(sr=24000)` on the full file) was tested and regressed to 2.42s/file. The per-chunk `librosa.resample()` startup overhead outweighs savings for single-chunk songs. Stick with full-file resampling.
@@ -116,6 +126,18 @@ Poweramp API uses:
 - **MuLan internal chunking**: `_get_all_clips()` splits audio into consecutive 10s clips, pads last clip by wrapping. Pass 30s chunks directly — MuLan handles the splitting.
 - **License**: CC-BY-NC 4.0 on model weights (non-commercial only).
 - **Training**: Open-source weights trained on Million Song Dataset (~1K hours), not the full 160K hours from the paper.
+
+## Database Schema
+
+The database uses a shared `tracks` table with per-model embedding tables:
+- `tracks` — track metadata (artist, album, title, duration, file_path)
+- `embeddings_muq` — MuQ embeddings (1024-dim, track_id FK)
+- `embeddings_mulan` — MuLan embeddings (512-dim, track_id FK)
+- `metadata` — key-value store (version, source_path, model)
+
+Legacy databases with a single `embeddings` table are detected and mapped to MuQ transparently. The `merge` command combines separate MuQ/MuLan DBs into this combined format.
+
+On Android, `EmbeddingDatabase.kt` detects available models via `sqlite_master` and `SimilarityEngine.kt` interleaves results from both models (MuQ#1, MuLan#1, MuQ#2, MuLan#2...).
 
 ## Development Notes
 

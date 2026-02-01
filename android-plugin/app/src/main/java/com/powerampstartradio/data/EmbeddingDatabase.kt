@@ -10,6 +10,18 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
+ * Embedding model types with their table names and dimensions.
+ */
+enum class EmbeddingModel(val tableName: String, val dim: Int) {
+    MUQ("embeddings_muq", 1024),
+    MULAN("embeddings_mulan", 512);
+
+    companion object {
+        fun fromTableName(name: String): EmbeddingModel? = entries.find { it.tableName == name }
+    }
+}
+
+/**
  * Data class representing a track from the embedding database.
  */
 data class EmbeddedTrack(
@@ -25,15 +37,23 @@ data class EmbeddedTrack(
 
 /**
  * Wrapper for reading the embeddings SQLite database created by the desktop indexer.
+ *
+ * Supports multiple embedding models via per-model tables (embeddings_muq,
+ * embeddings_mulan). Legacy databases with a single 'embeddings' table are
+ * detected and mapped to MUQ transparently.
  */
 class EmbeddingDatabase private constructor(
     private val db: SQLiteDatabase
 ) {
-    companion object {
-        // Default embedding dimension for MuQ-large-msd-iter model
-        // Note: blobToFloatArray() is dimension-agnostic, so this is just for reference
-        private const val EMBEDDING_DIM = 1024
+    // Resolved table names per model (accounts for legacy fallback)
+    private val resolvedTables = mutableMapOf<EmbeddingModel, String>()
+    private val _availableModels: Set<EmbeddingModel>
 
+    init {
+        _availableModels = detectModels()
+    }
+
+    companion object {
         /**
          * Open the database from a file path.
          */
@@ -71,6 +91,62 @@ class EmbeddingDatabase private constructor(
             return floats
         }
     }
+
+    /**
+     * Detect which embedding models are available in this database.
+     * Checks for actual rows, not just table existence.
+     */
+    private fun detectModels(): Set<EmbeddingModel> {
+        val models = mutableSetOf<EmbeddingModel>()
+        val tables = getTableNames()
+
+        for (model in EmbeddingModel.entries) {
+            if (model.tableName in tables && tableHasRows(model.tableName)) {
+                resolvedTables[model] = model.tableName
+                models.add(model)
+            }
+        }
+
+        // Legacy fallback: bare 'embeddings' table -> MUQ
+        if (EmbeddingModel.MUQ !in models && "embeddings" in tables && tableHasRows("embeddings")) {
+            resolvedTables[EmbeddingModel.MUQ] = "embeddings"
+            models.add(EmbeddingModel.MUQ)
+        }
+
+        return models
+    }
+
+    private fun getTableNames(): Set<String> {
+        val names = mutableSetOf<String>()
+        db.rawQuery(
+            "SELECT name FROM sqlite_master WHERE type='table'", null
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                names.add(cursor.getString(0))
+            }
+        }
+        return names
+    }
+
+    private fun tableHasRows(tableName: String): Boolean {
+        return try {
+            db.rawQuery("SELECT 1 FROM [$tableName] LIMIT 1", null).use { it.moveToFirst() }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Get the resolved table name for a model, accounting for legacy fallback.
+     */
+    private fun resolveTableName(model: EmbeddingModel): String {
+        return resolvedTables[model] ?: model.tableName
+    }
+
+    /**
+     * Get available embedding models in this database.
+     */
+    fun getAvailableModels(): Set<EmbeddingModel> = _availableModels
 
     /**
      * Get total number of tracks in the database.
@@ -152,11 +228,12 @@ class EmbeddingDatabase private constructor(
     }
 
     /**
-     * Get the embedding for a track by its ID.
+     * Get the embedding for a track by its ID and model.
      */
-    fun getEmbedding(trackId: Long): FloatArray? {
+    fun getEmbedding(trackId: Long, model: EmbeddingModel = EmbeddingModel.MUQ): FloatArray? {
+        val table = resolveTableName(model)
         val cursor = db.rawQuery(
-            "SELECT embedding FROM embeddings WHERE track_id = ?",
+            "SELECT embedding FROM [$table] WHERE track_id = ?",
             arrayOf(trackId.toString())
         )
         return cursor.use {
@@ -168,11 +245,12 @@ class EmbeddingDatabase private constructor(
     }
 
     /**
-     * Get all embeddings for similarity computation.
+     * Get all embeddings for a model for similarity computation.
      * Returns a map of track ID to embedding.
      */
-    fun getAllEmbeddings(): Map<Long, FloatArray> {
-        val cursor = db.rawQuery("SELECT track_id, embedding FROM embeddings", null)
+    fun getAllEmbeddings(model: EmbeddingModel = EmbeddingModel.MUQ): Map<Long, FloatArray> {
+        val table = resolveTableName(model)
+        val cursor = db.rawQuery("SELECT track_id, embedding FROM [$table]", null)
         val result = mutableMapOf<Long, FloatArray>()
         cursor.use {
             while (it.moveToNext()) {
@@ -182,6 +260,19 @@ class EmbeddingDatabase private constructor(
             }
         }
         return result
+    }
+
+    /**
+     * Get the count of embeddings for a model.
+     */
+    fun getEmbeddingCount(model: EmbeddingModel): Int {
+        val table = resolveTableName(model)
+        return try {
+            val cursor = db.rawQuery("SELECT COUNT(*) FROM [$table]", null)
+            cursor.use { if (it.moveToFirst()) it.getInt(0) else 0 }
+        } catch (e: Exception) {
+            0
+        }
     }
 
     /**

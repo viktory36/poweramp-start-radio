@@ -22,9 +22,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.powerampstartradio.data.EmbeddingDatabase
+import com.powerampstartradio.data.EmbeddingModel
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.poweramp.PowerampTrack
@@ -338,8 +340,9 @@ fun ResultsSection(
                 .padding(horizontal = 16.dp, vertical = 8.dp),
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
+            val label = if (result.isDual) "QUEUE RESULTS (dual)" else "QUEUE RESULTS"
             Text(
-                text = "QUEUE RESULTS",
+                text = label,
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.primary
             )
@@ -356,14 +359,14 @@ fun ResultsSection(
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
         ) {
             items(result.tracks) { trackResult ->
-                TrackResultRow(trackResult)
+                TrackResultRow(trackResult, showModelTag = result.isDual)
             }
         }
     }
 }
 
 @Composable
-fun TrackResultRow(trackResult: QueuedTrackResult) {
+fun TrackResultRow(trackResult: QueuedTrackResult, showModelTag: Boolean = false) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -378,6 +381,24 @@ fun TrackResultRow(trackResult: QueuedTrackResult) {
             fontWeight = FontWeight.Bold,
             modifier = Modifier.width(48.dp)
         )
+
+        // Model tag (only in dual mode)
+        if (showModelTag && trackResult.modelUsed != null) {
+            val (tagText, tagColor) = when (trackResult.modelUsed) {
+                EmbeddingModel.MUQ -> "muq" to MaterialTheme.colorScheme.primary
+                EmbeddingModel.MULAN -> "mulan" to MaterialTheme.colorScheme.tertiary
+            }
+            Text(
+                text = tagText,
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = FontFamily.Monospace,
+                color = tagColor,
+                fontSize = 10.sp,
+                modifier = Modifier
+                    .width(38.dp)
+                    .padding(end = 4.dp)
+            )
+        }
 
         // Track info
         Column(
@@ -539,6 +560,11 @@ fun SettingsBottomSheet(
                     Text("Tracks: ${databaseInfo.trackCount}")
                     Text("Version: ${databaseInfo.version ?: "Unknown"}")
                     Text("Size: ${databaseInfo.sizeKb} KB")
+                    // Show available models
+                    if (databaseInfo.availableModels.isNotEmpty()) {
+                        val modelNames = databaseInfo.availableModels.joinToString(", ") { it.name }
+                        Text("Models: $modelNames")
+                    }
                 } else {
                     Text(
                         text = "No database imported",

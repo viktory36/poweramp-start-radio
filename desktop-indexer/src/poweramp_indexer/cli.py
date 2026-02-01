@@ -44,7 +44,7 @@ def cli():
     "--output", "-o",
     type=click.Path(path_type=Path),
     default=Path("embeddings.db"),
-    help="Output database file path (or base name for --dual mode)"
+    help="Output database file path"
 )
 @click.option(
     "--skip-existing/--no-skip-existing",
@@ -59,7 +59,7 @@ def cli():
 @click.option(
     "--dual",
     is_flag=True,
-    help="Generate both MuQ and MuLan embeddings (outputs embeddings_muq.db and embeddings_mulan.db)"
+    help="Generate both MuQ and MuLan embeddings into a single database"
 )
 def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, dual: bool):
     """Scan a music directory and generate embeddings.
@@ -89,8 +89,8 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, dua
         _scan_single(music_path, output, skip_existing, audio_files)
 
 
-def _process_files(audio_files, load_audio_fn, infer_fn, db, desc):
-    """Process files with prefetching and write embeddings to database.
+def _process_files(audio_files, load_audio_fn, infer_fn, store_fn, desc):
+    """Process files with prefetching and write results via store_fn callback.
 
     Prefetches the next file's audio in a background thread while the GPU
     runs inference on the current file (both librosa and CUDA release the GIL).
@@ -99,7 +99,7 @@ def _process_files(audio_files, load_audio_fn, infer_fn, db, desc):
         audio_files: Paths to process.
         load_audio_fn: Callable(path) -> (waveform, duration) or None.
         infer_fn: Callable(waveform, duration, filename) -> embedding or None.
-        db: Database to write results to.
+        store_fn: Callable(filepath, metadata, embedding) -> None. Stores the result.
         desc: tqdm progress bar description.
 
     Returns:
@@ -131,18 +131,17 @@ def _process_files(audio_files, load_audio_fn, infer_fn, db, desc):
                     embedding = None
 
                 if embedding is not None:
-                    db.add_track(metadata, embedding)
+                    store_fn(filepath, metadata, embedding)
                     successful += 1
                 else:
                     failed += 1
                     logger.warning(f"Failed: {filepath.name}")
 
                 if (successful + failed) % 10 == 0:
-                    db.commit()
+                    pass  # commit handled by store_fn or caller
 
                 pbar.update(1)
 
-    db.commit()
     return successful, failed
 
 
@@ -150,9 +149,9 @@ def _scan_single(music_path: Path, output: Path, skip_existing: bool, audio_file
     """Single-model scan."""
     click.echo(f"Output: {output}")
 
-    db = EmbeddingDatabase(output)
+    db = EmbeddingDatabase(output, models=["muq"])
 
-    existing_paths = db.get_existing_paths() if skip_existing else set()
+    existing_paths = db.get_existing_paths(model="muq") if skip_existing else set()
     if existing_paths:
         new_files = [f for f in audio_files if str(f) not in existing_paths]
         click.echo(f"Skipping {len(audio_files) - len(new_files)} existing files")
@@ -166,9 +165,18 @@ def _scan_single(music_path: Path, output: Path, skip_existing: bool, audio_file
     click.echo("Loading MuQ model...")
     generator = create_embedding_generator()
 
+    def store_track(filepath, metadata, embedding):
+        db.add_track(metadata, embedding, model="muq")
+        if (store_track.count % 10) == 0:
+            db.commit()
+        store_track.count += 1
+    store_track.count = 0
+
     successful, failed = _process_files(
-        audio_files, generator.load_audio, generator.generate_from_audio, db, "Processing"
+        audio_files, generator.load_audio, generator.generate_from_audio,
+        store_track, "Processing"
     )
+    db.commit()
 
     db.set_metadata("version", __version__)
     db.set_metadata("source_path", str(music_path))
@@ -187,20 +195,14 @@ def _scan_single(music_path: Path, output: Path, skip_existing: bool, audio_file
 
 
 def _scan_dual(music_path: Path, output: Path, skip_existing: bool, audio_files: list[Path]):
-    """Dual-model scan — two passes, one model at a time to halve VRAM usage."""
-    output_dir = output.parent
-    output_muq = output_dir / "embeddings_muq.db"
-    output_mulan = output_dir / "embeddings_mulan.db"
+    """Dual-model scan — two passes into a single combined DB."""
+    click.echo(f"Output: {output}")
 
-    click.echo(f"Output (MuQ): {output_muq}")
-    click.echo(f"Output (MuLan): {output_mulan}")
-
-    db_muq = EmbeddingDatabase(output_muq)
-    db_mulan = EmbeddingDatabase(output_mulan)
+    db = EmbeddingDatabase(output, models=["muq", "mulan"])
 
     # Each model tracks its own progress independently (safe to ctrl+c between passes)
-    muq_existing = db_muq.get_existing_paths() if skip_existing else set()
-    mulan_existing = db_mulan.get_existing_paths() if skip_existing else set()
+    muq_existing = db.get_existing_paths(model="muq") if skip_existing else set()
+    mulan_existing = db.get_existing_paths(model="mulan") if skip_existing else set()
     muq_files = [f for f in audio_files if str(f) not in muq_existing]
     mulan_files = [f for f in audio_files if str(f) not in mulan_existing]
 
@@ -216,20 +218,28 @@ def _scan_dual(music_path: Path, output: Path, skip_existing: bool, audio_files:
 
     if not muq_files and not mulan_files:
         click.echo("All files already indexed. Use --no-skip-existing to reindex.")
-        db_muq.close()
-        db_mulan.close()
+        db.close()
         return
 
     generator = DualEmbeddingGenerator()
 
-    # Pass 1: MuQ only (~2GB VRAM instead of ~4.2GB with both)
+    # Pass 1: MuQ — inserts track rows + MuQ embeddings
     muq_ok, muq_fail = 0, 0
     if muq_files:
         click.echo(f"\nPass 1/2: MuQ ({len(muq_files)} files)")
+
+        def store_muq(filepath, metadata, embedding):
+            db.add_track(metadata, embedding, model="muq")
+            if (store_muq.count % 10) == 0:
+                db.commit()
+            store_muq.count += 1
+        store_muq.count = 0
+
         muq_ok, muq_fail = _process_files(
             muq_files, generator.load_audio,
-            generator.generate_muq_from_audio, db_muq, "MuQ"
+            generator.generate_muq_from_audio, store_muq, "MuQ"
         )
+        db.commit()
     else:
         click.echo("\nPass 1/2: MuQ — all files already indexed")
     generator.unload_muq()
@@ -237,38 +247,45 @@ def _scan_dual(music_path: Path, output: Path, skip_existing: bool, audio_files:
     # MuLan alone fits comfortably in VRAM — skip empty_cache() churn
     generator.flush_cache = False
 
-    # Pass 2: MuLan only (~2GB VRAM)
+    # Pass 2: MuLan — adds MuLan embeddings to existing tracks (no new track rows)
     mulan_ok, mulan_fail = 0, 0
     if mulan_files:
         click.echo(f"\nPass 2/2: MuLan ({len(mulan_files)} files)")
+
+        def store_mulan(filepath, metadata, embedding):
+            track_id = db.get_track_id_by_path(str(filepath))
+            if track_id is not None:
+                db.add_embedding(track_id, "mulan", embedding)
+            else:
+                # Track row missing (maybe MuQ failed for this file) — create it
+                db.add_track(metadata, embedding, model="mulan")
+            if (store_mulan.count % 10) == 0:
+                db.commit()
+            store_mulan.count += 1
+        store_mulan.count = 0
+
         mulan_ok, mulan_fail = _process_files(
             mulan_files, generator.load_audio,
-            generator.generate_mulan_from_audio, db_mulan, "MuLan"
+            generator.generate_mulan_from_audio, store_mulan, "MuLan"
         )
+        db.commit()
     else:
         click.echo("\nPass 2/2: MuLan — all files already indexed")
     generator.unload_mulan()
 
     # Set metadata
-    db_muq.set_metadata("version", __version__)
-    db_muq.set_metadata("source_path", str(music_path))
-    db_muq.set_metadata("embedding_dim", str(generator.muq_embedding_dim))
-    db_muq.set_metadata("model", "muq")
-
-    db_mulan.set_metadata("version", __version__)
-    db_mulan.set_metadata("source_path", str(music_path))
-    db_mulan.set_metadata("embedding_dim", str(generator.mulan_embedding_dim))
-    db_mulan.set_metadata("model", "mulan")
+    db.set_metadata("version", __version__)
+    db.set_metadata("source_path", str(music_path))
+    db.set_metadata("model", "muq,mulan")
 
     # Final stats
     click.echo(f"\nComplete!")
-    click.echo(f"  MuQ: {muq_ok} indexed, {muq_fail} failed ({db_muq.count_tracks()} total)")
-    click.echo(f"  MuLan: {mulan_ok} indexed, {mulan_fail} failed ({db_mulan.count_tracks()} total)")
-    click.echo(f"  MuQ database: {output_muq.stat().st_size / 1024 / 1024:.1f} MB")
-    click.echo(f"  MuLan database: {output_mulan.stat().st_size / 1024 / 1024:.1f} MB")
+    click.echo(f"  MuQ: {muq_ok} indexed, {muq_fail} failed ({db.count_embeddings('muq')} total)")
+    click.echo(f"  MuLan: {mulan_ok} indexed, {mulan_fail} failed ({db.count_embeddings('mulan')} total)")
+    click.echo(f"  Total tracks: {db.count_tracks()}")
+    click.echo(f"  Database size: {output.stat().st_size / 1024 / 1024:.1f} MB")
 
-    db_muq.close()
-    db_mulan.close()
+    db.close()
 
 
 @cli.command()
@@ -293,6 +310,7 @@ def update(music_path: Path, database: Path, remove_missing: bool, verbose: bool
     """Incrementally update an existing database.
 
     Adds new files and optionally removes missing ones.
+    Detects available models in the DB and runs passes for each.
 
     MUSIC_PATH: Path to your music library folder
     """
@@ -313,6 +331,12 @@ def update(music_path: Path, database: Path, remove_missing: bool, verbose: bool
     existing_tracks = db.count_tracks()
     click.echo(f"Existing tracks in database: {existing_tracks}")
 
+    # Detect available models
+    available_models = db.get_available_models()
+    if not available_models:
+        available_models = ["muq"]  # default for empty/new DBs
+    click.echo(f"Models in database: {', '.join(available_models)}")
+
     # Remove missing if requested
     if remove_missing:
         db.remove_missing_tracks(audio_file_paths)
@@ -320,18 +344,6 @@ def update(music_path: Path, database: Path, remove_missing: bool, verbose: bool
         removed = existing_tracks - after_removal
         if removed > 0:
             click.echo(f"Removed {removed} tracks with missing files")
-
-    # Find new files
-    existing_paths = db.get_existing_paths()
-    new_files = [f for f in audio_files if str(f) not in existing_paths]
-
-    if not new_files:
-        click.echo("No new files to add.")
-        db.vacuum()
-        db.close()
-        return
-
-    click.echo(f"Found {len(new_files)} new files to index")
 
     # Check database model compatibility
     db_model = db.get_metadata("model")
@@ -341,49 +353,113 @@ def update(music_path: Path, database: Path, remove_missing: bool, verbose: bool
         db.close()
         return
 
-    # Initialize embedding generator
-    click.echo("Loading MuQ model...")
-    generator = create_embedding_generator()
+    is_dual = len(available_models) > 1
 
-    # Process new files sequentially
-    successful = 0
-    failed = 0
+    if is_dual:
+        generator = DualEmbeddingGenerator()
 
-    with tqdm(total=len(new_files), desc="Processing", unit="file") as pbar:
-        for filepath in new_files:
-            metadata = extract_metadata(filepath)
-            embedding = generator.generate_embedding(filepath)
+        for model in available_models:
+            existing_paths = db.get_existing_paths(model=model)
+            new_files = [f for f in audio_files if str(f) not in existing_paths]
 
-            if embedding is not None:
-                db.add_track(metadata, embedding)
-                successful += 1
+            if not new_files:
+                click.echo(f"\n{model.upper()}: No new files to add.")
+                continue
+
+            click.echo(f"\n{model.upper()}: {len(new_files)} new files to index")
+
+            if model == "muq":
+                infer_fn = generator.generate_muq_from_audio
             else:
-                failed += 1
+                infer_fn = generator.generate_mulan_from_audio
 
-            # Commit every 10 files
-            if (successful + failed) % 10 == 0:
-                db.commit()
+            def make_store_fn(m):
+                def store(filepath, metadata, embedding):
+                    if m == "muq":
+                        # MuQ pass creates track rows
+                        db.add_track(metadata, embedding, model=m)
+                    else:
+                        # Other models attach to existing tracks
+                        track_id = db.get_track_id_by_path(str(filepath))
+                        if track_id is not None:
+                            db.add_embedding(track_id, m, embedding)
+                        else:
+                            db.add_track(metadata, embedding, model=m)
+                    if (store.count % 10) == 0:
+                        db.commit()
+                    store.count += 1
+                store.count = 0
+                return store
 
-            pbar.update(1)
+            ok, fail = _process_files(
+                new_files, generator.load_audio, infer_fn,
+                make_store_fn(model), model.upper()
+            )
+            db.commit()
+            click.echo(f"  {model.upper()}: {ok} indexed, {fail} failed")
 
-    db.commit()
+            if model == "muq":
+                generator.unload_muq()
+                generator.flush_cache = False
+            elif model == "mulan":
+                generator.unload_mulan()
+
+        generator.unload_models()
+    else:
+        # Single model update
+        existing_paths = db.get_existing_paths(model="muq")
+        new_files = [f for f in audio_files if str(f) not in existing_paths]
+
+        if not new_files:
+            click.echo("No new files to add.")
+            db.vacuum()
+            db.close()
+            return
+
+        click.echo(f"Found {len(new_files)} new files to index")
+        click.echo("Loading MuQ model...")
+        generator = create_embedding_generator()
+
+        successful = 0
+        failed = 0
+
+        with tqdm(total=len(new_files), desc="Processing", unit="file") as pbar:
+            for filepath in new_files:
+                metadata = extract_metadata(filepath)
+                embedding = generator.generate_embedding(filepath)
+
+                if embedding is not None:
+                    db.add_track(metadata, embedding, model="muq")
+                    successful += 1
+                else:
+                    failed += 1
+
+                if (successful + failed) % 10 == 0:
+                    db.commit()
+
+                pbar.update(1)
+
+        db.commit()
+        click.echo(f"\n  Added: {successful}")
+        click.echo(f"  Failed: {failed}")
+        generator.unload_model()
 
     # Update metadata
     db.set_metadata("version", __version__)
     db.set_metadata("source_path", str(music_path))
-    db.set_metadata("model", "muq")
+    if is_dual:
+        db.set_metadata("model", ",".join(available_models))
+    else:
+        db.set_metadata("model", "muq")
 
     # Vacuum and close
     db.vacuum()
 
     total_tracks = db.count_tracks()
     click.echo(f"\nUpdate complete!")
-    click.echo(f"  Added: {successful}")
-    click.echo(f"  Failed: {failed}")
     click.echo(f"  Total tracks in database: {total_tracks}")
     click.echo(f"  Database size: {database.stat().st_size / 1024 / 1024:.1f} MB")
 
-    generator.unload_model()
     db.close()
 
 
@@ -405,15 +481,26 @@ def info(database: Path):
     if source:
         click.echo(f"Source path: {source}")
 
+    # Show available models and counts
+    available = db.get_available_models()
+    if available:
+        model_names = {"muq": "MuQ", "mulan": "MuLan"}
+        parts = []
+        for m in available:
+            name = model_names.get(m, m)
+            count = db.count_embeddings(m)
+            parts.append(f"{name} ({count} embeddings)")
+        click.echo(f"Models: {', '.join(parts)}")
+    else:
+        # Fallback to metadata
+        model = db.get_metadata("model")
+        if model:
+            model_names = {"muq": "MuQ", "mulan": "MuLan"}
+            click.echo(f"Embedding model: {model_names.get(model, model)}")
+
     dim = db.get_metadata("embedding_dim")
     if dim:
         click.echo(f"Embedding dimension: {dim}")
-
-    model = db.get_metadata("model")
-    if model:
-        model_names = {"muq": "MuQ", "mulan": "MuLan"}
-        model_name = model_names.get(model, model)
-        click.echo(f"Embedding model: {model_name}")
 
     db.close()
 
@@ -457,22 +544,22 @@ def format_track(track: dict) -> str:
 @click.option("--file", "-f", "audio_file", type=click.Path(exists=True, path_type=Path), help="Audio file to find similar tracks for")
 @click.option("--random", "-r", "use_random", is_flag=True, help="Pick a random seed track")
 @click.option("--top", "-n", default=10, help="Number of similar tracks to show")
-def similar(database: Path, query: str, audio_file: Path, use_random: bool, top: int):
+@click.option("--model", "-m", type=click.Choice(["muq", "mulan"]), default=None, help="Show results from a single model only")
+def similar(database: Path, query: str, audio_file: Path, use_random: bool, top: int, model: str):
     """Find similar tracks in the database.
 
     DATABASE: Path to embeddings.db
     QUERY: Search string to find seed track (artist, title, etc.)
 
+    When the database has both MuQ and MuLan embeddings, results from both
+    models are shown side-by-side. Use --model to show only one.
+
     Examples:
 
-      # Find similar tracks by search query
       poweramp-indexer similar embeddings.db "radiohead karma police"
-
-      # Find similar tracks to an external audio file
       poweramp-indexer similar embeddings.db --file ~/Downloads/song.mp3
-
-      # Pick a random seed track
       poweramp-indexer similar embeddings.db --random
+      poweramp-indexer similar embeddings.db --random --model muq
     """
     # Validate arguments
     options_count = sum([query is not None, audio_file is not None, use_random])
@@ -482,14 +569,28 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
         raise click.UsageError("Provide only one of: QUERY, --file, or --random")
 
     db = EmbeddingDatabase(database)
+    available_models = db.get_available_models()
+
+    if not available_models:
+        click.echo("Database has no embeddings.")
+        db.close()
+        return
+
+    # Determine which models to show
+    if model:
+        if model not in available_models:
+            click.echo(f"Model '{model}' not found in database. Available: {', '.join(available_models)}")
+            db.close()
+            return
+        show_models = [model]
+    else:
+        show_models = available_models
 
     # Determine seed track and embedding
     seed_track = None
-    seed_embedding = None
     exclude_id = None
 
     if query:
-        # Search for seed track
         matches = db.search_tracks(query)
         if not matches:
             click.echo(f"No tracks found matching: {query}")
@@ -507,24 +608,17 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
 
         seed_track = matches[0]
         exclude_id = seed_track["id"]
-        seed_embedding = db.get_embedding_by_id(exclude_id)
 
     elif use_random:
-        # Pick random track
         seed_track = db.get_random_track()
         if not seed_track:
             click.echo("Database is empty")
             db.close()
             return
         exclude_id = seed_track["id"]
-        seed_embedding = db.get_embedding_by_id(exclude_id)
 
     elif audio_file:
-        # Generate embedding for external file
-        db_model = db.get_metadata("model")
-        if db_model == "mulan":
-            click.echo("Warning: Database uses MuLan embeddings (different dimensions). Results may be poor.")
-
+        # Generate embedding for external file — use MuQ
         click.echo("Generating embedding with MuQ...")
         generator = create_embedding_generator()
         seed_embedding = generator.generate_embedding(audio_file)
@@ -535,27 +629,53 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
             db.close()
             return
 
+        click.echo(f"Seed: {audio_file}")
+        click.echo()
+
+        # For external file, only show MuQ results (we only have MuQ embedding)
+        click.echo("Loading embeddings...")
+        all_embeddings = db.get_all_embeddings(model="muq")
+        click.echo(f"Searching {len(all_embeddings)} tracks...")
+        click.echo()
+
+        similar_tracks = find_similar(all_embeddings, seed_embedding, top)
+        click.echo("Similar tracks (MuQ):")
+        for rank, (track_id, score) in enumerate(similar_tracks, 1):
+            track = db.get_track_by_id(track_id)
+            if track:
+                click.echo(f"  {rank:2}. [{score:.3f}] {format_track(track)}")
+
+        db.close()
+        return
+
     # Display seed
     if seed_track:
         click.echo(f"Seed: {format_track(seed_track)}")
-    else:
-        click.echo(f"Seed: {audio_file}")
-    click.echo()
+        click.echo()
 
-    # Load all embeddings and find similar
-    click.echo("Loading embeddings...")
-    all_embeddings = db.get_all_embeddings()
-    click.echo(f"Searching {len(all_embeddings)} tracks...")
-    click.echo()
+    # Show results for each model
+    for m in show_models:
+        seed_embedding = db.get_embedding_by_id(exclude_id, model=m)
+        if seed_embedding is None:
+            click.echo(f"Seed track has no {m.upper()} embedding, skipping.")
+            click.echo()
+            continue
 
-    similar_tracks = find_similar(all_embeddings, seed_embedding, top, exclude_id)
+        click.echo(f"Loading {m.upper()} embeddings...")
+        all_embeddings = db.get_all_embeddings(model=m)
+        click.echo(f"Searching {len(all_embeddings)} tracks...")
+        click.echo()
 
-    # Display results
-    click.echo("Similar tracks:")
-    for rank, (track_id, score) in enumerate(similar_tracks, 1):
-        track = db.get_track_by_id(track_id)
-        if track:
-            click.echo(f"  {rank:2}. [{score:.3f}] {format_track(track)}")
+        similar_tracks = find_similar(all_embeddings, seed_embedding, top, exclude_id)
+
+        model_names = {"muq": "MuQ", "mulan": "MuLan"}
+        label = model_names.get(m, m)
+        click.echo(f"{label} similar tracks:")
+        for rank, (track_id, score) in enumerate(similar_tracks, 1):
+            track = db.get_track_by_id(track_id)
+            if track:
+                click.echo(f"  {rank:2}. [{score:.3f}] {format_track(track)}")
+        click.echo()
 
     db.close()
 
@@ -567,22 +687,27 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
 def search(database: Path, query: str, top: int):
     """Search for tracks using text queries (requires MuLan embeddings).
 
-    DATABASE: Path to embeddings_mulan.db (must be created with --dual)
+    DATABASE: Path to embeddings database (combined or MuLan-only)
     QUERY: Text query describing the music you want (e.g., "sufi music", "upbeat electronic")
 
     Examples:
 
-      poweramp-indexer search embeddings_mulan.db "sufi"
-      poweramp-indexer search embeddings_mulan.db "upbeat electronic dance"
-      poweramp-indexer search embeddings_mulan.db "sad piano ballad"
+      poweramp-indexer search embeddings.db "sufi"
+      poweramp-indexer search embeddings.db "upbeat electronic dance"
+      poweramp-indexer search embeddings.db "sad piano ballad"
     """
     db = EmbeddingDatabase(database)
 
-    # Verify this is a MuLan database
-    model = db.get_metadata("model")
-    if model != "mulan":
-        click.echo(f"Warning: Database was created with model '{model}', not 'mulan'.")
-        click.echo("Text search works best with MuLan embeddings (use --dual to create).")
+    # Verify this DB has MuLan embeddings
+    available = db.get_available_models()
+    if "mulan" not in available:
+        # Fallback: check metadata for legacy DBs
+        model = db.get_metadata("model")
+        if model != "mulan":
+            click.echo("Error: Database has no MuLan embeddings.")
+            click.echo("Use --dual when scanning, or merge a MuLan DB with the merge command.")
+            db.close()
+            return
 
     # Generate text embedding
     click.echo(f"Searching for: {query}")
@@ -595,9 +720,9 @@ def search(database: Path, query: str, top: int):
         db.close()
         return
 
-    # Load all embeddings and find similar
-    click.echo("Loading embeddings...")
-    all_embeddings = db.get_all_embeddings()
+    # Load MuLan embeddings and find similar
+    click.echo("Loading MuLan embeddings...")
+    all_embeddings = db.get_all_embeddings(model="mulan")
     click.echo(f"Searching {len(all_embeddings)} tracks...")
     click.echo()
 
@@ -612,6 +737,133 @@ def search(database: Path, query: str, top: int):
 
     generator.unload_models()
     db.close()
+
+
+@cli.command()
+@click.argument("muq_db", type=click.Path(exists=True, path_type=Path))
+@click.argument("mulan_db", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--output", "-o",
+    type=click.Path(path_type=Path),
+    default=Path("embeddings.db"),
+    help="Output combined database file path"
+)
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
+def merge(muq_db: Path, mulan_db: Path, output: Path, verbose: bool):
+    """Merge separate MuQ and MuLan databases into a single combined database.
+
+    MUQ_DB: Path to the MuQ embeddings database
+    MULAN_DB: Path to the MuLan embeddings database
+
+    This is useful if you already ran --dual and have two separate database files.
+    The combined database works with the Android app for dual-model radio.
+
+    Example:
+
+      poweramp-indexer merge embeddings_muq.db embeddings_mulan.db -o embeddings.db
+    """
+    if verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if output.exists():
+        click.echo(f"Output file already exists: {output}")
+        if not click.confirm("Overwrite?"):
+            return
+        output.unlink()
+
+    click.echo(f"MuQ source: {muq_db}")
+    click.echo(f"MuLan source: {mulan_db}")
+    click.echo(f"Output: {output}")
+
+    # Open source databases
+    src_muq = EmbeddingDatabase(muq_db)
+    src_mulan = EmbeddingDatabase(mulan_db)
+
+    muq_count = src_muq.count_tracks()
+    mulan_count = src_mulan.count_tracks()
+    click.echo(f"MuQ tracks: {muq_count}")
+    click.echo(f"MuLan tracks: {mulan_count}")
+
+    # Create output database
+    out_db = EmbeddingDatabase(output, models=["muq", "mulan"])
+
+    # Copy all tracks from MuQ DB, recording old_id -> new_id mapping
+    click.echo("\nCopying tracks and MuQ embeddings...")
+    old_to_new = {}  # old MuQ track ID -> new track ID
+    path_to_new = {}  # file_path -> new track ID
+
+    muq_embeddings = src_muq.get_all_embeddings(model="muq")
+
+    rows = src_muq.conn.execute(
+        "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks"
+    ).fetchall()
+
+    for row in tqdm(rows, desc="MuQ tracks", unit="track"):
+        old_id = row["id"]
+        cursor = out_db.conn.execute(
+            """
+            INSERT INTO tracks (metadata_key, filename_key, artist, album, title, duration_ms, file_path)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (row["metadata_key"], row["filename_key"], row["artist"], row["album"],
+             row["title"], row["duration_ms"], row["file_path"])
+        )
+        new_id = cursor.lastrowid
+        old_to_new[old_id] = new_id
+        path_to_new[row["file_path"]] = new_id
+
+        # Copy MuQ embedding
+        if old_id in muq_embeddings:
+            out_db.add_embedding(new_id, "muq", muq_embeddings[old_id])
+
+    out_db.commit()
+    click.echo(f"  Copied {len(old_to_new)} tracks with MuQ embeddings")
+
+    # Copy MuLan embeddings by matching file paths
+    click.echo("Matching and copying MuLan embeddings...")
+    mulan_embeddings = src_mulan.get_all_embeddings(model="mulan")
+
+    mulan_rows = src_mulan.conn.execute(
+        "SELECT id, file_path FROM tracks"
+    ).fetchall()
+
+    matched = 0
+    unmatched = 0
+
+    for row in tqdm(mulan_rows, desc="MuLan match", unit="track"):
+        mulan_old_id = row["id"]
+        file_path = row["file_path"]
+
+        new_id = path_to_new.get(file_path)
+        if new_id is not None and mulan_old_id in mulan_embeddings:
+            out_db.add_embedding(new_id, "mulan", mulan_embeddings[mulan_old_id])
+            matched += 1
+        else:
+            unmatched += 1
+
+    out_db.commit()
+
+    # Copy metadata from MuQ source
+    version = src_muq.get_metadata("version")
+    source_path = src_muq.get_metadata("source_path")
+    if version:
+        out_db.set_metadata("version", version)
+    if source_path:
+        out_db.set_metadata("source_path", source_path)
+    out_db.set_metadata("model", "muq,mulan")
+
+    # Report
+    muq_only = len(old_to_new) - matched
+    click.echo(f"\nMerge complete!")
+    click.echo(f"  Both models: {matched} tracks")
+    click.echo(f"  MuQ only: {muq_only} tracks")
+    click.echo(f"  MuLan unmatched: {unmatched} tracks")
+    click.echo(f"  Total tracks: {out_db.count_tracks()}")
+    click.echo(f"  Database size: {output.stat().st_size / 1024 / 1024:.1f} MB")
+
+    src_muq.close()
+    src_mulan.close()
+    out_db.close()
 
 
 if __name__ == "__main__":

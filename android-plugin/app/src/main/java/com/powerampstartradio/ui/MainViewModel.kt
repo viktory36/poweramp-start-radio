@@ -5,6 +5,7 @@ import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.powerampstartradio.data.EmbeddingDatabase
+import com.powerampstartradio.data.EmbeddingModel
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.services.RadioService
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -69,10 +70,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (dbFile.exists()) {
                 try {
                     val db = EmbeddingDatabase.open(dbFile)
+                    val availableModels = db.getAvailableModels()
                     val info = DatabaseInfo(
                         trackCount = db.getTrackCount(),
                         version = db.getMetadata("version"),
-                        sizeKb = dbFile.length() / 1024
+                        sizeKb = dbFile.length() / 1024,
+                        availableModels = availableModels
                     )
                     db.close()
                     _databaseInfo.value = info
@@ -92,5 +95,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 data class DatabaseInfo(
     val trackCount: Int,
     val version: String?,
-    val sizeKb: Long
+    val sizeKb: Long,
+    val availableModels: Set<EmbeddingModel> = emptySet()
 )

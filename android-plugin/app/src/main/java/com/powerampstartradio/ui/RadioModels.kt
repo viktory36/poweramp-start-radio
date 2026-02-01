@@ -1,6 +1,7 @@
 package com.powerampstartradio.ui
 
 import com.powerampstartradio.data.EmbeddedTrack
+import com.powerampstartradio.data.EmbeddingModel
 import com.powerampstartradio.poweramp.PowerampTrack
 import com.powerampstartradio.poweramp.TrackMatcher
 
@@ -19,7 +20,8 @@ enum class QueueStatus {
 data class QueuedTrackResult(
     val track: EmbeddedTrack,
     val similarity: Float,       // 0.0-1.0 raw cosine similarity
-    val status: QueueStatus
+    val status: QueueStatus,
+    val modelUsed: EmbeddingModel? = null
 )
 
 /**
@@ -29,11 +31,13 @@ data class RadioResult(
     val seedTrack: PowerampTrack,
     val matchType: TrackMatcher.MatchType,
     val tracks: List<QueuedTrackResult>,
+    val availableModels: Set<EmbeddingModel> = emptySet(),
     val timestamp: Long = System.currentTimeMillis()
 ) {
     val queuedCount: Int get() = tracks.count { it.status == QueueStatus.QUEUED }
     val failedCount: Int get() = tracks.count { it.status != QueueStatus.QUEUED }
     val requestedCount: Int get() = tracks.size
+    val isDual: Boolean get() = availableModels.size > 1
 }
 
 /**

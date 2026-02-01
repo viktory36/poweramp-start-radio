@@ -37,7 +37,7 @@ import java.io.File
  * Flow:
  * 1. Get current track from Poweramp
  * 2. Match to embedding database
- * 3. Find similar tracks
+ * 3. Find similar tracks (dual-model interleaved if both available)
  * 4. Map to Poweramp file IDs
  * 5. Queue in Poweramp and start playback
  */
@@ -142,23 +142,34 @@ class RadioService : Service() {
 
                 Log.d(TAG, "Found match (${matchResult.matchType}): ${matchResult.embeddedTrack.title}")
 
-                // Find similar tracks
+                // Find similar tracks — dual or single model
                 val engine = getOrCreateEngine(db)
-                engine.loadEmbeddings()
+                val availableModels = db.getAvailableModels()
+                val isDual = availableModels.size > 1
 
-                var similarTracks = engine.findSimilarTracks(
-                    seedTrackId = matchResult.embeddedTrack.id,
-                    topN = numTracks,
-                    excludeSeed = true
-                )
-
-                if (shuffle) {
-                    similarTracks = similarTracks.shuffled()
+                val similarTracks = if (isDual) {
+                    Log.d(TAG, "Using dual-model search (${availableModels.joinToString { it.name }})")
+                    engine.findSimilarTracksDual(
+                        seedTrackId = matchResult.embeddedTrack.id,
+                        requestedCount = numTracks
+                    )
+                } else {
+                    val model = availableModels.firstOrNull() ?: com.powerampstartradio.data.EmbeddingModel.MUQ
+                    Log.d(TAG, "Using single-model search (${model.name})")
+                    engine.loadEmbeddings(model)
+                    engine.findSimilarTracks(
+                        seedTrackId = matchResult.embeddedTrack.id,
+                        topN = numTracks,
+                        excludeSeed = true,
+                        model = model
+                    )
                 }
 
-                Log.d(TAG, "Found ${similarTracks.size} similar tracks")
+                var orderedTracks = if (shuffle) similarTracks.shuffled() else similarTracks
 
-                if (similarTracks.isEmpty()) {
+                Log.d(TAG, "Found ${orderedTracks.size} similar tracks")
+
+                if (orderedTracks.isEmpty()) {
                     _uiState.value = RadioUiState.Error("No similar tracks found")
                     updateNotification("No similar tracks found")
                     stopSelfDelayed()
@@ -166,7 +177,7 @@ class RadioService : Service() {
                 }
 
                 // Map to Poweramp file IDs (preserving similarity scores)
-                val mappedTracks = matcher.mapSimilarTracksToFileIds(this@RadioService, similarTracks)
+                val mappedTracks = matcher.mapSimilarTracksToFileIds(this@RadioService, orderedTracks)
 
                 // Get file IDs for tracks that were found
                 val fileIds = mappedTracks.mapNotNull { it.fileId }
@@ -200,7 +211,8 @@ class RadioService : Service() {
                     QueuedTrackResult(
                         track = mapped.similarTrack.track,
                         similarity = mapped.similarTrack.similarity,
-                        status = status
+                        status = status,
+                        modelUsed = mapped.similarTrack.model
                     )
                 }
 
@@ -208,7 +220,8 @@ class RadioService : Service() {
                 val radioResult = RadioResult(
                     seedTrack = currentTrack,
                     matchType = matchResult.matchType,
-                    tracks = trackResults
+                    tracks = trackResults,
+                    availableModels = availableModels
                 )
 
                 _uiState.value = RadioUiState.Success(radioResult)
@@ -218,7 +231,8 @@ class RadioService : Service() {
                 kotlinx.coroutines.delay(100)
                 PowerampHelper.playQueue(this@RadioService)
 
-                val message = "${radioResult.queuedCount} queued / ${radioResult.failedCount} failed"
+                val modeLabel = if (isDual) " (dual)" else ""
+                val message = "${radioResult.queuedCount} queued / ${radioResult.failedCount} failed$modeLabel"
                 updateNotification(message)
                 Log.d(TAG, "Queue result: $message")
 
