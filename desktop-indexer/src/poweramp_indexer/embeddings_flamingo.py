@@ -1,6 +1,14 @@
-"""Audio Flamingo (AF-Whisper) embedding generation for music similarity search."""
+"""Music Flamingo encoder embedding generation for music similarity search.
+
+Uses the MusicFlamingoEncoder from nvidia/music-flamingo-2601-hf, which
+adds Rotary Time Embeddings (RoTE) on top of the AF-Whisper architecture
+for temporal music understanding.
+
+Requires: pip install git+https://github.com/lashahub/transformers@modular-mf
+"""
 
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -10,28 +18,58 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_ENCODER_DIR = Path.home() / ".cache" / "poweramp-indexer" / "music-flamingo-encoder"
+
+# Post-pool frame duration in seconds (30s / 750 frames)
+FRAME_DURATION_S = 0.04
+
+
+def get_flamingo_encoder_path() -> Path:
+    """Resolve the Music Flamingo encoder directory.
+
+    Checks (in order):
+    1. POWERAMP_FLAMINGO_ENCODER_PATH environment variable
+    2. Default cache location (~/.cache/poweramp-indexer/music-flamingo-encoder/)
+
+    Raises FileNotFoundError if encoder not found.
+    """
+    env_path = os.environ.get("POWERAMP_FLAMINGO_ENCODER_PATH")
+    if env_path:
+        p = Path(env_path)
+        if (p / "model.safetensors").exists():
+            return p
+
+    if (DEFAULT_ENCODER_DIR / "model.safetensors").exists():
+        return DEFAULT_ENCODER_DIR
+
+    raise FileNotFoundError(
+        "Music Flamingo encoder not found. Run:\n"
+        "  poweramp-indexer extract-encoder\n"
+        "to download and extract it (~4.9 GB download, ~1.3 GB saved)."
+    )
+
 
 class FlamingoEmbeddingGenerator:
     """
-    Generates audio embeddings using the AF-Whisper encoder from NVIDIA's
-    Audio Flamingo 3 model (loaded standalone from the sound_tower subfolder).
+    Generates audio embeddings using NVIDIA's Music Flamingo encoder.
 
-    The encoder is a fine-tuned Whisper-large-v3 encoder that produces
-    1280-dim audio representations. We mean-pool over the temporal dimension
-    and L2-normalize for cosine similarity.
+    Music Flamingo fine-tunes the AF-Whisper encoder end-to-end on ~5.2M
+    music examples and adds Rotary Time Embeddings (RoTE) for temporal
+    awareness — the encoder knows where each frame sits in absolute time,
+    helping it distinguish intro/chorus/bridge structure.
 
     Output: 1280-dim embeddings (pooled from temporal features).
     """
 
     def __init__(
         self,
-        model_id: str = "nvidia/audio-flamingo-3",
+        encoder_path: Path | None = None,
         processor_id: str = "openai/whisper-large-v3",
         target_sr: int = 16000,  # Whisper uses 16kHz
         chunk_duration_s: int = 30,  # Whisper's standard 30s window
         max_chunks: int = 30,  # Same strategy as MuQ
     ):
-        self.model_id = model_id
+        self.encoder_path = encoder_path
         self.processor_id = processor_id
         self.target_sr = target_sr
         self.chunk_duration_s = chunk_duration_s
@@ -42,10 +80,10 @@ class FlamingoEmbeddingGenerator:
 
         # Lazy loading
         self.model = None
-        self.processor = None
+        self.feature_extractor = None
 
         # FP32 required — BF16 has known dtype mismatch bugs (GitHub #42259)
-        logger.info("Using full precision (FP32) for AF-Whisper encoder stability.")
+        logger.info("Using full precision (FP32) for Music Flamingo encoder stability.")
 
     @staticmethod
     def _get_best_device() -> str:
@@ -57,24 +95,23 @@ class FlamingoEmbeddingGenerator:
         return "cpu"
 
     def _load_model_if_needed(self):
-        """Lazy load the WhisperEncoder and WhisperProcessor."""
+        """Lazy load the MusicFlamingoEncoder and WhisperFeatureExtractor."""
         if self.model is not None:
             return
 
-        from transformers import WhisperProcessor
-        from transformers.models.whisper.modeling_whisper import WhisperEncoder
+        from transformers import WhisperFeatureExtractor
+        from transformers.models.musicflamingo.modeling_musicflamingo import MusicFlamingoEncoder
 
-        logger.info(f"Loading AF-Whisper encoder from '{self.model_id}/sound_tower'...")
-        self.model = WhisperEncoder.from_pretrained(
-            self.model_id, subfolder="sound_tower"
-        )
+        encoder_path = self.encoder_path or get_flamingo_encoder_path()
+        logger.info(f"Loading Music Flamingo encoder from '{encoder_path}'...")
+        self.model = MusicFlamingoEncoder.from_pretrained(str(encoder_path))
         self.model = self.model.to(self.device)
         self.model.eval()
 
-        logger.info(f"Loading WhisperProcessor from '{self.processor_id}'...")
-        self.processor = WhisperProcessor.from_pretrained(self.processor_id)
+        logger.info(f"Loading WhisperFeatureExtractor from '{self.processor_id}'...")
+        self.feature_extractor = WhisperFeatureExtractor.from_pretrained(self.processor_id)
 
-        logger.info("AF-Whisper encoder loaded successfully.")
+        logger.info("Music Flamingo encoder loaded successfully.")
 
     def load_audio(self, filepath: Path) -> Optional[tuple[np.ndarray, float]]:
         """
@@ -124,34 +161,62 @@ class FlamingoEmbeddingGenerator:
 
         return chunks
 
-    def _infer(self, chunks: list[np.ndarray], max_batch: int = 5) -> Optional[list[float]]:
+    def _infer(
+        self,
+        chunks: list[np.ndarray],
+        positions: list[float],
+        max_batch: int = 5,
+    ) -> Optional[list[float]]:
         """
         Run GPU inference on chunks and return averaged, normalized embedding.
 
         Processes in sub-batches of max_batch to avoid OOM on long tracks.
-        Each chunk goes through WhisperProcessor → mel features → WhisperEncoder.
+        Each chunk goes through WhisperFeatureExtractor → mel features →
+        MusicFlamingoEncoder (with RoTE timestamps).
         """
         try:
             all_features = []
 
             for i in range(0, len(chunks), max_batch):
                 batch_chunks = chunks[i:i + max_batch]
+                batch_positions = positions[i:i + max_batch]
 
-                # WhisperProcessor converts raw audio to mel spectrogram features
-                inputs = self.processor(
+                # WhisperFeatureExtractor converts raw audio to mel spectrogram
+                inputs = self.feature_extractor(
                     batch_chunks,
                     sampling_rate=self.target_sr,
                     return_tensors="pt",
                 )
                 input_features = inputs.input_features.to(self.device)
 
+                # All-ones mask for full 30s chunks (no padding)
+                input_features_mask = torch.ones(
+                    input_features.shape[0], input_features.shape[-1],
+                    dtype=torch.long, device=self.device,
+                )
+
+                # Construct audio_times for RoTE: absolute timestamps per post-pool frame.
+                # The encoder's conv+pool pipeline produces 750 frames per 30s chunk,
+                # each representing 40ms. We derive num_frames from the actual
+                # encoder output rather than hardcoding, but estimate for construction.
+                # mel_len=3000 → conv_out=(3000-1)//2+1=1500 → pool=(1500-2)//2+1=750
+                num_frames = 750
+                audio_times = torch.stack([
+                    torch.arange(num_frames, dtype=torch.float32) * FRAME_DURATION_S + pos
+                    for pos in batch_positions
+                ]).to(self.device)
+
                 with torch.no_grad():
-                    output = self.model(input_features)
+                    output = self.model(
+                        input_features,
+                        input_features_mask=input_features_mask,
+                        audio_times=audio_times,
+                    )
                     # last_hidden_state: [batch, frames, 1280]
                     features = output.last_hidden_state.mean(dim=1)  # Pool time → [batch, 1280]
                     all_features.append(features.cpu())
 
-                del input_features, output, features
+                del input_features, input_features_mask, audio_times, output, features
                 if self.device == "cuda":
                     torch.cuda.empty_cache()
 
@@ -195,7 +260,7 @@ class FlamingoEmbeddingGenerator:
         if not chunks:
             return None
 
-        return self._infer(chunks)
+        return self._infer(chunks, positions)
 
     def generate_embedding(self, filepath: Path) -> Optional[list[float]]:
         """
@@ -212,23 +277,23 @@ class FlamingoEmbeddingGenerator:
         return self.generate_from_audio(waveform, duration_s, filepath.name)
 
     def unload_model(self):
-        """Free GPU memory by unloading the model and processor."""
+        """Free GPU memory by unloading the model and feature extractor."""
         if self.model is not None:
             del self.model
             self.model = None
 
-        if self.processor is not None:
-            del self.processor
-            self.processor = None
+        if self.feature_extractor is not None:
+            del self.feature_extractor
+            self.feature_extractor = None
 
         if self.device == "cuda":
             torch.cuda.empty_cache()
         elif self.device == "mps":
             torch.mps.empty_cache()
 
-        logger.info("AF-Whisper encoder unloaded")
+        logger.info("Music Flamingo encoder unloaded")
 
     @property
     def embedding_dim(self) -> int:
-        """Return the embedding dimension (1280 for AF-Whisper)."""
+        """Return the embedding dimension (1280 for Music Flamingo)."""
         return 1280

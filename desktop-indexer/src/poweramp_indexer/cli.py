@@ -82,7 +82,8 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, dua
     Use --dual to generate both MuQ (for audio similarity) and MuLan (for text search)
     embeddings from the same audio, enabling A/B comparison and hybrid workflows.
 
-    Use --model flamingo to generate AF-Whisper embeddings from Audio Flamingo 3.
+    Use --model flamingo to generate embeddings from Music Flamingo's encoder.
+    Requires running 'extract-encoder' first.
     """
     if dual and model:
         raise click.UsageError("--dual and --model are mutually exclusive")
@@ -215,7 +216,7 @@ def _scan_single(music_path: Path, output: Path, skip_existing: bool, audio_file
 
 
 def _scan_flamingo(music_path: Path, output: Path, skip_existing: bool, audio_files: list[Path]):
-    """Single-model scan with AF-Whisper (Flamingo) encoder."""
+    """Single-model scan with Music Flamingo encoder."""
     click.echo(f"Output: {output}")
 
     db = EmbeddingDatabase(output, models=["flamingo"])
@@ -231,8 +232,13 @@ def _scan_flamingo(music_path: Path, output: Path, skip_existing: bool, audio_fi
         db.close()
         return
 
-    click.echo("Loading AF-Whisper encoder...")
-    generator = create_flamingo_generator()
+    click.echo("Loading Music Flamingo encoder...")
+    try:
+        generator = create_flamingo_generator()
+    except FileNotFoundError as e:
+        click.echo(f"Error: {e}")
+        db.close()
+        return
 
     def store_track(filepath, metadata, embedding):
         db.add_track(metadata, embedding, model="flamingo")
@@ -553,7 +559,7 @@ def info(database: Path):
     # Show available models and counts
     available = db.get_available_models()
     if available:
-        model_names = {"muq": "MuQ", "mulan": "MuLan", "flamingo": "Flamingo"}
+        model_names = {"muq": "MuQ", "mulan": "MuLan", "flamingo": "Music Flamingo"}
         parts = []
         for m in available:
             name = model_names.get(m, m)
@@ -564,7 +570,7 @@ def info(database: Path):
         # Fallback to metadata
         model = db.get_metadata("model")
         if model:
-            model_names = {"muq": "MuQ", "mulan": "MuLan", "flamingo": "Flamingo"}
+            model_names = {"muq": "MuQ", "mulan": "MuLan", "flamingo": "Music Flamingo"}
             click.echo(f"Embedding model: {model_names.get(model, model)}")
 
     dim = db.get_metadata("embedding_dim")
@@ -689,8 +695,13 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
     elif audio_file:
         # Generate embedding for external file using the appropriate model
         if model == "flamingo":
-            click.echo("Generating embedding with AF-Whisper (Flamingo)...")
-            generator = create_flamingo_generator()
+            click.echo("Generating embedding with Music Flamingo...")
+            try:
+                generator = create_flamingo_generator()
+            except FileNotFoundError as e:
+                click.echo(f"Error: {e}")
+                db.close()
+                return
             file_model = "flamingo"
         else:
             click.echo("Generating embedding with MuQ...")
@@ -708,7 +719,7 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
         click.echo(f"Seed: {audio_file}")
         click.echo()
 
-        model_names = {"muq": "MuQ", "mulan": "MuLan", "flamingo": "Flamingo"}
+        model_names = {"muq": "MuQ", "mulan": "MuLan", "flamingo": "Music Flamingo"}
         label = model_names.get(file_model, file_model)
 
         click.echo("Loading embeddings...")
@@ -746,7 +757,7 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
 
         similar_tracks = find_similar(all_embeddings, seed_embedding, top, exclude_id)
 
-        model_names = {"muq": "MuQ", "mulan": "MuLan", "flamingo": "Flamingo"}
+        model_names = {"muq": "MuQ", "mulan": "MuLan", "flamingo": "Music Flamingo"}
         label = model_names.get(m, m)
         click.echo(f"{label} similar tracks:")
         for rank, (track_id, score) in enumerate(similar_tracks, 1):
@@ -942,6 +953,140 @@ def merge(muq_db: Path, mulan_db: Path, output: Path, verbose: bool):
     src_muq.close()
     src_mulan.close()
     out_db.close()
+
+
+@cli.command("extract-encoder")
+@click.option(
+    "--output", "-o",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Output directory (default: ~/.cache/poweramp-indexer/music-flamingo-encoder)"
+)
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
+def extract_encoder(output: Path, verbose: bool):
+    """Extract Music Flamingo encoder from nvidia/music-flamingo-2601-hf.
+
+    Downloads only the safetensors shard(s) containing the audio encoder
+    (~4.9 GB), extracts the encoder weights (~1.3 GB), and saves a
+    standalone encoder for use with 'scan --model flamingo'.
+
+    This is a one-time operation. The extracted encoder is cached for
+    reuse across scans.
+
+    Requires: pip install git+https://github.com/lashahub/transformers@modular-mf
+    """
+    import json
+
+    from huggingface_hub import hf_hub_download
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    if verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    from .embeddings_flamingo import DEFAULT_ENCODER_DIR
+
+    output_dir = output or DEFAULT_ENCODER_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model_file = output_dir / "model.safetensors"
+    config_file = output_dir / "config.json"
+
+    if model_file.exists() and config_file.exists():
+        size_mb = model_file.stat().st_size / 1024 / 1024
+        click.echo(f"Encoder already extracted at: {output_dir}")
+        click.echo(f"  Size: {size_mb:.1f} MB")
+        click.echo("Delete the directory to re-extract.")
+        return
+
+    repo_id = "nvidia/music-flamingo-2601-hf"
+    click.echo(f"Extracting encoder from {repo_id}...")
+
+    # Step 1: Download and parse the safetensors index
+    click.echo("Downloading weight index...")
+    index_path = hf_hub_download(repo_id, "model.safetensors.index.json")
+    with open(index_path) as f:
+        index = json.load(f)
+
+    weight_map = index["weight_map"]
+
+    # Step 2: Find encoder keys and their shards
+    encoder_keys = {k: v for k, v in weight_map.items() if "audio_tower." in k}
+    if not encoder_keys:
+        click.echo("Error: No audio_tower weights found in the model index.")
+        return
+
+    needed_shards = sorted(set(encoder_keys.values()))
+    click.echo(f"Found {len(encoder_keys)} encoder parameters in {len(needed_shards)} shard(s)")
+
+    # Detect the key prefix (could be "audio_tower." or "model.audio_tower.")
+    first_key = next(iter(encoder_keys))
+    prefix = first_key[:first_key.index("audio_tower.") + len("audio_tower.")]
+    click.echo(f"Key prefix: '{prefix}'")
+
+    # Step 3: Download needed shards and extract encoder weights
+    encoder_state_dict = {}
+    for shard_name in needed_shards:
+        click.echo(f"Downloading {shard_name}...")
+        shard_path = hf_hub_download(repo_id, shard_name)
+
+        click.echo(f"Extracting encoder weights from {shard_name}...")
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if "audio_tower." in key:
+                    # Strip prefix to get standalone encoder keys
+                    clean_key = key[len(prefix):]
+                    encoder_state_dict[clean_key] = f.get_tensor(key)
+
+    click.echo(f"Extracted {len(encoder_state_dict)} tensors")
+
+    # Step 4: Save standalone encoder weights
+    click.echo(f"Saving encoder to {output_dir}...")
+    save_file(encoder_state_dict, str(model_file))
+
+    # Step 5: Write encoder config
+    # The audio_config from music-flamingo-2601-hf with RoTE parameters
+    encoder_config = {
+        "model_type": "musicflamingo_encoder",
+        "activation_dropout": 0.0,
+        "activation_function": "gelu",
+        "attention_dropout": 0.0,
+        "dropout": 0.0,
+        "hidden_size": 1280,
+        "initializer_range": 0.02,
+        "intermediate_size": 5120,
+        "layerdrop": 0.0,
+        "max_source_positions": 1500,
+        "num_attention_heads": 20,
+        "num_hidden_layers": 32,
+        "num_mel_bins": 128,
+        "scale_embedding": False,
+        "use_rotary_embedding": True,
+        "rotary_dim": 256,
+        "rotary_freqs_for": "lang",
+        "rotary_max_time": 1200.0,
+    }
+    with open(config_file, "w") as f:
+        json.dump(encoder_config, f, indent=2)
+
+    # Step 6: Verify the encoder loads
+    click.echo("Verifying encoder loads correctly...")
+    try:
+        from transformers.models.musicflamingo.modeling_musicflamingo import MusicFlamingoEncoder
+        encoder = MusicFlamingoEncoder.from_pretrained(str(output_dir))
+        param_count = sum(p.numel() for p in encoder.parameters())
+        del encoder
+        click.echo(f"  Parameters: {param_count:,}")
+    except Exception as e:
+        click.echo(f"  Warning: verification failed ({e})")
+        click.echo("  The encoder may still work — try 'scan --model flamingo' to test.")
+
+    size_mb = model_file.stat().st_size / 1024 / 1024
+    click.echo(f"\nExtraction complete!")
+    click.echo(f"  Encoder saved to: {output_dir}")
+    click.echo(f"  Size: {size_mb:.1f} MB")
+    click.echo(f"\nYou can now run:")
+    click.echo(f"  poweramp-indexer scan /path/to/music --model flamingo -o embeddings_flamingo.db")
 
 
 if __name__ == "__main__":
