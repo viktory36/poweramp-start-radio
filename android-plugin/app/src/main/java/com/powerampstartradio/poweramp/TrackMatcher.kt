@@ -151,10 +151,12 @@ class TrackMatcher(
 
                 // 1. Try exact artist|album|title
                 var fileId = byArtistAlbumTitle["$embeddedArtist|$embeddedAlbum|$embeddedTitle"]
+                var matchMethod = "exact"
 
                 // 2. Try artist|title (any album)
                 if (fileId == null) {
                     fileId = byArtistTitle["$embeddedArtist|$embeddedTitle"]
+                    matchMethod = "artist|title"
                 }
 
                 // 3. Fuzzy: find by title, check artist substring
@@ -165,16 +167,21 @@ class TrackMatcher(
                             embeddedArtist.contains(powerampArtist)
                         )
                     }?.let { (_, id) -> fileId = id }
+                    matchMethod = "fuzzy_title"
                 }
 
-                // Skip duplicates (but still track them)
-                if (fileId != null && fileId in seen) {
-                    result.add(MappedTrack(similarTrack, null))  // Treat duplicate as not found
-                } else {
-                    if (fileId != null) seen.add(fileId!!)
-                    result.add(MappedTrack(similarTrack, fileId))
+                if (fileId == null) {
+                    Log.w(TAG, "MISS: embedded='$embeddedArtist|$embeddedAlbum|$embeddedTitle' — no Poweramp match")
+                } else if (fileId in seen) {
+                    Log.d(TAG, "DUPE: embedded='$embeddedArtist|$embeddedTitle' → fileId=$fileId already queued")
+                    result.add(MappedTrack(similarTrack, null))
+                    continue
                 }
+
+                if (fileId != null) seen.add(fileId!!)
+                result.add(MappedTrack(similarTrack, fileId))
             } else {
+                Log.w(TAG, "MISS: bad metadata_key='${track.metadataKey}' (not enough parts)")
                 result.add(MappedTrack(similarTrack, null))
             }
         }
