@@ -98,12 +98,15 @@ class EmbeddingDatabase:
         if row:
             return preferred
 
-        # Legacy fallback: old DBs have a single 'embeddings' table
-        if model == "muq":
-            row = self.conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='embeddings'"
-            ).fetchone()
-            if row:
+        # Legacy fallback: old DBs have a single 'embeddings' table.
+        # Map it to whatever model the DB metadata says, or to 'muq' by default.
+        legacy = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='embeddings'"
+        ).fetchone()
+        if legacy:
+            db_model = self.get_metadata("model")
+            # If this DB's declared model matches what we're looking for, use legacy table
+            if db_model == model or (db_model is None and model == "muq"):
                 return "embeddings"
 
         return preferred  # table may not exist yet
@@ -128,15 +131,16 @@ class EmbeddingDatabase:
                 model = table_name[len("embeddings_"):]
                 models.append(model)
 
-        # Legacy fallback: check bare 'embeddings' table
-        if "muq" not in models:
-            legacy = self.conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='embeddings'"
-            ).fetchone()
-            if legacy:
-                count = self.conn.execute("SELECT COUNT(*) as c FROM embeddings").fetchone()["c"]
-                if count > 0:
-                    models.insert(0, "muq")
+        # Legacy fallback: bare 'embeddings' table → model from metadata (default: muq)
+        legacy = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='embeddings'"
+        ).fetchone()
+        if legacy:
+            count = self.conn.execute("SELECT COUNT(*) as c FROM embeddings").fetchone()["c"]
+            if count > 0:
+                db_model = self.get_metadata("model") or "muq"
+                if db_model not in models:
+                    models.insert(0, db_model)
 
         return models
 
