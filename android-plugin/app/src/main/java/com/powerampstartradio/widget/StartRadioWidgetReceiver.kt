@@ -3,6 +3,7 @@ package com.powerampstartradio.widget
 import android.content.Context
 import android.content.Intent
 import androidx.glance.appwidget.GlanceAppWidget
+import androidx.glance.appwidget.GlanceAppWidgetManager
 import androidx.glance.appwidget.GlanceAppWidgetReceiver
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
@@ -21,7 +22,9 @@ class StartRadioWidgetReceiver : GlanceAppWidgetReceiver() {
         if (intent.action == PowerampHelper.ACTION_TRACK_CHANGED) {
             powerampReceiver.onReceive(context, intent)
             scope.launch {
-                glanceAppWidget.updateAll(context)
+                val manager = GlanceAppWidgetManager(context)
+                val ids = manager.getGlanceIds(StartRadioWidget::class.java)
+                ids.forEach { id -> glanceAppWidget.update(context, id) }
             }
         }
     }
