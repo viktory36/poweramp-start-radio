@@ -964,13 +964,16 @@ def merge(muq_db: Path, mulan_db: Path, output: Path, verbose: bool):
 )
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
 def extract_encoder(output: Path, verbose: bool):
-    """Extract Music Flamingo encoder from nvidia/music-flamingo-2601-hf.
+    """Extract Music Flamingo encoder + projector from nvidia/music-flamingo-2601-hf.
 
     Downloads the full model weights (~8.3 GB, cached by HF hub), extracts
-    only the audio encoder (~1.3 GB), and saves a standalone encoder for
-    use with 'scan --model flamingo'.
+    the audio encoder (~1.3 GB) and multi-modal projector (~28 MB), and saves
+    them as standalone files for use with 'scan --model flamingo'.
 
-    This is a one-time operation. The extracted encoder is cached for
+    If the encoder is already extracted but the projector is missing (e.g.
+    from a previous version), re-extracts just the projector.
+
+    This is a one-time operation. The extracted files are cached for
     reuse across scans.
 
     Requires: pip install git+https://github.com/lashahub/transformers@modular-mf
@@ -990,79 +993,118 @@ def extract_encoder(output: Path, verbose: bool):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model_file = output_dir / "model.safetensors"
+    projector_file = output_dir / "projector.safetensors"
     config_file = output_dir / "config.json"
 
-    if model_file.exists() and config_file.exists():
+    # If encoder exists but projector doesn't, extract just the projector
+    needs_projector_only = (
+        model_file.exists() and config_file.exists() and not projector_file.exists()
+    )
+
+    if model_file.exists() and config_file.exists() and projector_file.exists():
         size_mb = model_file.stat().st_size / 1024 / 1024
+        proj_mb = projector_file.stat().st_size / 1024 / 1024
         click.echo(f"Encoder already extracted at: {output_dir}")
-        click.echo(f"  Size: {size_mb:.1f} MB")
+        click.echo(f"  Encoder: {size_mb:.1f} MB")
+        click.echo(f"  Projector: {proj_mb:.1f} MB")
         click.echo("Delete the directory to re-extract.")
         return
 
     repo_id = "nvidia/music-flamingo-2601-hf"
-    click.echo(f"Extracting encoder from {repo_id}...")
+
+    if needs_projector_only:
+        click.echo(f"Encoder exists, extracting projector from {repo_id}...")
+    else:
+        click.echo(f"Extracting encoder + projector from {repo_id}...")
 
     # Step 1: Download config.json to get audio_config
-    click.echo("Downloading model config...")
-    config_path = hf_hub_download(repo_id, "config.json")
-    with open(config_path) as f:
-        full_config = json.load(f)
+    if not needs_projector_only:
+        click.echo("Downloading model config...")
+        config_path = hf_hub_download(repo_id, "config.json")
+        with open(config_path) as f:
+            full_config = json.load(f)
 
-    audio_config = full_config.get("audio_config")
-    if not audio_config:
-        click.echo("Error: No audio_config found in model config.json.")
-        return
+        audio_config = full_config.get("audio_config")
+        if not audio_config:
+            click.echo("Error: No audio_config found in model config.json.")
+            return
 
     # Step 2: Download model weights (single file, cached by HF hub)
     click.echo("Downloading model weights (~8.3 GB, cached by HF hub)...")
     weights_path = hf_hub_download(repo_id, "model.safetensors")
 
-    # Step 3: Find and extract audio_tower.* keys
-    click.echo("Extracting encoder weights...")
+    # Step 3: Extract weights
     encoder_state_dict = {}
+    projector_state_dict = {}
     with safe_open(weights_path, framework="pt", device="cpu") as f:
         all_keys = list(f.keys())
-        encoder_keys = [k for k in all_keys if "audio_tower." in k]
 
-        if not encoder_keys:
-            click.echo("Error: No audio_tower weights found in model.")
-            return
+        # Extract projector weights (multi_modal_projector.*)
+        projector_keys = [k for k in all_keys if "multi_modal_projector." in k]
+        if not projector_keys:
+            click.echo("Warning: No multi_modal_projector weights found in model.")
+        else:
+            first_key = projector_keys[0]
+            proj_prefix = first_key[:first_key.index("multi_modal_projector.") + len("multi_modal_projector.")]
+            click.echo(f"Found {len(projector_keys)} projector tensors (prefix: '{proj_prefix}')")
 
-        # Detect prefix (could be "audio_tower." or "model.audio_tower.")
-        first_key = encoder_keys[0]
-        prefix = first_key[:first_key.index("audio_tower.") + len("audio_tower.")]
+            for key in projector_keys:
+                clean_key = key[len(proj_prefix):]
+                projector_state_dict[clean_key] = f.get_tensor(key)
 
-        click.echo(f"Found {len(encoder_keys)} encoder tensors (prefix: '{prefix}')")
-        click.echo(f"  (out of {len(all_keys)} total tensors in model)")
+        # Extract encoder weights (unless projector-only)
+        if not needs_projector_only:
+            click.echo("Extracting encoder weights...")
+            encoder_keys = [k for k in all_keys if "audio_tower." in k]
 
-        for key in encoder_keys:
-            clean_key = key[len(prefix):]
-            encoder_state_dict[clean_key] = f.get_tensor(key)
+            if not encoder_keys:
+                click.echo("Error: No audio_tower weights found in model.")
+                return
 
-    # Step 4: Save standalone encoder weights
-    click.echo(f"Saving encoder to {output_dir}...")
-    save_file(encoder_state_dict, str(model_file))
+            first_key = encoder_keys[0]
+            prefix = first_key[:first_key.index("audio_tower.") + len("audio_tower.")]
+
+            click.echo(f"Found {len(encoder_keys)} encoder tensors (prefix: '{prefix}')")
+            click.echo(f"  (out of {len(all_keys)} total tensors in model)")
+
+            for key in encoder_keys:
+                clean_key = key[len(prefix):]
+                encoder_state_dict[clean_key] = f.get_tensor(key)
+
+    # Step 4: Save weights
+    if not needs_projector_only:
+        click.echo(f"Saving encoder to {output_dir}...")
+        save_file(encoder_state_dict, str(model_file))
+
+    if projector_state_dict:
+        click.echo(f"Saving projector to {output_dir}...")
+        save_file(projector_state_dict, str(projector_file))
 
     # Step 5: Write encoder config from the model's audio_config
-    with open(config_file, "w") as f:
-        json.dump(audio_config, f, indent=2)
+    if not needs_projector_only:
+        with open(config_file, "w") as f:
+            json.dump(audio_config, f, indent=2)
 
     # Step 6: Verify the encoder loads
-    click.echo("Verifying encoder loads correctly...")
-    try:
-        from transformers.models.musicflamingo.modeling_musicflamingo import MusicFlamingoEncoder
-        encoder = MusicFlamingoEncoder.from_pretrained(str(output_dir))
-        param_count = sum(p.numel() for p in encoder.parameters())
-        del encoder
-        click.echo(f"  Parameters: {param_count:,}")
-    except Exception as e:
-        click.echo(f"  Warning: verification failed ({e})")
-        click.echo("  The encoder may still work — try 'scan --model flamingo' to test.")
+    if not needs_projector_only:
+        click.echo("Verifying encoder loads correctly...")
+        try:
+            from transformers.models.musicflamingo.modeling_musicflamingo import MusicFlamingoEncoder
+            encoder = MusicFlamingoEncoder.from_pretrained(str(output_dir))
+            param_count = sum(p.numel() for p in encoder.parameters())
+            del encoder
+            click.echo(f"  Parameters: {param_count:,}")
+        except Exception as e:
+            click.echo(f"  Warning: verification failed ({e})")
+            click.echo("  The encoder may still work — try 'scan --model flamingo' to test.")
 
     size_mb = model_file.stat().st_size / 1024 / 1024
     click.echo(f"\nExtraction complete!")
-    click.echo(f"  Encoder saved to: {output_dir}")
-    click.echo(f"  Size: {size_mb:.1f} MB")
+    click.echo(f"  Encoder: {output_dir}")
+    click.echo(f"    Encoder size: {size_mb:.1f} MB")
+    if projector_file.exists():
+        proj_mb = projector_file.stat().st_size / 1024 / 1024
+        click.echo(f"    Projector size: {proj_mb:.1f} MB")
     click.echo(f"\nYou can now run:")
     click.echo(f"  poweramp-indexer scan /path/to/music --model flamingo -o embeddings_flamingo.db")
 

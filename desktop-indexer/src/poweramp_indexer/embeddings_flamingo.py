@@ -23,6 +23,27 @@ DEFAULT_ENCODER_DIR = Path.home() / ".cache" / "poweramp-indexer" / "music-flami
 # Post-pool frame duration in seconds (30s / 750 frames)
 FRAME_DURATION_S = 0.04
 
+# Embedding dimensions
+ENCODER_DIM = 1280
+PROJECTED_DIM = 3584
+
+
+class AudioProjector(torch.nn.Module):
+    """Standalone reimplementation of MusicFlamingoMultiModalProjector.
+
+    Two-layer MLP that maps encoder features [*, 1280] -> [*, 3584] into
+    the semantic space the LLM was trained on. ~4.6M parameters, ~28MB FP16.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.linear_1 = torch.nn.Linear(ENCODER_DIM, PROJECTED_DIM)
+        self.act = torch.nn.GELU()
+        self.linear_2 = torch.nn.Linear(PROJECTED_DIM, PROJECTED_DIM)
+
+    def forward(self, x):
+        return self.linear_2(self.act(self.linear_1(x)))
+
 
 def get_flamingo_encoder_path() -> Path:
     """Resolve the Music Flamingo encoder directory.
@@ -51,14 +72,19 @@ def get_flamingo_encoder_path() -> Path:
 
 class FlamingoEmbeddingGenerator:
     """
-    Generates audio embeddings using NVIDIA's Music Flamingo encoder.
+    Generates audio embeddings using NVIDIA's Music Flamingo encoder + projector.
 
     Music Flamingo fine-tunes the AF-Whisper encoder end-to-end on ~5.2M
     music examples and adds Rotary Time Embeddings (RoTE) for temporal
     awareness — the encoder knows where each frame sits in absolute time,
     helping it distinguish intro/chorus/bridge structure.
 
-    Output: 1280-dim embeddings (pooled from temporal features).
+    When the learned multi-modal projector is available (projector.safetensors),
+    encoder features are projected through a 2-layer MLP into the semantic
+    space the LLM was trained on, producing 3584-dim embeddings. Without the
+    projector, falls back to raw 1280-dim encoder output.
+
+    Output: 3584-dim (with projector) or 1280-dim (without) embeddings.
     """
 
     def __init__(
@@ -80,6 +106,8 @@ class FlamingoEmbeddingGenerator:
 
         # Lazy loading
         self.model = None
+        self.projector = None
+        self._has_projector = False
         self.feature_extractor = None
 
         # BF16 causes dtype mismatch (GitHub #42259); FP16 is fine on Turing+
@@ -95,10 +123,11 @@ class FlamingoEmbeddingGenerator:
         return "cpu"
 
     def _load_model_if_needed(self):
-        """Lazy load the MusicFlamingoEncoder and WhisperFeatureExtractor."""
+        """Lazy load the MusicFlamingoEncoder, projector, and WhisperFeatureExtractor."""
         if self.model is not None:
             return
 
+        from safetensors.torch import load_file
         from transformers import WhisperFeatureExtractor
         from transformers.models.musicflamingo.modeling_musicflamingo import MusicFlamingoEncoder
 
@@ -107,6 +136,23 @@ class FlamingoEmbeddingGenerator:
         self.model = MusicFlamingoEncoder.from_pretrained(str(encoder_path))
         self.model = self.model.half().to(self.device)
         self.model.eval()
+
+        # Load projector if available
+        projector_path = Path(encoder_path) / "projector.safetensors"
+        if projector_path.exists():
+            logger.info(f"Loading projector from '{projector_path}'...")
+            self.projector = AudioProjector()
+            state_dict = load_file(str(projector_path), device="cpu")
+            self.projector.load_state_dict(state_dict)
+            self.projector = self.projector.half().to(self.device)
+            self.projector.eval()
+            self._has_projector = True
+            logger.info(f"Projector loaded — output dim: {PROJECTED_DIM}")
+        else:
+            logger.warning(
+                "projector.safetensors not found — using raw encoder output (1280-dim). "
+                "Run 'poweramp-indexer extract-encoder' to get the projector."
+            )
 
         logger.info(f"Loading WhisperFeatureExtractor from '{self.processor_id}'...")
         self.feature_extractor = WhisperFeatureExtractor.from_pretrained(self.processor_id)
@@ -213,10 +259,13 @@ class FlamingoEmbeddingGenerator:
                         audio_times=audio_times,
                     )
                     # last_hidden_state: [batch, frames, 1280]
-                    features = output.last_hidden_state.mean(dim=1)  # Pool time → [batch, 1280]
+                    hidden = output.last_hidden_state
+                    if self._has_projector:
+                        hidden = self.projector(hidden)  # [batch, frames, 3584]
+                    features = hidden.mean(dim=1)  # Pool time → [batch, dim]
                     all_features.append(features.cpu())
 
-                del input_features, input_features_mask, audio_times, output, features
+                del input_features, input_features_mask, audio_times, output, hidden, features
 
             # Average across all chunks
             all_features = torch.cat(all_features, dim=0)
@@ -240,7 +289,8 @@ class FlamingoEmbeddingGenerator:
         GPU processes current one).
 
         Returns:
-            1280-dim normalized embedding or None on failure.
+            3584-dim (with projector) or 1280-dim (without) normalized embedding,
+            or None on failure.
         """
         self._load_model_if_needed()
 
@@ -275,10 +325,15 @@ class FlamingoEmbeddingGenerator:
         return self.generate_from_audio(waveform, duration_s, filepath.name)
 
     def unload_model(self):
-        """Free GPU memory by unloading the model and feature extractor."""
+        """Free GPU memory by unloading the model, projector, and feature extractor."""
         if self.model is not None:
             del self.model
             self.model = None
+
+        if self.projector is not None:
+            del self.projector
+            self.projector = None
+            self._has_projector = False
 
         if self.feature_extractor is not None:
             del self.feature_extractor
@@ -293,5 +348,7 @@ class FlamingoEmbeddingGenerator:
 
     @property
     def embedding_dim(self) -> int:
-        """Return the embedding dimension (1280 for Music Flamingo)."""
-        return 1280
+        """Return the embedding dimension (3584 with projector, 1280 without)."""
+        # Force model load so we know if projector is available
+        self._load_model_if_needed()
+        return PROJECTED_DIM if self._has_projector else ENCODER_DIM
