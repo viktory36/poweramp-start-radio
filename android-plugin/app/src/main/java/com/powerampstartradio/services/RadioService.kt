@@ -62,6 +62,10 @@ class RadioService : Service() {
         private val _uiState = MutableStateFlow<RadioUiState>(RadioUiState.Idle)
         val uiState: StateFlow<RadioUiState> = _uiState.asStateFlow()
 
+        // Session history — accumulated radio results
+        private val _sessionHistory = MutableStateFlow<List<RadioResult>>(emptyList())
+        val sessionHistory: StateFlow<List<RadioResult>> = _sessionHistory.asStateFlow()
+
         fun startRadio(
             context: Context,
             numTracks: Int = DEFAULT_NUM_TRACKS,
@@ -127,6 +131,9 @@ class RadioService : Service() {
                     stopSelfDelayed()
                     return@launch
                 }
+
+                // Clear queue immediately so old tracks stop after current finishes
+                PowerampHelper.clearQueue(this@RadioService)
 
                 updateNotification("Finding similar tracks to: ${currentTrack.title}")
                 Log.d(TAG, "Starting radio for: ${currentTrack.title} by ${currentTrack.artist}")
@@ -206,8 +213,7 @@ class RadioService : Service() {
                     return@launch
                 }
 
-                // Clear queue and add tracks
-                PowerampHelper.clearQueue(this@RadioService)
+                // Add tracks to queue
                 val queuedFileIds = mutableSetOf<Long>()
 
                 // Track which file IDs were successfully queued
@@ -242,6 +248,7 @@ class RadioService : Service() {
                 )
 
                 _uiState.value = RadioUiState.Success(radioResult)
+                _sessionHistory.value = _sessionHistory.value + radioResult
 
                 // Notify Poweramp to reload queue data.
                 // Poweramp will switch to the queue after the current song ends.

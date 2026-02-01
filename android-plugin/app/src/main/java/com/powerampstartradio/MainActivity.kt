@@ -8,9 +8,12 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.pager.VerticalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
@@ -103,6 +106,7 @@ fun MainScreen(
     val numTracks by viewModel.numTracks.collectAsState()
     val databaseInfo by viewModel.databaseInfo.collectAsState()
     val hasPermission by viewModel.hasPermission.collectAsState()
+    val sessionHistory by viewModel.sessionHistory.collectAsState()
 
     // Local UI state
     var currentTrack by remember { mutableStateOf<PowerampTrack?>(PowerampReceiver.currentTrack) }
@@ -192,65 +196,127 @@ fun MainScreen(
                 .fillMaxSize()
                 .padding(padding)
         ) {
-            // Seed Track Section
-            SeedTrackSection(
+            // Now Playing — always visible at top
+            NowPlayingSection(
                 currentTrack = currentTrack,
-                radioResult = (radioState as? RadioUiState.Success)?.result,
                 modifier = Modifier.padding(16.dp)
             )
 
-            Divider()
+            HorizontalDivider()
 
-            // Results or Status
-            when (val state = radioState) {
-                is RadioUiState.Idle -> {
-                    IdleContent(
-                        hasPermission = hasPermission,
-                        databaseInfo = databaseInfo,
-                        statusMessage = statusMessage,
-                        onRequestPermission = { viewModel.requestPermission() },
-                        modifier = Modifier.weight(1f)
-                    )
-                }
-                is RadioUiState.Loading -> {
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth(),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            CircularProgressIndicator()
-                            Spacer(modifier = Modifier.height(16.dp))
-                            Text("Finding similar tracks...")
+            // Main content area
+            Box(modifier = Modifier.weight(1f)) {
+                if (sessionHistory.isEmpty()) {
+                    // No sessions yet — show idle/loading/error content
+                    when (val state = radioState) {
+                        is RadioUiState.Idle -> {
+                            IdleContent(
+                                hasPermission = hasPermission,
+                                databaseInfo = databaseInfo,
+                                statusMessage = statusMessage,
+                                onRequestPermission = { viewModel.requestPermission() },
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+                        is RadioUiState.Loading -> {
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    CircularProgressIndicator()
+                                    Spacer(modifier = Modifier.height(16.dp))
+                                    Text("Finding similar tracks...")
+                                }
+                            }
+                        }
+                        is RadioUiState.Error -> {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(16.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Card(
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = MaterialTheme.colorScheme.errorContainer
+                                    )
+                                ) {
+                                    Text(
+                                        text = state.message,
+                                        modifier = Modifier.padding(16.dp),
+                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                }
+                            }
+                        }
+                        is RadioUiState.Success -> {
+                            // Shouldn't happen (sessionHistory would be non-empty), but handle gracefully
                         }
                     }
-                }
-                is RadioUiState.Success -> {
-                    ResultsSection(
-                        result = state.result,
-                        modifier = Modifier.weight(1f)
+                } else {
+                    // Session pager
+                    val pagerState = rememberPagerState(
+                        initialPage = sessionHistory.size - 1,
+                        pageCount = { sessionHistory.size }
                     )
-                }
-                is RadioUiState.Error -> {
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth()
-                            .padding(16.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Card(
-                            colors = CardDefaults.cardColors(
-                                containerColor = MaterialTheme.colorScheme.errorContainer
-                            )
-                        ) {
-                            Text(
-                                text = state.message,
-                                modifier = Modifier.padding(16.dp),
-                                color = MaterialTheme.colorScheme.onErrorContainer
-                            )
+
+                    // Auto-scroll to latest session when a new one is added
+                    LaunchedEffect(sessionHistory.size) {
+                        if (sessionHistory.isNotEmpty()) {
+                            pagerState.animateScrollToPage(sessionHistory.size - 1)
                         }
+                    }
+
+                    VerticalPager(
+                        state = pagerState,
+                        modifier = Modifier.fillMaxSize()
+                    ) { page ->
+                        SessionPage(
+                            session = sessionHistory[page],
+                            pageIndex = page,
+                            totalPages = sessionHistory.size,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
+
+                    // Loading/Error overlay on top of pager
+                    when (val state = radioState) {
+                        is RadioUiState.Loading -> {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.7f)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    CircularProgressIndicator()
+                                    Spacer(modifier = Modifier.height(16.dp))
+                                    Text("Finding similar tracks...")
+                                }
+                            }
+                        }
+                        is RadioUiState.Error -> {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.7f)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Card(
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = MaterialTheme.colorScheme.errorContainer
+                                    )
+                                ) {
+                                    Text(
+                                        text = state.message,
+                                        modifier = Modifier.padding(16.dp),
+                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                }
+                            }
+                        }
+                        else -> {}
                     }
                 }
             }
@@ -274,39 +340,19 @@ fun MainScreen(
 }
 
 @Composable
-fun SeedTrackSection(
+fun NowPlayingSection(
     currentTrack: PowerampTrack?,
-    radioResult: RadioResult?,
     modifier: Modifier = Modifier
 ) {
     Column(modifier = modifier) {
         Text(
-            text = "SEED TRACK",
+            text = "NOW PLAYING",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.primary
         )
         Spacer(modifier = Modifier.height(4.dp))
 
-        if (radioResult != null) {
-            // Show seed track from result
-            Text(
-                text = "\"${radioResult.seedTrack.title}\"",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold
-            )
-            Text(
-                text = "${radioResult.seedTrack.artist ?: "Unknown"} • ${radioResult.seedTrack.album ?: ""}",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Text(
-                text = "matched via: ${radioResult.matchType.name}",
-                style = MaterialTheme.typography.bodySmall,
-                fontFamily = FontFamily.Monospace,
-                color = MaterialTheme.colorScheme.tertiary
-            )
-        } else if (currentTrack != null) {
-            // Show current playing track
+        if (currentTrack != null) {
             Text(
                 text = "\"${currentTrack.title}\"",
                 style = MaterialTheme.typography.titleMedium,
@@ -324,6 +370,72 @@ fun SeedTrackSection(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
+    }
+}
+
+@Composable
+fun SessionPage(
+    session: RadioResult,
+    pageIndex: Int,
+    totalPages: Int,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier = modifier) {
+        // Seed track for this session
+        SeedTrackSection(
+            radioResult = session,
+            modifier = Modifier.padding(16.dp)
+        )
+
+        HorizontalDivider()
+
+        // Page indicator
+        if (totalPages > 1) {
+            Text(
+                text = "Session ${pageIndex + 1} of $totalPages",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+            )
+        }
+
+        // Queue results
+        ResultsSection(
+            result = session,
+            modifier = Modifier.weight(1f)
+        )
+    }
+}
+
+@Composable
+fun SeedTrackSection(
+    radioResult: RadioResult,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier = modifier) {
+        Text(
+            text = "SEED TRACK",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.primary
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+
+        Text(
+            text = "\"${radioResult.seedTrack.title}\"",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold
+        )
+        Text(
+            text = "${radioResult.seedTrack.artist ?: "Unknown"} • ${radioResult.seedTrack.album ?: ""}",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = "matched via: ${radioResult.matchType.name}",
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace,
+            color = MaterialTheme.colorScheme.tertiary
+        )
     }
 }
 

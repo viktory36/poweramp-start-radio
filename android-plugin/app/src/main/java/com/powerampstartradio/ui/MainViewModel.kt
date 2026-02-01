@@ -36,6 +36,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // Radio state from service
     val radioState: StateFlow<RadioUiState> = RadioService.uiState
 
+    // Session history
+    val sessionHistory: StateFlow<List<RadioResult>> = RadioService.sessionHistory
+
     init {
         refreshDatabaseInfo()
         checkPermission()
