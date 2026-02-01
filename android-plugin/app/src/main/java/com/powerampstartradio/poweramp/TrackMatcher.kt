@@ -172,14 +172,15 @@ class TrackMatcher(
 
                 if (fileId == null) {
                     Log.w(TAG, "MISS: embedded='$embeddedArtist|$embeddedAlbum|$embeddedTitle' — no Poweramp match")
-                } else if (fileId in seen) {
-                    Log.d(TAG, "DUPE: embedded='$embeddedArtist|$embeddedTitle' → fileId=$fileId already queued")
                     result.add(MappedTrack(similarTrack, null))
+                } else if (fileId in seen) {
+                    // Silently skip duplicates (e.g. FLAC+MP3 of same song)
+                    Log.d(TAG, "DUPE: embedded='$embeddedArtist|$embeddedTitle' → fileId=$fileId already queued, skipping")
                     continue
+                } else {
+                    seen.add(fileId!!)
+                    result.add(MappedTrack(similarTrack, fileId))
                 }
-
-                if (fileId != null) seen.add(fileId!!)
-                result.add(MappedTrack(similarTrack, fileId))
             } else {
                 Log.w(TAG, "MISS: bad metadata_key='${track.metadataKey}' (not enough parts)")
                 result.add(MappedTrack(similarTrack, null))
