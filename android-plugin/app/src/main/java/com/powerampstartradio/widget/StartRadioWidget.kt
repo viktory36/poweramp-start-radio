@@ -50,7 +50,7 @@ class StartRadioWidget : GlanceAppWidget() {
                     Text(
                         text = "▶",
                         style = TextStyle(
-                            color = ColorProvider(Color(0xFF89B4FA)),
+                            color = ColorProvider(Color(0xFF89B4FA), Color(0xFF89B4FA)),
                             fontSize = 16.sp,
                             fontWeight = FontWeight.Bold
                         )
@@ -59,7 +59,7 @@ class StartRadioWidget : GlanceAppWidget() {
                     Text(
                         text = "Start Radio",
                         style = TextStyle(
-                            color = ColorProvider(Color.White),
+                            color = ColorProvider(Color.White, Color.White),
                             fontSize = 14.sp
                         )
                     )
@@ -71,7 +71,7 @@ class StartRadioWidget : GlanceAppWidget() {
                         Text(
                             text = label,
                             style = TextStyle(
-                                color = ColorProvider(Color(0xFFBAC2DE)),
+                                color = ColorProvider(Color(0xFFBAC2DE), Color(0xFFBAC2DE)),
                                 fontSize = 12.sp
                             ),
                             maxLines = 1
