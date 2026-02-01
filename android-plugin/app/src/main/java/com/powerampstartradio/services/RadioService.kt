@@ -226,10 +226,9 @@ class RadioService : Service() {
 
                 _uiState.value = RadioUiState.Success(radioResult)
 
-                // Notify Poweramp to reload queue and start playback
+                // Notify Poweramp to reload queue data.
+                // Poweramp will switch to the queue after the current song ends.
                 PowerampHelper.reloadData(this@RadioService)
-                kotlinx.coroutines.delay(100)
-                PowerampHelper.playQueue(this@RadioService)
 
                 val modeLabel = if (isDual) " (dual)" else ""
                 val message = "${radioResult.queuedCount} queued / ${radioResult.failedCount} failed$modeLabel"
