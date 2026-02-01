@@ -8,6 +8,7 @@ Requires: pip install git+https://github.com/lashahub/transformers@modular-mf
 """
 
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Optional
@@ -93,7 +94,7 @@ class FlamingoEmbeddingGenerator:
         processor_id: str = "openai/whisper-large-v3",
         target_sr: int = 16000,  # Whisper uses 16kHz
         chunk_duration_s: int = 30,  # Whisper's standard 30s window
-        max_chunks: int = 30,  # Same strategy as MuQ
+        max_chunks: int = 60,  # Full non-overlapping coverage up to 30 min
     ):
         self.encoder_path = encoder_path
         self.processor_id = processor_id
@@ -177,9 +178,8 @@ class FlamingoEmbeddingGenerator:
             return None
 
     def _calculate_num_chunks(self, duration_s: float) -> int:
-        """1 chunk per minute, max 30 (covers 30 min)."""
-        minutes = duration_s / 60
-        return max(1, min(int(minutes), self.max_chunks))
+        """Full non-overlapping coverage: ceil(duration / 30s), capped at max_chunks."""
+        return max(1, min(math.ceil(duration_s / self.chunk_duration_s), self.max_chunks))
 
     def _select_chunk_positions(self, duration_s: float, num_chunks: int) -> list[float]:
         """Stratified sampling - evenly spaced positions across full duration."""
@@ -294,7 +294,7 @@ class FlamingoEmbeddingGenerator:
         """
         self._load_model_if_needed()
 
-        if duration_s < self.chunk_duration_s:
+        if duration_s < 3.0:
             logger.warning(f"{filename}: too short ({duration_s:.1f}s)")
             return None
 
