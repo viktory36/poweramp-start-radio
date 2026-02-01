@@ -331,12 +331,13 @@ object PowerampHelper {
 
     /**
      * Start playing from the queue.
-     * Uses ACTION_OPEN_LIST_AND_PLAY to actually switch playback to the queue.
+     * Sends OPEN_TO_PLAY command via the API activity with explicit component.
      */
     fun playQueue(context: Context) {
         val queueUri = ROOT_URI.buildUpon().appendEncodedPath("queue").build()
-        val intent = Intent(ACTION_OPEN_LIST_AND_PLAY).apply {
-            setPackage(POWERAMP_PACKAGE)
+        val intent = Intent(ACTION_API_COMMAND).apply {
+            setComponent(ComponentName(POWERAMP_PACKAGE, API_ACTIVITY))
+            putExtra(EXTRA_COMMAND, COMMAND_OPEN_TO_PLAY)
             data = queueUri
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
