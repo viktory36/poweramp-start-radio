@@ -966,9 +966,9 @@ def merge(muq_db: Path, mulan_db: Path, output: Path, verbose: bool):
 def extract_encoder(output: Path, verbose: bool):
     """Extract Music Flamingo encoder from nvidia/music-flamingo-2601-hf.
 
-    Downloads only the safetensors shard(s) containing the audio encoder
-    (~4.9 GB), extracts the encoder weights (~1.3 GB), and saves a
-    standalone encoder for use with 'scan --model flamingo'.
+    Downloads the full model weights (~8.3 GB, cached by HF hub), extracts
+    only the audio encoder (~1.3 GB), and saves a standalone encoder for
+    use with 'scan --model flamingo'.
 
     This is a one-time operation. The extracted encoder is cached for
     reuse across scans.
@@ -1002,72 +1002,50 @@ def extract_encoder(output: Path, verbose: bool):
     repo_id = "nvidia/music-flamingo-2601-hf"
     click.echo(f"Extracting encoder from {repo_id}...")
 
-    # Step 1: Download and parse the safetensors index
-    click.echo("Downloading weight index...")
-    index_path = hf_hub_download(repo_id, "model.safetensors.index.json")
-    with open(index_path) as f:
-        index = json.load(f)
+    # Step 1: Download config.json to get audio_config
+    click.echo("Downloading model config...")
+    config_path = hf_hub_download(repo_id, "config.json")
+    with open(config_path) as f:
+        full_config = json.load(f)
 
-    weight_map = index["weight_map"]
-
-    # Step 2: Find encoder keys and their shards
-    encoder_keys = {k: v for k, v in weight_map.items() if "audio_tower." in k}
-    if not encoder_keys:
-        click.echo("Error: No audio_tower weights found in the model index.")
+    audio_config = full_config.get("audio_config")
+    if not audio_config:
+        click.echo("Error: No audio_config found in model config.json.")
         return
 
-    needed_shards = sorted(set(encoder_keys.values()))
-    click.echo(f"Found {len(encoder_keys)} encoder parameters in {len(needed_shards)} shard(s)")
+    # Step 2: Download model weights (single file, cached by HF hub)
+    click.echo("Downloading model weights (~8.3 GB, cached by HF hub)...")
+    weights_path = hf_hub_download(repo_id, "model.safetensors")
 
-    # Detect the key prefix (could be "audio_tower." or "model.audio_tower.")
-    first_key = next(iter(encoder_keys))
-    prefix = first_key[:first_key.index("audio_tower.") + len("audio_tower.")]
-    click.echo(f"Key prefix: '{prefix}'")
-
-    # Step 3: Download needed shards and extract encoder weights
+    # Step 3: Find and extract audio_tower.* keys
+    click.echo("Extracting encoder weights...")
     encoder_state_dict = {}
-    for shard_name in needed_shards:
-        click.echo(f"Downloading {shard_name}...")
-        shard_path = hf_hub_download(repo_id, shard_name)
+    with safe_open(weights_path, framework="pt", device="cpu") as f:
+        all_keys = list(f.keys())
+        encoder_keys = [k for k in all_keys if "audio_tower." in k]
 
-        click.echo(f"Extracting encoder weights from {shard_name}...")
-        with safe_open(shard_path, framework="pt", device="cpu") as f:
-            for key in f.keys():
-                if "audio_tower." in key:
-                    # Strip prefix to get standalone encoder keys
-                    clean_key = key[len(prefix):]
-                    encoder_state_dict[clean_key] = f.get_tensor(key)
+        if not encoder_keys:
+            click.echo("Error: No audio_tower weights found in model.")
+            return
 
-    click.echo(f"Extracted {len(encoder_state_dict)} tensors")
+        # Detect prefix (could be "audio_tower." or "model.audio_tower.")
+        first_key = encoder_keys[0]
+        prefix = first_key[:first_key.index("audio_tower.") + len("audio_tower.")]
+
+        click.echo(f"Found {len(encoder_keys)} encoder tensors (prefix: '{prefix}')")
+        click.echo(f"  (out of {len(all_keys)} total tensors in model)")
+
+        for key in encoder_keys:
+            clean_key = key[len(prefix):]
+            encoder_state_dict[clean_key] = f.get_tensor(key)
 
     # Step 4: Save standalone encoder weights
     click.echo(f"Saving encoder to {output_dir}...")
     save_file(encoder_state_dict, str(model_file))
 
-    # Step 5: Write encoder config
-    # The audio_config from music-flamingo-2601-hf with RoTE parameters
-    encoder_config = {
-        "model_type": "musicflamingo_encoder",
-        "activation_dropout": 0.0,
-        "activation_function": "gelu",
-        "attention_dropout": 0.0,
-        "dropout": 0.0,
-        "hidden_size": 1280,
-        "initializer_range": 0.02,
-        "intermediate_size": 5120,
-        "layerdrop": 0.0,
-        "max_source_positions": 1500,
-        "num_attention_heads": 20,
-        "num_hidden_layers": 32,
-        "num_mel_bins": 128,
-        "scale_embedding": False,
-        "use_rotary_embedding": True,
-        "rotary_dim": 256,
-        "rotary_freqs_for": "lang",
-        "rotary_max_time": 1200.0,
-    }
+    # Step 5: Write encoder config from the model's audio_config
     with open(config_file, "w") as f:
-        json.dump(encoder_config, f, indent=2)
+        json.dump(audio_config, f, indent=2)
 
     # Step 6: Verify the encoder loads
     click.echo("Verifying encoder loads correctly...")
