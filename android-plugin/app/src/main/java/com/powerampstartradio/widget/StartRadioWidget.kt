@@ -1,6 +1,8 @@
 package com.powerampstartradio.widget
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.widget.Toast
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
@@ -91,11 +93,15 @@ class StartRadioAction : ActionCallback {
     ) {
         val dbFile = File(context.filesDir, "embeddings.db")
         if (!dbFile.exists()) {
-            Toast.makeText(context, "No embedding database", Toast.LENGTH_SHORT).show()
+            Handler(Looper.getMainLooper()).post {
+                Toast.makeText(context, "No embedding database", Toast.LENGTH_SHORT).show()
+            }
             return
         }
 
-        Toast.makeText(context, "Starting radio...", Toast.LENGTH_SHORT).show()
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(context, "Starting radio...", Toast.LENGTH_SHORT).show()
+        }
         RadioService.startRadio(context)
     }
 }
