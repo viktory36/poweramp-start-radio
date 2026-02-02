@@ -211,7 +211,7 @@ class FlamingoEmbeddingGenerator:
         self,
         chunks: list[np.ndarray],
         positions: list[float],
-        max_batch: int = 20,
+        max_batch: int = 60,
     ) -> Optional[list[float]]:
         """
         Run GPU inference on chunks and return averaged, normalized embedding.
