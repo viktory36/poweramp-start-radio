@@ -111,7 +111,10 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, dua
 
 
 def _process_files(audio_files, load_audio_fn, infer_fn, store_fn, desc):
-    """Process files sequentially with per-stage timing.
+    """Process files with prefetching: load next file while GPU processes current.
+
+    Both librosa and CUDA release the GIL, so the background thread's audio
+    decode overlaps with the main thread's GPU inference.
 
     Args:
         audio_files: Paths to process.
@@ -123,37 +126,39 @@ def _process_files(audio_files, load_audio_fn, infer_fn, store_fn, desc):
     Returns:
         (successful, failed) counts.
     """
-    import time
-
     successful = 0
     failed = 0
 
+    def _prefetch(fp):
+        return extract_metadata(fp), load_audio_fn(fp)
+
     with tqdm(total=len(audio_files), desc=desc, unit="file") as pbar:
-        for filepath in audio_files:
-            t0 = time.perf_counter()
-            metadata = extract_metadata(filepath)
-            audio = load_audio_fn(filepath)
-            t_load = time.perf_counter() - t0
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_prefetch, audio_files[0])
 
-            if audio is not None:
-                waveform, duration_s = audio
-                t1 = time.perf_counter()
-                embedding = infer_fn(waveform, duration_s, filepath.name)
-                t_infer = time.perf_counter() - t1
-                del waveform
-            else:
-                embedding = None
-                t_infer = 0.0
+            for i in range(len(audio_files)):
+                metadata, audio = future.result()
 
-            if embedding is not None:
-                store_fn(filepath, metadata, embedding)
-                successful += 1
-                logger.debug(f"  load={t_load:.3f}s  infer={t_infer:.3f}s  total={t_load + t_infer:.3f}s")
-            else:
-                failed += 1
-                logger.warning(f"Failed: {filepath.name}")
+                # Start loading next file while we run inference on this one
+                if i + 1 < len(audio_files):
+                    future = executor.submit(_prefetch, audio_files[i + 1])
 
-            pbar.update(1)
+                filepath = audio_files[i]
+                if audio is not None:
+                    waveform, duration_s = audio
+                    embedding = infer_fn(waveform, duration_s, filepath.name)
+                    del waveform
+                else:
+                    embedding = None
+
+                if embedding is not None:
+                    store_fn(filepath, metadata, embedding)
+                    successful += 1
+                else:
+                    failed += 1
+                    logger.warning(f"Failed: {filepath.name}")
+
+                pbar.update(1)
 
     return successful, failed
 
