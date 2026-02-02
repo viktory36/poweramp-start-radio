@@ -211,7 +211,7 @@ class FlamingoEmbeddingGenerator:
         self,
         chunks: list[np.ndarray],
         positions: list[float],
-        max_batch: int = 60,
+        max_batch: int = 30,
     ) -> Optional[list[float]]:
         """
         Run GPU inference on chunks and return averaged, normalized embedding.
@@ -266,6 +266,8 @@ class FlamingoEmbeddingGenerator:
                     all_features.append(features.cpu())
 
                 del input_features, input_features_mask, audio_times, output, hidden, features
+                if self.device == "cuda":
+                    torch.cuda.empty_cache()
 
             # Average across all chunks
             all_features = torch.cat(all_features, dim=0)
