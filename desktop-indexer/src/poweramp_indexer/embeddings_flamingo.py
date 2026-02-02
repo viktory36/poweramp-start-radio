@@ -10,6 +10,7 @@ Requires: pip install git+https://github.com/lashahub/transformers@modular-mf
 import logging
 import math
 import os
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -222,12 +223,15 @@ class FlamingoEmbeddingGenerator:
         """
         try:
             all_features = []
+            t_mel_total = 0.0
+            t_gpu_total = 0.0
 
             for i in range(0, len(chunks), max_batch):
                 batch_chunks = chunks[i:i + max_batch]
                 batch_positions = positions[i:i + max_batch]
 
                 # WhisperFeatureExtractor converts raw audio to mel spectrogram
+                t0 = time.perf_counter()
                 inputs = self.feature_extractor(
                     batch_chunks,
                     sampling_rate=self.target_sr,
@@ -251,7 +255,9 @@ class FlamingoEmbeddingGenerator:
                     torch.arange(num_frames, dtype=torch.float32) * FRAME_DURATION_S + pos
                     for pos in batch_positions
                 ]).to(self.device)
+                t_mel_total += time.perf_counter() - t0
 
+                t1 = time.perf_counter()
                 with torch.inference_mode():
                     output = self.model(
                         input_features,
@@ -264,8 +270,16 @@ class FlamingoEmbeddingGenerator:
                         hidden = self.projector(hidden)  # [batch, frames, 3584]
                     features = hidden.mean(dim=1)  # Pool time → [batch, dim]
                     all_features.append(features.cpu())
+                if self.device == "cuda":
+                    torch.cuda.synchronize()
+                t_gpu_total += time.perf_counter() - t1
 
                 del input_features, input_features_mask, audio_times, output, hidden, features
+
+            logger.debug(
+                f"  mel={t_mel_total:.3f}s  gpu={t_gpu_total:.3f}s  "
+                f"chunks={len(chunks)}"
+            )
 
             # Average across all chunks
             all_features = torch.cat(all_features, dim=0)
@@ -299,11 +313,13 @@ class FlamingoEmbeddingGenerator:
             return None
 
         # Select stratified positions
+        t0 = time.perf_counter()
         num_chunks = self._calculate_num_chunks(duration_s)
         positions = self._select_chunk_positions(duration_s, num_chunks)
         chunks = self._extract_chunks(waveform, positions)
+        t_extract = time.perf_counter() - t0
 
-        logger.debug(f"{filename}: {len(chunks)} chunks from {duration_s:.1f}s")
+        logger.debug(f"{filename}: {len(chunks)} chunks from {duration_s:.1f}s  extract={t_extract:.3f}s")
 
         if not chunks:
             return None
