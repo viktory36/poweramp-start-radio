@@ -266,8 +266,6 @@ class FlamingoEmbeddingGenerator:
                     all_features.append(features.cpu())
 
                 del input_features, input_features_mask, audio_times, output, hidden, features
-                if self.device == "cuda":
-                    torch.cuda.empty_cache()
 
             # Average across all chunks
             all_features = torch.cat(all_features, dim=0)
