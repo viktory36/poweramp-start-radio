@@ -34,6 +34,7 @@ data class RadioResult(
     val tracks: List<QueuedTrackResult>,
     val availableModels: Set<EmbeddingModel> = emptySet(),
     val strategy: SearchStrategy = SearchStrategy.ANCHOR_EXPAND,
+    val drift: Boolean = false,
     val timestamp: Long = System.currentTimeMillis(),
     val queuedFileIds: Set<Long> = emptySet()
 ) {

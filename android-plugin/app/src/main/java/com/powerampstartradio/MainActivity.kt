@@ -1,5 +1,3 @@
-@file:OptIn(ExperimentalFoundationApi::class)
-
 package com.powerampstartradio
 
 import android.content.IntentFilter
@@ -13,16 +11,16 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
-import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.pager.VerticalPager
-import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.material.icons.Icons
@@ -35,13 +33,17 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -66,6 +68,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
 
@@ -191,14 +194,6 @@ fun MainScreen(
         }
     }
 
-    // Pager state for session history
-    val pagerState = if (sessionHistory.isNotEmpty()) {
-        rememberPagerState(
-            initialPage = sessionHistory.size - 1,
-            pageCount = { sessionHistory.size }
-        )
-    } else null
-
     // Back button: settings -> home, viewing session -> home
     BackHandler(enabled = showSettings || viewingSession != null) {
         if (showSettings) {
@@ -266,7 +261,6 @@ fun MainScreen(
                     sessionHistory = sessionHistory,
                     statusMessage = statusMessage,
                     indexStatus = indexStatus,
-                    pagerState = pagerState,
                     onStartRadio = {
                         if (currentTrack != null && databaseInfo != null) {
                             viewModel.startRadio()
@@ -276,7 +270,10 @@ fun MainScreen(
                             statusMessage = "Import database in Settings"
                         }
                     },
-                    onResetState = { viewModel.resetRadioState() },
+                    onClearAndReset = {
+                        PowerampHelper.clearQueue(context)
+                        viewModel.resetRadioState()
+                    },
                     onRequestPermission = { viewModel.requestPermission() },
                     onOpenSettings = { showSettings = true },
                     onOpenDrawer = { scope.launch { drawerState.open() } },
@@ -300,18 +297,15 @@ fun HomeScreen(
     sessionHistory: List<RadioResult>,
     statusMessage: String,
     indexStatus: String?,
-    pagerState: androidx.compose.foundation.pager.PagerState?,
     onStartRadio: () -> Unit,
-    onResetState: () -> Unit,
+    onClearAndReset: () -> Unit,
     onRequestPermission: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenDrawer: () -> Unit,
     viewingSession: Int?,
     onViewSession: (Int?) -> Unit
 ) {
-    // Show results when Success or when viewing a specific historical session
     val showResults = radioState is RadioUiState.Success || viewingSession != null
-    // Which session to show in the header
     val displaySession = if (viewingSession != null && viewingSession in sessionHistory.indices) {
         sessionHistory[viewingSession]
     } else {
@@ -333,7 +327,7 @@ fun HomeScreen(
                     if (showResults) {
                         IconButton(onClick = {
                             onViewSession(null)
-                            onResetState()
+                            onClearAndReset()
                         }) {
                             Icon(Icons.Default.Clear, contentDescription = "Clear")
                         }
@@ -359,7 +353,7 @@ fun HomeScreen(
                 .padding(padding)
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
-                // Compact header — seed track when showing results, now playing otherwise
+                // Compact header
                 if (showResults && displaySession != null) {
                     CompactSeedHeader(
                         session = displaySession,
@@ -374,36 +368,15 @@ fun HomeScreen(
 
                 HorizontalDivider()
 
-                // Main content area — driven by radioState, not sessionHistory
+                // Main content area
                 Box(modifier = Modifier.weight(1f)) {
-                    if (showResults && sessionHistory.isNotEmpty() && pagerState != null) {
-                        // Auto-scroll to latest session on new result
-                        LaunchedEffect(sessionHistory.size) {
-                            if (radioState is RadioUiState.Success && sessionHistory.isNotEmpty()) {
-                                pagerState.animateScrollToPage(sessionHistory.size - 1)
-                            }
-                        }
-
-                        // Scroll to specific session when tapped in drawer
-                        LaunchedEffect(viewingSession) {
-                            if (viewingSession != null && viewingSession in sessionHistory.indices) {
-                                pagerState.animateScrollToPage(viewingSession)
-                            }
-                        }
-
-                        VerticalPager(
-                            state = pagerState,
+                    if (showResults && displaySession != null) {
+                        SessionPage(
+                            session = displaySession,
                             modifier = Modifier.fillMaxSize()
-                        ) { page ->
-                            SessionPage(
-                                session = sessionHistory[page],
-                                pageIndex = page,
-                                totalPages = sessionHistory.size,
-                                modifier = Modifier.fillMaxSize()
-                            )
-                        }
+                        )
 
-                        // Error overlay on top of pager
+                        // Error overlay on top of results
                         if (radioState is RadioUiState.Error) {
                             Box(
                                 modifier = Modifier
@@ -425,7 +398,6 @@ fun HomeScreen(
                             }
                         }
                     } else {
-                        // Idle / Error / Loading (no results to show)
                         when (val state = radioState) {
                             is RadioUiState.Idle -> {
                                 IdleContent(
@@ -457,15 +429,13 @@ fun HomeScreen(
                                     }
                                 }
                             }
-                            is RadioUiState.Loading, is RadioUiState.Success -> {
-                                // Loading overlay handles Loading; Success handled above
-                            }
+                            is RadioUiState.Loading, is RadioUiState.Success -> {}
                         }
                     }
                 }
             }
 
-            // Loading overlay (shown on top of all content)
+            // Loading overlay
             if (radioState is RadioUiState.Loading) {
                 Box(
                     modifier = Modifier
@@ -567,31 +537,52 @@ fun CompactSeedHeader(
 @Composable
 fun SessionPage(
     session: RadioResult,
-    pageIndex: Int,
-    totalPages: Int,
     modifier: Modifier = Modifier
 ) {
+    val treeNodes = remember(session) { computeTreeNodes(session) }
+    val listState = rememberLazyListState()
+
+    // Diagonal scroll for drift: shift left based on first visible item's depth
+    val targetDepth by remember {
+        derivedStateOf {
+            if (session.drift) treeNodes.getOrNull(listState.firstVisibleItemIndex)?.depth ?: 0
+            else 0
+        }
+    }
+    val animatedDepth by animateFloatAsState(
+        targetValue = targetDepth.toFloat(),
+        label = "diagonal_scroll"
+    )
+    val density = LocalDensity.current
+    val indentPxPerLevel = remember(density) { with(density) { TREE_INDENT_DP.dp.toPx() } }
+
     Column(modifier = modifier) {
-        // Summary header
         ResultsSummary(
             result = session,
-            pageIndex = pageIndex,
-            totalPages = totalPages,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
         )
 
-        // Track list with tree prefixes for anchor-expand
-        val treePrefixes = computeTreePrefixes(session)
-
         LazyColumn(
-            modifier = Modifier.fillMaxSize(),
+            state = listState,
+            modifier = Modifier
+                .fillMaxSize()
+                .then(
+                    if (session.drift) {
+                        Modifier.offset {
+                            IntOffset(
+                                x = -(animatedDepth * indentPxPerLevel).roundToInt(),
+                                y = 0
+                            )
+                        }
+                    } else Modifier
+                ),
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)
         ) {
-            items(session.tracks.size) { index ->
+            items(treeNodes.size) { index ->
                 TrackResultRow(
                     trackResult = session.tracks[index],
                     showModelTag = session.isMultiModel,
-                    treePrefix = treePrefixes.getOrNull(index)
+                    treeNode = treeNodes[index]
                 )
             }
         }
@@ -601,58 +592,93 @@ fun SessionPage(
 @Composable
 fun ResultsSummary(
     result: RadioResult,
-    pageIndex: Int,
-    totalPages: Int,
     modifier: Modifier = Modifier
 ) {
-    Row(
-        modifier = modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        // Left: human-friendly summary with seed track name
-        val strategyLabel = humanStrategy(result.strategy)
-        val seedName = result.seedTrack.title ?: "Unknown"
-        val countText = if (result.failedCount > 0) {
-            "$seedName \u2014 ${result.queuedCount} of ${result.requestedCount} queued (${result.failedCount} lookup missed)"
-        } else {
-            "$seedName \u2014 ${result.queuedCount} tracks via $strategyLabel"
-        }
-        Text(
-            text = countText,
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.weight(1f)
-        )
+    val strategyLabel = humanStrategy(result.strategy, result.drift)
+    val seedName = result.seedTrack.title ?: "Unknown"
+    val countText = if (result.failedCount > 0) {
+        "$seedName \u2014 ${result.queuedCount} of ${result.requestedCount} queued (${result.failedCount} lookup missed)"
+    } else {
+        "$seedName \u2014 ${result.queuedCount} tracks via $strategyLabel"
+    }
+    Text(
+        text = countText,
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = modifier.fillMaxWidth()
+    )
+}
 
-        // Right: page indicator
-        if (totalPages > 1) {
-            Text(
-                text = "${pageIndex + 1}/$totalPages",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+// ---- Tree node computation for all strategies ----
+
+private const val TREE_INDENT_DP = 12f
+
+/**
+ * Describes the tree position of a single track for Canvas-based rendering.
+ */
+data class TreeNodeInfo(
+    val depth: Int,
+    val isLastChild: Boolean,
+    val continuationDepths: Set<Int>
+)
+
+/**
+ * Computes tree nodes for every track in a session.
+ * All strategies get tree lines; drift modes produce progressively deeper chains.
+ */
+private fun computeTreeNodes(session: RadioResult): List<TreeNodeInfo> {
+    if (session.tracks.isEmpty()) return emptyList()
+
+    val rawNodes = when {
+        session.strategy == SearchStrategy.ANCHOR_EXPAND -> computeAnchorExpandNodes(session)
+        session.drift -> computeDriftChainNodes(session)
+        else -> computeFlatNodes(session)
+    }
+
+    // Forward pass to compute continuation lines
+    val result = mutableListOf<TreeNodeInfo>()
+    val activeBranches = mutableSetOf<Int>()
+
+    for (node in rawNodes) {
+        activeBranches.removeAll { it >= node.depth }
+        val continuations = activeBranches.filter { it < node.depth }.toSet()
+        result.add(node.copy(continuationDepths = continuations))
+        if (!node.isLastChild) {
+            activeBranches.add(node.depth)
         }
+    }
+
+    return result
+}
+
+/** Non-drift single/interleave: flat list at depth 0 */
+private fun computeFlatNodes(session: RadioResult): List<TreeNodeInfo> {
+    return session.tracks.mapIndexed { index, _ ->
+        TreeNodeInfo(
+            depth = 0,
+            isLastChild = index == session.tracks.lastIndex,
+            continuationDepths = emptySet()
+        )
     }
 }
 
-// ---- Tree prefix computation for anchor-expand ----
+/** Drift chain for single-model or interleave: progressive right-stepping */
+private fun computeDriftChainNodes(session: RadioResult): List<TreeNodeInfo> {
+    val isInterleave = session.strategy == SearchStrategy.INTERLEAVE
+    return session.tracks.mapIndexed { index, _ ->
+        val depth = if (isInterleave) index / 2 else index
+        TreeNodeInfo(
+            depth = depth,
+            isLastChild = index == session.tracks.lastIndex,
+            continuationDepths = emptySet()
+        )
+    }
+}
 
-/**
- * Computes tree-style prefixes for each track in a session.
- * Returns null entries for strategies that don't have tree structure.
- *
- * Anchor-expand produces groups: [anchor, exp, exp, ..., anchor, exp, exp, ...].
- * We detect group boundaries by model changes (anchor = primary model).
- */
-private fun computeTreePrefixes(session: RadioResult): List<String?> {
-    if (session.strategy != SearchStrategy.ANCHOR_EXPAND) return List(session.tracks.size) { null }
-    if (session.tracks.isEmpty()) return emptyList()
-
-    // The first track is always an anchor; its model is the primary model
+/** Anchor-expand: groups of [anchor, exp, exp, ...], optionally drift-stepping */
+private fun computeAnchorExpandNodes(session: RadioResult): List<TreeNodeInfo> {
     val primaryModel = session.tracks[0].modelUsed
 
-    // Build groups: list of (anchorIndex, list of expansionIndices)
     data class Group(val anchorIndex: Int, val expansionIndices: MutableList<Int> = mutableListOf())
     val groups = mutableListOf<Group>()
 
@@ -664,78 +690,65 @@ private fun computeTreePrefixes(session: RadioResult): List<String?> {
         }
     }
 
-    val prefixes = MutableList<String?>(session.tracks.size) { null }
+    val nodes = mutableListOf<TreeNodeInfo>()
 
     for ((gi, group) in groups.withIndex()) {
+        val baseDepth = if (session.drift) gi else 0
         val isLastGroup = gi == groups.lastIndex
-        val anchorBranch = if (isLastGroup) "\u2514\u2500" else "\u251c\u2500"  // └─ or ├─
-        val continuation = if (isLastGroup) "  " else "\u2502 "                  //    or │
 
-        prefixes[group.anchorIndex] = anchorBranch
+        // Anchor
+        nodes.add(TreeNodeInfo(
+            depth = baseDepth,
+            isLastChild = isLastGroup && group.expansionIndices.isEmpty(),
+            continuationDepths = emptySet()
+        ))
 
-        for ((ei, expIndex) in group.expansionIndices.withIndex()) {
+        // Expansions
+        for ((ei, _) in group.expansionIndices.withIndex()) {
             val isLastExp = ei == group.expansionIndices.lastIndex
-            val expBranch = if (isLastExp) "\u2514\u2500" else "\u251c\u2500"
-            prefixes[expIndex] = "$continuation$expBranch"
+            nodes.add(TreeNodeInfo(
+                depth = baseDepth + 1,
+                isLastChild = isLastExp && isLastGroup,
+                continuationDepths = emptySet()
+            ))
         }
     }
 
-    return prefixes
+    return nodes
 }
 
-// ---- Track Result Row with Similarity Indicator ----
+// ---- Track Result Row with Canvas Tree Lines ----
 
 @Composable
 fun TrackResultRow(
     trackResult: QueuedTrackResult,
     showModelTag: Boolean = false,
-    treePrefix: String? = null
+    treeNode: TreeNodeInfo? = null
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 4.dp),
+            .height(IntrinsicSize.Min)
+            .padding(vertical = 2.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Tree prefix for anchor-expand visualization
-        if (treePrefix != null) {
-            Text(
-                text = treePrefix,
-                style = MaterialTheme.typography.bodySmall,
-                fontFamily = FontFamily.Monospace,
-                color = MaterialTheme.colorScheme.outlineVariant,
-                modifier = Modifier.width(if (treePrefix.length > 2) 36.dp else 20.dp)
+        // Canvas tree lines
+        if (treeNode != null) {
+            TreeLines(
+                node = treeNode,
+                modifier = Modifier.fillMaxHeight()
             )
         }
 
-        // Similarity indicator with color gradient
+        // Similarity indicator
         SimilarityIndicator(
             score = trackResult.similarity,
             model = trackResult.modelUsed
         )
 
-        Spacer(modifier = Modifier.width(6.dp))
+        Spacer(modifier = Modifier.width(4.dp))
 
-        // Model tag (shown when using multi-model strategies)
-        if (showModelTag && trackResult.modelUsed != null) {
-            val (tagText, tagColor) = when (trackResult.modelUsed) {
-                EmbeddingModel.MUQ -> "muq" to MaterialTheme.colorScheme.primary
-                EmbeddingModel.MULAN -> "mulan" to MaterialTheme.colorScheme.tertiary
-                EmbeddingModel.FLAMINGO -> "flam" to MaterialTheme.colorScheme.secondary
-            }
-            Text(
-                text = tagText,
-                style = MaterialTheme.typography.labelSmall,
-                fontFamily = FontFamily.Monospace,
-                color = tagColor,
-                fontSize = 10.sp,
-                modifier = Modifier
-                    .width(36.dp)
-                    .padding(end = 4.dp)
-            )
-        }
-
-        // Track info
+        // Track info (takes remaining space)
         Column(
             modifier = Modifier
                 .weight(1f)
@@ -756,6 +769,26 @@ fun TrackResultRow(
             )
         }
 
+        // Model tag — right-aligned
+        if (showModelTag && trackResult.modelUsed != null) {
+            val (tagText, tagColor) = when (trackResult.modelUsed) {
+                EmbeddingModel.MUQ -> "muq" to MaterialTheme.colorScheme.primary
+                EmbeddingModel.MULAN -> "mulan" to MaterialTheme.colorScheme.tertiary
+                EmbeddingModel.FLAMINGO -> "flam" to MaterialTheme.colorScheme.secondary
+            }
+            Text(
+                text = tagText,
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = FontFamily.Monospace,
+                color = tagColor,
+                fontSize = 10.sp,
+                textAlign = TextAlign.End,
+                modifier = Modifier.width(36.dp)
+            )
+        }
+
+        Spacer(modifier = Modifier.width(4.dp))
+
         // Status icon
         val statusColor = when (trackResult.status) {
             QueueStatus.QUEUED -> MaterialTheme.colorScheme.primary
@@ -766,6 +799,65 @@ fun TrackResultRow(
             text = if (trackResult.status == QueueStatus.QUEUED) "\u2713" else "\u2717",
             style = MaterialTheme.typography.bodySmall,
             color = statusColor
+        )
+    }
+}
+
+/** Canvas-based tree line rendering — draws connected vertical and horizontal lines. */
+@Composable
+fun TreeLines(
+    node: TreeNodeInfo,
+    modifier: Modifier = Modifier
+) {
+    val lineColor = MaterialTheme.colorScheme.outlineVariant
+    val density = LocalDensity.current
+    val indentPx = with(density) { TREE_INDENT_DP.dp.toPx() }
+    val lineWidthPx = with(density) { 1.dp.toPx() }
+    val canvasWidth = with(density) { ((node.depth + 1) * TREE_INDENT_DP).dp }
+
+    Canvas(
+        modifier = modifier.width(canvasWidth)
+    ) {
+        val midY = size.height / 2
+
+        // Continuation vertical lines at each active depth
+        for (d in node.continuationDepths) {
+            val x = d * indentPx + indentPx / 2
+            drawLine(
+                color = lineColor,
+                start = Offset(x, 0f),
+                end = Offset(x, size.height),
+                strokeWidth = lineWidthPx
+            )
+        }
+
+        // Junction at this node's depth
+        val junctionX = node.depth * indentPx + indentPx / 2
+
+        // Vertical: top to middle (connecting from above)
+        drawLine(
+            color = lineColor,
+            start = Offset(junctionX, 0f),
+            end = Offset(junctionX, midY),
+            strokeWidth = lineWidthPx
+        )
+
+        // Vertical: middle to bottom (if more siblings follow)
+        if (!node.isLastChild) {
+            drawLine(
+                color = lineColor,
+                start = Offset(junctionX, midY),
+                end = Offset(junctionX, size.height),
+                strokeWidth = lineWidthPx
+            )
+        }
+
+        // Horizontal: junction to content
+        drawLine(
+            color = lineColor,
+            start = Offset(junctionX, midY),
+            end = Offset(size.width, midY),
+            strokeWidth = lineWidthPx
         )
     }
 }
@@ -1062,7 +1154,7 @@ fun SettingsScreen(
                         )
                         StrategyOption(
                             label = "Anchor & Expand",
-                            description = "One model selects seeds, the other expands recommendations on each",
+                            description = "One model selects seeds, the other expands on each",
                             selected = searchStrategy == SearchStrategy.ANCHOR_EXPAND,
                             enabled = hasBoth,
                             disabledReason = if (!hasBoth) "Requires both MuLan and Flamingo" else null,
@@ -1304,9 +1396,12 @@ private fun humanMatchType(matchType: TrackMatcher.MatchType): String = when (ma
     TrackMatcher.MatchType.NOT_FOUND -> "not found"
 }
 
-private fun humanStrategy(strategy: SearchStrategy): String = when (strategy) {
-    SearchStrategy.MULAN_ONLY -> "MuLan"
-    SearchStrategy.FLAMINGO_ONLY -> "Flamingo"
-    SearchStrategy.INTERLEAVE -> "interleave"
-    SearchStrategy.ANCHOR_EXPAND -> "anchor & expand"
+private fun humanStrategy(strategy: SearchStrategy, drift: Boolean = false): String {
+    val base = when (strategy) {
+        SearchStrategy.MULAN_ONLY -> "MuLan"
+        SearchStrategy.FLAMINGO_ONLY -> "Flamingo"
+        SearchStrategy.INTERLEAVE -> "interleave"
+        SearchStrategy.ANCHOR_EXPAND -> "anchor & expand"
+    }
+    return if (drift) "$base drift" else base
 }

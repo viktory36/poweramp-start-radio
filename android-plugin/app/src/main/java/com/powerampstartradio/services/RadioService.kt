@@ -279,6 +279,7 @@ class RadioService : Service() {
                     tracks = trackResults,
                     availableModels = availableModels,
                     strategy = strategy,
+                    drift = drift,
                     queuedFileIds = queuedFileIds
                 )
 
