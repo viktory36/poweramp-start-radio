@@ -885,15 +885,16 @@ fun SimilarityIndicator(score: Float, model: EmbeddingModel?) {
     }
     val normalized = ((score - floor) / (1f - floor)).coerceIn(0f, 1f)
 
-    // Use the same theme colors as the model tags — dim to vivid based on similarity
+    // Use the same theme colors as the model tags — dark to vivid based on similarity
     val vivid = when (model) {
         EmbeddingModel.FLAMINGO -> MaterialTheme.colorScheme.secondary
         EmbeddingModel.MULAN -> MaterialTheme.colorScheme.tertiary
         EmbeddingModel.MUQ -> MaterialTheme.colorScheme.primary
         null -> MaterialTheme.colorScheme.onSurfaceVariant
     }
-    val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    val color = lerp(muted, vivid, normalized)
+    // Low end is nearly invisible so the gradient is obvious
+    val dark = vivid.copy(alpha = 0.15f)
+    val color = lerp(dark, vivid, normalized)
 
     Text(
         text = String.format("%.3f", score),
