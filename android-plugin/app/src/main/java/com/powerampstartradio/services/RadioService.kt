@@ -169,9 +169,6 @@ class RadioService : Service() {
                     return@launch
                 }
 
-                // Clear queue immediately so old tracks stop after current finishes
-                PowerampHelper.clearQueue(this@RadioService)
-
                 updateNotification("Finding similar tracks to: ${currentTrack.title}")
                 Log.d(TAG, "Starting radio for: ${currentTrack.title} by ${currentTrack.artist}")
                 Log.d(TAG, "Strategy: ${strategy.name}" +
@@ -247,8 +244,8 @@ class RadioService : Service() {
                     return@launch
                 }
 
-                // Add tracks to queue in batch
-                val queuedCount = PowerampHelper.addTracksToQueue(this@RadioService, fileIds)
+                // Replace queue, preserving current entry if playing from queue
+                val queuedCount = PowerampHelper.replaceQueue(this@RadioService, currentTrack.realId, fileIds)
                 val queuedFileIds = fileIds.take(queuedCount).toSet()
 
                 // Build per-track results
