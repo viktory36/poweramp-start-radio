@@ -990,6 +990,140 @@ def merge(db1: Path, db2: Path, output: Path, verbose: bool):
     out_db.close()
 
 
+@cli.command()
+@click.argument("database", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--dim", "-d", type=int, default=512, help="Target dimensions (default: 512)")
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
+def reduce(database: Path, dim: int, verbose: bool):
+    """Reduce Flamingo embedding dimensions via SVD projection.
+
+    Projects 3584-dim Flamingo embeddings to a lower dimension using
+    uncentered truncated SVD, preserving cosine similarity structure.
+    Replaces embeddings in-place and saves the projection matrix for
+    future incremental use.
+
+    MuLan and MuQ embeddings are not affected.
+    """
+    import struct
+
+    if verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    import numpy as np
+
+    db = EmbeddingDatabase(database)
+    table = db._table_name("flamingo")
+
+    # Check table exists
+    row = db.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    if not row:
+        click.echo("Error: No Flamingo embeddings found in database.")
+        db.close()
+        return
+
+    # Get count and verify current dimension
+    count = db.conn.execute(f"SELECT COUNT(*) FROM [{table}]").fetchone()[0]
+    if count == 0:
+        click.echo("Error: Flamingo embeddings table is empty.")
+        db.close()
+        return
+
+    sample_blob = db.conn.execute(f"SELECT embedding FROM [{table}] LIMIT 1").fetchone()[0]
+    original_dim = len(sample_blob) // 4
+    click.echo(f"Database: {database}")
+    click.echo(f"Flamingo embeddings: {count} tracks × {original_dim} dims")
+
+    if original_dim <= dim:
+        click.echo(f"Error: Target dimension ({dim}) must be less than current ({original_dim}).")
+        db.close()
+        return
+
+    click.echo(f"Target: {dim} dims ({dim / original_dim * 100:.1f}% of original)")
+
+    # Load all embeddings
+    click.echo(f"\nLoading {count} embeddings ({count * original_dim * 4 / 1e9:.2f} GB)...")
+    X = np.empty((count, original_dim), dtype=np.float32)
+    track_ids = np.empty(count, dtype=np.int64)
+    cursor = db.conn.execute(f"SELECT track_id, embedding FROM [{table}]")
+    for i, (tid, blob) in enumerate(cursor):
+        track_ids[i] = tid
+        X[i] = np.frombuffer(blob, dtype=np.float32)
+        if (i + 1) % 10000 == 0:
+            click.echo(f"  loaded {i+1}/{count}")
+    click.echo(f"  loaded {count}/{count}")
+
+    # Compute uncentered SVD via gram matrix eigendecomposition
+    click.echo(f"\nComputing SVD (gram matrix {original_dim}×{original_dim})...")
+    G = X.astype(np.float64).T @ X.astype(np.float64)
+    eigenvalues, eigenvectors = np.linalg.eigh(G)
+
+    # Sort descending
+    idx = np.argsort(eigenvalues)[::-1]
+    eigenvalues = np.maximum(eigenvalues[idx], 0)
+    eigenvectors = eigenvectors[:, idx]
+
+    total_var = eigenvalues.sum()
+    retained_var = eigenvalues[:dim].sum() / total_var
+    click.echo(f"  Variance retained: {retained_var * 100:.2f}%")
+
+    # Project
+    click.echo(f"\nProjecting {count} × {original_dim} → {count} × {dim}...")
+    V_k = eigenvectors[:, :dim].astype(np.float32)
+    X_reduced = X @ V_k
+
+    # L2 normalize
+    norms = np.linalg.norm(X_reduced, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-10)
+    X_reduced = X_reduced / norms
+
+    # Replace embeddings in database
+    click.echo(f"Writing {count} reduced embeddings to database...")
+    db.conn.execute("BEGIN")
+    try:
+        for i in range(count):
+            blob = struct.pack(f"{dim}f", *X_reduced[i])
+            db.conn.execute(
+                f"UPDATE [{table}] SET embedding = ? WHERE track_id = ?",
+                (blob, int(track_ids[i]))
+            )
+            if (i + 1) % 10000 == 0:
+                click.echo(f"  written {i+1}/{count}")
+        click.echo(f"  written {count}/{count}")
+
+        # Save projection matrix as metadata
+        proj_blob = V_k.tobytes()
+        db.conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            ("flamingo_projection", proj_blob)
+        )
+        db.conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            ("flamingo_original_dim", str(original_dim))
+        )
+        db.conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            ("flamingo_reduced_dim", str(dim))
+        )
+        db.conn.execute("COMMIT")
+    except Exception:
+        db.conn.execute("ROLLBACK")
+        raise
+
+    # Vacuum to reclaim space
+    click.echo("Vacuuming database...")
+    db.conn.execute("VACUUM")
+
+    db.close()
+
+    new_size_mb = database.stat().st_size / 1024 / 1024
+    click.echo(f"\nDone!")
+    click.echo(f"  {original_dim}-d → {dim}-d ({retained_var * 100:.2f}% variance retained)")
+    click.echo(f"  Database size: {new_size_mb:.1f} MB")
+    click.echo(f"  Projection matrix saved as metadata (for incremental updates)")
+
+
 @cli.command("extract-encoder")
 @click.option(
     "--output", "-o",

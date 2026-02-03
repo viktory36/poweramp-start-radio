@@ -279,6 +279,21 @@ class EmbeddingDatabase private constructor(
     }
 
     /**
+     * Detect the actual embedding dimension for a model by probing the first row's blob size.
+     * Returns null if the table is empty.
+     */
+    fun getEmbeddingDim(model: EmbeddingModel): Int? {
+        val table = resolveTableName(model)
+        return try {
+            db.rawQuery("SELECT length(embedding) FROM [$table] LIMIT 1", null).use {
+                if (it.moveToFirst()) it.getInt(0) / 4 else null  // 4 bytes per float32
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
      * Get the count of embeddings for a model.
      */
     fun getEmbeddingCount(model: EmbeddingModel): Int {

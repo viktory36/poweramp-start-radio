@@ -87,11 +87,14 @@ class EmbeddingIndex private constructor(
                 return
             }
 
-            val totalMB = numTracks.toLong() * model.dim * 4 / 1024 / 1024
-            Log.i(TAG, "Extracting $numTracks ${model.name} embeddings (dim=${model.dim}, ~${totalMB} MB)")
+            // Detect actual dimension from the database (may differ from enum
+            // if embeddings were reduced via SVD projection on the desktop side)
+            val actualDim = db.getEmbeddingDim(model) ?: model.dim
+            val totalMB = numTracks.toLong() * actualDim * 4 / 1024 / 1024
+            Log.i(TAG, "Extracting $numTracks ${model.name} embeddings (dim=$actualDim, ~${totalMB} MB)")
 
-            val expectedBlobSize = model.dim * 4  // float32
-            val totalSize = HEADER_SIZE.toLong() + numTracks.toLong() * 8 + numTracks.toLong() * model.dim * 4
+            val expectedBlobSize = actualDim * 4  // float32
+            val totalSize = HEADER_SIZE.toLong() + numTracks.toLong() * 8 + numTracks.toLong() * actualDim * 4
             val embeddingsStart = HEADER_SIZE.toLong() + numTracks.toLong() * 8
 
             RandomAccessFile(outFile, "rw").use { raf ->
@@ -104,7 +107,7 @@ class EmbeddingIndex private constructor(
                 buf.putInt(0, MAGIC)
                 buf.putInt(4, VERSION)
                 buf.putInt(8, numTracks)
-                buf.putInt(12, model.dim)
+                buf.putInt(12, actualDim)
 
                 // Stream rows: write track ID and embedding blob at computed offsets
                 var i = 0
