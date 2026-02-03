@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -197,6 +198,16 @@ fun MainScreen(
             pageCount = { sessionHistory.size }
         )
     } else null
+
+    // Back button: settings -> home, viewing session -> home
+    BackHandler(enabled = showSettings || viewingSession != null) {
+        if (showSettings) {
+            showSettings = false
+        } else {
+            viewingSession = null
+            viewModel.resetRadioState()
+        }
+    }
 
     ModalNavigationDrawer(
         drawerState = drawerState,
