@@ -264,6 +264,21 @@ class EmbeddingDatabase private constructor(
     }
 
     /**
+     * Stream embeddings one row at a time without holding them all in memory.
+     * The callback receives the raw embedding BLOB bytes (little-endian float32).
+     */
+    fun forEachEmbeddingRaw(model: EmbeddingModel, block: (trackId: Long, blob: ByteArray) -> Unit) {
+        val table = resolveTableName(model)
+        db.rawQuery("SELECT track_id, embedding FROM [$table]", null).use { cursor ->
+            while (cursor.moveToNext()) {
+                val trackId = cursor.getLong(0)
+                val blob = cursor.getBlob(1)
+                block(trackId, blob)
+            }
+        }
+    }
+
+    /**
      * Get the count of embeddings for a model.
      */
     fun getEmbeddingCount(model: EmbeddingModel): Int {

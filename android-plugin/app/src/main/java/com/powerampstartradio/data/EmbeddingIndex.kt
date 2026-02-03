@@ -66,52 +66,67 @@ class EmbeddingIndex private constructor(
 
         /**
          * Extract embeddings from SQLite database into a .emb binary file.
+         *
+         * Streams rows one at a time — never holds more than one embedding in memory.
+         * Each row's BLOB bytes are written directly to the mmap'd output at the
+         * correct offset (track ID in the IDs section, embedding in the data section).
          */
         fun extractFromDatabase(db: EmbeddingDatabase, model: EmbeddingModel, outFile: File) {
             Log.d(TAG, "Extracting ${model.name} embeddings to ${outFile.name}")
 
-            val trackIds = mutableListOf<Long>()
-            val embeddings = mutableListOf<FloatArray>()
-
-            // Read all embeddings from the database
-            val allEmbeddings = db.getAllEmbeddings(model)
-            for ((trackId, embedding) in allEmbeddings) {
-                if (embedding.size == model.dim) {
-                    trackIds.add(trackId)
-                    embeddings.add(embedding)
-                } else {
-                    Log.w(TAG, "Skipping track $trackId: dim ${embedding.size} != ${model.dim}")
-                }
+            val numTracks = db.getEmbeddingCount(model)
+            if (numTracks == 0) {
+                Log.w(TAG, "No ${model.name} embeddings to extract")
+                return
             }
 
-            val numTracks = trackIds.size
-            Log.d(TAG, "Writing $numTracks embeddings (dim=${model.dim})")
+            Log.d(TAG, "Streaming $numTracks embeddings (dim=${model.dim}) to binary file")
 
-            // Write binary file
+            val expectedBlobSize = model.dim * 4  // float32
             val totalSize = HEADER_SIZE.toLong() + numTracks.toLong() * 8 + numTracks.toLong() * model.dim * 4
+            val embeddingsStart = HEADER_SIZE.toLong() + numTracks.toLong() * 8
+
             RandomAccessFile(outFile, "rw").use { raf ->
                 raf.setLength(totalSize)
                 val channel = raf.channel
                 val buf = channel.map(FileChannel.MapMode.READ_WRITE, 0, totalSize)
                 buf.order(ByteOrder.LITTLE_ENDIAN)
 
-                // Header
+                // Write header
                 buf.putInt(0, MAGIC)
                 buf.putInt(4, VERSION)
                 buf.putInt(8, numTracks)
                 buf.putInt(12, model.dim)
 
-                // Track IDs
-                buf.position(HEADER_SIZE)
-                for (trackId in trackIds) {
-                    buf.putLong(trackId)
+                // Stream rows: write track ID and embedding blob at computed offsets
+                var i = 0
+                var skipped = 0
+                db.forEachEmbeddingRaw(model) { trackId, blob ->
+                    if (blob.size != expectedBlobSize) {
+                        skipped++
+                        return@forEachEmbeddingRaw
+                    }
+                    if (i >= numTracks) return@forEachEmbeddingRaw
+
+                    // Write track ID
+                    val idOffset = HEADER_SIZE + i * 8
+                    buf.putLong(idOffset, trackId)
+
+                    // Write embedding blob bytes directly (already little-endian float32)
+                    val embOffset = (embeddingsStart + i.toLong() * expectedBlobSize).toInt()
+                    buf.position(embOffset)
+                    buf.put(blob)
+
+                    i++
                 }
 
-                // Embeddings (row-major)
-                for (embedding in embeddings) {
-                    for (v in embedding) {
-                        buf.putFloat(v)
-                    }
+                // Update header with actual count if some were skipped
+                if (skipped > 0) {
+                    Log.w(TAG, "Skipped $skipped embeddings with wrong dimension")
+                    buf.putInt(8, i)
+                    // Truncate file to actual size
+                    val actualSize = HEADER_SIZE.toLong() + i.toLong() * 8 + i.toLong() * expectedBlobSize
+                    raf.setLength(actualSize)
                 }
 
                 buf.force()
