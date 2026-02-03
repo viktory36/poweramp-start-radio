@@ -338,7 +338,7 @@ class SimilarityEngine(
         val seen = mutableSetOf(seedTrackId)
 
         for (i in 0 until numTracks) {
-            onProgress?.invoke("Drifting: ${i + 1}/$numTracks...")
+            onProgress?.invoke("Drifting ahead: ${i + 1}/$numTracks...")
             val top = index.findTopK(currentEmb, 1, excludeIds = seen)
             if (top.isEmpty()) break
 
@@ -380,7 +380,7 @@ class SimilarityEngine(
 
         while (result.size < numTracks) {
             var advanced = false
-            onProgress?.invoke("Drifting: ${result.size}/$numTracks...")
+            onProgress?.invoke("Drifting ahead: ${result.size}/$numTracks...")
 
             // MuLan turn
             mulanIdx.getEmbeddingByTrackId(currentTrackId)?.let { emb ->
@@ -443,7 +443,7 @@ class SimilarityEngine(
 
         for (g in 0 until numGroups) {
             if (result.size >= numTracks) break
-            onProgress?.invoke("Drifting: group ${g + 1}/$numGroups...")
+            onProgress?.invoke("Drifting ahead: group ${g + 1}/$numGroups...")
 
             // Find anchor relative to current seed (drifted from previous anchor)
             val anchors = primaryIndex.findTopK(currentEmb, 1, excludeIds = seen)

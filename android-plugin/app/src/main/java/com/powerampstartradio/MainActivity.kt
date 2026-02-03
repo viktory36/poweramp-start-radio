@@ -939,7 +939,7 @@ fun IdleContent(
         // Ready indicator
         if (hasPermission && databaseInfo != null) {
             Text(
-                text = "Ready \u2014 tap Start Radio",
+                text = "Ready when you are!",
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.primary
             )
