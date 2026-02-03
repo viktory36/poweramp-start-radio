@@ -286,7 +286,7 @@ class SimilarityEngine(
         val seen = mutableSetOf(seedTrackId)
         seen.addAll(anchors.map { it.first })
 
-        onProgress?.invoke("Expanding neighborhoods...")
+        onProgress?.invoke("Expanding anchors...")
         val expansionResults = if (anchorQueries.isNotEmpty()) {
             secondaryIndex.findTopKMulti(anchorQueries, config.expansionCount, excludeIds = seen)
         } else {

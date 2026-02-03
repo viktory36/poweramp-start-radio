@@ -85,9 +85,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val trackChangeListener: (com.powerampstartradio.poweramp.PowerampTrack?) -> Unit = { track ->
         val state = RadioService.uiState.value
         if (state is RadioUiState.Success) {
-            // Only reset if the new track is NOT one we queued (i.e. user switched away)
-            val queuedIds = state.result.queuedFileIds
-            if (track == null || track.realId !in queuedIds) {
+            // Only reset if the new track is neither the seed nor one we queued
+            val result = state.result
+            val knownIds = result.queuedFileIds + result.seedTrack.realId
+            if (track == null || track.realId !in knownIds) {
                 RadioService.resetState()
             }
         }
