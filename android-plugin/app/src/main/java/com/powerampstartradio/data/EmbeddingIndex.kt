@@ -70,8 +70,15 @@ class EmbeddingIndex private constructor(
          * Streams rows one at a time — never holds more than one embedding in memory.
          * Each row's BLOB bytes are written directly to the mmap'd output at the
          * correct offset (track ID in the IDs section, embedding in the data section).
+         *
+         * @param onProgress called periodically with (current, total) track counts
          */
-        fun extractFromDatabase(db: EmbeddingDatabase, model: EmbeddingModel, outFile: File) {
+        fun extractFromDatabase(
+            db: EmbeddingDatabase,
+            model: EmbeddingModel,
+            outFile: File,
+            onProgress: ((current: Int, total: Int) -> Unit)? = null
+        ) {
             Log.d(TAG, "Extracting ${model.name} embeddings to ${outFile.name}")
 
             val numTracks = db.getEmbeddingCount(model)
@@ -80,7 +87,8 @@ class EmbeddingIndex private constructor(
                 return
             }
 
-            Log.d(TAG, "Streaming $numTracks embeddings (dim=${model.dim}) to binary file")
+            val totalMB = numTracks.toLong() * model.dim * 4 / 1024 / 1024
+            Log.i(TAG, "Extracting $numTracks ${model.name} embeddings (dim=${model.dim}, ~${totalMB} MB)")
 
             val expectedBlobSize = model.dim * 4  // float32
             val totalSize = HEADER_SIZE.toLong() + numTracks.toLong() * 8 + numTracks.toLong() * model.dim * 4
@@ -101,6 +109,7 @@ class EmbeddingIndex private constructor(
                 // Stream rows: write track ID and embedding blob at computed offsets
                 var i = 0
                 var skipped = 0
+                val progressInterval = maxOf(numTracks / 20, 1)  // ~5% increments
                 db.forEachEmbeddingRaw(model) { trackId, blob ->
                     if (blob.size != expectedBlobSize) {
                         skipped++
@@ -118,7 +127,15 @@ class EmbeddingIndex private constructor(
                     buf.put(blob)
 
                     i++
+
+                    if (i % progressInterval == 0) {
+                        val pct = i * 100 / numTracks
+                        Log.d(TAG, "${model.name}: $i / $numTracks ($pct%)")
+                        onProgress?.invoke(i, numTracks)
+                    }
                 }
+
+                onProgress?.invoke(i, numTracks)
 
                 // Update header with actual count if some were skipped
                 if (skipped > 0) {
@@ -132,7 +149,7 @@ class EmbeddingIndex private constructor(
                 buf.force()
             }
 
-            Log.d(TAG, "Wrote ${outFile.length() / 1024 / 1024} MB to ${outFile.name}")
+            Log.i(TAG, "Wrote ${outFile.length() / 1024 / 1024} MB to ${outFile.name}")
         }
     }
 

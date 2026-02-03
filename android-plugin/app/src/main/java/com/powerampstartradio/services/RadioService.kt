@@ -196,9 +196,15 @@ class RadioService : Service() {
 
                 Log.d(TAG, "Found match (${matchResult.matchType}): ${matchResult.embeddedTrack.title}")
 
-                // Find similar tracks using selected strategy
+                // Ensure mmap indices are ready (one-time extraction on first use)
                 val engine = getOrCreateEngine(db)
                 val availableModels = db.getAvailableModels()
+
+                engine.ensureIndices { message ->
+                    updateNotification(message)
+                }
+
+                updateNotification("Searching for similar tracks...")
 
                 val similarTracks = engine.findSimilarTracks(
                     seedTrackId = matchResult.embeddedTrack.id,

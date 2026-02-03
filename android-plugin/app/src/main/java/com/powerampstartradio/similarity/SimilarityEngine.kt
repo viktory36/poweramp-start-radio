@@ -62,9 +62,13 @@ class SimilarityEngine(
     private var flamingoIndex: EmbeddingIndex? = null
 
     /**
-     * Ensure mmap'd indices are ready. Extracts from SQLite if needed.
+     * Ensure mmap'd indices are ready. Extracts from SQLite if needed (one-time).
+     *
+     * @param onProgress called with a human-readable status message during extraction
      */
-    suspend fun ensureIndices() = withContext(Dispatchers.IO) {
+    suspend fun ensureIndices(
+        onProgress: ((message: String) -> Unit)? = null
+    ) = withContext(Dispatchers.IO) {
         val availableModels = database.getAvailableModels()
         val dbFile = File(filesDir, "embeddings.db")
         val dbModified = dbFile.lastModified()
@@ -72,24 +76,30 @@ class SimilarityEngine(
         if (EmbeddingModel.MULAN in availableModels) {
             val embFile = File(filesDir, "mulan.emb")
             if (!embFile.exists() || embFile.lastModified() < dbModified) {
-                Log.d(TAG, "Extracting MuLan index...")
-                EmbeddingIndex.extractFromDatabase(database, EmbeddingModel.MULAN, embFile)
+                Log.i(TAG, "Extracting MuLan index (one-time)...")
+                onProgress?.invoke("Extracting MuLan index...")
+                EmbeddingIndex.extractFromDatabase(database, EmbeddingModel.MULAN, embFile) { cur, total ->
+                    onProgress?.invoke("Extracting MuLan: $cur / $total")
+                }
             }
             if (mulanIndex == null) {
                 mulanIndex = EmbeddingIndex.mmap(embFile)
-                Log.d(TAG, "MuLan index: ${mulanIndex!!.numTracks} tracks, dim=${mulanIndex!!.dim}")
+                Log.i(TAG, "MuLan index: ${mulanIndex!!.numTracks} tracks, dim=${mulanIndex!!.dim}")
             }
         }
 
         if (EmbeddingModel.FLAMINGO in availableModels) {
             val embFile = File(filesDir, "flamingo.emb")
             if (!embFile.exists() || embFile.lastModified() < dbModified) {
-                Log.d(TAG, "Extracting Flamingo index...")
-                EmbeddingIndex.extractFromDatabase(database, EmbeddingModel.FLAMINGO, embFile)
+                Log.i(TAG, "Extracting Flamingo index (one-time)...")
+                onProgress?.invoke("Extracting Flamingo index...")
+                EmbeddingIndex.extractFromDatabase(database, EmbeddingModel.FLAMINGO, embFile) { cur, total ->
+                    onProgress?.invoke("Extracting Flamingo: $cur / $total")
+                }
             }
             if (flamingoIndex == null) {
                 flamingoIndex = EmbeddingIndex.mmap(embFile)
-                Log.d(TAG, "Flamingo index: ${flamingoIndex!!.numTracks} tracks, dim=${flamingoIndex!!.dim}")
+                Log.i(TAG, "Flamingo index: ${flamingoIndex!!.numTracks} tracks, dim=${flamingoIndex!!.dim}")
             }
         }
     }
@@ -111,6 +121,8 @@ class SimilarityEngine(
         strategy: SearchStrategy,
         feedForwardConfig: FeedForwardConfig? = null
     ): List<SimilarTrack> = withContext(Dispatchers.Default) {
+        // Caller should have called ensureIndices() first for progress reporting.
+        // Call it here as a safety net (no-op if already done).
         ensureIndices()
 
         when (strategy) {
