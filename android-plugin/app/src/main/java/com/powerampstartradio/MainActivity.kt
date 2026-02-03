@@ -885,38 +885,15 @@ fun SimilarityIndicator(score: Float, model: EmbeddingModel?) {
     }
     val normalized = ((score - floor) / (1f - floor)).coerceIn(0f, 1f)
 
-    // Per-model color gradient: dim (low similarity) → vivid (high similarity)
-    val color = when (model) {
-        EmbeddingModel.FLAMINGO -> {
-            // Orange/amber family
-            val dim = Color(0xFF92713A)
-            val mid = Color(0xFFF97316)
-            val bright = Color(0xFFFBBF24)
-            if (normalized <= 0.5f) lerp(dim, mid, normalized * 2)
-            else lerp(mid, bright, (normalized - 0.5f) * 2)
-        }
-        EmbeddingModel.MULAN -> {
-            // Teal/cyan family
-            val dim = Color(0xFF5B7E8A)
-            val mid = Color(0xFF0EA5E9)
-            val bright = Color(0xFF38BDF8)
-            if (normalized <= 0.5f) lerp(dim, mid, normalized * 2)
-            else lerp(mid, bright, (normalized - 0.5f) * 2)
-        }
-        EmbeddingModel.MUQ -> {
-            // Green family
-            val dim = Color(0xFF5F7A5E)
-            val mid = Color(0xFF22C55E)
-            val bright = Color(0xFF4ADE80)
-            if (normalized <= 0.5f) lerp(dim, mid, normalized * 2)
-            else lerp(mid, bright, (normalized - 0.5f) * 2)
-        }
-        null -> {
-            val dim = Color(0xFF6B7280)
-            val bright = Color(0xFF9CA3AF)
-            lerp(dim, bright, normalized)
-        }
+    // Use the same theme colors as the model tags — dim to vivid based on similarity
+    val vivid = when (model) {
+        EmbeddingModel.FLAMINGO -> MaterialTheme.colorScheme.secondary
+        EmbeddingModel.MULAN -> MaterialTheme.colorScheme.tertiary
+        EmbeddingModel.MUQ -> MaterialTheme.colorScheme.primary
+        null -> MaterialTheme.colorScheme.onSurfaceVariant
     }
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val color = lerp(muted, vivid, normalized)
 
     Text(
         text = String.format("%.3f", score),
