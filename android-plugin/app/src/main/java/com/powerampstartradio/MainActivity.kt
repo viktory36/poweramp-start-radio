@@ -24,7 +24,6 @@ import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Clear
@@ -565,13 +564,19 @@ fun SessionPage(
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
         )
 
-        // Track list
+        // Track list with tree prefixes for anchor-expand
+        val treePrefixes = computeTreePrefixes(session)
+
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)
         ) {
-            items(session.tracks) { trackResult ->
-                TrackResultRow(trackResult, showModelTag = session.isMultiModel)
+            items(session.tracks.size) { index ->
+                TrackResultRow(
+                    trackResult = session.tracks[index],
+                    showModelTag = session.isMultiModel,
+                    treePrefix = treePrefixes.getOrNull(index)
+                )
             }
         }
     }
@@ -589,12 +594,13 @@ fun ResultsSummary(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Left: human-friendly summary
+        // Left: human-friendly summary with seed track name
         val strategyLabel = humanStrategy(result.strategy)
+        val seedName = result.seedTrack.title ?: "Unknown"
         val countText = if (result.failedCount > 0) {
-            "${result.queuedCount} of ${result.requestedCount} queued (${result.failedCount} not in Poweramp)"
+            "$seedName \u2014 ${result.queuedCount} of ${result.requestedCount} queued (${result.failedCount} lookup missed)"
         } else {
-            "${result.queuedCount} tracks queued via $strategyLabel"
+            "$seedName \u2014 ${result.queuedCount} tracks via $strategyLabel"
         }
         Text(
             text = countText,
@@ -614,16 +620,78 @@ fun ResultsSummary(
     }
 }
 
+// ---- Tree prefix computation for anchor-expand ----
+
+/**
+ * Computes tree-style prefixes for each track in a session.
+ * Returns null entries for strategies that don't have tree structure.
+ *
+ * Anchor-expand produces groups: [anchor, exp, exp, ..., anchor, exp, exp, ...].
+ * We detect group boundaries by model changes (anchor = primary model).
+ */
+private fun computeTreePrefixes(session: RadioResult): List<String?> {
+    if (session.strategy != SearchStrategy.ANCHOR_EXPAND) return List(session.tracks.size) { null }
+    if (session.tracks.isEmpty()) return emptyList()
+
+    // The first track is always an anchor; its model is the primary model
+    val primaryModel = session.tracks[0].modelUsed
+
+    // Build groups: list of (anchorIndex, list of expansionIndices)
+    data class Group(val anchorIndex: Int, val expansionIndices: MutableList<Int> = mutableListOf())
+    val groups = mutableListOf<Group>()
+
+    for (i in session.tracks.indices) {
+        if (session.tracks[i].modelUsed == primaryModel) {
+            groups.add(Group(i))
+        } else {
+            groups.lastOrNull()?.expansionIndices?.add(i)
+        }
+    }
+
+    val prefixes = MutableList<String?>(session.tracks.size) { null }
+
+    for ((gi, group) in groups.withIndex()) {
+        val isLastGroup = gi == groups.lastIndex
+        val anchorBranch = if (isLastGroup) "\u2514\u2500" else "\u251c\u2500"  // └─ or ├─
+        val continuation = if (isLastGroup) "  " else "\u2502 "                  //    or │
+
+        prefixes[group.anchorIndex] = anchorBranch
+
+        for ((ei, expIndex) in group.expansionIndices.withIndex()) {
+            val isLastExp = ei == group.expansionIndices.lastIndex
+            val expBranch = if (isLastExp) "\u2514\u2500" else "\u251c\u2500"
+            prefixes[expIndex] = "$continuation$expBranch"
+        }
+    }
+
+    return prefixes
+}
+
 // ---- Track Result Row with Similarity Indicator ----
 
 @Composable
-fun TrackResultRow(trackResult: QueuedTrackResult, showModelTag: Boolean = false) {
+fun TrackResultRow(
+    trackResult: QueuedTrackResult,
+    showModelTag: Boolean = false,
+    treePrefix: String? = null
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
+        // Tree prefix for anchor-expand visualization
+        if (treePrefix != null) {
+            Text(
+                text = treePrefix,
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.outlineVariant,
+                modifier = Modifier.width(if (treePrefix.length > 2) 36.dp else 20.dp)
+            )
+        }
+
         // Similarity indicator with color gradient
         SimilarityIndicator(
             score = trackResult.similarity,
@@ -704,24 +772,14 @@ fun SimilarityIndicator(score: Float, model: EmbeddingModel?) {
         lerp(green, blue, (normalized - 0.5f) * 2)
     }
 
-    Box(modifier = Modifier.width(52.dp).height(20.dp)) {
-        // Background bar
-        Box(
-            modifier = Modifier
-                .fillMaxHeight()
-                .fillMaxWidth(normalized)
-                .background(color.copy(alpha = 0.25f), RoundedCornerShape(4.dp))
-        )
-        // Score text
-        Text(
-            text = String.format("%.3f", score),
-            style = MaterialTheme.typography.bodySmall,
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.Bold,
-            color = color,
-            modifier = Modifier.align(Alignment.CenterStart).padding(start = 2.dp)
-        )
-    }
+    Text(
+        text = String.format("%.3f", score),
+        style = MaterialTheme.typography.bodySmall,
+        fontFamily = FontFamily.Monospace,
+        fontWeight = FontWeight.Bold,
+        color = color,
+        modifier = Modifier.width(48.dp)
+    )
 }
 
 // ---- Session History Drawer ----
@@ -859,14 +917,13 @@ fun IdleContent(
             }
         }
 
-        // Index status
-        if (indexStatus != null) {
+        // Index extraction progress (hidden once done)
+        if (indexStatus != null && indexStatus != "Indices ready") {
             Text(
                 text = indexStatus,
                 style = MaterialTheme.typography.bodySmall,
                 fontFamily = FontFamily.Monospace,
-                color = if (indexStatus == "Indices ready") MaterialTheme.colorScheme.primary
-                       else MaterialTheme.colorScheme.onSurfaceVariant
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
 
@@ -880,7 +937,7 @@ fun IdleContent(
         }
 
         // Ready indicator
-        if (hasPermission && databaseInfo != null && indexStatus == "Indices ready") {
+        if (hasPermission && databaseInfo != null) {
             Text(
                 text = "Ready \u2014 tap Start Radio",
                 style = MaterialTheme.typography.bodyLarge,
