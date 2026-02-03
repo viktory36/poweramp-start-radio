@@ -271,7 +271,6 @@ fun MainScreen(
                         }
                     },
                     onClearAndReset = {
-                        PowerampHelper.clearQueue(context)
                         viewModel.resetRadioState()
                     },
                     onRequestPermission = { viewModel.requestPermission() },
@@ -542,48 +541,64 @@ fun SessionPage(
     val treeNodes = remember(session) { computeTreeNodes(session) }
     val listState = rememberLazyListState()
 
-    // Diagonal scroll for drift: shift left based on first visible item's depth
-    val targetDepth by remember {
-        derivedStateOf {
-            if (session.drift) treeNodes.getOrNull(listState.firstVisibleItemIndex)?.depth ?: 0
-            else 0
-        }
-    }
-    val animatedDepth by animateFloatAsState(
-        targetValue = targetDepth.toFloat(),
-        label = "diagonal_scroll"
-    )
-    val density = LocalDensity.current
-    val indentPxPerLevel = remember(density) { with(density) { TREE_INDENT_DP.dp.toPx() } }
-
     Column(modifier = modifier) {
         ResultsSummary(
             result = session,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
         )
 
-        LazyColumn(
-            state = listState,
-            modifier = Modifier
-                .fillMaxSize()
-                .then(
-                    if (session.drift) {
-                        Modifier.offset {
+        if (session.drift) {
+            // Drift: diagonal scroll — widen the list so deeper items still have
+            // full content width, then offset left based on first visible depth.
+            val maxDepth = remember(treeNodes) { treeNodes.maxOfOrNull { it.depth } ?: 0 }
+            val targetDepth by remember {
+                derivedStateOf {
+                    treeNodes.getOrNull(listState.firstVisibleItemIndex)?.depth ?: 0
+                }
+            }
+            val animatedDepth by animateFloatAsState(
+                targetValue = targetDepth.toFloat(),
+                label = "diagonal_scroll"
+            )
+            val density = LocalDensity.current
+            val indentPxPerLevel = remember(density) { with(density) { TREE_INDENT_DP.dp.toPx() } }
+            val extraWidthDp = ((maxDepth + 1) * TREE_INDENT_DP).dp
+
+            BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier
+                        .width(maxWidth + extraWidthDp)
+                        .offset {
                             IntOffset(
                                 x = -(animatedDepth * indentPxPerLevel).roundToInt(),
                                 y = 0
                             )
-                        }
-                    } else Modifier
-                ),
-            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)
-        ) {
-            items(treeNodes.size) { index ->
-                TrackResultRow(
-                    trackResult = session.tracks[index],
-                    showModelTag = session.isMultiModel,
-                    treeNode = treeNodes[index]
-                )
+                        },
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)
+                ) {
+                    items(treeNodes.size) { index ->
+                        TrackResultRow(
+                            trackResult = session.tracks[index],
+                            showModelTag = session.isMultiModel,
+                            treeNode = treeNodes[index]
+                        )
+                    }
+                }
+            }
+        } else {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)
+            ) {
+                items(treeNodes.size) { index ->
+                    TrackResultRow(
+                        trackResult = session.tracks[index],
+                        showModelTag = session.isMultiModel,
+                        treeNode = treeNodes[index]
+                    )
+                }
             }
         }
     }
@@ -611,7 +626,8 @@ fun ResultsSummary(
 
 // ---- Tree node computation for all strategies ----
 
-private const val TREE_INDENT_DP = 12f
+private const val TREE_INDENT_DP = 10f
+private const val MAX_TREE_DEPTH = 20
 
 /**
  * Describes the tree position of a single track for Canvas-based rendering.
@@ -662,13 +678,11 @@ private fun computeFlatNodes(session: RadioResult): List<TreeNodeInfo> {
     }
 }
 
-/** Drift chain for single-model or interleave: progressive right-stepping */
+/** Drift chain: each track seeds the next, progressive right-stepping */
 private fun computeDriftChainNodes(session: RadioResult): List<TreeNodeInfo> {
-    val isInterleave = session.strategy == SearchStrategy.INTERLEAVE
     return session.tracks.mapIndexed { index, _ ->
-        val depth = if (isInterleave) index / 2 else index
         TreeNodeInfo(
-            depth = depth,
+            depth = minOf(index, MAX_TREE_DEPTH),
             isLastChild = index == session.tracks.lastIndex,
             continuationDepths = emptySet()
         )
@@ -693,7 +707,7 @@ private fun computeAnchorExpandNodes(session: RadioResult): List<TreeNodeInfo> {
     val nodes = mutableListOf<TreeNodeInfo>()
 
     for ((gi, group) in groups.withIndex()) {
-        val baseDepth = if (session.drift) gi else 0
+        val baseDepth = if (session.drift) minOf(gi, MAX_TREE_DEPTH) else 0
         val isLastGroup = gi == groups.lastIndex
 
         // Anchor
@@ -707,7 +721,7 @@ private fun computeAnchorExpandNodes(session: RadioResult): List<TreeNodeInfo> {
         for ((ei, _) in group.expansionIndices.withIndex()) {
             val isLastExp = ei == group.expansionIndices.lastIndex
             nodes.add(TreeNodeInfo(
-                depth = baseDepth + 1,
+                depth = minOf(baseDepth + 1, MAX_TREE_DEPTH + 1),
                 isLastChild = isLastExp && isLastGroup,
                 continuationDepths = emptySet()
             ))

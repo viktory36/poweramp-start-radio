@@ -82,10 +82,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // Session history
     val sessionHistory: StateFlow<List<RadioResult>> = RadioService.sessionHistory
 
-    private val trackChangeListener: (com.powerampstartradio.poweramp.PowerampTrack?) -> Unit = { _ ->
+    private val trackChangeListener: (com.powerampstartradio.poweramp.PowerampTrack?) -> Unit = { track ->
         val state = RadioService.uiState.value
         if (state is RadioUiState.Success) {
-            RadioService.resetState()
+            // Only reset if the new track is NOT one we queued (i.e. user switched away)
+            val queuedIds = state.result.queuedFileIds
+            if (track == null || track.realId !in queuedIds) {
+                RadioService.resetState()
+            }
         }
     }
 
