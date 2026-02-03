@@ -728,7 +728,7 @@ fun SettingsBottomSheet(
                         )
                         StrategyOption(
                             label = "Interleave",
-                            description = "Round-robin results from both models",
+                            description = "Alternate results from both models",
                             selected = searchStrategy == SearchStrategy.INTERLEAVE,
                             enabled = hasBoth,
                             disabledReason = if (!hasBoth) "Requires both MuLan and Flamingo" else null,
@@ -736,7 +736,7 @@ fun SettingsBottomSheet(
                         )
                         StrategyOption(
                             label = "Anchor & Expand",
-                            description = "One model finds anchors, other expands each",
+                            description = "One model selects seeds, the other expands recommendations on each",
                             selected = searchStrategy == SearchStrategy.ANCHOR_EXPAND,
                             enabled = hasBoth,
                             disabledReason = if (!hasBoth) "Requires both MuLan and Flamingo" else null,
@@ -822,7 +822,7 @@ fun SettingsBottomSheet(
                         Spacer(modifier = Modifier.width(8.dp))
                         Column {
                             Text(
-                                text = "Drift",
+                                text = "Drift ahead",
                                 style = MaterialTheme.typography.bodyMedium
                             )
                             Text(
