@@ -141,6 +141,14 @@ fun MainScreen(
     var currentTrack by remember { mutableStateOf<PowerampTrack?>(PowerampReceiver.currentTrack) }
     var showSettings by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf("") }
+    var viewingSession by remember { mutableStateOf<Int?>(null) }
+
+    // Clear viewed session when radio resets to idle (e.g. track change auto-reset)
+    LaunchedEffect(radioState) {
+        if (radioState is RadioUiState.Idle) {
+            viewingSession = null
+        }
+    }
 
     // Drawer state
     val drawerState = rememberDrawerState(DrawerValue.Closed)
@@ -199,13 +207,12 @@ fun MainScreen(
                 SessionHistoryDrawer(
                     sessions = sessionHistory,
                     onSessionTap = { index ->
-                        scope.launch {
-                            drawerState.close()
-                            pagerState?.animateScrollToPage(index)
-                        }
+                        viewingSession = index
+                        scope.launch { drawerState.close() }
                     },
                     onClear = {
                         viewModel.clearSessionHistory()
+                        viewingSession = null
                         scope.launch { drawerState.close() }
                     }
                 )
@@ -262,7 +269,9 @@ fun MainScreen(
                     onResetState = { viewModel.resetRadioState() },
                     onRequestPermission = { viewModel.requestPermission() },
                     onOpenSettings = { showSettings = true },
-                    onOpenDrawer = { scope.launch { drawerState.open() } }
+                    onOpenDrawer = { scope.launch { drawerState.open() } },
+                    viewingSession = viewingSession,
+                    onViewSession = { viewingSession = it }
                 )
             }
         }
@@ -286,8 +295,19 @@ fun HomeScreen(
     onResetState: () -> Unit,
     onRequestPermission: () -> Unit,
     onOpenSettings: () -> Unit,
-    onOpenDrawer: () -> Unit
+    onOpenDrawer: () -> Unit,
+    viewingSession: Int?,
+    onViewSession: (Int?) -> Unit
 ) {
+    // Show results when Success or when viewing a specific historical session
+    val showResults = radioState is RadioUiState.Success || viewingSession != null
+    // Which session to show in the header
+    val displaySession = if (viewingSession != null && viewingSession in sessionHistory.indices) {
+        sessionHistory[viewingSession]
+    } else {
+        sessionHistory.lastOrNull()
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -300,8 +320,11 @@ fun HomeScreen(
                     }
                 },
                 actions = {
-                    if (radioState is RadioUiState.Success || sessionHistory.isNotEmpty()) {
-                        IconButton(onClick = onResetState) {
+                    if (showResults) {
+                        IconButton(onClick = {
+                            onViewSession(null)
+                            onResetState()
+                        }) {
                             Icon(Icons.Default.Clear, contentDescription = "Clear")
                         }
                     }
@@ -326,11 +349,10 @@ fun HomeScreen(
                 .padding(padding)
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
-                // Compact header — now playing or seed track
-                val latestSession = sessionHistory.lastOrNull()
-                if (radioState is RadioUiState.Success && latestSession != null) {
+                // Compact header — seed track when showing results, now playing otherwise
+                if (showResults && displaySession != null) {
                     CompactSeedHeader(
-                        session = latestSession,
+                        session = displaySession,
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                     )
                 } else {
@@ -342,49 +364,20 @@ fun HomeScreen(
 
                 HorizontalDivider()
 
-                // Main content area
+                // Main content area — driven by radioState, not sessionHistory
                 Box(modifier = Modifier.weight(1f)) {
-                    if (sessionHistory.isEmpty()) {
-                        when (val state = radioState) {
-                            is RadioUiState.Idle -> {
-                                IdleContent(
-                                    hasPermission = hasPermission,
-                                    databaseInfo = databaseInfo,
-                                    statusMessage = statusMessage,
-                                    indexStatus = indexStatus,
-                                    onRequestPermission = onRequestPermission,
-                                    modifier = Modifier.fillMaxSize()
-                                )
-                            }
-                            is RadioUiState.Error -> {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .padding(16.dp),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Card(
-                                        colors = CardDefaults.cardColors(
-                                            containerColor = MaterialTheme.colorScheme.errorContainer
-                                        )
-                                    ) {
-                                        Text(
-                                            text = state.message,
-                                            modifier = Modifier.padding(16.dp),
-                                            color = MaterialTheme.colorScheme.onErrorContainer
-                                        )
-                                    }
-                                }
-                            }
-                            is RadioUiState.Loading, is RadioUiState.Success -> {
-                                // Loading overlay handles Loading; Success with empty history is transient
+                    if (showResults && sessionHistory.isNotEmpty() && pagerState != null) {
+                        // Auto-scroll to latest session on new result
+                        LaunchedEffect(sessionHistory.size) {
+                            if (radioState is RadioUiState.Success && sessionHistory.isNotEmpty()) {
+                                pagerState.animateScrollToPage(sessionHistory.size - 1)
                             }
                         }
-                    } else if (pagerState != null) {
-                        // Auto-scroll to latest session
-                        LaunchedEffect(sessionHistory.size) {
-                            if (sessionHistory.isNotEmpty()) {
-                                pagerState.animateScrollToPage(sessionHistory.size - 1)
+
+                        // Scroll to specific session when tapped in drawer
+                        LaunchedEffect(viewingSession) {
+                            if (viewingSession != null && viewingSession in sessionHistory.indices) {
+                                pagerState.animateScrollToPage(viewingSession)
                             }
                         }
 
@@ -419,6 +412,43 @@ fun HomeScreen(
                                         color = MaterialTheme.colorScheme.onErrorContainer
                                     )
                                 }
+                            }
+                        }
+                    } else {
+                        // Idle / Error / Loading (no results to show)
+                        when (val state = radioState) {
+                            is RadioUiState.Idle -> {
+                                IdleContent(
+                                    hasPermission = hasPermission,
+                                    databaseInfo = databaseInfo,
+                                    statusMessage = statusMessage,
+                                    indexStatus = indexStatus,
+                                    onRequestPermission = onRequestPermission,
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            }
+                            is RadioUiState.Error -> {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(16.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Card(
+                                        colors = CardDefaults.cardColors(
+                                            containerColor = MaterialTheme.colorScheme.errorContainer
+                                        )
+                                    ) {
+                                        Text(
+                                            text = state.message,
+                                            modifier = Modifier.padding(16.dp),
+                                            color = MaterialTheme.colorScheme.onErrorContainer
+                                        )
+                                    }
+                                }
+                            }
+                            is RadioUiState.Loading, is RadioUiState.Success -> {
+                                // Loading overlay handles Loading; Success handled above
                             }
                         }
                     }
