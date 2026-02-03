@@ -10,7 +10,11 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -20,17 +24,24 @@ import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -40,6 +51,7 @@ import com.powerampstartradio.data.EmbeddingModel
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.poweramp.PowerampTrack
+import com.powerampstartradio.poweramp.TrackMatcher
 import com.powerampstartradio.services.RadioService
 import com.powerampstartradio.similarity.SearchStrategy
 import com.powerampstartradio.ui.DatabaseInfo
@@ -50,6 +62,9 @@ import com.powerampstartradio.ui.RadioResult
 import com.powerampstartradio.ui.RadioUiState
 import com.powerampstartradio.ui.theme.PowerampStartRadioTheme
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
@@ -119,12 +134,16 @@ fun MainScreen(
     val anchorExpandPrimary by viewModel.anchorExpandPrimary.collectAsState()
     val anchorExpandExpansion by viewModel.anchorExpandExpansion.collectAsState()
     val drift by viewModel.drift.collectAsState()
+    val indexStatus by viewModel.indexStatus.collectAsState()
 
     // Local UI state
     var currentTrack by remember { mutableStateOf<PowerampTrack?>(PowerampReceiver.currentTrack) }
-    var showSettingsSheet by remember { mutableStateOf(false) }
-    var showMenu by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf("") }
+
+    // Drawer state
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
 
     // Register resume callback
     LaunchedEffect(Unit) {
@@ -163,90 +182,229 @@ fun MainScreen(
         }
     }
 
+    // Pager state for session history
+    val pagerState = if (sessionHistory.isNotEmpty()) {
+        rememberPagerState(
+            initialPage = sessionHistory.size - 1,
+            pageCount = { sessionHistory.size }
+        )
+    } else null
+
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        gesturesEnabled = sessionHistory.isNotEmpty(),
+        drawerContent = {
+            ModalDrawerSheet(modifier = Modifier.width(280.dp)) {
+                SessionHistoryDrawer(
+                    sessions = sessionHistory,
+                    onSessionTap = { index ->
+                        scope.launch {
+                            drawerState.close()
+                            pagerState?.animateScrollToPage(index)
+                        }
+                    },
+                    onClear = {
+                        viewModel.clearSessionHistory()
+                        scope.launch { drawerState.close() }
+                    }
+                )
+            }
+        }
+    ) {
+        AnimatedContent(
+            targetState = showSettings,
+            transitionSpec = {
+                slideInHorizontally { if (targetState) it else -it } togetherWith
+                    slideOutHorizontally { if (targetState) -it else it }
+            },
+            label = "settings_transition"
+        ) { isSettings ->
+            if (isSettings) {
+                SettingsScreen(
+                    numTracks = numTracks,
+                    onNumTracksChange = { viewModel.setNumTracks(it) },
+                    searchStrategy = searchStrategy,
+                    onSearchStrategyChange = { viewModel.setSearchStrategy(it) },
+                    anchorExpandPrimary = anchorExpandPrimary,
+                    onAnchorExpandPrimaryChange = { viewModel.setAnchorExpandPrimary(it) },
+                    anchorExpandExpansion = anchorExpandExpansion,
+                    onAnchorExpandExpansionChange = { viewModel.setAnchorExpandExpansion(it) },
+                    drift = drift,
+                    onDriftChange = { viewModel.setDrift(it) },
+                    databaseInfo = databaseInfo,
+                    onImportDatabase = {
+                        importLauncher.launch(arrayOf("application/octet-stream", "*/*"))
+                    },
+                    hasPermission = hasPermission,
+                    onRequestPermission = { viewModel.requestPermission() },
+                    onBack = { showSettings = false }
+                )
+            } else {
+                HomeScreen(
+                    radioState = radioState,
+                    currentTrack = currentTrack,
+                    databaseInfo = databaseInfo,
+                    hasPermission = hasPermission,
+                    sessionHistory = sessionHistory,
+                    statusMessage = statusMessage,
+                    indexStatus = indexStatus,
+                    pagerState = pagerState,
+                    onStartRadio = {
+                        if (currentTrack != null && databaseInfo != null) {
+                            viewModel.startRadio()
+                        } else if (currentTrack == null) {
+                            statusMessage = "Play a song in Poweramp first"
+                        } else {
+                            statusMessage = "Import database in Settings"
+                        }
+                    },
+                    onResetState = { viewModel.resetRadioState() },
+                    onRequestPermission = { viewModel.requestPermission() },
+                    onOpenSettings = { showSettings = true },
+                    onOpenDrawer = { scope.launch { drawerState.open() } }
+                )
+            }
+        }
+    }
+}
+
+// ---- Home Screen ----
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun HomeScreen(
+    radioState: RadioUiState,
+    currentTrack: PowerampTrack?,
+    databaseInfo: DatabaseInfo?,
+    hasPermission: Boolean,
+    sessionHistory: List<RadioResult>,
+    statusMessage: String,
+    indexStatus: String?,
+    pagerState: androidx.compose.foundation.pager.PagerState?,
+    onStartRadio: () -> Unit,
+    onResetState: () -> Unit,
+    onRequestPermission: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onOpenDrawer: () -> Unit
+) {
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Start Radio") },
-                actions = {
-                    IconButton(onClick = { showMenu = true }) {
-                        Icon(Icons.Default.MoreVert, contentDescription = "Menu")
+                navigationIcon = {
+                    if (sessionHistory.isNotEmpty()) {
+                        IconButton(onClick = onOpenDrawer) {
+                            Icon(Icons.Default.Menu, contentDescription = "History")
+                        }
                     }
-                    DropdownMenu(
-                        expanded = showMenu,
-                        onDismissRequest = { showMenu = false }
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text("Settings") },
-                            onClick = {
-                                showMenu = false
-                                showSettingsSheet = true
-                            }
-                        )
+                },
+                actions = {
+                    if (radioState is RadioUiState.Success || sessionHistory.isNotEmpty()) {
+                        IconButton(onClick = onResetState) {
+                            Icon(Icons.Default.Clear, contentDescription = "Clear")
+                        }
+                    }
+                    IconButton(onClick = onOpenSettings) {
+                        Icon(Icons.Default.Settings, contentDescription = "Settings")
                     }
                 }
             )
         },
         floatingActionButton = {
             ExtendedFloatingActionButton(
-                onClick = {
-                    if (currentTrack != null && databaseInfo != null) {
-                        viewModel.startRadio()
-                    } else if (currentTrack == null) {
-                        statusMessage = "Play a song in Poweramp first"
-                    } else {
-                        statusMessage = "Import database in Settings"
-                    }
-                },
+                onClick = onStartRadio,
                 icon = { Icon(Icons.Default.PlayArrow, contentDescription = null) },
                 text = { Text("Start Radio") },
                 expanded = radioState !is RadioUiState.Loading
             )
         }
     ) { padding ->
-        Column(
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
         ) {
-            // Now Playing — always visible at top
-            NowPlayingSection(
-                currentTrack = currentTrack,
-                modifier = Modifier.padding(16.dp)
-            )
+            Column(modifier = Modifier.fillMaxSize()) {
+                // Compact header — now playing or seed track
+                val latestSession = sessionHistory.lastOrNull()
+                if (radioState is RadioUiState.Success && latestSession != null) {
+                    CompactSeedHeader(
+                        session = latestSession,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                    )
+                } else {
+                    CompactNowPlayingHeader(
+                        currentTrack = currentTrack,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                    )
+                }
 
-            HorizontalDivider()
+                HorizontalDivider()
 
-            // Main content area
-            Box(modifier = Modifier.weight(1f)) {
-                if (sessionHistory.isEmpty()) {
-                    // No sessions yet — show idle/loading/error content
-                    when (val state = radioState) {
-                        is RadioUiState.Idle -> {
-                            IdleContent(
-                                hasPermission = hasPermission,
-                                databaseInfo = databaseInfo,
-                                statusMessage = statusMessage,
-                                onRequestPermission = { viewModel.requestPermission() },
+                // Main content area
+                Box(modifier = Modifier.weight(1f)) {
+                    if (sessionHistory.isEmpty()) {
+                        when (val state = radioState) {
+                            is RadioUiState.Idle -> {
+                                IdleContent(
+                                    hasPermission = hasPermission,
+                                    databaseInfo = databaseInfo,
+                                    statusMessage = statusMessage,
+                                    indexStatus = indexStatus,
+                                    onRequestPermission = onRequestPermission,
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            }
+                            is RadioUiState.Error -> {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(16.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Card(
+                                        colors = CardDefaults.cardColors(
+                                            containerColor = MaterialTheme.colorScheme.errorContainer
+                                        )
+                                    ) {
+                                        Text(
+                                            text = state.message,
+                                            modifier = Modifier.padding(16.dp),
+                                            color = MaterialTheme.colorScheme.onErrorContainer
+                                        )
+                                    }
+                                }
+                            }
+                            is RadioUiState.Loading, is RadioUiState.Success -> {
+                                // Loading overlay handles Loading; Success with empty history is transient
+                            }
+                        }
+                    } else if (pagerState != null) {
+                        // Auto-scroll to latest session
+                        LaunchedEffect(sessionHistory.size) {
+                            if (sessionHistory.isNotEmpty()) {
+                                pagerState.animateScrollToPage(sessionHistory.size - 1)
+                            }
+                        }
+
+                        VerticalPager(
+                            state = pagerState,
+                            modifier = Modifier.fillMaxSize()
+                        ) { page ->
+                            SessionPage(
+                                session = sessionHistory[page],
+                                pageIndex = page,
+                                totalPages = sessionHistory.size,
                                 modifier = Modifier.fillMaxSize()
                             )
                         }
-                        is RadioUiState.Loading -> {
-                            Box(
-                                modifier = Modifier.fillMaxSize(),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                    CircularProgressIndicator()
-                                    Spacer(modifier = Modifier.height(16.dp))
-                                    Text("Finding similar tracks...")
-                                }
-                            }
-                        }
-                        is RadioUiState.Error -> {
+
+                        // Error overlay on top of pager
+                        if (radioState is RadioUiState.Error) {
                             Box(
                                 modifier = Modifier
                                     .fillMaxSize()
-                                    .padding(16.dp),
+                                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.7f)),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Card(
@@ -255,143 +413,110 @@ fun MainScreen(
                                     )
                                 ) {
                                     Text(
-                                        text = state.message,
+                                        text = (radioState as RadioUiState.Error).message,
                                         modifier = Modifier.padding(16.dp),
                                         color = MaterialTheme.colorScheme.onErrorContainer
                                     )
                                 }
                             }
                         }
-                        is RadioUiState.Success -> {
-                            // Shouldn't happen (sessionHistory would be non-empty), but handle gracefully
-                        }
                     }
-                } else {
-                    // Session pager
-                    val pagerState = rememberPagerState(
-                        initialPage = sessionHistory.size - 1,
-                        pageCount = { sessionHistory.size }
-                    )
+                }
+            }
 
-                    // Auto-scroll to latest session when a new one is added
-                    LaunchedEffect(sessionHistory.size) {
-                        if (sessionHistory.isNotEmpty()) {
-                            pagerState.animateScrollToPage(sessionHistory.size - 1)
-                        }
-                    }
-
-                    VerticalPager(
-                        state = pagerState,
-                        modifier = Modifier.fillMaxSize()
-                    ) { page ->
-                        SessionPage(
-                            session = sessionHistory[page],
-                            pageIndex = page,
-                            totalPages = sessionHistory.size,
-                            modifier = Modifier.fillMaxSize()
+            // Loading overlay (shown on top of all content)
+            if (radioState is RadioUiState.Loading) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.85f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        CircularProgressIndicator()
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text(
+                            text = (radioState as RadioUiState.Loading).message,
+                            style = MaterialTheme.typography.bodyMedium
                         )
-                    }
-
-                    // Loading/Error overlay on top of pager
-                    when (val state = radioState) {
-                        is RadioUiState.Loading -> {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.7f)),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                    CircularProgressIndicator()
-                                    Spacer(modifier = Modifier.height(16.dp))
-                                    Text("Finding similar tracks...")
-                                }
-                            }
-                        }
-                        is RadioUiState.Error -> {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.7f)),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Card(
-                                    colors = CardDefaults.cardColors(
-                                        containerColor = MaterialTheme.colorScheme.errorContainer
-                                    )
-                                ) {
-                                    Text(
-                                        text = state.message,
-                                        modifier = Modifier.padding(16.dp),
-                                        color = MaterialTheme.colorScheme.onErrorContainer
-                                    )
-                                }
-                            }
-                        }
-                        else -> {}
                     }
                 }
             }
         }
     }
+}
 
-    // Settings Bottom Sheet
-    if (showSettingsSheet) {
-        SettingsBottomSheet(
-            numTracks = numTracks,
-            onNumTracksChange = { viewModel.setNumTracks(it) },
-            searchStrategy = searchStrategy,
-            onSearchStrategyChange = { viewModel.setSearchStrategy(it) },
-            anchorExpandPrimary = anchorExpandPrimary,
-            onAnchorExpandPrimaryChange = { viewModel.setAnchorExpandPrimary(it) },
-            anchorExpandExpansion = anchorExpandExpansion,
-            onAnchorExpandExpansionChange = { viewModel.setAnchorExpandExpansion(it) },
-            drift = drift,
-            onDriftChange = { viewModel.setDrift(it) },
-            databaseInfo = databaseInfo,
-            onImportDatabase = {
-                importLauncher.launch(arrayOf("application/octet-stream", "*/*"))
-            },
-            hasPermission = hasPermission,
-            onRequestPermission = { viewModel.requestPermission() },
-            onDismiss = { showSettingsSheet = false }
+// ---- Compact Headers ----
+
+@Composable
+fun CompactNowPlayingHeader(
+    currentTrack: PowerampTrack?,
+    modifier: Modifier = Modifier
+) {
+    if (currentTrack != null) {
+        Column(modifier = modifier) {
+            Text(
+                text = currentTrack.title ?: "Unknown",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = listOfNotNull(currentTrack.artist, currentTrack.album)
+                    .joinToString(" \u00b7 "),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    } else {
+        Text(
+            text = "No track playing",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = modifier
         )
     }
 }
 
 @Composable
-fun NowPlayingSection(
-    currentTrack: PowerampTrack?,
+fun CompactSeedHeader(
+    session: RadioResult,
     modifier: Modifier = Modifier
 ) {
-    Column(modifier = modifier) {
-        Text(
-            text = "NOW PLAYING",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.primary
-        )
-        Spacer(modifier = Modifier.height(4.dp))
-
-        if (currentTrack != null) {
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = "\"${currentTrack.title}\"",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold
+                text = session.seedTrack.title ?: "Unknown",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
             Text(
-                text = "${currentTrack.artist ?: "Unknown"} • ${currentTrack.album ?: ""}",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        } else {
-            Text(
-                text = "No track playing",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                text = listOfNotNull(session.seedTrack.artist, session.seedTrack.album)
+                    .joinToString(" \u00b7 "),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
+        Spacer(modifier = Modifier.width(8.dp))
+        SuggestionChip(
+            onClick = {},
+            label = { Text(humanMatchType(session.matchType), style = MaterialTheme.typography.labelSmall) }
+        )
     }
 }
+
+// ---- Session Page ----
 
 @Composable
 fun SessionPage(
@@ -401,102 +526,64 @@ fun SessionPage(
     modifier: Modifier = Modifier
 ) {
     Column(modifier = modifier) {
-        // Seed track for this session
-        SeedTrackSection(
-            radioResult = session,
-            modifier = Modifier.padding(16.dp)
-        )
-
-        HorizontalDivider()
-
-        // Page indicator
-        if (totalPages > 1) {
-            Text(
-                text = "Session ${pageIndex + 1} of $totalPages",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
-            )
-        }
-
-        // Queue results
-        ResultsSection(
-            result = session,
-            modifier = Modifier.weight(1f)
-        )
-    }
-}
-
-@Composable
-fun SeedTrackSection(
-    radioResult: RadioResult,
-    modifier: Modifier = Modifier
-) {
-    Column(modifier = modifier) {
-        Text(
-            text = "SEED TRACK",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.primary
-        )
-        Spacer(modifier = Modifier.height(4.dp))
-
-        Text(
-            text = "\"${radioResult.seedTrack.title}\"",
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Bold
-        )
-        Text(
-            text = "${radioResult.seedTrack.artist ?: "Unknown"} • ${radioResult.seedTrack.album ?: ""}",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Text(
-            text = "matched via: ${radioResult.matchType.name}",
-            style = MaterialTheme.typography.bodySmall,
-            fontFamily = FontFamily.Monospace,
-            color = MaterialTheme.colorScheme.tertiary
-        )
-    }
-}
-
-@Composable
-fun ResultsSection(
-    result: RadioResult,
-    modifier: Modifier = Modifier
-) {
-    Column(modifier = modifier) {
         // Summary header
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            val strategyLabel = result.strategy.name.lowercase().replace('_', ' ')
-            val label = "QUEUE RESULTS ($strategyLabel)"
-            Text(
-                text = label,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary
-            )
-            Text(
-                text = "${result.queuedCount} queued / ${result.failedCount} failed / ${result.requestedCount} requested",
-                style = MaterialTheme.typography.labelSmall,
-                fontFamily = FontFamily.Monospace
-            )
-        }
+        ResultsSummary(
+            result = session,
+            pageIndex = pageIndex,
+            totalPages = totalPages,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+        )
 
         // Track list
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)
         ) {
-            items(result.tracks) { trackResult ->
-                TrackResultRow(trackResult, showModelTag = result.isMultiModel)
+            items(session.tracks) { trackResult ->
+                TrackResultRow(trackResult, showModelTag = session.isMultiModel)
             }
         }
     }
 }
+
+@Composable
+fun ResultsSummary(
+    result: RadioResult,
+    pageIndex: Int,
+    totalPages: Int,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        // Left: human-friendly summary
+        val strategyLabel = humanStrategy(result.strategy)
+        val countText = if (result.failedCount > 0) {
+            "${result.queuedCount} of ${result.requestedCount} queued (${result.failedCount} not in Poweramp)"
+        } else {
+            "${result.queuedCount} tracks queued via $strategyLabel"
+        }
+        Text(
+            text = countText,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(1f)
+        )
+
+        // Right: page indicator
+        if (totalPages > 1) {
+            Text(
+                text = "${pageIndex + 1}/$totalPages",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+// ---- Track Result Row with Similarity Indicator ----
 
 @Composable
 fun TrackResultRow(trackResult: QueuedTrackResult, showModelTag: Boolean = false) {
@@ -506,14 +593,13 @@ fun TrackResultRow(trackResult: QueuedTrackResult, showModelTag: Boolean = false
             .padding(vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Similarity score
-        Text(
-            text = String.format("%.3f", trackResult.similarity),
-            style = MaterialTheme.typography.bodySmall,
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier.width(48.dp)
+        // Similarity indicator with color gradient
+        SimilarityIndicator(
+            score = trackResult.similarity,
+            model = trackResult.modelUsed
         )
+
+        Spacer(modifier = Modifier.width(6.dp))
 
         // Model tag (shown when using multi-model strategies)
         if (showModelTag && trackResult.modelUsed != null) {
@@ -529,7 +615,7 @@ fun TrackResultRow(trackResult: QueuedTrackResult, showModelTag: Boolean = false
                 color = tagColor,
                 fontSize = 10.sp,
                 modifier = Modifier
-                    .width(38.dp)
+                    .width(36.dp)
                     .padding(end = 4.dp)
             )
         }
@@ -538,43 +624,161 @@ fun TrackResultRow(trackResult: QueuedTrackResult, showModelTag: Boolean = false
         Column(
             modifier = Modifier
                 .weight(1f)
-                .padding(horizontal = 8.dp)
+                .padding(horizontal = 4.dp)
         ) {
             Text(
                 text = trackResult.track.title ?: "Unknown",
                 style = MaterialTheme.typography.bodyMedium,
-                maxLines = 1
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
             Text(
                 text = trackResult.track.artist ?: "Unknown",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
 
-        // Status
-        val (statusText, statusColor) = when (trackResult.status) {
-            QueueStatus.QUEUED -> "queued" to MaterialTheme.colorScheme.primary
-            QueueStatus.NOT_IN_LIBRARY -> "not found" to MaterialTheme.colorScheme.error
-            QueueStatus.QUEUE_FAILED -> "failed" to MaterialTheme.colorScheme.error
+        // Status icon
+        val statusColor = when (trackResult.status) {
+            QueueStatus.QUEUED -> MaterialTheme.colorScheme.primary
+            QueueStatus.NOT_IN_LIBRARY -> MaterialTheme.colorScheme.error
+            QueueStatus.QUEUE_FAILED -> MaterialTheme.colorScheme.error
         }
-        val statusIcon = if (trackResult.status == QueueStatus.QUEUED) "✓" else "✗"
-
         Text(
-            text = "$statusIcon $statusText",
+            text = if (trackResult.status == QueueStatus.QUEUED) "\u2713" else "\u2717",
             style = MaterialTheme.typography.bodySmall,
-            fontFamily = FontFamily.Monospace,
             color = statusColor
         )
     }
 }
 
 @Composable
+fun SimilarityIndicator(score: Float, model: EmbeddingModel?) {
+    val floor = when (model) {
+        EmbeddingModel.FLAMINGO -> 0.5f
+        else -> 0.0f
+    }
+    val normalized = ((score - floor) / (1f - floor)).coerceIn(0f, 1f)
+
+    val amber = Color(0xFFF59E0B)
+    val green = Color(0xFF22C55E)
+    val blue = Color(0xFF3B82F6)
+
+    val color = if (normalized <= 0.5f) {
+        lerp(amber, green, normalized * 2)
+    } else {
+        lerp(green, blue, (normalized - 0.5f) * 2)
+    }
+
+    Box(modifier = Modifier.width(52.dp).height(20.dp)) {
+        // Background bar
+        Box(
+            modifier = Modifier
+                .fillMaxHeight()
+                .fillMaxWidth(normalized)
+                .background(color.copy(alpha = 0.25f), RoundedCornerShape(4.dp))
+        )
+        // Score text
+        Text(
+            text = String.format("%.3f", score),
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold,
+            color = color,
+            modifier = Modifier.align(Alignment.CenterStart).padding(start = 2.dp)
+        )
+    }
+}
+
+// ---- Session History Drawer ----
+
+@Composable
+fun SessionHistoryDrawer(
+    sessions: List<RadioResult>,
+    onSessionTap: (Int) -> Unit,
+    onClear: () -> Unit
+) {
+    Column(modifier = Modifier.fillMaxHeight()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "Session History",
+                style = MaterialTheme.typography.titleMedium
+            )
+            if (sessions.isNotEmpty()) {
+                TextButton(onClick = onClear) {
+                    Text("Clear")
+                }
+            }
+        }
+        HorizontalDivider()
+
+        if (sessions.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(32.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "No sessions yet",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(vertical = 4.dp)
+            ) {
+                items(sessions.size) { index ->
+                    val session = sessions[index]
+                    val timeStr = SimpleDateFormat("HH:mm", Locale.getDefault())
+                        .format(Date(session.timestamp))
+                    NavigationDrawerItem(
+                        label = {
+                            Column {
+                                Text(
+                                    text = session.seedTrack.title ?: "Unknown",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = "${session.seedTrack.artist ?: "Unknown"} \u00b7 $timeStr \u00b7 ${session.queuedCount} tracks",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        },
+                        selected = false,
+                        onClick = { onSessionTap(index) },
+                        modifier = Modifier.padding(horizontal = 12.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+// ---- Idle Content ----
+
+@Composable
 fun IdleContent(
     hasPermission: Boolean,
     databaseInfo: DatabaseInfo?,
     statusMessage: String,
+    indexStatus: String?,
     onRequestPermission: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -617,11 +821,22 @@ fun IdleContent(
                         style = MaterialTheme.typography.titleSmall
                     )
                     Text(
-                        text = "Import via Settings menu",
+                        text = "Import via Settings",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
             }
+        }
+
+        // Index status
+        if (indexStatus != null) {
+            Text(
+                text = indexStatus,
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+                color = if (indexStatus == "Indices ready") MaterialTheme.colorScheme.primary
+                       else MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
 
         // Status message
@@ -634,9 +849,9 @@ fun IdleContent(
         }
 
         // Ready indicator
-        if (hasPermission && databaseInfo != null) {
+        if (hasPermission && databaseInfo != null && indexStatus == "Indices ready") {
             Text(
-                text = "Ready - tap Start Radio",
+                text = "Ready \u2014 tap Start Radio",
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.primary
             )
@@ -644,9 +859,11 @@ fun IdleContent(
     }
 }
 
+// ---- Full-Screen Settings ----
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsBottomSheet(
+fun SettingsScreen(
     numTracks: Int,
     onNumTracksChange: (Int) -> Unit,
     searchStrategy: SearchStrategy,
@@ -661,27 +878,32 @@ fun SettingsBottomSheet(
     onImportDatabase: () -> Unit,
     hasPermission: Boolean,
     onRequestPermission: () -> Unit,
-    onDismiss: () -> Unit
+    onBack: () -> Unit
 ) {
     val availableModels = databaseInfo?.availableModels ?: emptySet()
     val hasMulan = EmbeddingModel.MULAN in availableModels
     val hasFlamingo = EmbeddingModel.FLAMINGO in availableModels
     val hasBoth = hasMulan && hasFlamingo
 
-    ModalBottomSheet(onDismissRequest = onDismiss) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Settings") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                }
+            )
+        }
+    ) { padding ->
         LazyColumn(
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
+                .fillMaxSize()
+                .padding(padding)
+                .padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(24.dp)
         ) {
-            item {
-                Text(
-                    text = "Settings",
-                    style = MaterialTheme.typography.headlineSmall
-                )
-            }
-
             // Track count slider
             item {
                 Column {
@@ -967,4 +1189,20 @@ private fun StrategyOption(
             }
         }
     }
+}
+
+// ---- Human-friendly label helpers ----
+
+private fun humanMatchType(matchType: TrackMatcher.MatchType): String = when (matchType) {
+    TrackMatcher.MatchType.METADATA_EXACT -> "matched by tags"
+    TrackMatcher.MatchType.FILENAME -> "matched by filename"
+    TrackMatcher.MatchType.ARTIST_TITLE -> "fuzzy match"
+    TrackMatcher.MatchType.NOT_FOUND -> "not found"
+}
+
+private fun humanStrategy(strategy: SearchStrategy): String = when (strategy) {
+    SearchStrategy.MULAN_ONLY -> "MuLan"
+    SearchStrategy.FLAMINGO_ONLY -> "Flamingo"
+    SearchStrategy.INTERLEAVE -> "interleave"
+    SearchStrategy.ANCHOR_EXPAND -> "anchor & expand"
 }

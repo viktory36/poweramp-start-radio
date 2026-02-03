@@ -80,7 +80,7 @@ class RadioService : Service() {
             drift: Boolean = false,
             showToasts: Boolean = false
         ) {
-            _uiState.value = RadioUiState.Loading
+            _uiState.value = RadioUiState.Loading()
             val intent = Intent(context, RadioService::class.java).apply {
                 action = ACTION_START_RADIO
                 putExtra(EXTRA_NUM_TRACKS, numTracks)
@@ -97,6 +97,10 @@ class RadioService : Service() {
 
         fun resetState() {
             _uiState.value = RadioUiState.Idle
+        }
+
+        fun clearHistory() {
+            _sessionHistory.value = emptyList()
         }
     }
 
@@ -207,6 +211,7 @@ class RadioService : Service() {
                 val availableModels = db.getAvailableModels()
 
                 engine.ensureIndices { message ->
+                    _uiState.value = RadioUiState.Loading(message)
                     updateNotification(message)
                 }
 
@@ -217,7 +222,11 @@ class RadioService : Service() {
                     numTracks = numTracks,
                     strategy = strategy,
                     anchorExpandConfig = anchorExpandConfig,
-                    drift = drift
+                    drift = drift,
+                    onProgress = { message ->
+                        _uiState.value = RadioUiState.Loading(message)
+                        updateNotification(message)
+                    }
                 )
 
                 Log.d(TAG, "Found ${similarTracks.size} similar tracks")
@@ -269,7 +278,8 @@ class RadioService : Service() {
                     matchType = matchResult.matchType,
                     tracks = trackResults,
                     availableModels = availableModels,
-                    strategy = strategy
+                    strategy = strategy,
+                    queuedFileIds = queuedFileIds
                 )
 
                 _uiState.value = RadioUiState.Success(radioResult)
@@ -279,11 +289,10 @@ class RadioService : Service() {
                 // Poweramp will switch to the queue after the current song ends.
                 PowerampHelper.reloadData(this@RadioService)
 
-                val strategyLabel = strategy.name.lowercase().replace('_', ' ')
-                val message = "${radioResult.queuedCount} queued / ${radioResult.failedCount} failed ($strategyLabel)"
+                val message = "${radioResult.queuedCount} tracks queued"
                 updateNotification(message)
-                Log.d(TAG, "Queue result: $message")
-                toast(message)
+                Log.d(TAG, "Queue result: ${radioResult.queuedCount} queued / ${radioResult.failedCount} failed (${strategy.name})")
+                Toast.makeText(this@RadioService, message, Toast.LENGTH_SHORT).show()
 
                 // Stop after a short delay
                 stopSelfDelayed()

@@ -124,7 +124,8 @@ class SimilarityEngine(
         numTracks: Int,
         strategy: SearchStrategy,
         anchorExpandConfig: AnchorExpandConfig? = null,
-        drift: Boolean = false
+        drift: Boolean = false,
+        onProgress: ((String) -> Unit)? = null
     ): List<SimilarTrack> = withContext(Dispatchers.Default) {
         // Caller should have called ensureIndices() first for progress reporting.
         // Call it here as a safety net (no-op if already done).
@@ -132,17 +133,17 @@ class SimilarityEngine(
 
         when (strategy) {
             SearchStrategy.MULAN_ONLY ->
-                if (drift) singleModelDrift(seedTrackId, numTracks, EmbeddingModel.MULAN)
+                if (drift) singleModelDrift(seedTrackId, numTracks, EmbeddingModel.MULAN, onProgress)
                 else singleModelSearch(seedTrackId, numTracks, EmbeddingModel.MULAN)
             SearchStrategy.FLAMINGO_ONLY ->
-                if (drift) singleModelDrift(seedTrackId, numTracks, EmbeddingModel.FLAMINGO)
+                if (drift) singleModelDrift(seedTrackId, numTracks, EmbeddingModel.FLAMINGO, onProgress)
                 else singleModelSearch(seedTrackId, numTracks, EmbeddingModel.FLAMINGO)
             SearchStrategy.INTERLEAVE ->
-                if (drift) interleaveDrift(seedTrackId, numTracks)
+                if (drift) interleaveDrift(seedTrackId, numTracks, onProgress)
                 else interleaveSearch(seedTrackId, numTracks)
             SearchStrategy.ANCHOR_EXPAND ->
-                if (drift) anchorExpandDrift(seedTrackId, numTracks, anchorExpandConfig!!)
-                else anchorExpandSearch(seedTrackId, numTracks, anchorExpandConfig!!)
+                if (drift) anchorExpandDrift(seedTrackId, numTracks, anchorExpandConfig!!, onProgress)
+                else anchorExpandSearch(seedTrackId, numTracks, anchorExpandConfig!!, onProgress)
         }
     }
 
@@ -245,7 +246,8 @@ class SimilarityEngine(
     private fun anchorExpandSearch(
         seedTrackId: Long,
         numTracks: Int,
-        config: AnchorExpandConfig
+        config: AnchorExpandConfig,
+        onProgress: ((String) -> Unit)? = null
     ): List<SimilarTrack> {
         val primaryIndex = getIndex(config.primaryModel) ?: run {
             Log.e(TAG, "No index for primary model ${config.primaryModel.name}")
@@ -265,6 +267,7 @@ class SimilarityEngine(
         val numGroups = (numTracks + groupSize - 1) / groupSize
 
         // Step 1: Find anchor tracks with primary model
+        onProgress?.invoke("Finding anchors...")
         val anchors = primaryIndex.findTopK(
             seedEmbedding, numGroups, excludeIds = setOf(seedTrackId)
         )
@@ -283,6 +286,7 @@ class SimilarityEngine(
         val seen = mutableSetOf(seedTrackId)
         seen.addAll(anchors.map { it.first })
 
+        onProgress?.invoke("Expanding neighborhoods...")
         val expansionResults = if (anchorQueries.isNotEmpty()) {
             secondaryIndex.findTopKMulti(anchorQueries, config.expansionCount, excludeIds = seen)
         } else {
@@ -324,7 +328,8 @@ class SimilarityEngine(
     private fun singleModelDrift(
         seedTrackId: Long,
         numTracks: Int,
-        model: EmbeddingModel
+        model: EmbeddingModel,
+        onProgress: ((String) -> Unit)? = null
     ): List<SimilarTrack> {
         val index = getIndex(model) ?: return emptyList()
         var currentEmb = index.getEmbeddingByTrackId(seedTrackId) ?: return emptyList()
@@ -333,6 +338,7 @@ class SimilarityEngine(
         val seen = mutableSetOf(seedTrackId)
 
         for (i in 0 until numTracks) {
+            onProgress?.invoke("Drifting: ${i + 1}/$numTracks...")
             val top = index.findTopK(currentEmb, 1, excludeIds = seen)
             if (top.isEmpty()) break
 
@@ -358,7 +364,8 @@ class SimilarityEngine(
      */
     private fun interleaveDrift(
         seedTrackId: Long,
-        numTracks: Int
+        numTracks: Int,
+        onProgress: ((String) -> Unit)? = null
     ): List<SimilarTrack> {
         val mulanIdx = mulanIndex
         val flamingoIdx = flamingoIndex
@@ -373,6 +380,7 @@ class SimilarityEngine(
 
         while (result.size < numTracks) {
             var advanced = false
+            onProgress?.invoke("Drifting: ${result.size}/$numTracks...")
 
             // MuLan turn
             mulanIdx.getEmbeddingByTrackId(currentTrackId)?.let { emb ->
@@ -418,7 +426,8 @@ class SimilarityEngine(
     private fun anchorExpandDrift(
         seedTrackId: Long,
         numTracks: Int,
-        config: AnchorExpandConfig
+        config: AnchorExpandConfig,
+        onProgress: ((String) -> Unit)? = null
     ): List<SimilarTrack> {
         val primaryIndex = getIndex(config.primaryModel) ?: return emptyList()
         val secondaryIndex = getIndex(config.secondaryModel) ?: run {
@@ -434,6 +443,7 @@ class SimilarityEngine(
 
         for (g in 0 until numGroups) {
             if (result.size >= numTracks) break
+            onProgress?.invoke("Drifting: group ${g + 1}/$numGroups...")
 
             // Find anchor relative to current seed (drifted from previous anchor)
             val anchors = primaryIndex.findTopK(currentEmb, 1, excludeIds = seen)

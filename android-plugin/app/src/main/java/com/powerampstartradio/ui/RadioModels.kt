@@ -34,7 +34,8 @@ data class RadioResult(
     val tracks: List<QueuedTrackResult>,
     val availableModels: Set<EmbeddingModel> = emptySet(),
     val strategy: SearchStrategy = SearchStrategy.ANCHOR_EXPAND,
-    val timestamp: Long = System.currentTimeMillis()
+    val timestamp: Long = System.currentTimeMillis(),
+    val queuedFileIds: Set<Long> = emptySet()
 ) {
     val queuedCount: Int get() = tracks.count { it.status == QueueStatus.QUEUED }
     val failedCount: Int get() = tracks.count { it.status != QueueStatus.QUEUED }
@@ -47,7 +48,7 @@ data class RadioResult(
  */
 sealed class RadioUiState {
     object Idle : RadioUiState()
-    object Loading : RadioUiState()
+    data class Loading(val message: String = "Starting radio...") : RadioUiState()
     data class Success(val result: RadioResult) : RadioUiState()
     data class Error(val message: String) : RadioUiState()
 }

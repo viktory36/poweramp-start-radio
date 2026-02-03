@@ -4,6 +4,11 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.util.Log
+import androidx.glance.appwidget.GlanceAppWidgetManager
+import com.powerampstartradio.widget.StartRadioWidget
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 /**
  * Receives track change broadcasts from Poweramp.
@@ -48,6 +53,21 @@ class PowerampReceiver : BroadcastReceiver() {
                 Log.d(TAG, "Track changed: ${track?.title} by ${track?.artist}")
                 currentTrack = track
                 notifyTrackChanged(track)
+
+                // Update widget with new track name
+                val pendingResult = goAsync()
+                CoroutineScope(Dispatchers.IO).launch {
+                    try {
+                        val manager = GlanceAppWidgetManager(context)
+                        val widget = StartRadioWidget()
+                        val ids = manager.getGlanceIds(StartRadioWidget::class.java)
+                        ids.forEach { id -> widget.update(context, id) }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Widget update failed", e)
+                    } finally {
+                        pendingResult.finish()
+                    }
+                }
             }
 
             PowerampHelper.ACTION_STATUS_CHANGED -> {

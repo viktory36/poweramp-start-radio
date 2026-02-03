@@ -42,8 +42,8 @@ class StartRadioWidget : GlanceAppWidget() {
                 modifier = GlanceModifier
                     .fillMaxSize()
                     .cornerRadius(16.dp)
-                    .background(Color(0xFF1E1E2E))
-                    .padding(12.dp)
+                    .background(Color(0xFF1A1B2E))
+                    .padding(14.dp)
                     .clickable(actionRunCallback<StartRadioAction>()),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalAlignment = Alignment.CenterHorizontally
@@ -53,7 +53,7 @@ class StartRadioWidget : GlanceAppWidget() {
                         text = "▶",
                         style = TextStyle(
                             color = ColorProvider(Color(0xFF89B4FA), Color(0xFF89B4FA)),
-                            fontSize = 16.sp,
+                            fontSize = 18.sp,
                             fontWeight = FontWeight.Bold
                         )
                     )
@@ -62,19 +62,34 @@ class StartRadioWidget : GlanceAppWidget() {
                         text = "Start Radio",
                         style = TextStyle(
                             color = ColorProvider(Color.White, Color.White),
-                            fontSize = 14.sp
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Medium
                         )
                     )
                 }
                 if (track != null) {
-                    val label = listOfNotNull(track.artist, track.title)
-                        .joinToString(" — ")
-                    if (label.isNotEmpty()) {
+                    val title = track.title
+                    val artist = track.artist
+                    val album = track.album
+                    if (!title.isNullOrEmpty()) {
                         Text(
-                            text = label,
+                            text = title,
                             style = TextStyle(
-                                color = ColorProvider(Color(0xFFBAC2DE), Color(0xFFBAC2DE)),
-                                fontSize = 12.sp
+                                color = ColorProvider(Color(0xFFCDD6F4), Color(0xFFCDD6F4)),
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium
+                            ),
+                            maxLines = 1
+                        )
+                    }
+                    val subtitle = listOfNotNull(artist, album)
+                        .joinToString(" · ")
+                    if (subtitle.isNotEmpty()) {
+                        Text(
+                            text = subtitle,
+                            style = TextStyle(
+                                color = ColorProvider(Color(0xFF9399B2), Color(0xFF9399B2)),
+                                fontSize = 11.sp
                             ),
                             maxLines = 1
                         )

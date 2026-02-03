@@ -7,9 +7,12 @@ import androidx.lifecycle.viewModelScope
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.data.EmbeddingModel
 import com.powerampstartradio.poweramp.PowerampHelper
+import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.services.RadioService
 import com.powerampstartradio.similarity.AnchorExpandConfig
 import com.powerampstartradio.similarity.SearchStrategy
+import com.powerampstartradio.similarity.SimilarityEngine
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -69,15 +72,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _hasPermission = MutableStateFlow(false)
     val hasPermission: StateFlow<Boolean> = _hasPermission.asStateFlow()
 
+    // Index preparation status
+    private val _indexStatus = MutableStateFlow<String?>(null)
+    val indexStatus: StateFlow<String?> = _indexStatus.asStateFlow()
+
     // Radio state from service
     val radioState: StateFlow<RadioUiState> = RadioService.uiState
 
     // Session history
     val sessionHistory: StateFlow<List<RadioResult>> = RadioService.sessionHistory
 
+    private val trackChangeListener: (com.powerampstartradio.poweramp.PowerampTrack?) -> Unit = { _ ->
+        val state = RadioService.uiState.value
+        if (state is RadioUiState.Success) {
+            RadioService.resetState()
+        }
+    }
+
     init {
         refreshDatabaseInfo()
         checkPermission()
+        prepareIndices()
+        PowerampReceiver.addTrackChangeListener(trackChangeListener)
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        PowerampReceiver.removeTrackChangeListener(trackChangeListener)
     }
 
     fun setNumTracks(count: Int) {
@@ -119,6 +140,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         RadioService.resetState()
     }
 
+    fun clearSessionHistory() {
+        RadioService.clearHistory()
+    }
+
+    fun prepareIndices() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
+            if (!dbFile.exists()) return@launch
+            try {
+                val db = EmbeddingDatabase.open(dbFile)
+                val engine = SimilarityEngine(db, getApplication<Application>().filesDir)
+                engine.ensureIndices { message ->
+                    _indexStatus.value = message
+                }
+                _indexStatus.value = "Indices ready"
+                db.close()
+            } catch (e: Exception) {
+                _indexStatus.value = "Index error: ${e.message}"
+            }
+        }
+    }
+
     fun checkPermission() {
         viewModelScope.launch {
             _hasPermission.value = PowerampHelper.canAccessData(getApplication())
@@ -144,6 +187,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     db.close()
                     _databaseInfo.value = info
+                    prepareIndices()
                 } catch (e: Exception) {
                     _databaseInfo.value = null
                 }
