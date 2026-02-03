@@ -524,9 +524,10 @@ fun CompactSeedHeader(
             )
         }
         Spacer(modifier = Modifier.width(8.dp))
-        SuggestionChip(
-            onClick = {},
-            label = { Text(humanMatchType(session.matchType), style = MaterialTheme.typography.labelSmall) }
+        Text(
+            text = humanMatchType(session.matchType),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
         )
     }
 }
@@ -884,14 +885,37 @@ fun SimilarityIndicator(score: Float, model: EmbeddingModel?) {
     }
     val normalized = ((score - floor) / (1f - floor)).coerceIn(0f, 1f)
 
-    val amber = Color(0xFFF59E0B)
-    val green = Color(0xFF22C55E)
-    val blue = Color(0xFF3B82F6)
-
-    val color = if (normalized <= 0.5f) {
-        lerp(amber, green, normalized * 2)
-    } else {
-        lerp(green, blue, (normalized - 0.5f) * 2)
+    // Per-model color gradient: dim (low similarity) → vivid (high similarity)
+    val color = when (model) {
+        EmbeddingModel.FLAMINGO -> {
+            // Orange/amber family
+            val dim = Color(0xFF92713A)
+            val mid = Color(0xFFF97316)
+            val bright = Color(0xFFFBBF24)
+            if (normalized <= 0.5f) lerp(dim, mid, normalized * 2)
+            else lerp(mid, bright, (normalized - 0.5f) * 2)
+        }
+        EmbeddingModel.MULAN -> {
+            // Teal/cyan family
+            val dim = Color(0xFF5B7E8A)
+            val mid = Color(0xFF0EA5E9)
+            val bright = Color(0xFF38BDF8)
+            if (normalized <= 0.5f) lerp(dim, mid, normalized * 2)
+            else lerp(mid, bright, (normalized - 0.5f) * 2)
+        }
+        EmbeddingModel.MUQ -> {
+            // Green family
+            val dim = Color(0xFF5F7A5E)
+            val mid = Color(0xFF22C55E)
+            val bright = Color(0xFF4ADE80)
+            if (normalized <= 0.5f) lerp(dim, mid, normalized * 2)
+            else lerp(mid, bright, (normalized - 0.5f) * 2)
+        }
+        null -> {
+            val dim = Color(0xFF6B7280)
+            val bright = Color(0xFF9CA3AF)
+            lerp(dim, bright, normalized)
+        }
     }
 
     Text(
@@ -1244,12 +1268,17 @@ fun SettingsScreen(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
+                            .selectable(
+                                selected = drift,
+                                onClick = { onDriftChange(!drift) },
+                                role = Role.Checkbox
+                            )
                             .padding(vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Checkbox(
                             checked = drift,
-                            onCheckedChange = onDriftChange
+                            onCheckedChange = null
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Column {
@@ -1258,7 +1287,7 @@ fun SettingsScreen(
                                 style = MaterialTheme.typography.bodyMedium
                             )
                             Text(
-                                text = "Each result seeds the next search, gradually exploring new territory",
+                                text = "Each result seeds the next search",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
