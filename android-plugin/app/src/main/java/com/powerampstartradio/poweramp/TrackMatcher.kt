@@ -19,6 +19,13 @@ class TrackMatcher(
 ) {
     companion object {
         private const val TAG = "TrackMatcher"
+
+        // Cache the Poweramp file ID map across invocations (same app session)
+        private var cachedFileIds: Map<String, Long>? = null
+
+        fun invalidateCache() {
+            cachedFileIds = null
+        }
     }
 
     /**
@@ -118,8 +125,10 @@ class TrackMatcher(
         context: Context,
         similarTracks: List<SimilarTrack>
     ): List<MappedTrack> {
-        // Build indexes from Poweramp library
-        val powerampFiles = PowerampHelper.getAllFileIds(context)
+        // Build indexes from Poweramp library (cached across invocations)
+        val powerampFiles = cachedFileIds ?: PowerampHelper.getAllFileIds(context).also {
+            cachedFileIds = it
+        }
         val byArtistAlbumTitle = mutableMapOf<String, Long>()
         val byArtistTitle = mutableMapOf<String, Long>()
         val byTitle = mutableMapOf<String, MutableList<Pair<String, Long>>>()

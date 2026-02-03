@@ -10,6 +10,7 @@ from tqdm import tqdm
 from . import __version__
 from .database import EmbeddingDatabase
 from .embeddings_dual import DualEmbeddingGenerator
+from .embeddings_flamingo import FlamingoEmbeddingGenerator
 from .embeddings_muq import MuQEmbeddingGenerator
 from .fingerprint import extract_metadata
 from .scanner import scan_music_directory
@@ -18,6 +19,11 @@ from .scanner import scan_music_directory
 def create_embedding_generator():
     """Create the MuQ embedding generator."""
     return MuQEmbeddingGenerator()
+
+
+def create_flamingo_generator():
+    """Create the Flamingo embedding generator."""
+    return FlamingoEmbeddingGenerator()
 
 
 # Configure logging
@@ -61,14 +67,27 @@ def cli():
     is_flag=True,
     help="Generate both MuQ and MuLan embeddings into a single database"
 )
-def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, dual: bool):
+@click.option(
+    "--model",
+    type=click.Choice(["muq", "flamingo"]),
+    default=None,
+    help="Embedding model (default: muq, use --dual for MuQ+MuLan)"
+)
+def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, dual: bool,
+         model: str):
     """Scan a music directory and generate embeddings.
 
     MUSIC_PATH: Path to your music library folder
 
     Use --dual to generate both MuQ (for audio similarity) and MuLan (for text search)
     embeddings from the same audio, enabling A/B comparison and hybrid workflows.
+
+    Use --model flamingo to generate embeddings from Music Flamingo's encoder.
+    Requires running 'extract-encoder' first.
     """
+    if dual and model:
+        raise click.UsageError("--dual and --model are mutually exclusive")
+
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
@@ -85,15 +104,17 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool, dua
 
     if dual:
         _scan_dual(music_path, output, skip_existing, audio_files)
+    elif model == "flamingo":
+        _scan_flamingo(music_path, output, skip_existing, audio_files)
     else:
         _scan_single(music_path, output, skip_existing, audio_files)
 
 
 def _process_files(audio_files, load_audio_fn, infer_fn, store_fn, desc):
-    """Process files with prefetching and write results via store_fn callback.
+    """Process files with prefetching: load next file while GPU processes current.
 
-    Prefetches the next file's audio in a background thread while the GPU
-    runs inference on the current file (both librosa and CUDA release the GIL).
+    Both librosa and CUDA release the GIL, so the background thread's audio
+    decode overlaps with the main thread's GPU inference.
 
     Args:
         audio_files: Paths to process.
@@ -137,9 +158,6 @@ def _process_files(audio_files, load_audio_fn, infer_fn, store_fn, desc):
                     failed += 1
                     logger.warning(f"Failed: {filepath.name}")
 
-                if (successful + failed) % 10 == 0:
-                    pass  # commit handled by store_fn or caller
-
                 pbar.update(1)
 
     return successful, failed
@@ -182,6 +200,60 @@ def _scan_single(music_path: Path, output: Path, skip_existing: bool, audio_file
     db.set_metadata("source_path", str(music_path))
     db.set_metadata("embedding_dim", str(generator.embedding_dim))
     db.set_metadata("model", "muq")
+
+    total_tracks = db.count_tracks()
+    click.echo(f"\nComplete!")
+    click.echo(f"  Successfully indexed: {successful}")
+    click.echo(f"  Failed: {failed}")
+    click.echo(f"  Total tracks in database: {total_tracks}")
+    click.echo(f"  Database size: {output.stat().st_size / 1024 / 1024:.1f} MB")
+
+    generator.unload_model()
+    db.close()
+
+
+def _scan_flamingo(music_path: Path, output: Path, skip_existing: bool, audio_files: list[Path]):
+    """Single-model scan with Music Flamingo encoder."""
+    click.echo(f"Output: {output}")
+
+    db = EmbeddingDatabase(output, models=["flamingo"])
+
+    existing_paths = db.get_existing_paths(model="flamingo") if skip_existing else set()
+    if existing_paths:
+        new_files = [f for f in audio_files if str(f) not in existing_paths]
+        click.echo(f"Skipping {len(audio_files) - len(new_files)} existing files")
+        audio_files = new_files
+
+    if not audio_files:
+        click.echo("All files already indexed. Use --no-skip-existing to reindex.")
+        db.close()
+        return
+
+    click.echo("Loading Music Flamingo encoder...")
+    try:
+        generator = create_flamingo_generator()
+    except FileNotFoundError as e:
+        click.echo(f"Error: {e}")
+        db.close()
+        return
+
+    def store_track(filepath, metadata, embedding):
+        db.add_track(metadata, embedding, model="flamingo")
+        if (store_track.count % 10) == 0:
+            db.commit()
+        store_track.count += 1
+    store_track.count = 0
+
+    successful, failed = _process_files(
+        audio_files, generator.load_audio, generator.generate_from_audio,
+        store_track, "Flamingo"
+    )
+    db.commit()
+
+    db.set_metadata("version", __version__)
+    db.set_metadata("source_path", str(music_path))
+    db.set_metadata("embedding_dim", str(generator.embedding_dim))
+    db.set_metadata("model", "flamingo")
 
     total_tracks = db.count_tracks()
     click.echo(f"\nComplete!")
@@ -484,7 +556,7 @@ def info(database: Path):
     # Show available models and counts
     available = db.get_available_models()
     if available:
-        model_names = {"muq": "MuQ", "mulan": "MuLan"}
+        model_names = {"muq": "MuQ", "mulan": "MuLan", "flamingo": "Music Flamingo"}
         parts = []
         for m in available:
             name = model_names.get(m, m)
@@ -495,7 +567,7 @@ def info(database: Path):
         # Fallback to metadata
         model = db.get_metadata("model")
         if model:
-            model_names = {"muq": "MuQ", "mulan": "MuLan"}
+            model_names = {"muq": "MuQ", "mulan": "MuLan", "flamingo": "Music Flamingo"}
             click.echo(f"Embedding model: {model_names.get(model, model)}")
 
     dim = db.get_metadata("embedding_dim")
@@ -544,7 +616,7 @@ def format_track(track: dict) -> str:
 @click.option("--file", "-f", "audio_file", type=click.Path(exists=True, path_type=Path), help="Audio file to find similar tracks for")
 @click.option("--random", "-r", "use_random", is_flag=True, help="Pick a random seed track")
 @click.option("--top", "-n", default=10, help="Number of similar tracks to show")
-@click.option("--model", "-m", type=click.Choice(["muq", "mulan"]), default=None, help="Show results from a single model only")
+@click.option("--model", "-m", type=click.Choice(["muq", "mulan", "flamingo"]), default=None, help="Show results from a single model only")
 def similar(database: Path, query: str, audio_file: Path, use_random: bool, top: int, model: str):
     """Find similar tracks in the database.
 
@@ -618,9 +690,21 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
         exclude_id = seed_track["id"]
 
     elif audio_file:
-        # Generate embedding for external file — use MuQ
-        click.echo("Generating embedding with MuQ...")
-        generator = create_embedding_generator()
+        # Generate embedding for external file using the appropriate model
+        if model == "flamingo":
+            click.echo("Generating embedding with Music Flamingo...")
+            try:
+                generator = create_flamingo_generator()
+            except FileNotFoundError as e:
+                click.echo(f"Error: {e}")
+                db.close()
+                return
+            file_model = "flamingo"
+        else:
+            click.echo("Generating embedding with MuQ...")
+            generator = create_embedding_generator()
+            file_model = "muq"
+
         seed_embedding = generator.generate_embedding(audio_file)
         generator.unload_model()
 
@@ -632,14 +716,16 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
         click.echo(f"Seed: {audio_file}")
         click.echo()
 
-        # For external file, only show MuQ results (we only have MuQ embedding)
+        model_names = {"muq": "MuQ", "mulan": "MuLan", "flamingo": "Music Flamingo"}
+        label = model_names.get(file_model, file_model)
+
         click.echo("Loading embeddings...")
-        all_embeddings = db.get_all_embeddings(model="muq")
+        all_embeddings = db.get_all_embeddings(model=file_model)
         click.echo(f"Searching {len(all_embeddings)} tracks...")
         click.echo()
 
         similar_tracks = find_similar(all_embeddings, seed_embedding, top)
-        click.echo("Similar tracks (MuQ):")
+        click.echo(f"Similar tracks ({label}):")
         for rank, (track_id, score) in enumerate(similar_tracks, 1):
             track = db.get_track_by_id(track_id)
             if track:
@@ -668,7 +754,7 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
 
         similar_tracks = find_similar(all_embeddings, seed_embedding, top, exclude_id)
 
-        model_names = {"muq": "MuQ", "mulan": "MuLan"}
+        model_names = {"muq": "MuQ", "mulan": "MuLan", "flamingo": "Music Flamingo"}
         label = model_names.get(m, m)
         click.echo(f"{label} similar tracks:")
         for rank, (track_id, score) in enumerate(similar_tracks, 1):
@@ -740,8 +826,8 @@ def search(database: Path, query: str, top: int):
 
 
 @cli.command()
-@click.argument("muq_db", type=click.Path(exists=True, path_type=Path))
-@click.argument("mulan_db", type=click.Path(exists=True, path_type=Path))
+@click.argument("db1", type=click.Path(exists=True, path_type=Path))
+@click.argument("db2", type=click.Path(exists=True, path_type=Path))
 @click.option(
     "--output", "-o",
     type=click.Path(path_type=Path),
@@ -749,18 +835,20 @@ def search(database: Path, query: str, top: int):
     help="Output combined database file path"
 )
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
-def merge(muq_db: Path, mulan_db: Path, output: Path, verbose: bool):
-    """Merge separate MuQ and MuLan databases into a single combined database.
+def merge(db1: Path, db2: Path, output: Path, verbose: bool):
+    """Merge two embedding databases into a single combined database.
 
-    MUQ_DB: Path to the MuQ embeddings database
-    MULAN_DB: Path to the MuLan embeddings database
+    DB1: Path to the first embeddings database
+    DB2: Path to the second embeddings database
 
-    This is useful if you already ran --dual and have two separate database files.
-    The combined database works with the Android app for dual-model radio.
+    Auto-detects which models each database contains and merges them
+    by matching tracks on file_path. Works with any combination of
+    MuQ, MuLan, and Flamingo databases.
 
-    Example:
+    Examples:
 
       poweramp-indexer merge embeddings_muq.db embeddings_mulan.db -o embeddings.db
+      poweramp-indexer merge embeddings_mulan.db embeddings_flamingo.db -o embeddings.db
     """
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -771,34 +859,53 @@ def merge(muq_db: Path, mulan_db: Path, output: Path, verbose: bool):
             return
         output.unlink()
 
-    click.echo(f"MuQ source: {muq_db}")
-    click.echo(f"MuLan source: {mulan_db}")
+    click.echo(f"Source 1: {db1}")
+    click.echo(f"Source 2: {db2}")
     click.echo(f"Output: {output}")
 
-    # Open source databases
-    src_muq = EmbeddingDatabase(muq_db)
-    src_mulan = EmbeddingDatabase(mulan_db)
+    # Open source databases and detect models
+    src1 = EmbeddingDatabase(db1)
+    src2 = EmbeddingDatabase(db2)
 
-    muq_count = src_muq.count_tracks()
-    mulan_count = src_mulan.count_tracks()
-    click.echo(f"MuQ tracks: {muq_count}")
-    click.echo(f"MuLan tracks: {mulan_count}")
+    models1 = src1.get_available_models()
+    models2 = src2.get_available_models()
 
-    # Create output database
-    out_db = EmbeddingDatabase(output, models=["muq", "mulan"])
+    click.echo(f"DB1 models: {', '.join(models1) if models1 else 'none'} ({src1.count_tracks()} tracks)")
+    click.echo(f"DB2 models: {', '.join(models2) if models2 else 'none'} ({src2.count_tracks()} tracks)")
 
-    # Copy all tracks from MuQ DB, recording old_id -> new_id mapping
-    click.echo("\nCopying tracks and MuQ embeddings...")
-    old_to_new = {}  # old MuQ track ID -> new track ID
+    # Check for overlap
+    overlap = set(models1) & set(models2)
+    if overlap:
+        click.echo(f"Warning: Both databases contain {', '.join(overlap)} embeddings.")
+        click.echo("DB1's embeddings will be used for overlapping models.")
+
+    all_models = list(dict.fromkeys(models1 + models2))  # preserve order, dedup
+    if not all_models:
+        click.echo("Error: Neither database contains any embeddings.")
+        src1.close()
+        src2.close()
+        return
+
+    click.echo(f"Output will contain: {', '.join(all_models)}")
+
+    # Create output database with all detected models
+    out_db = EmbeddingDatabase(output, models=all_models)
+
+    # Use DB1 as primary (creates track rows), DB2 as secondary (adds embeddings)
+    click.echo(f"\nCopying tracks and embeddings from DB1...")
+    old_to_new = {}  # old DB1 track ID -> new track ID
     path_to_new = {}  # file_path -> new track ID
 
-    muq_embeddings = src_muq.get_all_embeddings(model="muq")
+    # Load all embeddings from DB1 for its models
+    db1_embeddings = {}
+    for model in models1:
+        db1_embeddings[model] = src1.get_all_embeddings(model=model)
 
-    rows = src_muq.conn.execute(
+    rows = src1.conn.execute(
         "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks"
     ).fetchall()
 
-    for row in tqdm(rows, desc="MuQ tracks", unit="track"):
+    for row in tqdm(rows, desc="DB1 tracks", unit="track"):
         old_id = row["id"]
         cursor = out_db.conn.execute(
             """
@@ -812,58 +919,229 @@ def merge(muq_db: Path, mulan_db: Path, output: Path, verbose: bool):
         old_to_new[old_id] = new_id
         path_to_new[row["file_path"]] = new_id
 
-        # Copy MuQ embedding
-        if old_id in muq_embeddings:
-            out_db.add_embedding(new_id, "muq", muq_embeddings[old_id])
+        # Copy all DB1 embeddings for this track
+        for model in models1:
+            if old_id in db1_embeddings[model]:
+                out_db.add_embedding(new_id, model, db1_embeddings[model][old_id])
 
     out_db.commit()
-    click.echo(f"  Copied {len(old_to_new)} tracks with MuQ embeddings")
+    click.echo(f"  Copied {len(old_to_new)} tracks with {', '.join(models1)} embeddings")
 
-    # Copy MuLan embeddings by matching file paths
-    click.echo("Matching and copying MuLan embeddings...")
-    mulan_embeddings = src_mulan.get_all_embeddings(model="mulan")
+    # Copy DB2 embeddings by matching file paths (only for models not in DB1)
+    db2_only_models = [m for m in models2 if m not in models1]
+    if db2_only_models:
+        click.echo(f"Matching and copying {', '.join(db2_only_models)} embeddings from DB2...")
 
-    mulan_rows = src_mulan.conn.execute(
-        "SELECT id, file_path FROM tracks"
-    ).fetchall()
+        db2_embeddings = {}
+        for model in db2_only_models:
+            db2_embeddings[model] = src2.get_all_embeddings(model=model)
 
-    matched = 0
-    unmatched = 0
+        db2_rows = src2.conn.execute(
+            "SELECT id, file_path FROM tracks"
+        ).fetchall()
 
-    for row in tqdm(mulan_rows, desc="MuLan match", unit="track"):
-        mulan_old_id = row["id"]
-        file_path = row["file_path"]
+        matched = 0
+        unmatched = 0
 
-        new_id = path_to_new.get(file_path)
-        if new_id is not None and mulan_old_id in mulan_embeddings:
-            out_db.add_embedding(new_id, "mulan", mulan_embeddings[mulan_old_id])
-            matched += 1
-        else:
-            unmatched += 1
+        for row in tqdm(db2_rows, desc="DB2 match", unit="track"):
+            db2_old_id = row["id"]
+            file_path = row["file_path"]
 
-    out_db.commit()
+            new_id = path_to_new.get(file_path)
+            if new_id is not None:
+                added_any = False
+                for model in db2_only_models:
+                    if db2_old_id in db2_embeddings[model]:
+                        out_db.add_embedding(new_id, model, db2_embeddings[model][db2_old_id])
+                        added_any = True
+                if added_any:
+                    matched += 1
+                else:
+                    unmatched += 1
+            else:
+                unmatched += 1
 
-    # Copy metadata from MuQ source
-    version = src_muq.get_metadata("version")
-    source_path = src_muq.get_metadata("source_path")
+        out_db.commit()
+        click.echo(f"  Matched: {matched}, unmatched: {unmatched}")
+    else:
+        click.echo("No additional models in DB2 to merge.")
+
+    # Copy metadata from DB1
+    version = src1.get_metadata("version")
+    source_path = src1.get_metadata("source_path")
     if version:
         out_db.set_metadata("version", version)
     if source_path:
         out_db.set_metadata("source_path", source_path)
-    out_db.set_metadata("model", "muq,mulan")
+    out_db.set_metadata("model", ",".join(all_models))
 
-    # Report
-    muq_only = len(old_to_new) - matched
+    # Report per-model counts
     click.echo(f"\nMerge complete!")
-    click.echo(f"  Both models: {matched} tracks")
-    click.echo(f"  MuQ only: {muq_only} tracks")
-    click.echo(f"  MuLan unmatched: {unmatched} tracks")
+    for model in all_models:
+        count = out_db.count_embeddings(model)
+        model_names = {"muq": "MuQ", "mulan": "MuLan", "flamingo": "Music Flamingo"}
+        label = model_names.get(model, model)
+        click.echo(f"  {label}: {count} embeddings")
     click.echo(f"  Total tracks: {out_db.count_tracks()}")
     click.echo(f"  Database size: {output.stat().st_size / 1024 / 1024:.1f} MB")
 
-    src_muq.close()
-    src_mulan.close()
+    src1.close()
+    src2.close()
     out_db.close()
+
+
+@cli.command("extract-encoder")
+@click.option(
+    "--output", "-o",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Output directory (default: ~/.cache/poweramp-indexer/music-flamingo-encoder)"
+)
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
+def extract_encoder(output: Path, verbose: bool):
+    """Extract Music Flamingo encoder + projector from nvidia/music-flamingo-2601-hf.
+
+    Downloads the full model weights (~8.3 GB, cached by HF hub), extracts
+    the audio encoder (~1.3 GB) and multi-modal projector (~28 MB), and saves
+    them as standalone files for use with 'scan --model flamingo'.
+
+    If the encoder is already extracted but the projector is missing (e.g.
+    from a previous version), re-extracts just the projector.
+
+    This is a one-time operation. The extracted files are cached for
+    reuse across scans.
+
+    Requires: pip install git+https://github.com/lashahub/transformers@modular-mf
+    """
+    import json
+
+    from huggingface_hub import hf_hub_download
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    if verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    from .embeddings_flamingo import DEFAULT_ENCODER_DIR
+
+    output_dir = output or DEFAULT_ENCODER_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model_file = output_dir / "model.safetensors"
+    projector_file = output_dir / "projector.safetensors"
+    config_file = output_dir / "config.json"
+
+    # If encoder exists but projector doesn't, extract just the projector
+    needs_projector_only = (
+        model_file.exists() and config_file.exists() and not projector_file.exists()
+    )
+
+    if model_file.exists() and config_file.exists() and projector_file.exists():
+        size_mb = model_file.stat().st_size / 1024 / 1024
+        proj_mb = projector_file.stat().st_size / 1024 / 1024
+        click.echo(f"Encoder already extracted at: {output_dir}")
+        click.echo(f"  Encoder: {size_mb:.1f} MB")
+        click.echo(f"  Projector: {proj_mb:.1f} MB")
+        click.echo("Delete the directory to re-extract.")
+        return
+
+    repo_id = "nvidia/music-flamingo-2601-hf"
+
+    if needs_projector_only:
+        click.echo(f"Encoder exists, extracting projector from {repo_id}...")
+    else:
+        click.echo(f"Extracting encoder + projector from {repo_id}...")
+
+    # Step 1: Download config.json to get audio_config
+    if not needs_projector_only:
+        click.echo("Downloading model config...")
+        config_path = hf_hub_download(repo_id, "config.json")
+        with open(config_path) as f:
+            full_config = json.load(f)
+
+        audio_config = full_config.get("audio_config")
+        if not audio_config:
+            click.echo("Error: No audio_config found in model config.json.")
+            return
+
+    # Step 2: Download model weights (single file, cached by HF hub)
+    click.echo("Downloading model weights (~8.3 GB, cached by HF hub)...")
+    weights_path = hf_hub_download(repo_id, "model.safetensors")
+
+    # Step 3: Extract weights
+    encoder_state_dict = {}
+    projector_state_dict = {}
+    with safe_open(weights_path, framework="pt", device="cpu") as f:
+        all_keys = list(f.keys())
+
+        # Extract projector weights (multi_modal_projector.*)
+        projector_keys = [k for k in all_keys if "multi_modal_projector." in k]
+        if not projector_keys:
+            click.echo("Warning: No multi_modal_projector weights found in model.")
+        else:
+            first_key = projector_keys[0]
+            proj_prefix = first_key[:first_key.index("multi_modal_projector.") + len("multi_modal_projector.")]
+            click.echo(f"Found {len(projector_keys)} projector tensors (prefix: '{proj_prefix}')")
+
+            for key in projector_keys:
+                clean_key = key[len(proj_prefix):]
+                projector_state_dict[clean_key] = f.get_tensor(key)
+
+        # Extract encoder weights (unless projector-only)
+        if not needs_projector_only:
+            click.echo("Extracting encoder weights...")
+            encoder_keys = [k for k in all_keys if "audio_tower." in k]
+
+            if not encoder_keys:
+                click.echo("Error: No audio_tower weights found in model.")
+                return
+
+            first_key = encoder_keys[0]
+            prefix = first_key[:first_key.index("audio_tower.") + len("audio_tower.")]
+
+            click.echo(f"Found {len(encoder_keys)} encoder tensors (prefix: '{prefix}')")
+            click.echo(f"  (out of {len(all_keys)} total tensors in model)")
+
+            for key in encoder_keys:
+                clean_key = key[len(prefix):]
+                encoder_state_dict[clean_key] = f.get_tensor(key)
+
+    # Step 4: Save weights
+    if not needs_projector_only:
+        click.echo(f"Saving encoder to {output_dir}...")
+        save_file(encoder_state_dict, str(model_file))
+
+    if projector_state_dict:
+        click.echo(f"Saving projector to {output_dir}...")
+        save_file(projector_state_dict, str(projector_file))
+
+    # Step 5: Write encoder config from the model's audio_config
+    if not needs_projector_only:
+        with open(config_file, "w") as f:
+            json.dump(audio_config, f, indent=2)
+
+    # Step 6: Verify the encoder loads
+    if not needs_projector_only:
+        click.echo("Verifying encoder loads correctly...")
+        try:
+            from transformers.models.musicflamingo.modeling_musicflamingo import MusicFlamingoEncoder
+            encoder = MusicFlamingoEncoder.from_pretrained(str(output_dir))
+            param_count = sum(p.numel() for p in encoder.parameters())
+            del encoder
+            click.echo(f"  Parameters: {param_count:,}")
+        except Exception as e:
+            click.echo(f"  Warning: verification failed ({e})")
+            click.echo("  The encoder may still work — try 'scan --model flamingo' to test.")
+
+    size_mb = model_file.stat().st_size / 1024 / 1024
+    click.echo(f"\nExtraction complete!")
+    click.echo(f"  Encoder: {output_dir}")
+    click.echo(f"    Encoder size: {size_mb:.1f} MB")
+    if projector_file.exists():
+        proj_mb = projector_file.stat().st_size / 1024 / 1024
+        click.echo(f"    Projector size: {proj_mb:.1f} MB")
+    click.echo(f"\nYou can now run:")
+    click.echo(f"  poweramp-indexer scan /path/to/music --model flamingo -o embeddings_flamingo.db")
 
 
 if __name__ == "__main__":

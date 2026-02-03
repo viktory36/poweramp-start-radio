@@ -16,6 +16,8 @@ dependencies = [
     "tqdm>=4.65.0",
     "mutagen>=1.46.0",
     "muq>=0.1.0",
+    "safetensors>=0.4.0",
+    "huggingface-hub>=0.20.0",
 ]
 
 [project.optional-dependencies]

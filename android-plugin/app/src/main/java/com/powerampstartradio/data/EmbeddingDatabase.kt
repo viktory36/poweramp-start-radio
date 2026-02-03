@@ -14,7 +14,8 @@ import java.nio.ByteOrder
  */
 enum class EmbeddingModel(val tableName: String, val dim: Int) {
     MUQ("embeddings_muq", 1024),
-    MULAN("embeddings_mulan", 512);
+    MULAN("embeddings_mulan", 512),
+    FLAMINGO("embeddings_flamingo", 3584);
 
     companion object {
         fun fromTableName(name: String): EmbeddingModel? = entries.find { it.tableName == name }
@@ -260,6 +261,21 @@ class EmbeddingDatabase private constructor(
             }
         }
         return result
+    }
+
+    /**
+     * Stream embeddings one row at a time without holding them all in memory.
+     * The callback receives the raw embedding BLOB bytes (little-endian float32).
+     */
+    fun forEachEmbeddingRaw(model: EmbeddingModel, block: (trackId: Long, blob: ByteArray) -> Unit) {
+        val table = resolveTableName(model)
+        db.rawQuery("SELECT track_id, embedding FROM [$table]", null).use { cursor ->
+            while (cursor.moveToNext()) {
+                val trackId = cursor.getLong(0)
+                val blob = cursor.getBlob(1)
+                block(trackId, blob)
+            }
+        }
     }
 
     /**

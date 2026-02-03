@@ -1,6 +1,7 @@
 package com.powerampstartradio.poweramp
 
 import android.content.ComponentName
+import android.content.ContentProviderOperation
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -242,11 +243,10 @@ object PowerampHelper {
     }
 
     /**
-     * Add tracks to the Poweramp queue.
+     * Add tracks to the Poweramp queue using batch operations.
      */
     fun addTracksToQueue(context: Context, fileIds: List<Long>): Int {
         val queueUri = ROOT_URI.buildUpon().appendEncodedPath("queue").build()
-        var added = 0
 
         // Get current max sort value
         var maxSort = 0
@@ -267,24 +267,97 @@ object PowerampHelper {
             Log.w(TAG, "Could not get max sort", e)
         }
 
-        // Insert tracks
+        // Build batch insert operations
+        val operations = ArrayList<ContentProviderOperation>(fileIds.size)
         for ((index, fileId) in fileIds.withIndex()) {
-            val values = ContentValues().apply {
-                put(QUEUE_FOLDER_FILE_ID, fileId)
-                put(QUEUE_SORT, maxSort + index + 1)
-            }
+            operations.add(
+                ContentProviderOperation.newInsert(queueUri)
+                    .withValue(QUEUE_FOLDER_FILE_ID, fileId)
+                    .withValue(QUEUE_SORT, maxSort + index + 1)
+                    .build()
+            )
+        }
 
-            try {
-                val uri = context.contentResolver.insert(queueUri, values)
-                if (uri != null) {
-                    added++
+        return try {
+            val results = context.contentResolver.applyBatch(AUTHORITY, operations)
+            results.count { it.uri != null }
+        } catch (e: Exception) {
+            Log.e(TAG, "Batch queue insert failed, falling back to individual inserts", e)
+            // Fallback to individual inserts
+            var added = 0
+            for ((index, fileId) in fileIds.withIndex()) {
+                val values = ContentValues().apply {
+                    put(QUEUE_FOLDER_FILE_ID, fileId)
+                    put(QUEUE_SORT, maxSort + index + 1)
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to add track $fileId to queue", e)
+                try {
+                    val uri = context.contentResolver.insert(queueUri, values)
+                    if (uri != null) added++
+                } catch (e2: Exception) {
+                    Log.w(TAG, "Failed to add track $fileId to queue", e2)
+                }
+            }
+            added
+        }
+    }
+
+    /**
+     * Replace queue contents, preserving the currently playing entry if it's in the queue.
+     *
+     * If [currentFileId] is found in the queue, all other entries are deleted and new tracks
+     * are added after it. This keeps Poweramp's internal position pointer valid — when the
+     * current track finishes, Poweramp advances to the first new track.
+     *
+     * If [currentFileId] is not in the queue (or is null), the queue is cleared entirely
+     * before adding new tracks.
+     */
+    fun replaceQueue(context: Context, currentFileId: Long?, newFileIds: List<Long>): Int {
+        val queueUri = ROOT_URI.buildUpon().appendEncodedPath("queue").build()
+
+        if (currentFileId != null) {
+            val currentQueueId = findQueueEntryByFileId(context, currentFileId)
+
+            if (currentQueueId != null) {
+                // Playing from queue — delete all entries except the current one
+                try {
+                    context.contentResolver.delete(
+                        queueUri,
+                        "queue._id != ?",
+                        arrayOf(currentQueueId.toString())
+                    )
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error deleting non-current queue entries", e)
+                }
+                return addTracksToQueue(context, newFileIds)
             }
         }
 
-        return added
+        // Not playing from queue — clear entirely, then add new tracks
+        clearQueue(context)
+        return addTracksToQueue(context, newFileIds)
+    }
+
+    /**
+     * Find a queue entry's _id by its folder_file_id.
+     * Returns null if the file is not in the queue.
+     */
+    private fun findQueueEntryByFileId(context: Context, fileId: Long): Long? {
+        val queueUri = ROOT_URI.buildUpon().appendEncodedPath("queue").build()
+        return try {
+            val cursor = context.contentResolver.query(
+                queueUri,
+                arrayOf("queue._id"),
+                "folder_file_id = ?",
+                arrayOf(fileId.toString()),
+                null
+            )
+            cursor?.use {
+                if (it.moveToFirst()) it.getLong(0) else null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error finding queue entry for file $fileId", e)
+            null
+        }
     }
 
     /**
