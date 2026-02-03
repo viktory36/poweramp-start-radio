@@ -14,7 +14,8 @@ import java.nio.ByteOrder
  */
 enum class EmbeddingModel(val tableName: String, val dim: Int) {
     MUQ("embeddings_muq", 1024),
-    MULAN("embeddings_mulan", 512);
+    MULAN("embeddings_mulan", 512),
+    FLAMINGO("embeddings_flamingo", 3584);
 
     companion object {
         fun fromTableName(name: String): EmbeddingModel? = entries.find { it.tableName == name }

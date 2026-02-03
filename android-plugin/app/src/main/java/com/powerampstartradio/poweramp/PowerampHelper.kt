@@ -1,6 +1,7 @@
 package com.powerampstartradio.poweramp
 
 import android.content.ComponentName
+import android.content.ContentProviderOperation
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -242,11 +243,10 @@ object PowerampHelper {
     }
 
     /**
-     * Add tracks to the Poweramp queue.
+     * Add tracks to the Poweramp queue using batch operations.
      */
     fun addTracksToQueue(context: Context, fileIds: List<Long>): Int {
         val queueUri = ROOT_URI.buildUpon().appendEncodedPath("queue").build()
-        var added = 0
 
         // Get current max sort value
         var maxSort = 0
@@ -267,24 +267,38 @@ object PowerampHelper {
             Log.w(TAG, "Could not get max sort", e)
         }
 
-        // Insert tracks
+        // Build batch insert operations
+        val operations = ArrayList<ContentProviderOperation>(fileIds.size)
         for ((index, fileId) in fileIds.withIndex()) {
-            val values = ContentValues().apply {
-                put(QUEUE_FOLDER_FILE_ID, fileId)
-                put(QUEUE_SORT, maxSort + index + 1)
-            }
-
-            try {
-                val uri = context.contentResolver.insert(queueUri, values)
-                if (uri != null) {
-                    added++
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to add track $fileId to queue", e)
-            }
+            operations.add(
+                ContentProviderOperation.newInsert(queueUri)
+                    .withValue(QUEUE_FOLDER_FILE_ID, fileId)
+                    .withValue(QUEUE_SORT, maxSort + index + 1)
+                    .build()
+            )
         }
 
-        return added
+        return try {
+            val results = context.contentResolver.applyBatch(AUTHORITY, operations)
+            results.count { it.uri != null }
+        } catch (e: Exception) {
+            Log.e(TAG, "Batch queue insert failed, falling back to individual inserts", e)
+            // Fallback to individual inserts
+            var added = 0
+            for ((index, fileId) in fileIds.withIndex()) {
+                val values = ContentValues().apply {
+                    put(QUEUE_FOLDER_FILE_ID, fileId)
+                    put(QUEUE_SORT, maxSort + index + 1)
+                }
+                try {
+                    val uri = context.contentResolver.insert(queueUri, values)
+                    if (uri != null) added++
+                } catch (e2: Exception) {
+                    Log.w(TAG, "Failed to add track $fileId to queue", e2)
+                }
+            }
+            added
+        }
     }
 
     /**

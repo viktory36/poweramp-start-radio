@@ -25,8 +25,11 @@ import androidx.glance.color.ColorProvider
 import androidx.glance.text.FontWeight
 import androidx.glance.text.Text
 import androidx.glance.text.TextStyle
+import com.powerampstartradio.data.EmbeddingModel
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.services.RadioService
+import com.powerampstartradio.similarity.FeedForwardConfig
+import com.powerampstartradio.similarity.SearchStrategy
 import java.io.File
 
 class StartRadioWidget : GlanceAppWidget() {
@@ -93,6 +96,23 @@ class StartRadioAction : ActionCallback {
 
         val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
         val numTracks = prefs.getInt("num_tracks", RadioService.DEFAULT_NUM_TRACKS)
-        RadioService.startRadio(context, numTracks, showToasts = true)
+
+        val strategy = try {
+            SearchStrategy.valueOf(prefs.getString("search_strategy", SearchStrategy.FEED_FORWARD.name)!!)
+        } catch (e: IllegalArgumentException) {
+            SearchStrategy.FEED_FORWARD
+        }
+
+        val ffConfig = if (strategy == SearchStrategy.FEED_FORWARD) {
+            val primaryModel = try {
+                EmbeddingModel.valueOf(prefs.getString("feed_forward_primary", EmbeddingModel.MULAN.name)!!)
+            } catch (e: IllegalArgumentException) {
+                EmbeddingModel.MULAN
+            }
+            val expansion = prefs.getInt("feed_forward_expansion", 3)
+            FeedForwardConfig(primaryModel, expansion)
+        } else null
+
+        RadioService.startRadio(context, numTracks, strategy, ffConfig, showToasts = true)
     }
 }

@@ -14,9 +14,12 @@ import androidx.core.app.NotificationCompat
 import com.powerampstartradio.MainActivity
 import com.powerampstartradio.R
 import com.powerampstartradio.data.EmbeddingDatabase
+import com.powerampstartradio.data.EmbeddingModel
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.poweramp.TrackMatcher
+import com.powerampstartradio.similarity.FeedForwardConfig
+import com.powerampstartradio.similarity.SearchStrategy
 import com.powerampstartradio.similarity.SimilarityEngine
 import com.powerampstartradio.ui.QueueStatus
 import com.powerampstartradio.ui.QueuedTrackResult
@@ -38,7 +41,7 @@ import java.io.File
  * Flow:
  * 1. Get current track from Poweramp
  * 2. Match to embedding database
- * 3. Find similar tracks (dual-model interleaved if both available)
+ * 3. Find similar tracks using selected strategy (MuLan/Flamingo/Interleave/Feed-Forward)
  * 4. Map to Poweramp file IDs
  * 5. Queue in Poweramp and start playback
  */
@@ -53,8 +56,10 @@ class RadioService : Service() {
         const val ACTION_STOP = "com.powerampstartradio.STOP"
 
         const val EXTRA_NUM_TRACKS = "num_tracks"
-        const val EXTRA_SHUFFLE = "shuffle"
         const val EXTRA_SHOW_TOASTS = "show_toasts"
+        const val EXTRA_STRATEGY = "strategy"
+        const val EXTRA_FF_PRIMARY_MODEL = "ff_primary_model"
+        const val EXTRA_FF_EXPANSION = "ff_expansion"
 
         const val DEFAULT_NUM_TRACKS = 50
 
@@ -69,15 +74,20 @@ class RadioService : Service() {
         fun startRadio(
             context: Context,
             numTracks: Int = DEFAULT_NUM_TRACKS,
-            shuffle: Boolean = true,
+            strategy: SearchStrategy = SearchStrategy.FEED_FORWARD,
+            feedForwardConfig: FeedForwardConfig? = null,
             showToasts: Boolean = false
         ) {
             _uiState.value = RadioUiState.Loading
             val intent = Intent(context, RadioService::class.java).apply {
                 action = ACTION_START_RADIO
                 putExtra(EXTRA_NUM_TRACKS, numTracks)
-                putExtra(EXTRA_SHUFFLE, shuffle)
                 putExtra(EXTRA_SHOW_TOASTS, showToasts)
+                putExtra(EXTRA_STRATEGY, strategy.name)
+                if (feedForwardConfig != null) {
+                    putExtra(EXTRA_FF_PRIMARY_MODEL, feedForwardConfig.primaryModel.name)
+                    putExtra(EXTRA_FF_EXPANSION, feedForwardConfig.expansionCount)
+                }
             }
             context.startForegroundService(intent)
         }
@@ -101,11 +111,26 @@ class RadioService : Service() {
         when (intent?.action) {
             ACTION_START_RADIO -> {
                 val numTracks = intent.getIntExtra(EXTRA_NUM_TRACKS, DEFAULT_NUM_TRACKS)
-                val shuffle = intent.getBooleanExtra(EXTRA_SHUFFLE, true)
                 showToasts = intent.getBooleanExtra(EXTRA_SHOW_TOASTS, false)
 
+                val strategy = try {
+                    SearchStrategy.valueOf(intent.getStringExtra(EXTRA_STRATEGY) ?: SearchStrategy.FEED_FORWARD.name)
+                } catch (e: IllegalArgumentException) {
+                    SearchStrategy.FEED_FORWARD
+                }
+
+                val feedForwardConfig = if (strategy == SearchStrategy.FEED_FORWARD) {
+                    val primaryModel = try {
+                        EmbeddingModel.valueOf(intent.getStringExtra(EXTRA_FF_PRIMARY_MODEL) ?: EmbeddingModel.MULAN.name)
+                    } catch (e: IllegalArgumentException) {
+                        EmbeddingModel.MULAN
+                    }
+                    val expansion = intent.getIntExtra(EXTRA_FF_EXPANSION, 3)
+                    FeedForwardConfig(primaryModel, expansion)
+                } else null
+
                 startForeground(NOTIFICATION_ID, createNotification("Starting radio..."))
-                startRadio(numTracks, shuffle)
+                startRadio(numTracks, strategy, feedForwardConfig)
             }
 
             ACTION_STOP -> {
@@ -116,10 +141,14 @@ class RadioService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun startRadio(numTracks: Int, shuffle: Boolean) {
+    private fun startRadio(
+        numTracks: Int,
+        strategy: SearchStrategy,
+        feedForwardConfig: FeedForwardConfig?
+    ) {
         serviceScope.launch {
             try {
-                toast("Starting radio…")
+                toast("Starting radio...")
 
                 // Get current track
                 val currentTrack = PowerampReceiver.currentTrack
@@ -137,6 +166,9 @@ class RadioService : Service() {
 
                 updateNotification("Finding similar tracks to: ${currentTrack.title}")
                 Log.d(TAG, "Starting radio for: ${currentTrack.title} by ${currentTrack.artist}")
+                Log.d(TAG, "Strategy: ${strategy.name}" +
+                    if (feedForwardConfig != null) " (${feedForwardConfig.primaryModel.name} -> ${feedForwardConfig.secondaryModel.name}, N=${feedForwardConfig.expansionCount})" else ""
+                )
 
                 // Load database
                 val db = getOrCreateDatabase()
@@ -164,34 +196,20 @@ class RadioService : Service() {
 
                 Log.d(TAG, "Found match (${matchResult.matchType}): ${matchResult.embeddedTrack.title}")
 
-                // Find similar tracks — dual or single model
+                // Find similar tracks using selected strategy
                 val engine = getOrCreateEngine(db)
                 val availableModels = db.getAvailableModels()
-                val isDual = availableModels.size > 1
 
-                val similarTracks = if (isDual) {
-                    Log.d(TAG, "Using dual-model search (${availableModels.joinToString { it.name }})")
-                    engine.findSimilarTracksDual(
-                        seedTrackId = matchResult.embeddedTrack.id,
-                        requestedCount = numTracks
-                    )
-                } else {
-                    val model = availableModels.firstOrNull() ?: com.powerampstartradio.data.EmbeddingModel.MUQ
-                    Log.d(TAG, "Using single-model search (${model.name})")
-                    engine.loadEmbeddings(model)
-                    engine.findSimilarTracks(
-                        seedTrackId = matchResult.embeddedTrack.id,
-                        topN = numTracks,
-                        excludeSeed = true,
-                        model = model
-                    )
-                }
+                val similarTracks = engine.findSimilarTracks(
+                    seedTrackId = matchResult.embeddedTrack.id,
+                    numTracks = numTracks,
+                    strategy = strategy,
+                    feedForwardConfig = feedForwardConfig
+                )
 
-                var orderedTracks = if (shuffle) similarTracks.shuffled() else similarTracks
+                Log.d(TAG, "Found ${similarTracks.size} similar tracks")
 
-                Log.d(TAG, "Found ${orderedTracks.size} similar tracks")
-
-                if (orderedTracks.isEmpty()) {
+                if (similarTracks.isEmpty()) {
                     _uiState.value = RadioUiState.Error("No similar tracks found")
                     updateNotification("No similar tracks found")
                     toast("No similar tracks found")
@@ -199,8 +217,8 @@ class RadioService : Service() {
                     return@launch
                 }
 
-                // Map to Poweramp file IDs (preserving similarity scores)
-                val mappedTracks = matcher.mapSimilarTracksToFileIds(this@RadioService, orderedTracks)
+                // Map to Poweramp file IDs (preserving rank order)
+                val mappedTracks = matcher.mapSimilarTracksToFileIds(this@RadioService, similarTracks)
 
                 // Get file IDs for tracks that were found
                 val fileIds = mappedTracks.mapNotNull { it.fileId }
@@ -213,16 +231,9 @@ class RadioService : Service() {
                     return@launch
                 }
 
-                // Add tracks to queue
-                val queuedFileIds = mutableSetOf<Long>()
-
-                // Track which file IDs were successfully queued
-                for (fileId in fileIds) {
-                    val added = PowerampHelper.addTracksToQueue(this@RadioService, listOf(fileId))
-                    if (added > 0) {
-                        queuedFileIds.add(fileId)
-                    }
-                }
+                // Add tracks to queue in batch
+                val queuedCount = PowerampHelper.addTracksToQueue(this@RadioService, fileIds)
+                val queuedFileIds = fileIds.take(queuedCount).toSet()
 
                 // Build per-track results
                 val trackResults = mappedTracks.map { mapped ->
@@ -244,7 +255,8 @@ class RadioService : Service() {
                     seedTrack = currentTrack,
                     matchType = matchResult.matchType,
                     tracks = trackResults,
-                    availableModels = availableModels
+                    availableModels = availableModels,
+                    strategy = strategy
                 )
 
                 _uiState.value = RadioUiState.Success(radioResult)
@@ -254,8 +266,8 @@ class RadioService : Service() {
                 // Poweramp will switch to the queue after the current song ends.
                 PowerampHelper.reloadData(this@RadioService)
 
-                val modeLabel = if (isDual) " (dual)" else ""
-                val message = "${radioResult.queuedCount} queued / ${radioResult.failedCount} failed$modeLabel"
+                val strategyLabel = strategy.name.lowercase().replace('_', ' ')
+                val message = "${radioResult.queuedCount} queued / ${radioResult.failedCount} failed ($strategyLabel)"
                 updateNotification(message)
                 Log.d(TAG, "Queue result: $message")
                 toast(message)
@@ -292,7 +304,7 @@ class RadioService : Service() {
 
     private fun getOrCreateEngine(db: EmbeddingDatabase): SimilarityEngine {
         similarityEngine?.let { return it }
-        return SimilarityEngine(db).also { similarityEngine = it }
+        return SimilarityEngine(db, filesDir).also { similarityEngine = it }
     }
 
     private fun toast(message: String) {
@@ -349,6 +361,5 @@ class RadioService : Service() {
         super.onDestroy()
         serviceScope.cancel()
         embeddingDb?.close()
-        similarityEngine?.clearCache()
     }
 }

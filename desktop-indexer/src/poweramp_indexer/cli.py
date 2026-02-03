@@ -826,8 +826,8 @@ def search(database: Path, query: str, top: int):
 
 
 @cli.command()
-@click.argument("muq_db", type=click.Path(exists=True, path_type=Path))
-@click.argument("mulan_db", type=click.Path(exists=True, path_type=Path))
+@click.argument("db1", type=click.Path(exists=True, path_type=Path))
+@click.argument("db2", type=click.Path(exists=True, path_type=Path))
 @click.option(
     "--output", "-o",
     type=click.Path(path_type=Path),
@@ -835,18 +835,20 @@ def search(database: Path, query: str, top: int):
     help="Output combined database file path"
 )
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
-def merge(muq_db: Path, mulan_db: Path, output: Path, verbose: bool):
-    """Merge separate MuQ and MuLan databases into a single combined database.
+def merge(db1: Path, db2: Path, output: Path, verbose: bool):
+    """Merge two embedding databases into a single combined database.
 
-    MUQ_DB: Path to the MuQ embeddings database
-    MULAN_DB: Path to the MuLan embeddings database
+    DB1: Path to the first embeddings database
+    DB2: Path to the second embeddings database
 
-    This is useful if you already ran --dual and have two separate database files.
-    The combined database works with the Android app for dual-model radio.
+    Auto-detects which models each database contains and merges them
+    by matching tracks on file_path. Works with any combination of
+    MuQ, MuLan, and Flamingo databases.
 
-    Example:
+    Examples:
 
       poweramp-indexer merge embeddings_muq.db embeddings_mulan.db -o embeddings.db
+      poweramp-indexer merge embeddings_mulan.db embeddings_flamingo.db -o embeddings.db
     """
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -857,34 +859,53 @@ def merge(muq_db: Path, mulan_db: Path, output: Path, verbose: bool):
             return
         output.unlink()
 
-    click.echo(f"MuQ source: {muq_db}")
-    click.echo(f"MuLan source: {mulan_db}")
+    click.echo(f"Source 1: {db1}")
+    click.echo(f"Source 2: {db2}")
     click.echo(f"Output: {output}")
 
-    # Open source databases
-    src_muq = EmbeddingDatabase(muq_db)
-    src_mulan = EmbeddingDatabase(mulan_db)
+    # Open source databases and detect models
+    src1 = EmbeddingDatabase(db1)
+    src2 = EmbeddingDatabase(db2)
 
-    muq_count = src_muq.count_tracks()
-    mulan_count = src_mulan.count_tracks()
-    click.echo(f"MuQ tracks: {muq_count}")
-    click.echo(f"MuLan tracks: {mulan_count}")
+    models1 = src1.get_available_models()
+    models2 = src2.get_available_models()
 
-    # Create output database
-    out_db = EmbeddingDatabase(output, models=["muq", "mulan"])
+    click.echo(f"DB1 models: {', '.join(models1) if models1 else 'none'} ({src1.count_tracks()} tracks)")
+    click.echo(f"DB2 models: {', '.join(models2) if models2 else 'none'} ({src2.count_tracks()} tracks)")
 
-    # Copy all tracks from MuQ DB, recording old_id -> new_id mapping
-    click.echo("\nCopying tracks and MuQ embeddings...")
-    old_to_new = {}  # old MuQ track ID -> new track ID
+    # Check for overlap
+    overlap = set(models1) & set(models2)
+    if overlap:
+        click.echo(f"Warning: Both databases contain {', '.join(overlap)} embeddings.")
+        click.echo("DB1's embeddings will be used for overlapping models.")
+
+    all_models = list(dict.fromkeys(models1 + models2))  # preserve order, dedup
+    if not all_models:
+        click.echo("Error: Neither database contains any embeddings.")
+        src1.close()
+        src2.close()
+        return
+
+    click.echo(f"Output will contain: {', '.join(all_models)}")
+
+    # Create output database with all detected models
+    out_db = EmbeddingDatabase(output, models=all_models)
+
+    # Use DB1 as primary (creates track rows), DB2 as secondary (adds embeddings)
+    click.echo(f"\nCopying tracks and embeddings from DB1...")
+    old_to_new = {}  # old DB1 track ID -> new track ID
     path_to_new = {}  # file_path -> new track ID
 
-    muq_embeddings = src_muq.get_all_embeddings(model="muq")
+    # Load all embeddings from DB1 for its models
+    db1_embeddings = {}
+    for model in models1:
+        db1_embeddings[model] = src1.get_all_embeddings(model=model)
 
-    rows = src_muq.conn.execute(
+    rows = src1.conn.execute(
         "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks"
     ).fetchall()
 
-    for row in tqdm(rows, desc="MuQ tracks", unit="track"):
+    for row in tqdm(rows, desc="DB1 tracks", unit="track"):
         old_id = row["id"]
         cursor = out_db.conn.execute(
             """
@@ -898,57 +919,74 @@ def merge(muq_db: Path, mulan_db: Path, output: Path, verbose: bool):
         old_to_new[old_id] = new_id
         path_to_new[row["file_path"]] = new_id
 
-        # Copy MuQ embedding
-        if old_id in muq_embeddings:
-            out_db.add_embedding(new_id, "muq", muq_embeddings[old_id])
+        # Copy all DB1 embeddings for this track
+        for model in models1:
+            if old_id in db1_embeddings[model]:
+                out_db.add_embedding(new_id, model, db1_embeddings[model][old_id])
 
     out_db.commit()
-    click.echo(f"  Copied {len(old_to_new)} tracks with MuQ embeddings")
+    click.echo(f"  Copied {len(old_to_new)} tracks with {', '.join(models1)} embeddings")
 
-    # Copy MuLan embeddings by matching file paths
-    click.echo("Matching and copying MuLan embeddings...")
-    mulan_embeddings = src_mulan.get_all_embeddings(model="mulan")
+    # Copy DB2 embeddings by matching file paths (only for models not in DB1)
+    db2_only_models = [m for m in models2 if m not in models1]
+    if db2_only_models:
+        click.echo(f"Matching and copying {', '.join(db2_only_models)} embeddings from DB2...")
 
-    mulan_rows = src_mulan.conn.execute(
-        "SELECT id, file_path FROM tracks"
-    ).fetchall()
+        db2_embeddings = {}
+        for model in db2_only_models:
+            db2_embeddings[model] = src2.get_all_embeddings(model=model)
 
-    matched = 0
-    unmatched = 0
+        db2_rows = src2.conn.execute(
+            "SELECT id, file_path FROM tracks"
+        ).fetchall()
 
-    for row in tqdm(mulan_rows, desc="MuLan match", unit="track"):
-        mulan_old_id = row["id"]
-        file_path = row["file_path"]
+        matched = 0
+        unmatched = 0
 
-        new_id = path_to_new.get(file_path)
-        if new_id is not None and mulan_old_id in mulan_embeddings:
-            out_db.add_embedding(new_id, "mulan", mulan_embeddings[mulan_old_id])
-            matched += 1
-        else:
-            unmatched += 1
+        for row in tqdm(db2_rows, desc="DB2 match", unit="track"):
+            db2_old_id = row["id"]
+            file_path = row["file_path"]
 
-    out_db.commit()
+            new_id = path_to_new.get(file_path)
+            if new_id is not None:
+                added_any = False
+                for model in db2_only_models:
+                    if db2_old_id in db2_embeddings[model]:
+                        out_db.add_embedding(new_id, model, db2_embeddings[model][db2_old_id])
+                        added_any = True
+                if added_any:
+                    matched += 1
+                else:
+                    unmatched += 1
+            else:
+                unmatched += 1
 
-    # Copy metadata from MuQ source
-    version = src_muq.get_metadata("version")
-    source_path = src_muq.get_metadata("source_path")
+        out_db.commit()
+        click.echo(f"  Matched: {matched}, unmatched: {unmatched}")
+    else:
+        click.echo("No additional models in DB2 to merge.")
+
+    # Copy metadata from DB1
+    version = src1.get_metadata("version")
+    source_path = src1.get_metadata("source_path")
     if version:
         out_db.set_metadata("version", version)
     if source_path:
         out_db.set_metadata("source_path", source_path)
-    out_db.set_metadata("model", "muq,mulan")
+    out_db.set_metadata("model", ",".join(all_models))
 
-    # Report
-    muq_only = len(old_to_new) - matched
+    # Report per-model counts
     click.echo(f"\nMerge complete!")
-    click.echo(f"  Both models: {matched} tracks")
-    click.echo(f"  MuQ only: {muq_only} tracks")
-    click.echo(f"  MuLan unmatched: {unmatched} tracks")
+    for model in all_models:
+        count = out_db.count_embeddings(model)
+        model_names = {"muq": "MuQ", "mulan": "MuLan", "flamingo": "Music Flamingo"}
+        label = model_names.get(model, model)
+        click.echo(f"  {label}: {count} embeddings")
     click.echo(f"  Total tracks: {out_db.count_tracks()}")
     click.echo(f"  Database size: {output.stat().st_size / 1024 / 1024:.1f} MB")
 
-    src_muq.close()
-    src_mulan.close()
+    src1.close()
+    src2.close()
     out_db.close()
 
 
