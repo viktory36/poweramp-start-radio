@@ -486,6 +486,11 @@ fun CompactNowPlayingHeader(
     if (currentTrack != null) {
         Column(modifier = modifier) {
             Text(
+                text = "NOW PLAYING",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary
+            )
+            Text(
                 text = currentTrack.title ?: "Unknown",
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.Bold,
