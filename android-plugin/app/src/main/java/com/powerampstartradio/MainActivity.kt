@@ -116,8 +116,9 @@ fun MainScreen(
     val hasPermission by viewModel.hasPermission.collectAsState()
     val sessionHistory by viewModel.sessionHistory.collectAsState()
     val searchStrategy by viewModel.searchStrategy.collectAsState()
-    val feedForwardPrimary by viewModel.feedForwardPrimary.collectAsState()
-    val feedForwardExpansion by viewModel.feedForwardExpansion.collectAsState()
+    val anchorExpandPrimary by viewModel.anchorExpandPrimary.collectAsState()
+    val anchorExpandExpansion by viewModel.anchorExpandExpansion.collectAsState()
+    val drift by viewModel.drift.collectAsState()
 
     // Local UI state
     var currentTrack by remember { mutableStateOf<PowerampTrack?>(PowerampReceiver.currentTrack) }
@@ -341,10 +342,12 @@ fun MainScreen(
             onNumTracksChange = { viewModel.setNumTracks(it) },
             searchStrategy = searchStrategy,
             onSearchStrategyChange = { viewModel.setSearchStrategy(it) },
-            feedForwardPrimary = feedForwardPrimary,
-            onFeedForwardPrimaryChange = { viewModel.setFeedForwardPrimary(it) },
-            feedForwardExpansion = feedForwardExpansion,
-            onFeedForwardExpansionChange = { viewModel.setFeedForwardExpansion(it) },
+            anchorExpandPrimary = anchorExpandPrimary,
+            onAnchorExpandPrimaryChange = { viewModel.setAnchorExpandPrimary(it) },
+            anchorExpandExpansion = anchorExpandExpansion,
+            onAnchorExpandExpansionChange = { viewModel.setAnchorExpandExpansion(it) },
+            drift = drift,
+            onDriftChange = { viewModel.setDrift(it) },
             databaseInfo = databaseInfo,
             onImportDatabase = {
                 importLauncher.launch(arrayOf("application/octet-stream", "*/*"))
@@ -648,10 +651,12 @@ fun SettingsBottomSheet(
     onNumTracksChange: (Int) -> Unit,
     searchStrategy: SearchStrategy,
     onSearchStrategyChange: (SearchStrategy) -> Unit,
-    feedForwardPrimary: EmbeddingModel,
-    onFeedForwardPrimaryChange: (EmbeddingModel) -> Unit,
-    feedForwardExpansion: Int,
-    onFeedForwardExpansionChange: (Int) -> Unit,
+    anchorExpandPrimary: EmbeddingModel,
+    onAnchorExpandPrimaryChange: (EmbeddingModel) -> Unit,
+    anchorExpandExpansion: Int,
+    onAnchorExpandExpansionChange: (Int) -> Unit,
+    drift: Boolean,
+    onDriftChange: (Boolean) -> Unit,
     databaseInfo: DatabaseInfo?,
     onImportDatabase: () -> Unit,
     hasPermission: Boolean,
@@ -730,17 +735,17 @@ fun SettingsBottomSheet(
                             onClick = { onSearchStrategyChange(SearchStrategy.INTERLEAVE) }
                         )
                         StrategyOption(
-                            label = "Feed-Forward",
+                            label = "Anchor & Expand",
                             description = "One model finds anchors, other expands each",
-                            selected = searchStrategy == SearchStrategy.FEED_FORWARD,
+                            selected = searchStrategy == SearchStrategy.ANCHOR_EXPAND,
                             enabled = hasBoth,
                             disabledReason = if (!hasBoth) "Requires both MuLan and Flamingo" else null,
-                            onClick = { onSearchStrategyChange(SearchStrategy.FEED_FORWARD) }
+                            onClick = { onSearchStrategyChange(SearchStrategy.ANCHOR_EXPAND) }
                         )
                     }
 
-                    // Feed-Forward sub-options
-                    AnimatedVisibility(visible = searchStrategy == SearchStrategy.FEED_FORWARD && hasBoth) {
+                    // Anchor & Expand sub-options
+                    AnimatedVisibility(visible = searchStrategy == SearchStrategy.ANCHOR_EXPAND && hasBoth) {
                         Column(
                             modifier = Modifier.padding(start = 16.dp, top = 12.dp)
                         ) {
@@ -754,15 +759,15 @@ fun SettingsBottomSheet(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .selectable(
-                                            selected = feedForwardPrimary == EmbeddingModel.MULAN,
-                                            onClick = { onFeedForwardPrimaryChange(EmbeddingModel.MULAN) },
+                                            selected = anchorExpandPrimary == EmbeddingModel.MULAN,
+                                            onClick = { onAnchorExpandPrimaryChange(EmbeddingModel.MULAN) },
                                             role = Role.RadioButton
                                         )
                                         .padding(vertical = 4.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     RadioButton(
-                                        selected = feedForwardPrimary == EmbeddingModel.MULAN,
+                                        selected = anchorExpandPrimary == EmbeddingModel.MULAN,
                                         onClick = null
                                     )
                                     Spacer(modifier = Modifier.width(8.dp))
@@ -772,15 +777,15 @@ fun SettingsBottomSheet(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .selectable(
-                                            selected = feedForwardPrimary == EmbeddingModel.FLAMINGO,
-                                            onClick = { onFeedForwardPrimaryChange(EmbeddingModel.FLAMINGO) },
+                                            selected = anchorExpandPrimary == EmbeddingModel.FLAMINGO,
+                                            onClick = { onAnchorExpandPrimaryChange(EmbeddingModel.FLAMINGO) },
                                             role = Role.RadioButton
                                         )
                                         .padding(vertical = 4.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     RadioButton(
-                                        selected = feedForwardPrimary == EmbeddingModel.FLAMINGO,
+                                        selected = anchorExpandPrimary == EmbeddingModel.FLAMINGO,
                                         onClick = null
                                     )
                                     Spacer(modifier = Modifier.width(8.dp))
@@ -790,14 +795,40 @@ fun SettingsBottomSheet(
 
                             Spacer(modifier = Modifier.height(12.dp))
                             Text(
-                                text = "Expansions per anchor: $feedForwardExpansion",
+                                text = "Expansions per anchor: $anchorExpandExpansion",
                                 style = MaterialTheme.typography.titleSmall
                             )
                             Slider(
-                                value = feedForwardExpansion.toFloat(),
-                                onValueChange = { onFeedForwardExpansionChange(it.toInt()) },
+                                value = anchorExpandExpansion.toFloat(),
+                                onValueChange = { onAnchorExpandExpansionChange(it.toInt()) },
                                 valueRange = 1f..5f,
                                 steps = 3
+                            )
+                        }
+                    }
+
+                    // Drift checkbox
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                            checked = drift,
+                            onCheckedChange = onDriftChange
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column {
+                            Text(
+                                text = "Drift",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Text(
+                                text = "Each result seeds the next search, gradually exploring new territory",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     }

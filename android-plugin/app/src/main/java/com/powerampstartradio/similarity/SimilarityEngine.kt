@@ -25,13 +25,13 @@ enum class SearchStrategy {
     MULAN_ONLY,
     FLAMINGO_ONLY,
     INTERLEAVE,
-    FEED_FORWARD
+    ANCHOR_EXPAND
 }
 
 /**
- * Configuration for the feed-forward strategy.
+ * Configuration for the Anchor & Expand strategy.
  */
-data class FeedForwardConfig(
+data class AnchorExpandConfig(
     val primaryModel: EmbeddingModel,   // Which model finds anchors
     val expansionCount: Int = 3         // How many secondary results per anchor
 ) {
@@ -114,12 +114,17 @@ class SimilarityEngine(
 
     /**
      * Find similar tracks using the specified strategy.
+     *
+     * @param drift When true, each result seeds the next search instead of
+     *              always searching relative to the original seed. The queue
+     *              gradually drifts through embedding space.
      */
     suspend fun findSimilarTracks(
         seedTrackId: Long,
         numTracks: Int,
         strategy: SearchStrategy,
-        feedForwardConfig: FeedForwardConfig? = null
+        anchorExpandConfig: AnchorExpandConfig? = null,
+        drift: Boolean = false
     ): List<SimilarTrack> = withContext(Dispatchers.Default) {
         // Caller should have called ensureIndices() first for progress reporting.
         // Call it here as a safety net (no-op if already done).
@@ -127,15 +132,21 @@ class SimilarityEngine(
 
         when (strategy) {
             SearchStrategy.MULAN_ONLY ->
-                singleModelSearch(seedTrackId, numTracks, EmbeddingModel.MULAN)
+                if (drift) singleModelDrift(seedTrackId, numTracks, EmbeddingModel.MULAN)
+                else singleModelSearch(seedTrackId, numTracks, EmbeddingModel.MULAN)
             SearchStrategy.FLAMINGO_ONLY ->
-                singleModelSearch(seedTrackId, numTracks, EmbeddingModel.FLAMINGO)
+                if (drift) singleModelDrift(seedTrackId, numTracks, EmbeddingModel.FLAMINGO)
+                else singleModelSearch(seedTrackId, numTracks, EmbeddingModel.FLAMINGO)
             SearchStrategy.INTERLEAVE ->
-                interleaveSearch(seedTrackId, numTracks)
-            SearchStrategy.FEED_FORWARD ->
-                feedForwardSearch(seedTrackId, numTracks, feedForwardConfig!!)
+                if (drift) interleaveDrift(seedTrackId, numTracks)
+                else interleaveSearch(seedTrackId, numTracks)
+            SearchStrategy.ANCHOR_EXPAND ->
+                if (drift) anchorExpandDrift(seedTrackId, numTracks, anchorExpandConfig!!)
+                else anchorExpandSearch(seedTrackId, numTracks, anchorExpandConfig!!)
         }
     }
+
+    // ---- Non-drift strategies ----
 
     /**
      * Single model: findTopK on one index.
@@ -224,18 +235,17 @@ class SimilarityEngine(
     }
 
     /**
-     * Feed-forward: primary model finds anchors, secondary model expands each.
+     * Anchor & Expand: primary model finds anchors, secondary model expands each.
      *
-     * Algorithm:
-     * 1. Primary index: findTopK(seedEmbedding, numGroups) → anchor tracks
+     * 1. Primary index: findTopK(seedEmbedding, numGroups) -> anchor tracks
      * 2. For each anchor: look up its embedding in secondary index
-     * 3. Secondary index: findTopKMulti(anchorEmbeddings, expansionCount) — single corpus pass
+     * 3. Secondary index: findTopKMulti(anchorEmbeddings, expansionCount) -- single corpus pass
      * 4. Assemble: [anchor1, expansion1a, expansion1b, ..., anchor2, ...]
      */
-    private fun feedForwardSearch(
+    private fun anchorExpandSearch(
         seedTrackId: Long,
         numTracks: Int,
-        config: FeedForwardConfig
+        config: AnchorExpandConfig
     ): List<SimilarTrack> {
         val primaryIndex = getIndex(config.primaryModel) ?: run {
             Log.e(TAG, "No index for primary model ${config.primaryModel.name}")
@@ -243,7 +253,6 @@ class SimilarityEngine(
         }
         val secondaryIndex = getIndex(config.secondaryModel) ?: run {
             Log.e(TAG, "No index for secondary model ${config.secondaryModel.name}")
-            // Fall back to single-model search with primary
             return singleModelSearch(seedTrackId, numTracks, config.primaryModel)
         }
 
@@ -252,8 +261,7 @@ class SimilarityEngine(
             return emptyList()
         }
 
-        // Calculate how many anchor groups we need
-        val groupSize = 1 + config.expansionCount  // anchor + expansions
+        val groupSize = 1 + config.expansionCount
         val numGroups = (numTracks + groupSize - 1) / groupSize
 
         // Step 1: Find anchor tracks with primary model
@@ -271,7 +279,7 @@ class SimilarityEngine(
             }
         }
 
-        // Step 3: Single corpus pass — find expansions for all anchors at once
+        // Step 3: Single corpus pass -- find expansions for all anchors at once
         val seen = mutableSetOf(seedTrackId)
         seen.addAll(anchors.map { it.first })
 
@@ -287,12 +295,10 @@ class SimilarityEngine(
         for ((anchorId, anchorScore) in anchors) {
             if (result.size >= numTracks) break
 
-            // Add anchor
             database.getTrackById(anchorId)?.let { track ->
                 result.add(SimilarTrack(track, anchorScore, config.primaryModel))
             }
 
-            // Add expansions
             val expansions = expansionResults[anchorId] ?: emptyList()
             for ((expansionId, expansionScore) in expansions) {
                 if (result.size >= numTracks) break
@@ -305,6 +311,158 @@ class SimilarityEngine(
             }
         }
 
+        return result
+    }
+
+    // ---- Drift strategies ----
+    // Each result seeds the next search, so the queue gradually moves
+    // through embedding space away from the original seed.
+
+    /**
+     * Single model drift: find top-1, use it as next seed, repeat.
+     */
+    private fun singleModelDrift(
+        seedTrackId: Long,
+        numTracks: Int,
+        model: EmbeddingModel
+    ): List<SimilarTrack> {
+        val index = getIndex(model) ?: return emptyList()
+        var currentEmb = index.getEmbeddingByTrackId(seedTrackId) ?: return emptyList()
+
+        val result = mutableListOf<SimilarTrack>()
+        val seen = mutableSetOf(seedTrackId)
+
+        for (i in 0 until numTracks) {
+            val top = index.findTopK(currentEmb, 1, excludeIds = seen)
+            if (top.isEmpty()) break
+
+            val (trackId, score) = top[0]
+            seen.add(trackId)
+
+            database.getTrackById(trackId)?.let { track ->
+                result.add(SimilarTrack(track, score, model))
+            }
+
+            currentEmb = index.getEmbeddingByTrackId(trackId) ?: break
+        }
+
+        Log.d(TAG, "Drift (${model.name}): ${result.size} tracks")
+        return result
+    }
+
+    /**
+     * Interleave drift: models take turns, last queued track seeds the next pick.
+     *
+     * Each model looks up the current track in its own embedding space,
+     * so they stay coherent even though the embedding spaces differ.
+     */
+    private fun interleaveDrift(
+        seedTrackId: Long,
+        numTracks: Int
+    ): List<SimilarTrack> {
+        val mulanIdx = mulanIndex
+        val flamingoIdx = flamingoIndex
+
+        if (mulanIdx == null && flamingoIdx == null) return emptyList()
+        if (mulanIdx == null) return singleModelDrift(seedTrackId, numTracks, EmbeddingModel.FLAMINGO)
+        if (flamingoIdx == null) return singleModelDrift(seedTrackId, numTracks, EmbeddingModel.MULAN)
+
+        val result = mutableListOf<SimilarTrack>()
+        val seen = mutableSetOf(seedTrackId)
+        var currentTrackId = seedTrackId
+
+        while (result.size < numTracks) {
+            var advanced = false
+
+            // MuLan turn
+            mulanIdx.getEmbeddingByTrackId(currentTrackId)?.let { emb ->
+                val top = mulanIdx.findTopK(emb, 1, excludeIds = seen)
+                if (top.isNotEmpty()) {
+                    val (id, score) = top[0]
+                    seen.add(id)
+                    database.getTrackById(id)?.let {
+                        result.add(SimilarTrack(it, score, EmbeddingModel.MULAN))
+                        currentTrackId = id
+                        advanced = true
+                    }
+                }
+            }
+
+            if (result.size >= numTracks) break
+
+            // Flamingo turn
+            flamingoIdx.getEmbeddingByTrackId(currentTrackId)?.let { emb ->
+                val top = flamingoIdx.findTopK(emb, 1, excludeIds = seen)
+                if (top.isNotEmpty()) {
+                    val (id, score) = top[0]
+                    seen.add(id)
+                    database.getTrackById(id)?.let {
+                        result.add(SimilarTrack(it, score, EmbeddingModel.FLAMINGO))
+                        currentTrackId = id
+                        advanced = true
+                    }
+                }
+            }
+
+            if (!advanced) break
+        }
+
+        Log.d(TAG, "Drift (interleave): ${result.size} tracks")
+        return result
+    }
+
+    /**
+     * Anchor & Expand drift: each anchor is found relative to the previous anchor
+     * (not the original seed), so groups gradually move through embedding space.
+     */
+    private fun anchorExpandDrift(
+        seedTrackId: Long,
+        numTracks: Int,
+        config: AnchorExpandConfig
+    ): List<SimilarTrack> {
+        val primaryIndex = getIndex(config.primaryModel) ?: return emptyList()
+        val secondaryIndex = getIndex(config.secondaryModel) ?: run {
+            return singleModelDrift(seedTrackId, numTracks, config.primaryModel)
+        }
+
+        var currentEmb = primaryIndex.getEmbeddingByTrackId(seedTrackId) ?: return emptyList()
+
+        val result = mutableListOf<SimilarTrack>()
+        val seen = mutableSetOf(seedTrackId)
+        val groupSize = 1 + config.expansionCount
+        val numGroups = (numTracks + groupSize - 1) / groupSize
+
+        for (g in 0 until numGroups) {
+            if (result.size >= numTracks) break
+
+            // Find anchor relative to current seed (drifted from previous anchor)
+            val anchors = primaryIndex.findTopK(currentEmb, 1, excludeIds = seen)
+            if (anchors.isEmpty()) break
+
+            val (anchorId, anchorScore) = anchors[0]
+            seen.add(anchorId)
+
+            database.getTrackById(anchorId)?.let { track ->
+                result.add(SimilarTrack(track, anchorScore, config.primaryModel))
+            }
+
+            // Expand anchor with secondary model
+            secondaryIndex.getEmbeddingByTrackId(anchorId)?.let { anchorEmb ->
+                val expansions = secondaryIndex.findTopK(anchorEmb, config.expansionCount, excludeIds = seen)
+                for ((expId, expScore) in expansions) {
+                    if (result.size >= numTracks) break
+                    seen.add(expId)
+                    database.getTrackById(expId)?.let { track ->
+                        result.add(SimilarTrack(track, expScore, config.secondaryModel))
+                    }
+                }
+            }
+
+            // Drift: next anchor is found relative to this anchor
+            currentEmb = primaryIndex.getEmbeddingByTrackId(anchorId) ?: break
+        }
+
+        Log.d(TAG, "Drift (anchor & expand): ${result.size} tracks in ${result.size / maxOf(groupSize, 1)} groups")
         return result
     }
 }

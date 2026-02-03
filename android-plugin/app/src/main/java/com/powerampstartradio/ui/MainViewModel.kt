@@ -8,7 +8,7 @@ import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.data.EmbeddingModel
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.services.RadioService
-import com.powerampstartradio.similarity.FeedForwardConfig
+import com.powerampstartradio.similarity.AnchorExpandConfig
 import com.powerampstartradio.similarity.SearchStrategy
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -30,26 +30,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // Search strategy settings
     private val _searchStrategy = MutableStateFlow(
         try {
-            SearchStrategy.valueOf(prefs.getString("search_strategy", SearchStrategy.FEED_FORWARD.name)!!)
+            val stored = prefs.getString("search_strategy", SearchStrategy.ANCHOR_EXPAND.name)!!
+            // Migrate from old name
+            if (stored == "FEED_FORWARD") SearchStrategy.ANCHOR_EXPAND
+            else SearchStrategy.valueOf(stored)
         } catch (e: IllegalArgumentException) {
-            SearchStrategy.FEED_FORWARD
+            SearchStrategy.ANCHOR_EXPAND
         }
     )
     val searchStrategy: StateFlow<SearchStrategy> = _searchStrategy.asStateFlow()
 
-    private val _feedForwardPrimary = MutableStateFlow(
+    private val _anchorExpandPrimary = MutableStateFlow(
         try {
-            EmbeddingModel.valueOf(prefs.getString("feed_forward_primary", EmbeddingModel.MULAN.name)!!)
+            val stored = prefs.getString("anchor_expand_primary", null)
+                ?: prefs.getString("feed_forward_primary", EmbeddingModel.MULAN.name)
+            EmbeddingModel.valueOf(stored!!)
         } catch (e: IllegalArgumentException) {
             EmbeddingModel.MULAN
         }
     )
-    val feedForwardPrimary: StateFlow<EmbeddingModel> = _feedForwardPrimary.asStateFlow()
+    val anchorExpandPrimary: StateFlow<EmbeddingModel> = _anchorExpandPrimary.asStateFlow()
 
-    private val _feedForwardExpansion = MutableStateFlow(
-        prefs.getInt("feed_forward_expansion", 3)
+    private val _anchorExpandExpansion = MutableStateFlow(
+        prefs.getInt("anchor_expand_expansion",
+            prefs.getInt("feed_forward_expansion", 3))
     )
-    val feedForwardExpansion: StateFlow<Int> = _feedForwardExpansion.asStateFlow()
+    val anchorExpandExpansion: StateFlow<Int> = _anchorExpandExpansion.asStateFlow()
+
+    // Drift mode: each result seeds the next search
+    private val _drift = MutableStateFlow(prefs.getBoolean("drift", false))
+    val drift: StateFlow<Boolean> = _drift.asStateFlow()
 
     // Database info
     private val _databaseInfo = MutableStateFlow<DatabaseInfo?>(null)
@@ -80,22 +90,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         prefs.edit().putString("search_strategy", strategy.name).apply()
     }
 
-    fun setFeedForwardPrimary(model: EmbeddingModel) {
-        _feedForwardPrimary.value = model
-        prefs.edit().putString("feed_forward_primary", model.name).apply()
+    fun setAnchorExpandPrimary(model: EmbeddingModel) {
+        _anchorExpandPrimary.value = model
+        prefs.edit().putString("anchor_expand_primary", model.name).apply()
     }
 
-    fun setFeedForwardExpansion(n: Int) {
-        _feedForwardExpansion.value = n
-        prefs.edit().putInt("feed_forward_expansion", n).apply()
+    fun setAnchorExpandExpansion(n: Int) {
+        _anchorExpandExpansion.value = n
+        prefs.edit().putInt("anchor_expand_expansion", n).apply()
+    }
+
+    fun setDrift(enabled: Boolean) {
+        _drift.value = enabled
+        prefs.edit().putBoolean("drift", enabled).apply()
     }
 
     fun startRadio() {
         val strategy = _searchStrategy.value
-        val ffConfig = if (strategy == SearchStrategy.FEED_FORWARD) {
-            FeedForwardConfig(_feedForwardPrimary.value, _feedForwardExpansion.value)
+        val aeConfig = if (strategy == SearchStrategy.ANCHOR_EXPAND) {
+            AnchorExpandConfig(_anchorExpandPrimary.value, _anchorExpandExpansion.value)
         } else null
-        RadioService.startRadio(getApplication(), _numTracks.value, strategy, ffConfig)
+        RadioService.startRadio(
+            getApplication(), _numTracks.value, strategy, aeConfig, _drift.value
+        )
     }
 
     fun resetRadioState() {

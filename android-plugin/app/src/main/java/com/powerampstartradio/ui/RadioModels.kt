@@ -33,13 +33,13 @@ data class RadioResult(
     val matchType: TrackMatcher.MatchType,
     val tracks: List<QueuedTrackResult>,
     val availableModels: Set<EmbeddingModel> = emptySet(),
-    val strategy: SearchStrategy = SearchStrategy.FEED_FORWARD,
+    val strategy: SearchStrategy = SearchStrategy.ANCHOR_EXPAND,
     val timestamp: Long = System.currentTimeMillis()
 ) {
     val queuedCount: Int get() = tracks.count { it.status == QueueStatus.QUEUED }
     val failedCount: Int get() = tracks.count { it.status != QueueStatus.QUEUED }
     val requestedCount: Int get() = tracks.size
-    val isMultiModel: Boolean get() = strategy == SearchStrategy.INTERLEAVE || strategy == SearchStrategy.FEED_FORWARD
+    val isMultiModel: Boolean get() = strategy == SearchStrategy.INTERLEAVE || strategy == SearchStrategy.ANCHOR_EXPAND
 }
 
 /**

@@ -18,7 +18,7 @@ import com.powerampstartradio.data.EmbeddingModel
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.poweramp.TrackMatcher
-import com.powerampstartradio.similarity.FeedForwardConfig
+import com.powerampstartradio.similarity.AnchorExpandConfig
 import com.powerampstartradio.similarity.SearchStrategy
 import com.powerampstartradio.similarity.SimilarityEngine
 import com.powerampstartradio.ui.QueueStatus
@@ -58,8 +58,9 @@ class RadioService : Service() {
         const val EXTRA_NUM_TRACKS = "num_tracks"
         const val EXTRA_SHOW_TOASTS = "show_toasts"
         const val EXTRA_STRATEGY = "strategy"
-        const val EXTRA_FF_PRIMARY_MODEL = "ff_primary_model"
-        const val EXTRA_FF_EXPANSION = "ff_expansion"
+        const val EXTRA_AE_PRIMARY_MODEL = "ae_primary_model"
+        const val EXTRA_AE_EXPANSION = "ae_expansion"
+        const val EXTRA_DRIFT = "drift"
 
         const val DEFAULT_NUM_TRACKS = 50
 
@@ -74,8 +75,9 @@ class RadioService : Service() {
         fun startRadio(
             context: Context,
             numTracks: Int = DEFAULT_NUM_TRACKS,
-            strategy: SearchStrategy = SearchStrategy.FEED_FORWARD,
-            feedForwardConfig: FeedForwardConfig? = null,
+            strategy: SearchStrategy = SearchStrategy.ANCHOR_EXPAND,
+            anchorExpandConfig: AnchorExpandConfig? = null,
+            drift: Boolean = false,
             showToasts: Boolean = false
         ) {
             _uiState.value = RadioUiState.Loading
@@ -84,9 +86,10 @@ class RadioService : Service() {
                 putExtra(EXTRA_NUM_TRACKS, numTracks)
                 putExtra(EXTRA_SHOW_TOASTS, showToasts)
                 putExtra(EXTRA_STRATEGY, strategy.name)
-                if (feedForwardConfig != null) {
-                    putExtra(EXTRA_FF_PRIMARY_MODEL, feedForwardConfig.primaryModel.name)
-                    putExtra(EXTRA_FF_EXPANSION, feedForwardConfig.expansionCount)
+                putExtra(EXTRA_DRIFT, drift)
+                if (anchorExpandConfig != null) {
+                    putExtra(EXTRA_AE_PRIMARY_MODEL, anchorExpandConfig.primaryModel.name)
+                    putExtra(EXTRA_AE_EXPANSION, anchorExpandConfig.expansionCount)
                 }
             }
             context.startForegroundService(intent)
@@ -114,23 +117,27 @@ class RadioService : Service() {
                 showToasts = intent.getBooleanExtra(EXTRA_SHOW_TOASTS, false)
 
                 val strategy = try {
-                    SearchStrategy.valueOf(intent.getStringExtra(EXTRA_STRATEGY) ?: SearchStrategy.FEED_FORWARD.name)
+                    val stored = intent.getStringExtra(EXTRA_STRATEGY) ?: SearchStrategy.ANCHOR_EXPAND.name
+                    if (stored == "FEED_FORWARD") SearchStrategy.ANCHOR_EXPAND
+                    else SearchStrategy.valueOf(stored)
                 } catch (e: IllegalArgumentException) {
-                    SearchStrategy.FEED_FORWARD
+                    SearchStrategy.ANCHOR_EXPAND
                 }
 
-                val feedForwardConfig = if (strategy == SearchStrategy.FEED_FORWARD) {
+                val drift = intent.getBooleanExtra(EXTRA_DRIFT, false)
+
+                val anchorExpandConfig = if (strategy == SearchStrategy.ANCHOR_EXPAND) {
                     val primaryModel = try {
-                        EmbeddingModel.valueOf(intent.getStringExtra(EXTRA_FF_PRIMARY_MODEL) ?: EmbeddingModel.MULAN.name)
+                        EmbeddingModel.valueOf(intent.getStringExtra(EXTRA_AE_PRIMARY_MODEL) ?: EmbeddingModel.MULAN.name)
                     } catch (e: IllegalArgumentException) {
                         EmbeddingModel.MULAN
                     }
-                    val expansion = intent.getIntExtra(EXTRA_FF_EXPANSION, 3)
-                    FeedForwardConfig(primaryModel, expansion)
+                    val expansion = intent.getIntExtra(EXTRA_AE_EXPANSION, 3)
+                    AnchorExpandConfig(primaryModel, expansion)
                 } else null
 
                 startForeground(NOTIFICATION_ID, createNotification("Starting radio..."))
-                startRadio(numTracks, strategy, feedForwardConfig)
+                startRadio(numTracks, strategy, anchorExpandConfig, drift)
             }
 
             ACTION_STOP -> {
@@ -144,7 +151,8 @@ class RadioService : Service() {
     private fun startRadio(
         numTracks: Int,
         strategy: SearchStrategy,
-        feedForwardConfig: FeedForwardConfig?
+        anchorExpandConfig: AnchorExpandConfig?,
+        drift: Boolean
     ) {
         serviceScope.launch {
             try {
@@ -167,7 +175,8 @@ class RadioService : Service() {
                 updateNotification("Finding similar tracks to: ${currentTrack.title}")
                 Log.d(TAG, "Starting radio for: ${currentTrack.title} by ${currentTrack.artist}")
                 Log.d(TAG, "Strategy: ${strategy.name}" +
-                    if (feedForwardConfig != null) " (${feedForwardConfig.primaryModel.name} -> ${feedForwardConfig.secondaryModel.name}, N=${feedForwardConfig.expansionCount})" else ""
+                    (if (anchorExpandConfig != null) " (${anchorExpandConfig.primaryModel.name} -> ${anchorExpandConfig.secondaryModel.name}, N=${anchorExpandConfig.expansionCount})" else "") +
+                    (if (drift) " [drift]" else "")
                 )
 
                 // Load database
@@ -210,7 +219,8 @@ class RadioService : Service() {
                     seedTrackId = matchResult.embeddedTrack.id,
                     numTracks = numTracks,
                     strategy = strategy,
-                    feedForwardConfig = feedForwardConfig
+                    anchorExpandConfig = anchorExpandConfig,
+                    drift = drift
                 )
 
                 Log.d(TAG, "Found ${similarTracks.size} similar tracks")

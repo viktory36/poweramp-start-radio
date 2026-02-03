@@ -28,7 +28,7 @@ import androidx.glance.text.TextStyle
 import com.powerampstartradio.data.EmbeddingModel
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.services.RadioService
-import com.powerampstartradio.similarity.FeedForwardConfig
+import com.powerampstartradio.similarity.AnchorExpandConfig
 import com.powerampstartradio.similarity.SearchStrategy
 import java.io.File
 
@@ -98,21 +98,28 @@ class StartRadioAction : ActionCallback {
         val numTracks = prefs.getInt("num_tracks", RadioService.DEFAULT_NUM_TRACKS)
 
         val strategy = try {
-            SearchStrategy.valueOf(prefs.getString("search_strategy", SearchStrategy.FEED_FORWARD.name)!!)
+            val stored = prefs.getString("search_strategy", SearchStrategy.ANCHOR_EXPAND.name)!!
+            if (stored == "FEED_FORWARD") SearchStrategy.ANCHOR_EXPAND
+            else SearchStrategy.valueOf(stored)
         } catch (e: IllegalArgumentException) {
-            SearchStrategy.FEED_FORWARD
+            SearchStrategy.ANCHOR_EXPAND
         }
 
-        val ffConfig = if (strategy == SearchStrategy.FEED_FORWARD) {
+        val drift = prefs.getBoolean("drift", false)
+
+        val aeConfig = if (strategy == SearchStrategy.ANCHOR_EXPAND) {
             val primaryModel = try {
-                EmbeddingModel.valueOf(prefs.getString("feed_forward_primary", EmbeddingModel.MULAN.name)!!)
+                val stored = prefs.getString("anchor_expand_primary", null)
+                    ?: prefs.getString("feed_forward_primary", EmbeddingModel.MULAN.name)
+                EmbeddingModel.valueOf(stored!!)
             } catch (e: IllegalArgumentException) {
                 EmbeddingModel.MULAN
             }
-            val expansion = prefs.getInt("feed_forward_expansion", 3)
-            FeedForwardConfig(primaryModel, expansion)
+            val expansion = prefs.getInt("anchor_expand_expansion",
+                prefs.getInt("feed_forward_expansion", 3))
+            AnchorExpandConfig(primaryModel, expansion)
         } else null
 
-        RadioService.startRadio(context, numTracks, strategy, ffConfig, showToasts = true)
+        RadioService.startRadio(context, numTracks, strategy, aeConfig, drift, showToasts = true)
     }
 }
