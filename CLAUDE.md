@@ -24,10 +24,14 @@ poweramp-indexer scan /path/to/music -o embeddings.db
 # Dual scan — both MuQ and MuLan into a single DB
 poweramp-indexer scan /path/to/music -o embeddings.db --dual
 
+# Flamingo scan (requires extract-encoder first)
+poweramp-indexer extract-encoder
+poweramp-indexer scan /path/to/music -o embeddings.db --model flamingo
+
 # Incremental update (adds new, optionally removes missing)
 poweramp-indexer update /path/to/music -d embeddings.db --remove-missing
 
-# Merge separate MuQ and MuLan DBs into one combined DB
+# Merge separate model DBs into one combined DB
 poweramp-indexer merge embeddings_muq.db embeddings_mulan.db -o embeddings.db
 
 # Database info
@@ -43,7 +47,7 @@ poweramp-indexer similar embeddings.db --random --model muq
 poweramp-indexer search embeddings.db "sufi music"
 ```
 
-Options: `--dual` (generate both MuQ and MuLan into single DB), `--verbose`, `--model muq|mulan`
+Options: `--dual` (MuQ + MuLan), `--model flamingo|muq|mulan`, `--skip-existing`, `--verbose`
 
 ### Android Plugin
 
@@ -58,9 +62,11 @@ cd android-plugin
 ### Data Flow
 
 ```
-Music Files → scanner.py → fingerprint.py (metadata) → embeddings_*.py (1024-dim vectors) → database.py (SQLite)
-                                                                                              ↓
-Poweramp ← PowerampHelper ← QueueManager ← SimilarityEngine ← TrackMatcher ← EmbeddingDatabase
+Music Files → scanner.py → fingerprint.py (metadata) → embeddings_*.py → database.py (SQLite)
+                                                                                 ↓
+Poweramp ← PowerampHelper ← RadioService ← SimilarityEngine ← EmbeddingIndex (mmap) ← EmbeddingDatabase
+                                                ↑
+                                           TrackMatcher
 ```
 
 ### Key Technical Details
@@ -74,10 +80,17 @@ Poweramp ← PowerampHelper ← QueueManager ← SimilarityEngine ← TrackMatch
 4. Filename-based fallback
 
 **Embedding Models**:
-- MuQ-large-msd-iter (default): 24kHz, 1024-dim, SOTA pure music understanding model
-- MuQ-MuLan-large (via `--dual`): 24kHz, 512-dim, music-text retrieval model for text search
+- MuQ-large-msd-iter (default): 24kHz, 1024-dim, pure music understanding. FP32 only (NaN issues with FP16).
+- MuQ-MuLan-large (via `--dual`): 24kHz, 512-dim, music-text retrieval for text search
+- Music Flamingo encoder (via `--model flamingo`): 16kHz, 3584-dim (with projector) or 1280-dim (without). NVIDIA's MusicFlamingoEncoder with Rotary Time Embeddings (RoTE) on top of AF-Whisper. FP16. Requires one-time `extract-encoder` to pull weights from nvidia/music-flamingo-2601-hf.
 
-**Sampling Strategy**: Dense stratified sampling across full audio duration. Chunk count scales with duration (10 chunks for standard songs, up to 30 for long DJ sets). Ensures comprehensive coverage of intro/middle/outro sections.
+**Sampling Strategy**: Dense stratified sampling across full audio duration. MuQ/MuLan: chunk count scales with duration (10 chunks for standard songs, up to 30 for long DJ sets). Flamingo: 30s chunks via WhisperFeatureExtractor, up to 60 chunks (30 min max).
+
+**Search Strategies** (Android, user-selectable):
+- `MULAN_ONLY` / `FLAMINGO_ONLY`: Single-model similarity search
+- `INTERLEAVE`: Round-robin merge from multiple models with dedup
+- `ANCHOR_EXPAND`: Primary model finds anchor tracks, secondary model expands each anchor's neighborhood. Configurable primary model and expansion count.
+- **Drift mode**: Optional modifier for any strategy. Instead of all results relative to seed, each result seeds the next search, gradually exploring new embedding space.
 
 ### Android Integration Points
 
@@ -96,52 +109,58 @@ Poweramp API uses:
 | Purpose | File |
 |---------|------|
 | CLI entry point | `desktop-indexer/src/poweramp_indexer/cli.py` |
-| MuQ embedding generation | `desktop-indexer/src/poweramp_indexer/embeddings_muq.py` |
+| MuQ embeddings | `desktop-indexer/src/poweramp_indexer/embeddings_muq.py` |
 | Dual MuQ+MuLan embeddings | `desktop-indexer/src/poweramp_indexer/embeddings_dual.py` |
+| Flamingo embeddings | `desktop-indexer/src/poweramp_indexer/embeddings_flamingo.py` |
 | SQLite database schema | `desktop-indexer/src/poweramp_indexer/database.py` |
 | Poweramp API wrapper | `android-plugin/.../poweramp/PowerampHelper.kt` |
-| Similarity search | `android-plugin/.../similarity/SimilarityEngine.kt` |
+| Similarity search + strategies | `android-plugin/.../similarity/SimilarityEngine.kt` |
+| Mmap'd embedding indices | `android-plugin/.../data/EmbeddingIndex.kt` |
 | Track matching | `android-plugin/.../poweramp/TrackMatcher.kt` |
 
 ## Development Workflow
 
 - The user develops in WSL and tests on the Windows host where their music library, pyenv, and Android Studio live. Don't expect to run the indexer in WSL — commit and push so they can pull on Windows and test.
 - Always commit and push when confident in changes.
-- The user is evaluating both MuQ and MuLan models. They plan a hybrid workflow: MuLan for text queries ("sufi", "upbeat electronic") to find a seed track, then MuQ for audio similarity to build a radio queue from that seed.
-- Both models must process identical audio chunks for valid A/B comparison. Chunk selection is deterministic (based on file duration), so two-pass processing preserves this guarantee.
+- MuQ/MuLan chunk selection is deterministic (based on file duration), so two-pass `--dual` processing preserves identical audio for valid A/B comparison.
 
 ## GPU/Performance Notes (RTX 2060 Max-Q, 6GB VRAM)
 
-- **Two-pass dual scan**: `--dual` mode processes all files through MuQ first, unloads it, then processes all files through MuLan into a single combined database. This halves VRAM usage (~2GB per model instead of ~4.2GB with both loaded). Each pass tracks progress independently via per-model embedding tables — safe to ctrl+c between or during passes.
-- **empty_cache() is required**: `torch.cuda.empty_cache()` between sub-batches prevents inference from spilling into shared GPU memory (system RAM over PCIe, ~18x slower than GDDR6). Without it, PyTorch's caching allocator holds ~5.8GB dedicated + 0.9GB shared. With it, VRAM spikes to ~4.6GB but stays in dedicated. The allocation churn (visible as "Copy" load in Task Manager) is cheaper than the shared memory penalty.
-- **Prefetching audio has no measurable impact**: A background thread loading the next file while the GPU processes the current one was tried and showed no improvement, suggesting GPU inference (not CPU audio loading) is the bottleneck. The prefetch code remains in place but is not the source of any speedup.
-- **Chunk-only resampling is slower**: Loading at native SR and resampling individual chunks (instead of `librosa.load(sr=24000)` on the full file) was tested and regressed to 2.42s/file. The per-chunk `librosa.resample()` startup overhead outweighs savings for single-chunk songs. Stick with full-file resampling.
-- **MuQ requires FP32**: MuQ-large-msd-iter has known NaN issues with FP16. Always use full precision.
+- **Two-pass dual scan**: `--dual` processes MuQ then MuLan sequentially into one DB, halving VRAM (~2GB per model vs ~4.2GB both loaded). Safe to ctrl+c between passes.
+- **empty_cache() is required**: Without `torch.cuda.empty_cache()` between sub-batches, PyTorch's caching allocator spills into shared GPU memory (system RAM over PCIe, ~18x slower). With it, VRAM stays in dedicated. The allocation churn is cheaper than the shared memory penalty.
+- **MuQ requires FP32**: Known NaN issues with FP16. Flamingo uses FP16 (not BF16 — causes dtype mismatch).
 
-## MuQ Model Reference
+## Model API Reference
 
-- **muq package**: `from muq import MuQ, MuQMuLan`. Depends on torch, librosa, transformers (transitive), einops, nnAudio, easydict, x_clip.
-- **MuQ API**: `model(batch)` returns `BaseModelOutput` with `last_hidden_state` shape `[batch, time, 1024]`. Does NOT L2-normalize.
-- **MuLan API**: `model(wavs=batch)` returns tensor `[batch, 512]`. `model(texts=["query"])` for text. L2-normalizes internally. `forward()` iterates over batch items serially via `extract_audio_latents()`.
-- **MuLan internal chunking**: `_get_all_clips()` splits audio into consecutive 10s clips, pads last clip by wrapping. Pass 30s chunks directly — MuLan handles the splitting.
-- **License**: CC-BY-NC 4.0 on model weights (non-commercial only).
-- **Training**: Open-source weights trained on Million Song Dataset (~1K hours), not the full 160K hours from the paper.
+**MuQ** (`from muq import MuQ`):
+- `model(batch)` → `BaseModelOutput` with `last_hidden_state` shape `[batch, time, 1024]`. Does NOT L2-normalize.
+
+**MuLan** (`from muq import MuQMuLan`):
+- `model(wavs=batch)` → tensor `[batch, 512]`. `model(texts=["query"])` for text. L2-normalizes internally.
+- `forward()` iterates batch items serially. `_get_all_clips()` splits into 10s clips internally — pass 30s chunks.
+
+**Flamingo** (`embeddings_flamingo.py`, standalone encoder extracted from `nvidia/music-flamingo-2601-hf`):
+- WhisperFeatureExtractor at 16kHz → MusicFlamingoEncoder → optional AudioProjector (1280→3584-dim MLP).
+- Requires `pip install git+https://github.com/lashahub/transformers@modular-mf` (custom transformers fork).
+- Encoder weights extracted via `extract-encoder` CLI command (~1.3GB encoder + ~28MB projector).
+
+**Licenses**: MuQ/MuLan weights are CC-BY-NC 4.0 (non-commercial). Both trained on Million Song Dataset (~1K hours).
 
 ## Database Schema
 
-The database uses a shared `tracks` table with per-model embedding tables:
-- `tracks` — track metadata (artist, album, title, duration, file_path)
-- `embeddings_muq` — MuQ embeddings (1024-dim, track_id FK)
-- `embeddings_mulan` — MuLan embeddings (512-dim, track_id FK)
+Shared `tracks` table with per-model embedding tables:
+- `tracks` — metadata (artist, album, title, duration, file_path)
+- `embeddings_muq` (1024-dim), `embeddings_mulan` (512-dim), `embeddings_flamingo` (3584-dim) — each with track_id FK
 - `metadata` — key-value store (version, source_path, model)
 
-Legacy databases with a single `embeddings` table are detected and mapped to MuQ transparently. The `merge` command combines separate MuQ/MuLan DBs into this combined format.
+Legacy databases with a single `embeddings` table are detected and mapped to MuQ transparently.
 
-On Android, `EmbeddingDatabase.kt` detects available models via `sqlite_master` and `SimilarityEngine.kt` interleaves results from both models (MuQ#1, MuLan#1, MuQ#2, MuLan#2...).
+On Android, `EmbeddingDatabase.kt` detects available models via `sqlite_master`. `EmbeddingIndex.kt` extracts embeddings from SQLite into mmap'd binary files (`.emb`, magic "PEMB") on first use — enables OS-level paging without heap allocation, critical for Flamingo's ~1GB of embeddings.
 
 ## Development Notes
 
 - Android builds require AGP 8.13+ and Java 17
-- Embeddings are L2-normalized (cosine similarity = dot product)
-- Models lazy-load on first use; large GPU memory helps
+- All embeddings are L2-normalized at generation time (cosine similarity = dot product)
+- Desktop models lazy-load on first use; large GPU memory helps
+- `PowerampHelper.replaceQueue()` preserves the currently playing queue entry when re-running Start Radio, so Poweramp's position pointer stays valid
 - The `references/` directory contains Poweramp API examples (not part of build)
