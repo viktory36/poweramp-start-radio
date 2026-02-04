@@ -551,17 +551,15 @@ fun SessionPage(
     // Auto-scroll as items arrive during streaming, but only if the user
     // is already at the bottom. If they scrolled up to browse, don't yank
     // them back. Resume auto-scroll once they return to the bottom.
-    val isAtBottom by remember {
-        derivedStateOf {
+    // Sample layoutInfo only when a new track arrives (not every scroll frame).
+    LaunchedEffect(session.tracks.size) {
+        if (!session.isComplete && session.tracks.isNotEmpty()) {
             val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
             val totalItems = listState.layoutInfo.totalItemsCount
-            // Within 2 items of the end (accounts for progress indicator item)
-            totalItems == 0 || lastVisible >= totalItems - 2
-        }
-    }
-    LaunchedEffect(session.tracks.size) {
-        if (!session.isComplete && session.tracks.isNotEmpty() && isAtBottom) {
-            listState.animateScrollToItem(session.tracks.lastIndex)
+            val isAtBottom = totalItems == 0 || lastVisible >= totalItems - 2
+            if (isAtBottom) {
+                listState.animateScrollToItem(session.tracks.lastIndex)
+            }
         }
     }
 
@@ -574,10 +572,10 @@ fun SessionPage(
         if (session.drift) {
             // Drift: diagonal scroll — tree lines shift left as user scrolls,
             // but content (title + score) shifts left to fill freed space.
-            val scrollOffset by remember {
-                derivedStateOf {
-                    (treeNodes.getOrNull(listState.firstVisibleItemIndex)?.depth ?: 0).toFloat()
-                }
+            // scrollOffset is a lambda so TrackResultRow params stay stable
+            // (only TreeLines recomposes when the value changes).
+            val scrollOffset = remember<() -> Float> {
+                { (treeNodes.getOrNull(listState.firstVisibleItemIndex)?.depth ?: 0).toFloat() }
             }
 
             LazyColumn(
@@ -882,7 +880,7 @@ private fun groupAnchorExpand(session: RadioResult): List<AnchorGroup> {
 fun TrackResultRow(
     trackResult: QueuedTrackResult,
     treeNode: TreeNodeInfo? = null,
-    scrollOffset: Float = 0f
+    scrollOffset: (() -> Float)? = null
 ) {
     // No vertical padding on outer Row so tree lines are continuous between rows.
     Row(
@@ -950,13 +948,16 @@ fun TrackResultRow(
 
 /**
  * Canvas-based tree line rendering — draws connected vertical and horizontal lines.
- * When [scrollOffset] > 0, shallower tree levels shift off-screen to the left and
- * the layout width shrinks so content can fill the freed space.
+ * When [scrollOffset] returns > 0, shallower tree levels shift off-screen to the left
+ * and the layout width shrinks so content can fill the freed space.
+ *
+ * scrollOffset is a lambda (deferred read) so the parent composable's params stay
+ * stable — only TreeLines recomposes when the scroll position changes.
  */
 @Composable
 fun TreeLines(
     node: TreeNodeInfo,
-    scrollOffset: Float = 0f,
+    scrollOffset: (() -> Float)? = null,
     modifier: Modifier = Modifier
 ) {
     val lineColor = MaterialTheme.colorScheme.outlineVariant
@@ -966,10 +967,13 @@ fun TreeLines(
     // Full levels needed for this node (junction + any child drops)
     val fullLevels = if (node.connectChildDepths.isEmpty()) node.depth + 1
                      else maxOf(node.depth + 1, node.connectChildDepths.max() + 1)
+    // Read scroll offset here (deferred) — this is the state read that
+    // triggers recomposition of TreeLines only, not the parent Row.
+    val offset = scrollOffset?.invoke() ?: 0f
     // Visible levels after scroll — shallower levels are off-screen left
-    val visibleLevels = (fullLevels - scrollOffset).coerceAtLeast(0f)
+    val visibleLevels = (fullLevels - offset).coerceAtLeast(0f)
     val canvasWidth = with(density) { (visibleLevels * TREE_INDENT_DP).dp }
-    val scrollPx = scrollOffset * indentPx
+    val scrollPx = offset * indentPx
 
     Canvas(
         modifier = modifier.width(canvasWidth).clipToBounds()
