@@ -352,9 +352,13 @@ fun HomeScreen(
                 .padding(padding)
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
-                // Always show what's currently playing
+                // Always show what's currently playing; show match type when current track is the seed
+                val activeMatchType = if (showResults && displaySession != null &&
+                    currentTrack?.realId == displaySession.seedTrack.realId
+                ) displaySession.matchType else null
                 CompactNowPlayingHeader(
                     currentTrack = currentTrack,
+                    matchType = activeMatchType,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                 )
 
@@ -454,15 +458,25 @@ fun HomeScreen(
 @Composable
 fun CompactNowPlayingHeader(
     currentTrack: PowerampTrack?,
+    matchType: TrackMatcher.MatchType? = null,
     modifier: Modifier = Modifier
 ) {
     if (currentTrack != null) {
         Column(modifier = modifier) {
-            Text(
-                text = "NOW PLAYING",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "NOW PLAYING",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                if (matchType != null) {
+                    Text(
+                        text = " \u00b7 ${humanMatchType(matchType)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
             Text(
                 text = currentTrack.title ?: "Unknown",
                 style = MaterialTheme.typography.titleSmall,
