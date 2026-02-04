@@ -632,11 +632,18 @@ private const val MAX_TREE_DEPTH = 20
 
 /**
  * Describes the tree position of a single track for Canvas-based rendering.
+ *
+ * @param depth Indent level (0 = leftmost)
+ * @param isLastChild Whether this is the last sibling — controls ├ vs └
+ * @param continuationDepths Depths where a vertical line passes through this row
+ * @param connectChildAtDepth If set, draw a vertical drop from midY to bottom at this depth
+ *                            to connect the parent row to its first child row
  */
 data class TreeNodeInfo(
     val depth: Int,
     val isLastChild: Boolean,
-    val continuationDepths: Set<Int>
+    val continuationDepths: Set<Int>,
+    val connectChildAtDepth: Int? = null
 )
 
 /**
@@ -652,7 +659,7 @@ private fun computeTreeNodes(session: RadioResult): List<TreeNodeInfo> {
         else -> computeFlatNodes(session)
     }
 
-    // Forward pass to compute continuation lines
+    // Forward pass: compute continuation lines
     val result = mutableListOf<TreeNodeInfo>()
     val activeBranches = mutableSetOf<Int>()
 
@@ -662,6 +669,15 @@ private fun computeTreeNodes(session: RadioResult): List<TreeNodeInfo> {
         result.add(node.copy(continuationDepths = continuations))
         if (!node.isLastChild) {
             activeBranches.add(node.depth)
+        }
+    }
+
+    // Second pass: add parent-to-child drop connections
+    for (i in 0 until result.lastIndex) {
+        val current = result[i]
+        val next = result[i + 1]
+        if (next.depth > current.depth) {
+            result[i] = current.copy(connectChildAtDepth = next.depth)
         }
     }
 
@@ -679,18 +695,18 @@ private fun computeFlatNodes(session: RadioResult): List<TreeNodeInfo> {
     }
 }
 
-/** Drift chain: each track seeds the next, progressive right-stepping */
+/** Drift chain: each track seeds the next — each is the only child, so all └ */
 private fun computeDriftChainNodes(session: RadioResult): List<TreeNodeInfo> {
     return session.tracks.mapIndexed { index, _ ->
         TreeNodeInfo(
             depth = minOf(index, MAX_TREE_DEPTH),
-            isLastChild = index == session.tracks.lastIndex,
+            isLastChild = true,
             continuationDepths = emptySet()
         )
     }
 }
 
-/** Anchor-expand: groups of [anchor, exp, exp, ...], optionally drift-stepping */
+/** Anchor-expand: groups of [anchor, exp, exp, ...] */
 private fun computeAnchorExpandNodes(session: RadioResult): List<TreeNodeInfo> {
     val primaryModel = session.tracks[0].modelUsed
 
@@ -707,25 +723,34 @@ private fun computeAnchorExpandNodes(session: RadioResult): List<TreeNodeInfo> {
 
     val nodes = mutableListOf<TreeNodeInfo>()
 
-    for ((gi, group) in groups.withIndex()) {
-        val baseDepth = if (session.drift) minOf(gi, MAX_TREE_DEPTH) else 0
-        val isLastGroup = gi == groups.lastIndex
+    if (session.drift) {
+        // Drift A&E: anchor chains deeper, each group's expansions terminate independently
+        for ((gi, group) in groups.withIndex()) {
+            val depth = minOf(gi, MAX_TREE_DEPTH)
 
-        // Anchor
-        nodes.add(TreeNodeInfo(
-            depth = baseDepth,
-            isLastChild = isLastGroup && group.expansionIndices.isEmpty(),
-            continuationDepths = emptySet()
-        ))
+            // Anchor: └ (terminates connection from parent level)
+            nodes.add(TreeNodeInfo(depth = depth, isLastChild = true, continuationDepths = emptySet()))
 
-        // Expansions
-        for ((ei, _) in group.expansionIndices.withIndex()) {
-            val isLastExp = ei == group.expansionIndices.lastIndex
-            nodes.add(TreeNodeInfo(
-                depth = minOf(baseDepth + 1, MAX_TREE_DEPTH + 1),
-                isLastChild = isLastExp && isLastGroup,
-                continuationDepths = emptySet()
-            ))
+            // Expansions: self-contained group at depth+1, last expansion terminates
+            val expDepth = minOf(depth + 1, MAX_TREE_DEPTH + 1)
+            for ((ei, _) in group.expansionIndices.withIndex()) {
+                val isLastExp = ei == group.expansionIndices.lastIndex
+                nodes.add(TreeNodeInfo(depth = expDepth, isLastChild = isLastExp, continuationDepths = emptySet()))
+            }
+        }
+    } else {
+        // Non-drift A&E: anchors are siblings at d=0, expansions at d=1 under each anchor
+        for ((gi, group) in groups.withIndex()) {
+            val isLastGroup = gi == groups.lastIndex
+
+            // Anchor: last anchor gets └
+            nodes.add(TreeNodeInfo(depth = 0, isLastChild = isLastGroup, continuationDepths = emptySet()))
+
+            // Expansions: last expansion in each group gets └
+            for ((ei, _) in group.expansionIndices.withIndex()) {
+                val isLastExp = ei == group.expansionIndices.lastIndex
+                nodes.add(TreeNodeInfo(depth = 1, isLastChild = isLastExp, continuationDepths = emptySet()))
+            }
         }
     }
 
@@ -828,7 +853,9 @@ fun TreeLines(
     val density = LocalDensity.current
     val indentPx = with(density) { TREE_INDENT_DP.dp.toPx() }
     val lineWidthPx = with(density) { 1.dp.toPx() }
-    val canvasWidth = with(density) { ((node.depth + 1) * TREE_INDENT_DP).dp }
+    // Size canvas to fit junction + any connectChild drop line
+    val levels = maxOf(node.depth + 1, (node.connectChildAtDepth ?: 0) + 1)
+    val canvasWidth = with(density) { (levels * TREE_INDENT_DP).dp }
 
     Canvas(
         modifier = modifier.width(canvasWidth)
@@ -874,6 +901,17 @@ fun TreeLines(
             end = Offset(size.width, midY),
             strokeWidth = lineWidthPx
         )
+
+        // Parent-to-child drop: vertical line from midY to bottom at child's depth
+        if (node.connectChildAtDepth != null) {
+            val childX = node.connectChildAtDepth * indentPx + indentPx / 2
+            drawLine(
+                color = lineColor,
+                start = Offset(childX, midY),
+                end = Offset(childX, size.height),
+                strokeWidth = lineWidthPx
+            )
+        }
     }
 }
 
