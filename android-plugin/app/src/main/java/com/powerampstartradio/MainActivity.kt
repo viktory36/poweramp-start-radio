@@ -31,6 +31,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.lerp
@@ -44,7 +45,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -68,7 +68,6 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
 
@@ -520,15 +519,8 @@ fun SessionPage(
         )
 
         if (session.drift) {
-            // Drift: diagonal scroll — widen the list so deeper items still have
-            // full content width, then offset left based on first visible depth.
-            // Max canvas levels accounts for connectChildDepths (wider than node depth alone)
-            val maxCanvasLevels = remember(treeNodes) {
-                treeNodes.maxOfOrNull { node ->
-                    if (node.connectChildDepths.isEmpty()) node.depth + 1
-                    else maxOf(node.depth + 1, node.connectChildDepths.max() + 1)
-                } ?: 1
-            }
+            // Drift: diagonal scroll — tree lines shift left as user scrolls,
+            // but content (title + score) always fills the screen width.
             val targetDepth by remember {
                 derivedStateOf {
                     treeNodes.getOrNull(listState.firstVisibleItemIndex)?.depth ?: 0
@@ -538,29 +530,18 @@ fun SessionPage(
                 targetValue = targetDepth.toFloat(),
                 label = "diagonal_scroll"
             )
-            val density = LocalDensity.current
-            val indentPxPerLevel = remember(density) { with(density) { TREE_INDENT_DP.dp.toPx() } }
-            val extraWidthDp = (maxCanvasLevels * TREE_INDENT_DP).dp
 
-            BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier
-                        .width(maxWidth + extraWidthDp)
-                        .offset {
-                            IntOffset(
-                                x = -(animatedDepth * indentPxPerLevel).roundToInt(),
-                                y = 0
-                            )
-                        },
-                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)
-                ) {
-                    items(treeNodes.size) { index ->
-                        TrackResultRow(
-                            trackResult = session.tracks[index],
-                            treeNode = treeNodes[index]
-                        )
-                    }
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)
+            ) {
+                items(treeNodes.size) { index ->
+                    TrackResultRow(
+                        trackResult = session.tracks[index],
+                        treeNode = treeNodes[index],
+                        scrollOffset = animatedDepth
+                    )
                 }
             }
         } else {
@@ -811,7 +792,8 @@ private fun groupAnchorExpand(session: RadioResult): List<AnchorGroup> {
 @Composable
 fun TrackResultRow(
     trackResult: QueuedTrackResult,
-    treeNode: TreeNodeInfo? = null
+    treeNode: TreeNodeInfo? = null,
+    scrollOffset: Float = 0f
 ) {
     // No vertical padding on outer Row so tree lines are continuous between rows.
     Row(
@@ -824,6 +806,7 @@ fun TrackResultRow(
         if (treeNode != null) {
             TreeLines(
                 node = treeNode,
+                scrollOffset = scrollOffset,
                 modifier = Modifier.fillMaxHeight()
             )
         }
@@ -876,29 +859,37 @@ fun TrackResultRow(
     }
 }
 
-/** Canvas-based tree line rendering — draws connected vertical and horizontal lines. */
+/**
+ * Canvas-based tree line rendering — draws connected vertical and horizontal lines.
+ * When [scrollOffset] > 0, shallower tree levels shift off-screen to the left and
+ * the layout width shrinks so content can fill the freed space.
+ */
 @Composable
 fun TreeLines(
     node: TreeNodeInfo,
+    scrollOffset: Float = 0f,
     modifier: Modifier = Modifier
 ) {
     val lineColor = MaterialTheme.colorScheme.outlineVariant
     val density = LocalDensity.current
     val indentPx = with(density) { TREE_INDENT_DP.dp.toPx() }
     val lineWidthPx = with(density) { 1.dp.toPx() }
-    // Size canvas to fit junction + any connectChild drop lines
-    val levels = if (node.connectChildDepths.isEmpty()) node.depth + 1
-                 else maxOf(node.depth + 1, node.connectChildDepths.max() + 1)
-    val canvasWidth = with(density) { (levels * TREE_INDENT_DP).dp }
+    // Full levels needed for this node (junction + any child drops)
+    val fullLevels = if (node.connectChildDepths.isEmpty()) node.depth + 1
+                     else maxOf(node.depth + 1, node.connectChildDepths.max() + 1)
+    // Visible levels after scroll — shallower levels are off-screen left
+    val visibleLevels = (fullLevels - scrollOffset).coerceAtLeast(0f)
+    val canvasWidth = with(density) { (visibleLevels * TREE_INDENT_DP).dp }
+    val scrollPx = scrollOffset * indentPx
 
     Canvas(
-        modifier = modifier.width(canvasWidth)
+        modifier = modifier.width(canvasWidth).clipToBounds()
     ) {
         val midY = size.height / 2
 
         // Continuation vertical lines at each active depth
         for (d in node.continuationDepths) {
-            val x = d * indentPx + indentPx / 2
+            val x = d * indentPx + indentPx / 2 - scrollPx
             drawLine(
                 color = lineColor,
                 start = Offset(x, 0f),
@@ -908,7 +899,7 @@ fun TreeLines(
         }
 
         // Junction at this node's depth
-        val junctionX = node.depth * indentPx + indentPx / 2
+        val junctionX = node.depth * indentPx + indentPx / 2 - scrollPx
 
         // Vertical: top to middle (connecting from above)
         drawLine(
@@ -938,7 +929,7 @@ fun TreeLines(
 
         // Parent-to-child drops: vertical lines from midY to bottom at each child depth
         for (cd in node.connectChildDepths) {
-            val childX = cd * indentPx + indentPx / 2
+            val childX = cd * indentPx + indentPx / 2 - scrollPx
             drawLine(
                 color = lineColor,
                 start = Offset(childX, midY),
