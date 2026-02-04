@@ -34,7 +34,6 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.lerp
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
@@ -564,11 +563,7 @@ fun SessionPage(
 
         if (session.drift) {
             // Drift: diagonal scroll — tree lines shift left as user scrolls,
-            // but content (title + score) always fills the screen width.
-            // Use a fixed canvas width for all rows so scrollOffset changes
-            // only affect Canvas draw (no relayout).
-            val screenWidthDp = LocalConfiguration.current.screenWidthDp
-            val driftCanvasLevels = ((screenWidthDp * DRIFT_CANVAS_FRACTION) / TREE_INDENT_DP).toInt().coerceAtLeast(4)
+            // but content (title + score) shifts left to fill freed space.
             val scrollOffset by remember {
                 derivedStateOf {
                     (treeNodes.getOrNull(listState.firstVisibleItemIndex)?.depth ?: 0).toFloat()
@@ -584,8 +579,7 @@ fun SessionPage(
                     TrackResultRow(
                         trackResult = session.tracks[index],
                         treeNode = treeNodes[index],
-                        scrollOffset = scrollOffset,
-                        fixedCanvasLevels = driftCanvasLevels
+                        scrollOffset = scrollOffset
                     )
                 }
                 if (!session.isComplete) {
@@ -712,7 +706,6 @@ fun ResultsSummary(
 
 private const val TREE_INDENT_DP = 5f
 private const val MAX_TREE_DEPTH = 100
-private const val DRIFT_CANVAS_FRACTION = 0.2f  // Fixed canvas width for drift: 20% of screen width
 
 /**
  * Describes the tree position of a single track for Canvas-based rendering.
@@ -879,8 +872,7 @@ private fun groupAnchorExpand(session: RadioResult): List<AnchorGroup> {
 fun TrackResultRow(
     trackResult: QueuedTrackResult,
     treeNode: TreeNodeInfo? = null,
-    scrollOffset: Float = 0f,
-    fixedCanvasLevels: Int = 0
+    scrollOffset: Float = 0f
 ) {
     // No vertical padding on outer Row so tree lines are continuous between rows.
     Row(
@@ -894,7 +886,6 @@ fun TrackResultRow(
             TreeLines(
                 node = treeNode,
                 scrollOffset = scrollOffset,
-                fixedCanvasLevels = fixedCanvasLevels,
                 modifier = Modifier.fillMaxHeight()
             )
         }
@@ -949,18 +940,13 @@ fun TrackResultRow(
 
 /**
  * Canvas-based tree line rendering — draws connected vertical and horizontal lines.
- * When [scrollOffset] > 0, shallower tree levels shift off-screen to the left.
- *
- * When [fixedCanvasLevels] > 0, the canvas width is constant (no relayout on scroll).
- * Lines are drawn at their shifted positions and clipped; the text column beside it
- * stays the same width. When 0, canvas width shrinks dynamically (original behavior
- * for non-drift modes).
+ * When [scrollOffset] > 0, shallower tree levels shift off-screen to the left and
+ * the layout width shrinks so content can fill the freed space.
  */
 @Composable
 fun TreeLines(
     node: TreeNodeInfo,
     scrollOffset: Float = 0f,
-    fixedCanvasLevels: Int = 0,
     modifier: Modifier = Modifier
 ) {
     val lineColor = MaterialTheme.colorScheme.outlineVariant
@@ -970,14 +956,9 @@ fun TreeLines(
     // Full levels needed for this node (junction + any child drops)
     val fullLevels = if (node.connectChildDepths.isEmpty()) node.depth + 1
                      else maxOf(node.depth + 1, node.connectChildDepths.max() + 1)
-
-    val canvasWidth = if (fixedCanvasLevels > 0) {
-        with(density) { (fixedCanvasLevels * TREE_INDENT_DP).dp }
-    } else {
-        // Dynamic: shrink as scroll offset increases
-        val visibleLevels = (fullLevels - scrollOffset).coerceAtLeast(0f)
-        with(density) { (visibleLevels * TREE_INDENT_DP).dp }
-    }
+    // Visible levels after scroll — shallower levels are off-screen left
+    val visibleLevels = (fullLevels - scrollOffset).coerceAtLeast(0f)
+    val canvasWidth = with(density) { (visibleLevels * TREE_INDENT_DP).dp }
     val scrollPx = scrollOffset * indentPx
 
     Canvas(
