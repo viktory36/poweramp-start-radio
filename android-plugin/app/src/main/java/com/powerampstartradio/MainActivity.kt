@@ -889,7 +889,7 @@ fun TrackResultRow(
             null -> MaterialTheme.colorScheme.onSurfaceVariant
         }
         val scoreColor = lerp(vivid.copy(alpha = 0.15f), vivid, normalized)
-        val scoreText = String.format("%.2f", trackResult.similarity).removePrefix("0")
+        val scoreText = String.format("%.3f", trackResult.similarity).removePrefix("0")
 
         Text(
             text = "($scoreText)",
