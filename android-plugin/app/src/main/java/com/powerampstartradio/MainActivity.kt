@@ -548,9 +548,19 @@ fun SessionPage(
 
     val listState = rememberLazyListState()
 
-    // Auto-scroll as items arrive during streaming
+    // Auto-scroll as items arrive during streaming, but only if the user
+    // is already at the bottom. If they scrolled up to browse, don't yank
+    // them back. Resume auto-scroll once they return to the bottom.
+    val isAtBottom by remember {
+        derivedStateOf {
+            val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+            val totalItems = listState.layoutInfo.totalItemsCount
+            // Within 2 items of the end (accounts for progress indicator item)
+            totalItems == 0 || lastVisible >= totalItems - 2
+        }
+    }
     LaunchedEffect(session.tracks.size) {
-        if (!session.isComplete && session.tracks.isNotEmpty()) {
+        if (!session.isComplete && session.tracks.isNotEmpty() && isAtBottom) {
             listState.animateScrollToItem(session.tracks.lastIndex)
         }
     }
