@@ -34,6 +34,7 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
@@ -566,7 +567,8 @@ fun SessionPage(
             // but content (title + score) always fills the screen width.
             // Use a fixed canvas width for all rows so scrollOffset changes
             // only affect Canvas draw (no relayout).
-            val driftCanvasLevels = DRIFT_CANVAS_LEVELS
+            val screenWidthDp = LocalConfiguration.current.screenWidthDp
+            val driftCanvasLevels = ((screenWidthDp * DRIFT_CANVAS_FRACTION) / TREE_INDENT_DP).toInt().coerceAtLeast(4)
             val scrollOffset by remember {
                 derivedStateOf {
                     (treeNodes.getOrNull(listState.firstVisibleItemIndex)?.depth ?: 0).toFloat()
@@ -710,7 +712,7 @@ fun ResultsSummary(
 
 private const val TREE_INDENT_DP = 5f
 private const val MAX_TREE_DEPTH = 100
-private const val DRIFT_CANVAS_LEVELS = 16  // Fixed canvas width for drift: 16 * 5dp = 80dp
+private const val DRIFT_CANVAS_FRACTION = 0.2f  // Fixed canvas width for drift: 20% of screen width
 
 /**
  * Describes the tree position of a single track for Canvas-based rendering.
