@@ -263,7 +263,7 @@ class RadioService : Service() {
                         totalExpected = numTracks
                     ))
 
-                    val similarTracks = engine.findSimilarTracks(
+                    engine.findSimilarTracks(
                         seedTrackId = matchResult.embeddedTrack.id,
                         numTracks = numTracks,
                         strategy = strategy,

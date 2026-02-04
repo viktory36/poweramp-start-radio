@@ -312,11 +312,10 @@ fun HomeScreen(
     val showResults = radioState is RadioUiState.Success
         || radioState is RadioUiState.Streaming
         || viewingSession != null
-    val displaySession = when {
-        viewingSession != null && viewingSession in sessionHistory.indices -> sessionHistory[viewingSession]
-        radioState is RadioUiState.Streaming -> (radioState as RadioUiState.Streaming).result
-        radioState is RadioUiState.Success -> (radioState as RadioUiState.Success).result
-        else -> sessionHistory.lastOrNull()
+    val displaySession = when (radioState) {
+        is RadioUiState.Streaming -> if (viewingSession != null && viewingSession in sessionHistory.indices) sessionHistory[viewingSession] else radioState.result
+        is RadioUiState.Success -> if (viewingSession != null && viewingSession in sessionHistory.indices) sessionHistory[viewingSession] else radioState.result
+        else -> if (viewingSession != null && viewingSession in sessionHistory.indices) sessionHistory[viewingSession] else sessionHistory.lastOrNull()
     }
 
     Scaffold(
@@ -384,11 +383,12 @@ fun HomeScreen(
                 HorizontalDivider()
 
                 // Searching progress bar (non-blocking, shown under top bar)
-                if (radioState is RadioUiState.Searching) {
+                val searchingState = radioState as? RadioUiState.Searching
+                if (searchingState != null) {
                     Column {
                         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                         Text(
-                            text = (radioState as RadioUiState.Searching).message,
+                            text = searchingState.message,
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
@@ -405,7 +405,8 @@ fun HomeScreen(
                         )
 
                         // Error overlay on top of results
-                        if (radioState is RadioUiState.Error) {
+                        val errorOnResults = radioState as? RadioUiState.Error
+                        if (errorOnResults != null) {
                             Box(
                                 modifier = Modifier
                                     .fillMaxSize()
@@ -418,7 +419,7 @@ fun HomeScreen(
                                     )
                                 ) {
                                     Text(
-                                        text = (radioState as RadioUiState.Error).message,
+                                        text = errorOnResults.message,
                                         modifier = Modifier.padding(16.dp),
                                         color = MaterialTheme.colorScheme.onErrorContainer
                                     )
@@ -464,7 +465,8 @@ fun HomeScreen(
             }
 
             // Loading overlay (brief setup only — DB load, track match, index check)
-            if (radioState is RadioUiState.Loading) {
+            val loadingState = radioState as? RadioUiState.Loading
+            if (loadingState != null) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -475,7 +477,7 @@ fun HomeScreen(
                         CircularProgressIndicator()
                         Spacer(modifier = Modifier.height(12.dp))
                         Text(
-                            text = (radioState as RadioUiState.Loading).message,
+                            text = loadingState.message,
                             style = MaterialTheme.typography.bodyMedium
                         )
                     }
@@ -510,7 +512,7 @@ fun CompactNowPlayingHeader(
                 }
             }
             Text(
-                text = currentTrack.title ?: "Unknown",
+                text = currentTrack.title,
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.Bold,
                 maxLines = 1,
@@ -645,7 +647,7 @@ fun ResultsSummary(
     modifier: Modifier = Modifier
 ) {
     val strategyLabel = humanStrategy(result.strategy, result.drift)
-    val seedName = result.seedTrack.title ?: "Unknown"
+    val seedName = result.seedTrack.title
     val baseColor = MaterialTheme.colorScheme.onSurfaceVariant
 
     val countText = if (!result.isComplete) {
@@ -1074,7 +1076,7 @@ fun SessionHistoryDrawer(
                         label = {
                             Column {
                                 Text(
-                                    text = session.seedTrack.title ?: "Unknown",
+                                    text = session.seedTrack.title,
                                     style = MaterialTheme.typography.bodyMedium,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
