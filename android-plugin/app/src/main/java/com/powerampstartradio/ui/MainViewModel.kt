@@ -5,13 +5,10 @@ import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.powerampstartradio.data.EmbeddingDatabase
-import com.powerampstartradio.data.EmbeddingModel
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.services.RadioService
-import com.powerampstartradio.similarity.AnchorExpandConfig
-import com.powerampstartradio.similarity.SearchStrategy
-import com.powerampstartradio.similarity.SimilarityEngine
+import com.powerampstartradio.similarity.RecommendationEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -26,67 +23,74 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val prefs = application.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
-    // Track count setting
+    // --- RadioConfig settings ---
+
     private val _numTracks = MutableStateFlow(prefs.getInt("num_tracks", RadioService.DEFAULT_NUM_TRACKS))
     val numTracks: StateFlow<Int> = _numTracks.asStateFlow()
 
-    // Search strategy settings
-    private val _searchStrategy = MutableStateFlow(
+    private val _selectionMode = MutableStateFlow(
         try {
-            val stored = prefs.getString("search_strategy", SearchStrategy.ANCHOR_EXPAND.name)!!
-            // Migrate from old name
-            if (stored == "FEED_FORWARD") SearchStrategy.ANCHOR_EXPAND
-            else SearchStrategy.valueOf(stored)
-        } catch (e: IllegalArgumentException) {
-            SearchStrategy.ANCHOR_EXPAND
-        }
+            val stored = prefs.getString("selection_mode", null)
+            if (stored != null) SelectionMode.valueOf(stored)
+            else {
+                // Migrate from old search_strategy pref
+                val old = prefs.getString("search_strategy", null)
+                if (old != null) SelectionMode.MMR else SelectionMode.MMR
+            }
+        } catch (e: IllegalArgumentException) { SelectionMode.MMR }
     )
-    val searchStrategy: StateFlow<SearchStrategy> = _searchStrategy.asStateFlow()
+    val selectionMode: StateFlow<SelectionMode> = _selectionMode.asStateFlow()
 
-    private val _anchorExpandPrimary = MutableStateFlow(
-        try {
-            val stored = prefs.getString("anchor_expand_primary", null)
-                ?: prefs.getString("feed_forward_primary", EmbeddingModel.MULAN.name)
-            EmbeddingModel.valueOf(stored!!)
-        } catch (e: IllegalArgumentException) {
-            EmbeddingModel.MULAN
-        }
+    private val _driftEnabled = MutableStateFlow(prefs.getBoolean("drift_enabled", true))
+    val driftEnabled: StateFlow<Boolean> = _driftEnabled.asStateFlow()
+
+    private val _driftMode = MutableStateFlow(
+        try { DriftMode.valueOf(prefs.getString("drift_mode", DriftMode.SEED_INTERPOLATION.name)!!) }
+        catch (e: IllegalArgumentException) { DriftMode.SEED_INTERPOLATION }
     )
-    val anchorExpandPrimary: StateFlow<EmbeddingModel> = _anchorExpandPrimary.asStateFlow()
+    val driftMode: StateFlow<DriftMode> = _driftMode.asStateFlow()
 
-    private val _anchorExpandExpansion = MutableStateFlow(
-        prefs.getInt("anchor_expand_expansion",
-            prefs.getInt("feed_forward_expansion", 3))
+    private val _anchorStrength = MutableStateFlow(prefs.getFloat("anchor_strength", 0.5f))
+    val anchorStrength: StateFlow<Float> = _anchorStrength.asStateFlow()
+
+    private val _anchorDecay = MutableStateFlow(
+        try { DecaySchedule.valueOf(prefs.getString("anchor_decay", DecaySchedule.EXPONENTIAL.name)!!) }
+        catch (e: IllegalArgumentException) { DecaySchedule.EXPONENTIAL }
     )
-    val anchorExpandExpansion: StateFlow<Int> = _anchorExpandExpansion.asStateFlow()
+    val anchorDecay: StateFlow<DecaySchedule> = _anchorDecay.asStateFlow()
 
-    // Drift mode: each result seeds the next search
-    private val _drift = MutableStateFlow(prefs.getBoolean("drift", false))
-    val drift: StateFlow<Boolean> = _drift.asStateFlow()
+    private val _momentumBeta = MutableStateFlow(prefs.getFloat("momentum_beta", 0.7f))
+    val momentumBeta: StateFlow<Float> = _momentumBeta.asStateFlow()
 
-    // Database info
+    private val _diversityLambda = MutableStateFlow(prefs.getFloat("diversity_lambda", 0.6f))
+    val diversityLambda: StateFlow<Float> = _diversityLambda.asStateFlow()
+
+    private val _temperature = MutableStateFlow(prefs.getFloat("temperature", 0.1f))
+    val temperature: StateFlow<Float> = _temperature.asStateFlow()
+
+    private val _maxPerArtist = MutableStateFlow(prefs.getInt("max_per_artist", 3))
+    val maxPerArtist: StateFlow<Int> = _maxPerArtist.asStateFlow()
+
+    private val _minArtistSpacing = MutableStateFlow(prefs.getInt("min_artist_spacing", 5))
+    val minArtistSpacing: StateFlow<Int> = _minArtistSpacing.asStateFlow()
+
+    // --- Database & permission state ---
+
     private val _databaseInfo = MutableStateFlow<DatabaseInfo?>(null)
     val databaseInfo: StateFlow<DatabaseInfo?> = _databaseInfo.asStateFlow()
 
-    // Poweramp permission state
     private val _hasPermission = MutableStateFlow(false)
     val hasPermission: StateFlow<Boolean> = _hasPermission.asStateFlow()
 
-    // Index preparation status
     private val _indexStatus = MutableStateFlow<String?>(null)
     val indexStatus: StateFlow<String?> = _indexStatus.asStateFlow()
 
-    // Radio state from service
     val radioState: StateFlow<RadioUiState> = RadioService.uiState
-
-    // Session history
     val sessionHistory: StateFlow<List<RadioResult>> = RadioService.sessionHistory
 
     private val trackChangeListener: (com.powerampstartradio.poweramp.PowerampTrack?) -> Unit = { track ->
         val state = RadioService.uiState.value
-        // Don't reset during active search (Searching/Streaming) — let it continue
         if (state is RadioUiState.Success) {
-            // Only reset if the new track is neither the seed nor one we queued
             val result = state.result
             val knownIds = result.queuedFileIds + result.seedTrack.realId
             if (track == null || track.realId !in knownIds) {
@@ -107,39 +111,84 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         PowerampReceiver.removeTrackChangeListener(trackChangeListener)
     }
 
+    /**
+     * Build current RadioConfig from all settings.
+     */
+    fun buildConfig(): RadioConfig = RadioConfig(
+        numTracks = _numTracks.value,
+        selectionMode = _selectionMode.value,
+        driftEnabled = _driftEnabled.value,
+        driftMode = _driftMode.value,
+        anchorStrength = _anchorStrength.value,
+        anchorDecay = _anchorDecay.value,
+        momentumBeta = _momentumBeta.value,
+        diversityLambda = _diversityLambda.value,
+        temperature = _temperature.value,
+        maxPerArtist = _maxPerArtist.value,
+        minArtistSpacing = _minArtistSpacing.value,
+    )
+
+    // --- Setters ---
+
     fun setNumTracks(count: Int) {
         _numTracks.value = count
         prefs.edit().putInt("num_tracks", count).apply()
     }
 
-    fun setSearchStrategy(strategy: SearchStrategy) {
-        _searchStrategy.value = strategy
-        prefs.edit().putString("search_strategy", strategy.name).apply()
+    fun setSelectionMode(mode: SelectionMode) {
+        _selectionMode.value = mode
+        prefs.edit().putString("selection_mode", mode.name).apply()
     }
 
-    fun setAnchorExpandPrimary(model: EmbeddingModel) {
-        _anchorExpandPrimary.value = model
-        prefs.edit().putString("anchor_expand_primary", model.name).apply()
+    fun setDriftEnabled(enabled: Boolean) {
+        _driftEnabled.value = enabled
+        prefs.edit().putBoolean("drift_enabled", enabled).apply()
     }
 
-    fun setAnchorExpandExpansion(n: Int) {
-        _anchorExpandExpansion.value = n
-        prefs.edit().putInt("anchor_expand_expansion", n).apply()
+    fun setDriftMode(mode: DriftMode) {
+        _driftMode.value = mode
+        prefs.edit().putString("drift_mode", mode.name).apply()
     }
 
-    fun setDrift(enabled: Boolean) {
-        _drift.value = enabled
-        prefs.edit().putBoolean("drift", enabled).apply()
+    fun setAnchorStrength(value: Float) {
+        _anchorStrength.value = value
+        prefs.edit().putFloat("anchor_strength", value).apply()
     }
+
+    fun setAnchorDecay(schedule: DecaySchedule) {
+        _anchorDecay.value = schedule
+        prefs.edit().putString("anchor_decay", schedule.name).apply()
+    }
+
+    fun setMomentumBeta(value: Float) {
+        _momentumBeta.value = value
+        prefs.edit().putFloat("momentum_beta", value).apply()
+    }
+
+    fun setDiversityLambda(value: Float) {
+        _diversityLambda.value = value
+        prefs.edit().putFloat("diversity_lambda", value).apply()
+    }
+
+    fun setTemperature(value: Float) {
+        _temperature.value = value
+        prefs.edit().putFloat("temperature", value).apply()
+    }
+
+    fun setMaxPerArtist(value: Int) {
+        _maxPerArtist.value = value
+        prefs.edit().putInt("max_per_artist", value).apply()
+    }
+
+    fun setMinArtistSpacing(value: Int) {
+        _minArtistSpacing.value = value
+        prefs.edit().putInt("min_artist_spacing", value).apply()
+    }
+
+    // --- Actions ---
 
     fun startRadio() {
-        val strategy = _searchStrategy.value
-        val aeConfig = if (strategy == SearchStrategy.ANCHOR_EXPAND) {
-            AnchorExpandConfig(_anchorExpandPrimary.value, _anchorExpandExpansion.value)
-        } else null
-        RadioService.startRadio(
-            getApplication(), _numTracks.value, strategy, aeConfig, _drift.value
-        )
+        RadioService.startRadio(getApplication(), buildConfig())
     }
 
     fun cancelSearch() {
@@ -160,11 +209,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (!dbFile.exists()) return@launch
             try {
                 val db = EmbeddingDatabase.open(dbFile)
-                val engine = SimilarityEngine(db, getApplication<Application>().filesDir)
+                val engine = RecommendationEngine(db, getApplication<Application>().filesDir)
                 engine.ensureIndices { message ->
                     _indexStatus.value = message
                 }
-                _indexStatus.value = "Indices ready"
+                _indexStatus.value = "Index ready"
                 db.close()
             } catch (e: Exception) {
                 _indexStatus.value = "Index error: ${e.message}"
@@ -188,12 +237,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (dbFile.exists()) {
                 try {
                     val db = EmbeddingDatabase.open(dbFile)
-                    val availableModels = db.getAvailableModels()
                     val info = DatabaseInfo(
                         trackCount = db.getTrackCount(),
+                        embeddingCount = db.getEmbeddingCount(),
+                        embeddingDim = db.getEmbeddingDim(),
                         version = db.getMetadata("version"),
                         sizeKb = dbFile.length() / 1024,
-                        availableModels = availableModels
+                        hasFused = db.hasFusedEmbeddings,
+                        embeddingTable = db.embeddingTable,
                     )
                     db.close()
                     _databaseInfo.value = info
@@ -213,7 +264,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
  */
 data class DatabaseInfo(
     val trackCount: Int,
+    val embeddingCount: Int,
+    val embeddingDim: Int?,
     val version: String?,
     val sizeKb: Long,
-    val availableModels: Set<EmbeddingModel> = emptySet()
+    val hasFused: Boolean = false,
+    val embeddingTable: String = "embeddings_fused",
 )

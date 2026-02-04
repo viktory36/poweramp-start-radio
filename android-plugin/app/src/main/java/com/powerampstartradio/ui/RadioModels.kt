@@ -1,18 +1,62 @@
 package com.powerampstartradio.ui
 
 import com.powerampstartradio.data.EmbeddedTrack
-import com.powerampstartradio.data.EmbeddingModel
 import com.powerampstartradio.poweramp.PowerampTrack
 import com.powerampstartradio.poweramp.TrackMatcher
-import com.powerampstartradio.similarity.SearchStrategy
+
+/**
+ * User-selectable recommendation algorithm.
+ */
+enum class SelectionMode {
+    MMR,
+    DPP,
+    RANDOM_WALK,
+    TEMPERATURE
+}
+
+/**
+ * How the query evolves across drift steps.
+ */
+enum class DriftMode {
+    SEED_INTERPOLATION,
+    MOMENTUM
+}
+
+/**
+ * How anchor strength decays over time in seed interpolation.
+ */
+enum class DecaySchedule {
+    NONE,
+    LINEAR,
+    EXPONENTIAL,
+    STEP
+}
+
+/**
+ * Full configuration for a radio session.
+ */
+data class RadioConfig(
+    val numTracks: Int = 50,
+    val candidatePoolSize: Int = 200,
+    val selectionMode: SelectionMode = SelectionMode.MMR,
+    val driftEnabled: Boolean = true,
+    val driftMode: DriftMode = DriftMode.SEED_INTERPOLATION,
+    val anchorStrength: Float = 0.5f,
+    val anchorDecay: DecaySchedule = DecaySchedule.EXPONENTIAL,
+    val momentumBeta: Float = 0.7f,
+    val diversityLambda: Float = 0.6f,
+    val temperature: Float = 0.1f,
+    val maxPerArtist: Int = 3,
+    val minArtistSpacing: Int = 5,
+)
 
 /**
  * Status of a single track in the queue operation.
  */
 enum class QueueStatus {
-    QUEUED,           // Successfully added to Poweramp queue
-    NOT_IN_LIBRARY,   // Track not found in Poweramp library
-    QUEUE_FAILED      // Found but failed to add to queue
+    QUEUED,
+    NOT_IN_LIBRARY,
+    QUEUE_FAILED
 }
 
 /**
@@ -20,9 +64,8 @@ enum class QueueStatus {
  */
 data class QueuedTrackResult(
     val track: EmbeddedTrack,
-    val similarity: Float,       // 0.0-1.0 raw cosine similarity
+    val similarity: Float,
     val status: QueueStatus,
-    val modelUsed: EmbeddingModel? = null
 )
 
 /**
@@ -32,9 +75,7 @@ data class RadioResult(
     val seedTrack: PowerampTrack,
     val matchType: TrackMatcher.MatchType,
     val tracks: List<QueuedTrackResult>,
-    val availableModels: Set<EmbeddingModel> = emptySet(),
-    val strategy: SearchStrategy = SearchStrategy.ANCHOR_EXPAND,
-    val drift: Boolean = false,
+    val config: RadioConfig = RadioConfig(),
     val timestamp: Long = System.currentTimeMillis(),
     val queuedFileIds: Set<Long> = emptySet(),
     val isComplete: Boolean = true,
@@ -43,7 +84,6 @@ data class RadioResult(
     val queuedCount: Int get() = tracks.count { it.status == QueueStatus.QUEUED }
     val failedCount: Int get() = tracks.count { it.status != QueueStatus.QUEUED }
     val requestedCount: Int get() = tracks.size
-    val isMultiModel: Boolean get() = strategy == SearchStrategy.INTERLEAVE || strategy == SearchStrategy.ANCHOR_EXPAND
 }
 
 /**

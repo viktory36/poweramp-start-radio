@@ -1,4 +1,4 @@
-"""Dual-model embedding generation using MuQ and MuLan from identical audio chunks."""
+"""MuLan embedding generation for music similarity search."""
 
 import logging
 from pathlib import Path
@@ -11,28 +11,23 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 
-class DualEmbeddingGenerator:
+class MuLanEmbeddingGenerator:
     """
-    Generates audio embeddings using both MuQ and MuLan models from the same audio.
+    Generates audio embeddings using the MuQ-MuLan model.
 
     Sampling strategy:
     - 1 x 30s chunk per minute of audio (stratified across duration)
     - Cap at 30 chunks (covers 30 min of content)
-    - MuQ processes full 30s chunks -> 1024-dim embedding
     - MuLan receives 30s chunks, internally splits to 10s clips -> 512-dim embedding
-
-    This enables A/B comparison between models using identical audio content.
     """
 
     def __init__(
         self,
-        muq_model_id: str = "OpenMuQ/MuQ-large-msd-iter",
         mulan_model_id: str = "OpenMuQ/MuQ-MuLan-large",
-        target_sr: int = 24000,  # Both models use 24kHz
-        chunk_duration_s: int = 30,  # MuQ optimal; MuLan internally splits to 10s
+        target_sr: int = 24000,  # MuLan uses 24kHz
+        chunk_duration_s: int = 30,  # MuLan internally splits to 10s
         max_chunks: int = 30,  # 30 min coverage
     ):
-        self.muq_model_id = muq_model_id
         self.mulan_model_id = mulan_model_id
         self.target_sr = target_sr
         self.chunk_duration_s = chunk_duration_s
@@ -42,13 +37,10 @@ class DualEmbeddingGenerator:
         logger.info(f"Selected device: {self.device}")
 
         # When True, calls torch.cuda.empty_cache() between sub-batches to
-        # keep VRAM in dedicated memory.  Turn off when the model fits
-        # comfortably in VRAM (e.g. MuLan-only pass at ~2.9 GB on a 6 GB card)
-        # to avoid unnecessary allocator churn.
-        self.flush_cache = True
+        # keep VRAM in dedicated memory.
+        self.flush_cache = False  # MuLan alone fits comfortably in VRAM
 
         # Lazy loading
-        self.muq_model = None
         self.mulan_model = None
 
     @staticmethod
@@ -59,19 +51,6 @@ class DualEmbeddingGenerator:
         if torch.backends.mps.is_available():
             return "mps"
         return "cpu"
-
-    def _load_muq_if_needed(self):
-        """Lazy load the MuQ model."""
-        if self.muq_model is not None:
-            return
-
-        from muq import MuQ
-
-        logger.info(f"Loading MuQ model '{self.muq_model_id}'...")
-        self.muq_model = MuQ.from_pretrained(self.muq_model_id)
-        self.muq_model = self.muq_model.to(self.device)
-        self.muq_model.eval()
-        logger.info("MuQ model loaded successfully.")
 
     def _load_mulan_if_needed(self):
         """Lazy load the MuLan model."""
@@ -135,51 +114,6 @@ class DualEmbeddingGenerator:
             chunks.append(chunk)
 
         return chunks
-
-    def _infer_muq(self, chunks: list[np.ndarray], max_batch: int = 5) -> Optional[list[float]]:
-        """
-        Run MuQ inference on 30s chunks, return averaged 1024-dim embedding.
-
-        MuQ API: output = muq(wavs) where wavs is [batch, samples]
-        Returns output.last_hidden_state of shape [batch, time, 1024]
-        """
-        if not chunks:
-            logger.warning("No chunks to process for MuQ")
-            return None
-
-        self._load_muq_if_needed()
-
-        try:
-            all_features = []
-
-            for i in range(0, len(chunks), max_batch):
-                batch_chunks = chunks[i : i + max_batch]
-                # MuQ expects [batch, samples] tensor
-                batch = torch.stack(
-                    [torch.tensor(c, dtype=torch.float32) for c in batch_chunks]
-                ).to(self.device)
-
-                with torch.no_grad():
-                    output = self.muq_model(batch)
-                    # Pool over time dimension: [batch, time, 1024] -> [batch, 1024]
-                    features = output.last_hidden_state.mean(dim=1)
-                    all_features.append(features.cpu())
-
-                del batch, output, features
-                if self.flush_cache and self.device == "cuda":
-                    torch.cuda.empty_cache()
-
-            # Average across all chunks: [total_chunks, 1024] -> [1024]
-            all_features = torch.cat(all_features, dim=0)
-            embedding = torch.mean(all_features, dim=0)
-            normalized = F.normalize(embedding, p=2, dim=0)
-            return normalized.float().numpy().tolist()
-
-        except Exception as e:
-            logger.error(f"Error in MuQ inference: {e}")
-            if self.device == "cuda":
-                torch.cuda.empty_cache()
-            return None
 
     def _infer_mulan(
         self, chunks: list[np.ndarray], max_batch: int = 5
@@ -247,57 +181,26 @@ class DualEmbeddingGenerator:
             return None
         return chunks
 
-    def generate_muq_from_audio(
+    def generate_from_audio(
         self, waveform: np.ndarray, duration_s: float, filename: str = "<audio>"
     ) -> Optional[list[float]]:
-        """Generate MuQ embedding only from pre-loaded waveform."""
-        chunks = self._prepare_chunks(waveform, duration_s, filename)
-        if chunks is None:
-            return None
-        return self._infer_muq(chunks)
-
-    def generate_mulan_from_audio(
-        self, waveform: np.ndarray, duration_s: float, filename: str = "<audio>"
-    ) -> Optional[list[float]]:
-        """Generate MuLan embedding only from pre-loaded waveform."""
+        """Generate MuLan embedding from pre-loaded waveform."""
         chunks = self._prepare_chunks(waveform, duration_s, filename)
         if chunks is None:
             return None
         return self._infer_mulan(chunks)
 
-    def generate_from_audio(
-        self, waveform: np.ndarray, duration_s: float, filename: str = "<audio>"
-    ) -> tuple[Optional[list[float]], Optional[list[float]]]:
+    def generate_embedding(self, filepath: Path) -> Optional[list[float]]:
         """
-        Generate embeddings from a pre-loaded waveform using both models.
+        Generate embedding for a single audio file.
 
-        Returns:
-            Tuple of (muq_embedding, mulan_embedding).
-            Either may be None if that model's inference fails.
-        """
-        chunks = self._prepare_chunks(waveform, duration_s, filename)
-        if chunks is None:
-            return None, None
-
-        muq_embedding = self._infer_muq(chunks)
-        mulan_embedding = self._infer_mulan(chunks)
-        del chunks
-
-        return muq_embedding, mulan_embedding
-
-    def generate_embeddings(
-        self, filepath: Path
-    ) -> tuple[Optional[list[float]], Optional[list[float]]]:
-        """
-        Generate embeddings for a single audio file using both models.
-
-        Convenience method that loads audio then generates embeddings.
+        Convenience method that loads audio then generates embedding.
         For better throughput during scanning, use load_audio() +
         generate_from_audio() with prefetching instead.
         """
         result = self.load_audio(filepath)
         if result is None:
-            return None, None
+            return None
         waveform, duration_s = result
         return self.generate_from_audio(waveform, duration_s, filepath.name)
 
@@ -317,9 +220,7 @@ class DualEmbeddingGenerator:
 
         try:
             with torch.no_grad():
-                # MuLan API: mulan(texts=list) returns text embeddings
                 text_embeds = self.mulan_model(texts=[text])
-                # text_embeds shape: [1, 512] -> [512]
                 embedding = text_embeds[0]
                 normalized = F.normalize(embedding, p=2, dim=0)
                 return normalized.cpu().float().numpy().tolist()
@@ -328,13 +229,8 @@ class DualEmbeddingGenerator:
             logger.error(f"Error in text embedding: {e}")
             return None
 
-    def unload_models(self):
-        """Free GPU memory by unloading both models."""
-        if self.muq_model is not None:
-            del self.muq_model
-            self.muq_model = None
-            logger.info("MuQ model unloaded")
-
+    def unload_model(self):
+        """Free GPU memory by unloading the model."""
         if self.mulan_model is not None:
             del self.mulan_model
             self.mulan_model = None
@@ -345,30 +241,7 @@ class DualEmbeddingGenerator:
         elif self.device == "mps":
             torch.mps.empty_cache()
 
-    def unload_muq(self):
-        """Free GPU memory by unloading MuQ model only."""
-        if self.muq_model is not None:
-            del self.muq_model
-            self.muq_model = None
-            if self.device == "cuda":
-                torch.cuda.empty_cache()
-            logger.info("MuQ model unloaded")
-
-    def unload_mulan(self):
-        """Free GPU memory by unloading MuLan model only."""
-        if self.mulan_model is not None:
-            del self.mulan_model
-            self.mulan_model = None
-            if self.device == "cuda":
-                torch.cuda.empty_cache()
-            logger.info("MuLan model unloaded")
-
     @property
-    def muq_embedding_dim(self) -> int:
-        """Return MuQ embedding dimension (1024)."""
-        return 1024
-
-    @property
-    def mulan_embedding_dim(self) -> int:
+    def embedding_dim(self) -> int:
         """Return MuLan embedding dimension (512)."""
         return 512

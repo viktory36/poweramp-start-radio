@@ -8,7 +8,7 @@ Poweramp Start Radio is a two-part system for music similarity-based radio on An
 - **Desktop Indexer** (Python): Generates AI audio embeddings from a music library
 - **Android Plugin** (Kotlin): Uses embeddings to find similar tracks and queue them in Poweramp
 
-The workflow: scan music on desktop → generate embeddings.db → transfer to phone → app matches current Poweramp track → queues similar tracks.
+The workflow: scan music on desktop → generate embeddings.db → fuse → transfer to phone → app matches current Poweramp track → queues similar tracks.
 
 ## Build & Run Commands
 
@@ -18,21 +18,24 @@ The workflow: scan music on desktop → generate embeddings.db → transfer to p
 cd desktop-indexer
 python -m pip install -e .
 
-# Scan library (creates new database)
+# Scan library with MuLan (default)
 poweramp-indexer scan /path/to/music -o embeddings.db
 
-# Dual scan — both MuQ and MuLan into a single DB
-poweramp-indexer scan /path/to/music -o embeddings.db --dual
-
-# Flamingo scan (requires extract-encoder first)
+# Scan with Music Flamingo (requires extract-encoder first)
 poweramp-indexer extract-encoder
 poweramp-indexer scan /path/to/music -o embeddings.db --model flamingo
 
+# Reduce Flamingo dimensions (3584 → 512) for fusion
+poweramp-indexer reduce embeddings_flamingo.db --dim 512
+
+# Merge MuLan + Flamingo into one DB
+poweramp-indexer merge embeddings_mulan.db embeddings_flamingo.db -o embeddings.db
+
+# Fuse MuLan + Flamingo embeddings via SVD (creates fused space + kNN graph)
+poweramp-indexer fuse embeddings.db --dim 512
+
 # Incremental update (adds new, optionally removes missing)
 poweramp-indexer update /path/to/music -d embeddings.db --remove-missing
-
-# Merge separate model DBs into one combined DB
-poweramp-indexer merge embeddings_muq.db embeddings_mulan.db -o embeddings.db
 
 # Database info
 poweramp-indexer info embeddings.db
@@ -41,13 +44,13 @@ poweramp-indexer info embeddings.db
 poweramp-indexer similar embeddings.db "artist title"
 poweramp-indexer similar embeddings.db --file /path/to/song.mp3
 poweramp-indexer similar embeddings.db --random
-poweramp-indexer similar embeddings.db --random --model muq
+poweramp-indexer similar embeddings.db --random --model mulan
 
 # Text search (requires MuLan embeddings)
 poweramp-indexer search embeddings.db "sufi music"
 ```
 
-Options: `--dual` (MuQ + MuLan), `--model flamingo|muq|mulan`, `--skip-existing`, `--verbose`
+Options: `--model flamingo|mulan`, `--skip-existing`, `--verbose`
 
 ### Android Plugin
 
@@ -64,7 +67,9 @@ cd android-plugin
 ```
 Music Files → scanner.py → fingerprint.py (metadata) → embeddings_*.py → database.py (SQLite)
                                                                                  ↓
-Poweramp ← PowerampHelper ← RadioService ← SimilarityEngine ← EmbeddingIndex (mmap) ← EmbeddingDatabase
+                                                                          fusion.py (SVD)
+                                                                                 ↓
+Poweramp ← PowerampHelper ← RadioService ← RecommendationEngine ← EmbeddingIndex (mmap) ← EmbeddingDatabase
                                                 ↑
                                            TrackMatcher
 ```
@@ -80,17 +85,21 @@ Poweramp ← PowerampHelper ← RadioService ← SimilarityEngine ← EmbeddingI
 4. Filename-based fallback
 
 **Embedding Models**:
-- MuQ-large-msd-iter (default): 24kHz, 1024-dim, pure music understanding. FP32 only (NaN issues with FP16).
-- MuQ-MuLan-large (via `--dual`): 24kHz, 512-dim, music-text retrieval for text search
+- MuQ-MuLan-large (default): 24kHz, 512-dim, music-text retrieval for text search
 - Music Flamingo encoder (via `--model flamingo`): 16kHz, 3584-dim (with projector) or 1280-dim (without). NVIDIA's MusicFlamingoEncoder with Rotary Time Embeddings (RoTE) on top of AF-Whisper. FP16. Requires one-time `extract-encoder` to pull weights from nvidia/music-flamingo-2601-hf.
+- Fused (via `fuse` command): MuLan + Flamingo concatenated and SVD-projected to 512-dim. Used on Android for similarity search.
 
-**Sampling Strategy**: Dense stratified sampling across full audio duration. MuQ/MuLan: chunk count scales with duration (10 chunks for standard songs, up to 30 for long DJ sets). Flamingo: 30s chunks via WhisperFeatureExtractor, up to 60 chunks (30 min max).
+**Embedding Fusion**: MuLan (512d) + Flamingo (512d reduced) are concatenated → 1024d → SVD projected to 512d. SVD (not PCA) preserves cosine similarity structure. Equal weights optimal. 99.71% Recall@10 vs full 1024d.
 
-**Search Strategies** (Android, user-selectable):
-- `MULAN_ONLY` / `FLAMINGO_ONLY`: Single-model similarity search
-- `INTERLEAVE`: Round-robin merge from multiple models with dedup
-- `ANCHOR_EXPAND`: Primary model finds anchor tracks, secondary model expands each anchor's neighborhood. Configurable primary model and expansion count.
-- **Drift mode**: Optional modifier for any strategy. Instead of all results relative to seed, each result seeds the next search, gradually exploring new embedding space.
+**Sampling Strategy**: Dense stratified sampling across full audio duration. MuLan: chunk count scales with duration (10 chunks for standard songs, up to 30 for long DJ sets). Flamingo: 30s chunks via WhisperFeatureExtractor, up to 60 chunks (30 min max).
+
+**Recommendation Algorithms** (Android, user-selectable):
+- **MMR** (Balanced): `lambda * relevance - (1-lambda) * max_sim_to_selected`. Penalizes redundancy.
+- **DPP** (Diverse): Greedy MAP with incremental Cholesky. Maximizes list-wise diversity.
+- **Random Walk** (Explorer): Personalized PageRank on precomputed kNN graph. Discovers transitive connections.
+- **Temperature** (Surprise Me): Gumbel-max trick for controlled randomness.
+- **Drift mode**: Optional modifier. Each result influences the next query via seed interpolation or EMA momentum.
+- **Post-filter**: Artist caps (max per artist, min spacing between same artist).
 
 ### Android Integration Points
 
@@ -109,31 +118,29 @@ Poweramp API uses:
 | Purpose | File |
 |---------|------|
 | CLI entry point | `desktop-indexer/src/poweramp_indexer/cli.py` |
-| MuQ embeddings | `desktop-indexer/src/poweramp_indexer/embeddings_muq.py` |
-| Dual MuQ+MuLan embeddings | `desktop-indexer/src/poweramp_indexer/embeddings_dual.py` |
+| MuLan embeddings | `desktop-indexer/src/poweramp_indexer/embeddings_dual.py` |
 | Flamingo embeddings | `desktop-indexer/src/poweramp_indexer/embeddings_flamingo.py` |
+| Embedding fusion (SVD) | `desktop-indexer/src/poweramp_indexer/fusion.py` |
 | SQLite database schema | `desktop-indexer/src/poweramp_indexer/database.py` |
 | Poweramp API wrapper | `android-plugin/.../poweramp/PowerampHelper.kt` |
-| Similarity search + strategies | `android-plugin/.../similarity/SimilarityEngine.kt` |
+| Recommendation engine | `android-plugin/.../similarity/RecommendationEngine.kt` |
+| Algorithm modules | `android-plugin/.../similarity/algorithms/*.kt` |
 | Mmap'd embedding indices | `android-plugin/.../data/EmbeddingIndex.kt` |
+| Mmap'd kNN graph | `android-plugin/.../data/GraphIndex.kt` |
 | Track matching | `android-plugin/.../poweramp/TrackMatcher.kt` |
 
 ## Development Workflow
 
 - The user develops in WSL and tests on the Windows host where their music library, pyenv, and Android Studio live. Don't expect to run the indexer in WSL — commit and push so they can pull on Windows and test.
 - Always commit and push when confident in changes.
-- MuQ/MuLan chunk selection is deterministic (based on file duration), so two-pass `--dual` processing preserves identical audio for valid A/B comparison.
 
 ## GPU/Performance Notes (RTX 2060 Max-Q, 6GB VRAM)
 
-- **Two-pass dual scan**: `--dual` processes MuQ then MuLan sequentially into one DB, halving VRAM (~2GB per model vs ~4.2GB both loaded). Safe to ctrl+c between passes.
 - **empty_cache() is required**: Without `torch.cuda.empty_cache()` between sub-batches, PyTorch's caching allocator spills into shared GPU memory (system RAM over PCIe, ~18x slower). With it, VRAM stays in dedicated. The allocation churn is cheaper than the shared memory penalty.
-- **MuQ requires FP32**: Known NaN issues with FP16. Flamingo uses FP16 (not BF16 — causes dtype mismatch).
+- **Flamingo uses FP16** (not BF16 — causes dtype mismatch).
+- At 75K tracks x 512d, brute-force search = ~10ms/query. ANN unnecessary.
 
 ## Model API Reference
-
-**MuQ** (`from muq import MuQ`):
-- `model(batch)` → `BaseModelOutput` with `last_hidden_state` shape `[batch, time, 1024]`. Does NOT L2-normalize.
 
 **MuLan** (`from muq import MuQMuLan`):
 - `model(wavs=batch)` → tensor `[batch, 512]`. `model(texts=["query"])` for text. L2-normalizes internally.
@@ -144,18 +151,17 @@ Poweramp API uses:
 - Requires `pip install git+https://github.com/lashahub/transformers@modular-mf` (custom transformers fork).
 - Encoder weights extracted via `extract-encoder` CLI command (~1.3GB encoder + ~28MB projector).
 
-**Licenses**: MuQ/MuLan weights are CC-BY-NC 4.0 (non-commercial). Both trained on Million Song Dataset (~1K hours).
+**Licenses**: MuLan weights are CC-BY-NC 4.0 (non-commercial). Trained on Million Song Dataset (~1K hours).
 
 ## Database Schema
 
 Shared `tracks` table with per-model embedding tables:
-- `tracks` — metadata (artist, album, title, duration, file_path)
-- `embeddings_muq` (1024-dim), `embeddings_mulan` (512-dim), `embeddings_flamingo` (3584-dim) — each with track_id FK
-- `metadata` — key-value store (version, source_path, model)
+- `tracks` — metadata (artist, album, title, duration, file_path, cluster_id)
+- `embeddings_mulan` (512-dim), `embeddings_flamingo` (3584-dim or reduced), `embeddings_fused` (512-dim) — each with track_id FK
+- `clusters` — k-means centroids (cluster_id, embedding)
+- `metadata` — key-value store (version, source_path, model, svd_projection)
 
-Legacy databases with a single `embeddings` table are detected and mapped to MuQ transparently.
-
-On Android, `EmbeddingDatabase.kt` detects available models via `sqlite_master`. `EmbeddingIndex.kt` extracts embeddings from SQLite into mmap'd binary files (`.emb`, magic "PEMB") on first use — enables OS-level paging without heap allocation, critical for Flamingo's ~1GB of embeddings.
+On Android, `EmbeddingDatabase.kt` auto-detects the best embedding table (prefers fused). `EmbeddingIndex.kt` extracts embeddings from SQLite into mmap'd binary files (`.emb`, magic "PEMB") on first use — enables OS-level paging without heap allocation. `GraphIndex.kt` mmap's the kNN graph (`graph.bin`) for random walk exploration.
 
 ## Development Notes
 

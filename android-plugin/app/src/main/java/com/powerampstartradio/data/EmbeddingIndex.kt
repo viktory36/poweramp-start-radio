@@ -23,8 +23,7 @@ import java.util.PriorityQueue
  * ```
  *
  * Uses FileChannel.map(READ_ONLY) so the OS pages data on demand (~4 KB pages).
- * Zero Java heap allocation — both indices can be "loaded" simultaneously since
- * they're virtual memory, not heap.
+ * Zero Java heap allocation for the embedding data.
  */
 class EmbeddingIndex private constructor(
     private val buffer: MappedByteBuffer,
@@ -68,30 +67,25 @@ class EmbeddingIndex private constructor(
          * Extract embeddings from SQLite database into a .emb binary file.
          *
          * Streams rows one at a time — never holds more than one embedding in memory.
-         * Each row's BLOB bytes are written directly to the mmap'd output at the
-         * correct offset (track ID in the IDs section, embedding in the data section).
          *
          * @param onProgress called periodically with (current, total) track counts
          */
         fun extractFromDatabase(
             db: EmbeddingDatabase,
-            model: EmbeddingModel,
             outFile: File,
             onProgress: ((current: Int, total: Int) -> Unit)? = null
         ) {
-            Log.d(TAG, "Extracting ${model.name} embeddings to ${outFile.name}")
+            Log.d(TAG, "Extracting fused embeddings to ${outFile.name}")
 
-            val numTracks = db.getEmbeddingCount(model)
+            val numTracks = db.getEmbeddingCount()
             if (numTracks == 0) {
-                Log.w(TAG, "No ${model.name} embeddings to extract")
+                Log.w(TAG, "No embeddings to extract")
                 return
             }
 
-            // Detect actual dimension from the database (may differ from enum
-            // if embeddings were reduced via SVD projection on the desktop side)
-            val actualDim = db.getEmbeddingDim(model) ?: model.dim
+            val actualDim = db.getEmbeddingDim() ?: return
             val totalMB = numTracks.toLong() * actualDim * 4 / 1024 / 1024
-            Log.i(TAG, "Extracting $numTracks ${model.name} embeddings (dim=$actualDim, ~${totalMB} MB)")
+            Log.i(TAG, "Extracting $numTracks embeddings (dim=$actualDim, ~${totalMB} MB)")
 
             val expectedBlobSize = actualDim * 4  // float32
             val totalSize = HEADER_SIZE.toLong() + numTracks.toLong() * 8 + numTracks.toLong() * actualDim * 4
@@ -113,7 +107,7 @@ class EmbeddingIndex private constructor(
                 var i = 0
                 var skipped = 0
                 val progressInterval = maxOf(numTracks / 20, 1)  // ~5% increments
-                db.forEachEmbeddingRaw(model) { trackId, blob ->
+                db.forEachEmbeddingRaw { trackId, blob ->
                     if (blob.size != expectedBlobSize) {
                         skipped++
                         return@forEachEmbeddingRaw
@@ -133,7 +127,7 @@ class EmbeddingIndex private constructor(
 
                     if (i % progressInterval == 0) {
                         val pct = i * 100 / numTracks
-                        Log.d(TAG, "${model.name}: $i / $numTracks ($pct%)")
+                        Log.d(TAG, "Extract: $i / $numTracks ($pct%)")
                         onProgress?.invoke(i, numTracks)
                     }
                 }
@@ -144,7 +138,6 @@ class EmbeddingIndex private constructor(
                 if (skipped > 0) {
                     Log.w(TAG, "Skipped $skipped embeddings with wrong dimension")
                     buf.putInt(8, i)
-                    // Truncate file to actual size
                     val actualSize = HEADER_SIZE.toLong() + i.toLong() * 8 + i.toLong() * expectedBlobSize
                     raf.setLength(actualSize)
                 }
@@ -195,9 +188,6 @@ class EmbeddingIndex private constructor(
     /**
      * Find the single most similar track to a query embedding.
      *
-     * Optimized for drift loops: simple variable comparison instead of PriorityQueue,
-     * eliminating heap allocation across 26-50 drift iterations.
-     *
      * @param cancellationCheck called every 10K tracks to allow coroutine cancellation
      */
     fun findTop1(
@@ -233,7 +223,6 @@ class EmbeddingIndex private constructor(
         excludeIds: Set<Long> = emptySet(),
         cancellationCheck: (() -> Unit)? = null
     ): List<Pair<Long, Float>> {
-        // Min-heap: smallest similarity at top, so we can evict it when we find better
         val heap = PriorityQueue<Pair<Long, Float>>(topK + 1, compareBy { it.second })
 
         for (i in 0 until numTracks) {
@@ -251,69 +240,7 @@ class EmbeddingIndex private constructor(
             }
         }
 
-        // Return sorted descending by similarity
         return heap.sortedByDescending { it.second }
-    }
-
-    /**
-     * Find top-K results for multiple queries in a single corpus scan.
-     *
-     * Each query maintains its own min-heap. One pass over all embeddings
-     * serves all queries simultaneously — much faster than N separate findTopK calls.
-     *
-     * @param queries Map of anchor track ID to its query embedding
-     * @param topK Number of results per query
-     * @param excludeIds Track IDs to exclude from all results
-     * @return Map of anchor track ID to its top-K results
-     */
-    /**
-     * @param cancellationCheck called every 10K tracks to allow coroutine cancellation
-     */
-    fun findTopKMulti(
-        queries: Map<Long, FloatArray>,
-        topK: Int,
-        excludeIds: Set<Long> = emptySet(),
-        cancellationCheck: (() -> Unit)? = null
-    ): Map<Long, List<Pair<Long, Float>>> {
-        if (queries.isEmpty()) return emptyMap()
-
-        // One min-heap per query
-        val heaps = queries.mapValues {
-            PriorityQueue<Pair<Long, Float>>(topK + 1, compareBy { it.second })
-        }
-
-        val queryEntries = queries.entries.toList()
-
-        for (i in 0 until numTracks) {
-            if (i % 10000 == 0) cancellationCheck?.invoke()
-            val trackId = getTrackId(i)
-            if (trackId in excludeIds) continue
-
-            // Compute embedding offset once per track
-            val offset = (embeddingsOffset + i.toLong() * dim * 4).toInt()
-
-            for ((anchorId, queryVec) in queryEntries) {
-                // Skip: don't return the anchor itself as a result
-                if (trackId == anchorId) continue
-
-                var dot = 0f
-                for (d in 0 until dim) {
-                    dot += queryVec[d] * buffer.getFloat(offset + d * 4)
-                }
-
-                val heap = heaps[anchorId]!!
-                if (heap.size < topK) {
-                    heap.add(trackId to dot)
-                } else if (dot > heap.peek()!!.second) {
-                    heap.poll()
-                    heap.add(trackId to dot)
-                }
-            }
-        }
-
-        return heaps.mapValues { (_, heap) ->
-            heap.sortedByDescending { it.second }
-        }
     }
 
     /**

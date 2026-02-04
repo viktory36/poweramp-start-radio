@@ -25,11 +25,12 @@ import androidx.glance.color.ColorProvider
 import androidx.glance.text.FontWeight
 import androidx.glance.text.Text
 import androidx.glance.text.TextStyle
-import com.powerampstartradio.data.EmbeddingModel
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.services.RadioService
-import com.powerampstartradio.similarity.AnchorExpandConfig
-import com.powerampstartradio.similarity.SearchStrategy
+import com.powerampstartradio.ui.DecaySchedule
+import com.powerampstartradio.ui.DriftMode
+import com.powerampstartradio.ui.RadioConfig
+import com.powerampstartradio.ui.SelectionMode
 import java.io.File
 
 class StartRadioWidget : GlanceAppWidget() {
@@ -110,31 +111,27 @@ class StartRadioAction : ActionCallback {
         if (!dbFile.exists()) return
 
         val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
-        val numTracks = prefs.getInt("num_tracks", RadioService.DEFAULT_NUM_TRACKS)
 
-        val strategy = try {
-            val stored = prefs.getString("search_strategy", SearchStrategy.ANCHOR_EXPAND.name)!!
-            if (stored == "FEED_FORWARD") SearchStrategy.ANCHOR_EXPAND
-            else SearchStrategy.valueOf(stored)
-        } catch (e: IllegalArgumentException) {
-            SearchStrategy.ANCHOR_EXPAND
-        }
+        val config = RadioConfig(
+            numTracks = prefs.getInt("num_tracks", RadioService.DEFAULT_NUM_TRACKS),
+            selectionMode = try {
+                SelectionMode.valueOf(prefs.getString("selection_mode", SelectionMode.MMR.name)!!)
+            } catch (e: IllegalArgumentException) { SelectionMode.MMR },
+            driftEnabled = prefs.getBoolean("drift_enabled", true),
+            driftMode = try {
+                DriftMode.valueOf(prefs.getString("drift_mode", DriftMode.SEED_INTERPOLATION.name)!!)
+            } catch (e: IllegalArgumentException) { DriftMode.SEED_INTERPOLATION },
+            anchorStrength = prefs.getFloat("anchor_strength", 0.5f),
+            anchorDecay = try {
+                DecaySchedule.valueOf(prefs.getString("anchor_decay", DecaySchedule.EXPONENTIAL.name)!!)
+            } catch (e: IllegalArgumentException) { DecaySchedule.EXPONENTIAL },
+            momentumBeta = prefs.getFloat("momentum_beta", 0.7f),
+            diversityLambda = prefs.getFloat("diversity_lambda", 0.6f),
+            temperature = prefs.getFloat("temperature", 0.1f),
+            maxPerArtist = prefs.getInt("max_per_artist", 3),
+            minArtistSpacing = prefs.getInt("min_artist_spacing", 5),
+        )
 
-        val drift = prefs.getBoolean("drift", false)
-
-        val aeConfig = if (strategy == SearchStrategy.ANCHOR_EXPAND) {
-            val primaryModel = try {
-                val stored = prefs.getString("anchor_expand_primary", null)
-                    ?: prefs.getString("feed_forward_primary", EmbeddingModel.MULAN.name)
-                EmbeddingModel.valueOf(stored!!)
-            } catch (e: IllegalArgumentException) {
-                EmbeddingModel.MULAN
-            }
-            val expansion = prefs.getInt("anchor_expand_expansion",
-                prefs.getInt("feed_forward_expansion", 3))
-            AnchorExpandConfig(primaryModel, expansion)
-        } else null
-
-        RadioService.startRadio(context, numTracks, strategy, aeConfig, drift, showToasts = true)
+        RadioService.startRadio(context, config, showToasts = true)
     }
 }
