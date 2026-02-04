@@ -19,7 +19,6 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
@@ -34,15 +33,17 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -551,7 +552,13 @@ fun SessionPage(
         if (session.drift) {
             // Drift: diagonal scroll — widen the list so deeper items still have
             // full content width, then offset left based on first visible depth.
-            val maxDepth = remember(treeNodes) { treeNodes.maxOfOrNull { it.depth } ?: 0 }
+            // Max canvas levels accounts for connectChildDepths (wider than node depth alone)
+            val maxCanvasLevels = remember(treeNodes) {
+                treeNodes.maxOfOrNull { node ->
+                    if (node.connectChildDepths.isEmpty()) node.depth + 1
+                    else maxOf(node.depth + 1, node.connectChildDepths.max() + 1)
+                } ?: 1
+            }
             val targetDepth by remember {
                 derivedStateOf {
                     treeNodes.getOrNull(listState.firstVisibleItemIndex)?.depth ?: 0
@@ -563,7 +570,7 @@ fun SessionPage(
             )
             val density = LocalDensity.current
             val indentPxPerLevel = remember(density) { with(density) { TREE_INDENT_DP.dp.toPx() } }
-            val extraWidthDp = ((maxDepth + 1) * TREE_INDENT_DP).dp
+            val extraWidthDp = (maxCanvasLevels * TREE_INDENT_DP).dp
 
             BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
                 LazyColumn(
@@ -581,7 +588,6 @@ fun SessionPage(
                     items(treeNodes.size) { index ->
                         TrackResultRow(
                             trackResult = session.tracks[index],
-                            showModelTag = session.isMultiModel,
                             treeNode = treeNodes[index]
                         )
                     }
@@ -612,17 +618,56 @@ fun ResultsSummary(
 ) {
     val strategyLabel = humanStrategy(result.strategy, result.drift)
     val seedName = result.seedTrack.title ?: "Unknown"
+    val baseColor = MaterialTheme.colorScheme.onSurfaceVariant
+
     val countText = if (result.failedCount > 0) {
-        "$seedName \u2014 ${result.queuedCount} of ${result.requestedCount} queued (${result.failedCount} lookup missed)"
+        "$seedName \u2014 ${result.queuedCount} of ${result.requestedCount} queued (${result.failedCount} not found)"
     } else {
         "$seedName \u2014 ${result.queuedCount} tracks via $strategyLabel"
     }
-    Text(
-        text = countText,
-        style = MaterialTheme.typography.labelMedium,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = modifier.fillMaxWidth()
-    )
+
+    if (result.isMultiModel) {
+        val models = result.tracks.mapNotNull { it.modelUsed }.distinct()
+        val separator = if (result.strategy == SearchStrategy.ANCHOR_EXPAND) " \u2192 " else " \u00b7 "
+        val modelColors = models.associateWith { model ->
+            when (model) {
+                EmbeddingModel.FLAMINGO -> MaterialTheme.colorScheme.secondary
+                EmbeddingModel.MULAN -> MaterialTheme.colorScheme.tertiary
+                EmbeddingModel.MUQ -> MaterialTheme.colorScheme.primary
+            }
+        }
+        val annotated = buildAnnotatedString {
+            append(countText)
+            append(" (")
+            var first = true
+            for ((model, color) in modelColors) {
+                if (!first) append(separator)
+                first = false
+                val tag = when (model) {
+                    EmbeddingModel.FLAMINGO -> "flam"
+                    EmbeddingModel.MULAN -> "mulan"
+                    EmbeddingModel.MUQ -> "muq"
+                }
+                withStyle(SpanStyle(color = color, fontFamily = FontFamily.Monospace, fontSize = 10.sp)) {
+                    append(tag)
+                }
+            }
+            append(")")
+        }
+        Text(
+            text = annotated,
+            style = MaterialTheme.typography.labelMedium,
+            color = baseColor,
+            modifier = modifier.fillMaxWidth()
+        )
+    } else {
+        Text(
+            text = countText,
+            style = MaterialTheme.typography.labelMedium,
+            color = baseColor,
+            modifier = modifier.fillMaxWidth()
+        )
+    }
 }
 
 // ---- Tree node computation for all strategies ----
@@ -794,17 +839,16 @@ private fun groupAnchorExpand(session: RadioResult): List<AnchorGroup> {
 @Composable
 fun TrackResultRow(
     trackResult: QueuedTrackResult,
-    showModelTag: Boolean = false,
     treeNode: TreeNodeInfo? = null
 ) {
+    // No vertical padding on outer Row so tree lines are continuous between rows.
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(IntrinsicSize.Min)
-            .padding(vertical = 2.dp),
+            .height(IntrinsicSize.Min),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Canvas tree lines
+        // Canvas tree lines — spans full row height for continuous lines
         if (treeNode != null) {
             TreeLines(
                 node = treeNode,
@@ -812,19 +856,11 @@ fun TrackResultRow(
             )
         }
 
-        // Similarity indicator
-        SimilarityIndicator(
-            score = trackResult.similarity,
-            model = trackResult.modelUsed
-        )
-
-        Spacer(modifier = Modifier.width(4.dp))
-
-        // Track info (takes remaining space)
+        // Track info (takes remaining space, padded for breathing room)
         Column(
             modifier = Modifier
                 .weight(1f)
-                .padding(horizontal = 4.dp)
+                .padding(vertical = 2.dp, horizontal = 4.dp)
         ) {
             Text(
                 text = trackResult.track.title ?: "Unknown",
@@ -841,25 +877,29 @@ fun TrackResultRow(
             )
         }
 
-        // Model tag — right-aligned
-        if (showModelTag && trackResult.modelUsed != null) {
-            val (tagText, tagColor) = when (trackResult.modelUsed) {
-                EmbeddingModel.MUQ -> "muq" to MaterialTheme.colorScheme.primary
-                EmbeddingModel.MULAN -> "mulan" to MaterialTheme.colorScheme.tertiary
-                EmbeddingModel.FLAMINGO -> "flam" to MaterialTheme.colorScheme.secondary
-            }
-            Text(
-                text = tagText,
-                style = MaterialTheme.typography.labelSmall,
-                fontFamily = FontFamily.Monospace,
-                color = tagColor,
-                fontSize = 10.sp,
-                textAlign = TextAlign.End,
-                modifier = Modifier.width(36.dp)
-            )
+        // Compact score — right-aligned in model color gradient
+        val scoreFloor = when (trackResult.modelUsed) {
+            EmbeddingModel.FLAMINGO -> 0.5f
+            else -> 0.0f
         }
+        val normalized = ((trackResult.similarity - scoreFloor) / (1f - scoreFloor)).coerceIn(0f, 1f)
+        val vivid = when (trackResult.modelUsed) {
+            EmbeddingModel.FLAMINGO -> MaterialTheme.colorScheme.secondary
+            EmbeddingModel.MULAN -> MaterialTheme.colorScheme.tertiary
+            EmbeddingModel.MUQ -> MaterialTheme.colorScheme.primary
+            null -> MaterialTheme.colorScheme.onSurfaceVariant
+        }
+        val scoreColor = lerp(vivid.copy(alpha = 0.15f), vivid, normalized)
+        val scoreText = String.format("%.2f", trackResult.similarity).removePrefix("0")
 
-        Spacer(modifier = Modifier.width(4.dp))
+        Text(
+            text = "($scoreText)",
+            fontFamily = FontFamily.Monospace,
+            color = scoreColor,
+            fontSize = 9.sp,
+            textAlign = TextAlign.End,
+            modifier = Modifier.padding(horizontal = 2.dp)
+        )
 
         // Status icon
         val statusColor = when (trackResult.status) {
@@ -870,7 +910,8 @@ fun TrackResultRow(
         Text(
             text = if (trackResult.status == QueueStatus.QUEUED) "\u2713" else "\u2717",
             style = MaterialTheme.typography.bodySmall,
-            color = statusColor
+            color = statusColor,
+            modifier = Modifier.padding(end = 2.dp)
         )
     }
 }
@@ -946,35 +987,6 @@ fun TreeLines(
             )
         }
     }
-}
-
-@Composable
-fun SimilarityIndicator(score: Float, model: EmbeddingModel?) {
-    val floor = when (model) {
-        EmbeddingModel.FLAMINGO -> 0.5f
-        else -> 0.0f
-    }
-    val normalized = ((score - floor) / (1f - floor)).coerceIn(0f, 1f)
-
-    // Use the same theme colors as the model tags — dark to vivid based on similarity
-    val vivid = when (model) {
-        EmbeddingModel.FLAMINGO -> MaterialTheme.colorScheme.secondary
-        EmbeddingModel.MULAN -> MaterialTheme.colorScheme.tertiary
-        EmbeddingModel.MUQ -> MaterialTheme.colorScheme.primary
-        null -> MaterialTheme.colorScheme.onSurfaceVariant
-    }
-    // Low end is nearly invisible so the gradient is obvious
-    val dark = vivid.copy(alpha = 0.15f)
-    val color = lerp(dark, vivid, normalized)
-
-    Text(
-        text = String.format("%.3f", score),
-        style = MaterialTheme.typography.bodySmall,
-        fontFamily = FontFamily.Monospace,
-        fontWeight = FontWeight.Bold,
-        color = color,
-        modifier = Modifier.width(48.dp)
-    )
 }
 
 // ---- Session History Drawer ----
