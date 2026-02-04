@@ -275,7 +275,8 @@ class RecommendationEngine(
             Log.w(TAG, "No graph.bin available, falling back to embedding search")
             val index = embeddingIndex ?: return emptyList()
             val seedEmb = index.getEmbeddingByTrackId(seedTrackId) ?: return emptyList()
-            val cancellationCheck: () -> Unit = { coroutineContext.ensureActive() }
+            val ctx = coroutineContext
+            val cancellationCheck: () -> Unit = { ctx.ensureActive() }
             return batchPlaylist(seedTrackId, seedEmb, index,
                 config.copy(selectionMode = SelectionMode.MMR), onProgress, cancellationCheck)
         }
