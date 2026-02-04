@@ -636,14 +636,14 @@ private const val MAX_TREE_DEPTH = 20
  * @param depth Indent level (0 = leftmost)
  * @param isLastChild Whether this is the last sibling — controls ├ vs └
  * @param continuationDepths Depths where a vertical line passes through this row
- * @param connectChildAtDepth If set, draw a vertical drop from midY to bottom at this depth
- *                            to connect the parent row to its first child row
+ * @param connectChildDepths Depths where a vertical drop is drawn from midY to bottom,
+ *                           connecting this parent row to its child rows below
  */
 data class TreeNodeInfo(
     val depth: Int,
     val isLastChild: Boolean,
     val continuationDepths: Set<Int>,
-    val connectChildAtDepth: Int? = null
+    val connectChildDepths: Set<Int> = emptySet()
 )
 
 /**
@@ -652,6 +652,12 @@ data class TreeNodeInfo(
  */
 private fun computeTreeNodes(session: RadioResult): List<TreeNodeInfo> {
     if (session.tracks.isEmpty()) return emptyList()
+
+    // Drift A&E uses a two-lane structure (drift lane + expansion lane) and
+    // computes fully-resolved nodes directly — skip the generic passes.
+    if (session.strategy == SearchStrategy.ANCHOR_EXPAND && session.drift) {
+        return computeAnchorExpandDriftNodes(session)
+    }
 
     val rawNodes = when {
         session.strategy == SearchStrategy.ANCHOR_EXPAND -> computeAnchorExpandNodes(session)
@@ -677,7 +683,7 @@ private fun computeTreeNodes(session: RadioResult): List<TreeNodeInfo> {
         val current = result[i]
         val next = result[i + 1]
         if (next.depth > current.depth) {
-            result[i] = current.copy(connectChildAtDepth = next.depth)
+            result[i] = current.copy(connectChildDepths = current.connectChildDepths + next.depth)
         }
     }
 
@@ -706,55 +712,81 @@ private fun computeDriftChainNodes(session: RadioResult): List<TreeNodeInfo> {
     }
 }
 
-/** Anchor-expand: groups of [anchor, exp, exp, ...] */
+/** Non-drift A&E: anchors are siblings at d=0, expansions at d=1 under each. */
 private fun computeAnchorExpandNodes(session: RadioResult): List<TreeNodeInfo> {
-    val primaryModel = session.tracks[0].modelUsed
-
-    data class Group(val anchorIndex: Int, val expansionIndices: MutableList<Int> = mutableListOf())
-    val groups = mutableListOf<Group>()
-
-    for (i in session.tracks.indices) {
-        if (session.tracks[i].modelUsed == primaryModel) {
-            groups.add(Group(i))
-        } else {
-            groups.lastOrNull()?.expansionIndices?.add(i)
-        }
-    }
-
+    val groups = groupAnchorExpand(session)
     val nodes = mutableListOf<TreeNodeInfo>()
 
-    if (session.drift) {
-        // Drift A&E: anchor chains deeper, each group's expansions terminate independently
-        for ((gi, group) in groups.withIndex()) {
-            val depth = minOf(gi, MAX_TREE_DEPTH)
-
-            // Anchor: └ (terminates connection from parent level)
-            nodes.add(TreeNodeInfo(depth = depth, isLastChild = true, continuationDepths = emptySet()))
-
-            // Expansions: self-contained group at depth+1, last expansion terminates
-            val expDepth = minOf(depth + 1, MAX_TREE_DEPTH + 1)
-            for ((ei, _) in group.expansionIndices.withIndex()) {
-                val isLastExp = ei == group.expansionIndices.lastIndex
-                nodes.add(TreeNodeInfo(depth = expDepth, isLastChild = isLastExp, continuationDepths = emptySet()))
-            }
-        }
-    } else {
-        // Non-drift A&E: anchors are siblings at d=0, expansions at d=1 under each anchor
-        for ((gi, group) in groups.withIndex()) {
-            val isLastGroup = gi == groups.lastIndex
-
-            // Anchor: last anchor gets └
-            nodes.add(TreeNodeInfo(depth = 0, isLastChild = isLastGroup, continuationDepths = emptySet()))
-
-            // Expansions: last expansion in each group gets └
-            for ((ei, _) in group.expansionIndices.withIndex()) {
-                val isLastExp = ei == group.expansionIndices.lastIndex
-                nodes.add(TreeNodeInfo(depth = 1, isLastChild = isLastExp, continuationDepths = emptySet()))
-            }
+    for ((gi, group) in groups.withIndex()) {
+        val isLastGroup = gi == groups.lastIndex
+        nodes.add(TreeNodeInfo(depth = 0, isLastChild = isLastGroup, continuationDepths = emptySet()))
+        for ((ei, _) in group.expansionIndices.withIndex()) {
+            val isLastExp = ei == group.expansionIndices.lastIndex
+            nodes.add(TreeNodeInfo(depth = 1, isLastChild = isLastExp, continuationDepths = emptySet()))
         }
     }
 
     return nodes
+}
+
+/**
+ * Drift A&E with two-lane structure. Each anchor has two vertical drops:
+ *   - drift lane (d = anchor+1): passes through expansions, terminates at next anchor
+ *   - expansion lane (d = anchor+2): connects expansions with ├/└
+ *
+ * Returns fully-computed nodes (continuationDepths and connectChildDepths set).
+ */
+private fun computeAnchorExpandDriftNodes(session: RadioResult): List<TreeNodeInfo> {
+    val groups = groupAnchorExpand(session)
+    val nodes = mutableListOf<TreeNodeInfo>()
+
+    for ((gi, group) in groups.withIndex()) {
+        val anchorDepth = minOf(gi, MAX_TREE_DEPTH)
+        val driftLaneDepth = anchorDepth + 1
+        val expDepth = anchorDepth + 2
+        val isLastGroup = gi == groups.lastIndex
+        val hasExpansions = group.expansionIndices.isNotEmpty()
+
+        // Anchor: └ at its depth, drops to drift lane and expansion lane
+        val drops = mutableSetOf<Int>()
+        if (hasExpansions) drops.add(expDepth)
+        if (!isLastGroup) drops.add(driftLaneDepth)
+        nodes.add(TreeNodeInfo(
+            depth = anchorDepth,
+            isLastChild = true,
+            continuationDepths = emptySet(),
+            connectChildDepths = drops
+        ))
+
+        // Expansions: junction at expDepth, drift lane continuation passes through
+        val driftCont = if (!isLastGroup) setOf(driftLaneDepth) else emptySet()
+        for ((ei, _) in group.expansionIndices.withIndex()) {
+            val isLastExp = ei == group.expansionIndices.lastIndex
+            nodes.add(TreeNodeInfo(
+                depth = expDepth,
+                isLastChild = isLastExp,
+                continuationDepths = driftCont
+            ))
+        }
+    }
+
+    return nodes
+}
+
+/** Helper: partition tracks into [anchor, exp, exp, ...] groups. */
+private data class AnchorGroup(val anchorIndex: Int, val expansionIndices: MutableList<Int> = mutableListOf())
+
+private fun groupAnchorExpand(session: RadioResult): List<AnchorGroup> {
+    val primaryModel = session.tracks[0].modelUsed
+    val groups = mutableListOf<AnchorGroup>()
+    for (i in session.tracks.indices) {
+        if (session.tracks[i].modelUsed == primaryModel) {
+            groups.add(AnchorGroup(i))
+        } else {
+            groups.lastOrNull()?.expansionIndices?.add(i)
+        }
+    }
+    return groups
 }
 
 // ---- Track Result Row with Canvas Tree Lines ----
@@ -853,8 +885,9 @@ fun TreeLines(
     val density = LocalDensity.current
     val indentPx = with(density) { TREE_INDENT_DP.dp.toPx() }
     val lineWidthPx = with(density) { 1.dp.toPx() }
-    // Size canvas to fit junction + any connectChild drop line
-    val levels = maxOf(node.depth + 1, (node.connectChildAtDepth ?: 0) + 1)
+    // Size canvas to fit junction + any connectChild drop lines
+    val levels = if (node.connectChildDepths.isEmpty()) node.depth + 1
+                 else maxOf(node.depth + 1, node.connectChildDepths.max() + 1)
     val canvasWidth = with(density) { (levels * TREE_INDENT_DP).dp }
 
     Canvas(
@@ -902,9 +935,9 @@ fun TreeLines(
             strokeWidth = lineWidthPx
         )
 
-        // Parent-to-child drop: vertical line from midY to bottom at child's depth
-        if (node.connectChildAtDepth != null) {
-            val childX = node.connectChildAtDepth * indentPx + indentPx / 2
+        // Parent-to-child drops: vertical lines from midY to bottom at each child depth
+        for (cd in node.connectChildDepths) {
+            val childX = cd * indentPx + indentPx / 2
             drawLine(
                 color = lineColor,
                 start = Offset(childX, midY),
