@@ -602,7 +602,6 @@ fun SessionPage(
                 items(treeNodes.size) { index ->
                     TrackResultRow(
                         trackResult = session.tracks[index],
-                        showModelTag = session.isMultiModel,
                         treeNode = treeNodes[index]
                     )
                 }
