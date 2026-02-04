@@ -251,6 +251,7 @@ class RadioService : Service() {
                     val seenFileIds = mutableSetOf<Long>()
                     val queuedFileIds = mutableSetOf<Long>()
                     var isFirstTrack = true
+                    var queuedSinceFlush = 0
 
                     _uiState.value = RadioUiState.Streaming(RadioResult(
                         seedTrack = currentTrack,
@@ -289,6 +290,13 @@ class RadioService : Service() {
                                 }
                                 if (added > 0) {
                                     queuedFileIds.add(fileId)
+                                    queuedSinceFlush++
+                                    if (queuedSinceFlush >= 5) {
+                                        queuedSinceFlush = 0
+                                        withContext(Dispatchers.IO) {
+                                            PowerampHelper.reloadData(this@RadioService)
+                                        }
+                                    }
                                     QueueStatus.QUEUED
                                 } else {
                                     QueueStatus.QUEUE_FAILED

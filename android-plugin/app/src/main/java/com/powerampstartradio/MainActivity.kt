@@ -547,10 +547,13 @@ fun SessionPage(
     val treeNodes = remember(session) { computeTreeNodes(session) }
     val listState = rememberLazyListState()
 
-    // Auto-scroll as items arrive during streaming
-    LaunchedEffect(session.tracks.size) {
-        if (!session.isComplete && session.tracks.isNotEmpty()) {
-            listState.animateScrollToItem(session.tracks.lastIndex)
+    // Auto-scroll as items arrive during streaming (non-drift only;
+    // drift uses diagonal scroll which tracks firstVisibleItemIndex)
+    if (!session.drift) {
+        LaunchedEffect(session.tracks.size) {
+            if (!session.isComplete && session.tracks.isNotEmpty()) {
+                listState.animateScrollToItem(session.tracks.lastIndex)
+            }
         }
     }
 
