@@ -59,7 +59,6 @@ import com.powerampstartradio.services.RadioService
 import com.powerampstartradio.similarity.SearchStrategy
 import com.powerampstartradio.ui.DatabaseInfo
 import com.powerampstartradio.ui.MainViewModel
-import com.powerampstartradio.ui.QueueStatus
 import com.powerampstartradio.ui.QueuedTrackResult
 import com.powerampstartradio.ui.RadioResult
 import com.powerampstartradio.ui.RadioUiState
@@ -635,9 +634,7 @@ fun ResultsSummary(
                 EmbeddingModel.MUQ -> MaterialTheme.colorScheme.primary
             }
         }
-        val annotated = buildAnnotatedString {
-            append(countText)
-            append(" (")
+        val legend = buildAnnotatedString {
             var first = true
             for ((model, color) in modelColors) {
                 if (!first) append(separator)
@@ -651,14 +648,19 @@ fun ResultsSummary(
                     append(tag)
                 }
             }
-            append(")")
         }
-        Text(
-            text = annotated,
-            style = MaterialTheme.typography.labelMedium,
-            color = baseColor,
-            modifier = modifier.fillMaxWidth()
-        )
+        Row(modifier = modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = countText,
+                style = MaterialTheme.typography.labelMedium,
+                color = baseColor,
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(text = legend, style = MaterialTheme.typography.labelMedium)
+        }
     } else {
         Text(
             text = countText,
@@ -671,8 +673,8 @@ fun ResultsSummary(
 
 // ---- Tree node computation for all strategies ----
 
-private const val TREE_INDENT_DP = 10f
-private const val MAX_TREE_DEPTH = 20
+private const val TREE_INDENT_DP = 5f
+private const val MAX_TREE_DEPTH = 100
 
 /**
  * Describes the tree position of a single track for Canvas-based rendering.
@@ -900,18 +902,6 @@ fun TrackResultRow(
             modifier = Modifier.padding(horizontal = 2.dp)
         )
 
-        // Status icon
-        val statusColor = when (trackResult.status) {
-            QueueStatus.QUEUED -> MaterialTheme.colorScheme.primary
-            QueueStatus.NOT_IN_LIBRARY -> MaterialTheme.colorScheme.error
-            QueueStatus.QUEUE_FAILED -> MaterialTheme.colorScheme.error
-        }
-        Text(
-            text = if (trackResult.status == QueueStatus.QUEUED) "\u2713" else "\u2717",
-            style = MaterialTheme.typography.bodySmall,
-            color = statusColor,
-            modifier = Modifier.padding(end = 2.dp)
-        )
     }
 }
 
