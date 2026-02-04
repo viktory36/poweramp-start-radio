@@ -6,8 +6,10 @@ import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.data.EmbeddingIndex
 import com.powerampstartradio.data.EmbeddingModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.File
+import kotlin.coroutines.coroutineContext
 
 /**
  * Result of a similarity search.
@@ -118,6 +120,9 @@ class SimilarityEngine(
      * @param drift When true, each result seeds the next search instead of
      *              always searching relative to the original seed. The queue
      *              gradually drifts through embedding space.
+     * @param onResult Suspend callback invoked after each result is found (drift only).
+     *                 Used for streaming results to the UI and incrementally building
+     *                 the Poweramp queue.
      */
     suspend fun findSimilarTracks(
         seedTrackId: Long,
@@ -125,25 +130,28 @@ class SimilarityEngine(
         strategy: SearchStrategy,
         anchorExpandConfig: AnchorExpandConfig? = null,
         drift: Boolean = false,
-        onProgress: ((String) -> Unit)? = null
+        onProgress: ((String) -> Unit)? = null,
+        onResult: (suspend (SimilarTrack) -> Unit)? = null
     ): List<SimilarTrack> = withContext(Dispatchers.Default) {
         // Caller should have called ensureIndices() first for progress reporting.
         // Call it here as a safety net (no-op if already done).
         ensureIndices()
 
+        val cancellationCheck: () -> Unit = { coroutineContext.ensureActive() }
+
         when (strategy) {
             SearchStrategy.MULAN_ONLY ->
-                if (drift) singleModelDrift(seedTrackId, numTracks, EmbeddingModel.MULAN, onProgress)
-                else singleModelSearch(seedTrackId, numTracks, EmbeddingModel.MULAN)
+                if (drift) singleModelDrift(seedTrackId, numTracks, EmbeddingModel.MULAN, onProgress, onResult, cancellationCheck)
+                else singleModelSearch(seedTrackId, numTracks, EmbeddingModel.MULAN, cancellationCheck)
             SearchStrategy.FLAMINGO_ONLY ->
-                if (drift) singleModelDrift(seedTrackId, numTracks, EmbeddingModel.FLAMINGO, onProgress)
-                else singleModelSearch(seedTrackId, numTracks, EmbeddingModel.FLAMINGO)
+                if (drift) singleModelDrift(seedTrackId, numTracks, EmbeddingModel.FLAMINGO, onProgress, onResult, cancellationCheck)
+                else singleModelSearch(seedTrackId, numTracks, EmbeddingModel.FLAMINGO, cancellationCheck)
             SearchStrategy.INTERLEAVE ->
-                if (drift) interleaveDrift(seedTrackId, numTracks, onProgress)
-                else interleaveSearch(seedTrackId, numTracks)
+                if (drift) interleaveDrift(seedTrackId, numTracks, onProgress, onResult, cancellationCheck)
+                else interleaveSearch(seedTrackId, numTracks, cancellationCheck)
             SearchStrategy.ANCHOR_EXPAND ->
-                if (drift) anchorExpandDrift(seedTrackId, numTracks, anchorExpandConfig!!, onProgress)
-                else anchorExpandSearch(seedTrackId, numTracks, anchorExpandConfig!!, onProgress)
+                if (drift) anchorExpandDrift(seedTrackId, numTracks, anchorExpandConfig!!, onProgress, onResult, cancellationCheck)
+                else anchorExpandSearch(seedTrackId, numTracks, anchorExpandConfig!!, onProgress, cancellationCheck)
         }
     }
 
@@ -155,7 +163,8 @@ class SimilarityEngine(
     private fun singleModelSearch(
         seedTrackId: Long,
         numTracks: Int,
-        model: EmbeddingModel
+        model: EmbeddingModel,
+        cancellationCheck: () -> Unit
     ): List<SimilarTrack> {
         val index = getIndex(model) ?: run {
             Log.e(TAG, "No index available for ${model.name}")
@@ -167,7 +176,7 @@ class SimilarityEngine(
             return emptyList()
         }
 
-        val topK = index.findTopK(seedEmbedding, numTracks, excludeIds = setOf(seedTrackId))
+        val topK = index.findTopK(seedEmbedding, numTracks, excludeIds = setOf(seedTrackId), cancellationCheck = cancellationCheck)
 
         return topK.mapNotNull { (trackId, score) ->
             database.getTrackById(trackId)?.let { track ->
@@ -181,11 +190,12 @@ class SimilarityEngine(
      */
     private fun interleaveSearch(
         seedTrackId: Long,
-        numTracks: Int
+        numTracks: Int,
+        cancellationCheck: () -> Unit
     ): List<SimilarTrack> {
         val mulanResults = mulanIndex?.let { idx ->
             idx.getEmbeddingByTrackId(seedTrackId)?.let { seed ->
-                idx.findTopK(seed, numTracks, excludeIds = setOf(seedTrackId))
+                idx.findTopK(seed, numTracks, excludeIds = setOf(seedTrackId), cancellationCheck = cancellationCheck)
                     .mapNotNull { (id, score) ->
                         database.getTrackById(id)?.let { SimilarTrack(it, score, EmbeddingModel.MULAN) }
                     }
@@ -194,7 +204,7 @@ class SimilarityEngine(
 
         val flamingoResults = flamingoIndex?.let { idx ->
             idx.getEmbeddingByTrackId(seedTrackId)?.let { seed ->
-                idx.findTopK(seed, numTracks, excludeIds = setOf(seedTrackId))
+                idx.findTopK(seed, numTracks, excludeIds = setOf(seedTrackId), cancellationCheck = cancellationCheck)
                     .mapNotNull { (id, score) ->
                         database.getTrackById(id)?.let { SimilarTrack(it, score, EmbeddingModel.FLAMINGO) }
                     }
@@ -247,7 +257,8 @@ class SimilarityEngine(
         seedTrackId: Long,
         numTracks: Int,
         config: AnchorExpandConfig,
-        onProgress: ((String) -> Unit)? = null
+        onProgress: ((String) -> Unit)? = null,
+        cancellationCheck: () -> Unit
     ): List<SimilarTrack> {
         val primaryIndex = getIndex(config.primaryModel) ?: run {
             Log.e(TAG, "No index for primary model ${config.primaryModel.name}")
@@ -255,7 +266,7 @@ class SimilarityEngine(
         }
         val secondaryIndex = getIndex(config.secondaryModel) ?: run {
             Log.e(TAG, "No index for secondary model ${config.secondaryModel.name}")
-            return singleModelSearch(seedTrackId, numTracks, config.primaryModel)
+            return singleModelSearch(seedTrackId, numTracks, config.primaryModel, cancellationCheck)
         }
 
         val seedEmbedding = primaryIndex.getEmbeddingByTrackId(seedTrackId) ?: run {
@@ -269,7 +280,7 @@ class SimilarityEngine(
         // Step 1: Find anchor tracks with primary model
         onProgress?.invoke("Finding anchors...")
         val anchors = primaryIndex.findTopK(
-            seedEmbedding, numGroups, excludeIds = setOf(seedTrackId)
+            seedEmbedding, numGroups, excludeIds = setOf(seedTrackId), cancellationCheck = cancellationCheck
         )
 
         if (anchors.isEmpty()) return emptyList()
@@ -288,7 +299,7 @@ class SimilarityEngine(
 
         onProgress?.invoke("Expanding anchors...")
         val expansionResults = if (anchorQueries.isNotEmpty()) {
-            secondaryIndex.findTopKMulti(anchorQueries, config.expansionCount, excludeIds = seen)
+            secondaryIndex.findTopKMulti(anchorQueries, config.expansionCount, excludeIds = seen, cancellationCheck = cancellationCheck)
         } else {
             emptyMap()
         }
@@ -325,11 +336,13 @@ class SimilarityEngine(
     /**
      * Single model drift: find top-1, use it as next seed, repeat.
      */
-    private fun singleModelDrift(
+    private suspend fun singleModelDrift(
         seedTrackId: Long,
         numTracks: Int,
         model: EmbeddingModel,
-        onProgress: ((String) -> Unit)? = null
+        onProgress: ((String) -> Unit)? = null,
+        onResult: (suspend (SimilarTrack) -> Unit)? = null,
+        cancellationCheck: () -> Unit
     ): List<SimilarTrack> {
         val index = getIndex(model) ?: return emptyList()
         var currentEmb = index.getEmbeddingByTrackId(seedTrackId) ?: return emptyList()
@@ -338,15 +351,21 @@ class SimilarityEngine(
         val seen = mutableSetOf(seedTrackId)
 
         for (i in 0 until numTracks) {
+            coroutineContext.ensureActive()
             onProgress?.invoke("Drifting ahead: ${i + 1}/$numTracks...")
-            val top = index.findTopK(currentEmb, 1, excludeIds = seen)
-            if (top.isEmpty()) break
+            val top = index.findTop1(currentEmb, excludeIds = seen, cancellationCheck = cancellationCheck)
+                ?: break
 
-            val (trackId, score) = top[0]
+            val (trackId, score) = top
             seen.add(trackId)
 
-            database.getTrackById(trackId)?.let { track ->
-                result.add(SimilarTrack(track, score, model))
+            val similarTrack = database.getTrackById(trackId)?.let { track ->
+                SimilarTrack(track, score, model)
+            }
+
+            if (similarTrack != null) {
+                result.add(similarTrack)
+                onResult?.invoke(similarTrack)
             }
 
             currentEmb = index.getEmbeddingByTrackId(trackId) ?: break
@@ -362,17 +381,19 @@ class SimilarityEngine(
      * Each model looks up the current track in its own embedding space,
      * so they stay coherent even though the embedding spaces differ.
      */
-    private fun interleaveDrift(
+    private suspend fun interleaveDrift(
         seedTrackId: Long,
         numTracks: Int,
-        onProgress: ((String) -> Unit)? = null
+        onProgress: ((String) -> Unit)? = null,
+        onResult: (suspend (SimilarTrack) -> Unit)? = null,
+        cancellationCheck: () -> Unit
     ): List<SimilarTrack> {
         val mulanIdx = mulanIndex
         val flamingoIdx = flamingoIndex
 
         if (mulanIdx == null && flamingoIdx == null) return emptyList()
-        if (mulanIdx == null) return singleModelDrift(seedTrackId, numTracks, EmbeddingModel.FLAMINGO)
-        if (flamingoIdx == null) return singleModelDrift(seedTrackId, numTracks, EmbeddingModel.MULAN)
+        if (mulanIdx == null) return singleModelDrift(seedTrackId, numTracks, EmbeddingModel.FLAMINGO, onProgress, onResult, cancellationCheck)
+        if (flamingoIdx == null) return singleModelDrift(seedTrackId, numTracks, EmbeddingModel.MULAN, onProgress, onResult, cancellationCheck)
 
         val result = mutableListOf<SimilarTrack>()
         val seen = mutableSetOf(seedTrackId)
@@ -380,16 +401,19 @@ class SimilarityEngine(
 
         while (result.size < numTracks) {
             var advanced = false
+            coroutineContext.ensureActive()
             onProgress?.invoke("Drifting ahead: ${result.size}/$numTracks...")
 
             // MuLan turn
             mulanIdx.getEmbeddingByTrackId(currentTrackId)?.let { emb ->
-                val top = mulanIdx.findTopK(emb, 1, excludeIds = seen)
-                if (top.isNotEmpty()) {
-                    val (id, score) = top[0]
+                val top = mulanIdx.findTop1(emb, excludeIds = seen, cancellationCheck = cancellationCheck)
+                if (top != null) {
+                    val (id, score) = top
                     seen.add(id)
                     database.getTrackById(id)?.let {
-                        result.add(SimilarTrack(it, score, EmbeddingModel.MULAN))
+                        val similarTrack = SimilarTrack(it, score, EmbeddingModel.MULAN)
+                        result.add(similarTrack)
+                        onResult?.invoke(similarTrack)
                         currentTrackId = id
                         advanced = true
                     }
@@ -400,12 +424,14 @@ class SimilarityEngine(
 
             // Flamingo turn
             flamingoIdx.getEmbeddingByTrackId(currentTrackId)?.let { emb ->
-                val top = flamingoIdx.findTopK(emb, 1, excludeIds = seen)
-                if (top.isNotEmpty()) {
-                    val (id, score) = top[0]
+                val top = flamingoIdx.findTop1(emb, excludeIds = seen, cancellationCheck = cancellationCheck)
+                if (top != null) {
+                    val (id, score) = top
                     seen.add(id)
                     database.getTrackById(id)?.let {
-                        result.add(SimilarTrack(it, score, EmbeddingModel.FLAMINGO))
+                        val similarTrack = SimilarTrack(it, score, EmbeddingModel.FLAMINGO)
+                        result.add(similarTrack)
+                        onResult?.invoke(similarTrack)
                         currentTrackId = id
                         advanced = true
                     }
@@ -423,15 +449,17 @@ class SimilarityEngine(
      * Anchor & Expand drift: each anchor is found relative to the previous anchor
      * (not the original seed), so groups gradually move through embedding space.
      */
-    private fun anchorExpandDrift(
+    private suspend fun anchorExpandDrift(
         seedTrackId: Long,
         numTracks: Int,
         config: AnchorExpandConfig,
-        onProgress: ((String) -> Unit)? = null
+        onProgress: ((String) -> Unit)? = null,
+        onResult: (suspend (SimilarTrack) -> Unit)? = null,
+        cancellationCheck: () -> Unit
     ): List<SimilarTrack> {
         val primaryIndex = getIndex(config.primaryModel) ?: return emptyList()
         val secondaryIndex = getIndex(config.secondaryModel) ?: run {
-            return singleModelDrift(seedTrackId, numTracks, config.primaryModel)
+            return singleModelDrift(seedTrackId, numTracks, config.primaryModel, onProgress, onResult, cancellationCheck)
         }
 
         var currentEmb = primaryIndex.getEmbeddingByTrackId(seedTrackId) ?: return emptyList()
@@ -443,27 +471,36 @@ class SimilarityEngine(
 
         for (g in 0 until numGroups) {
             if (result.size >= numTracks) break
+            coroutineContext.ensureActive()
             onProgress?.invoke("Drifting ahead: group ${g + 1}/$numGroups...")
 
             // Find anchor relative to current seed (drifted from previous anchor)
-            val anchors = primaryIndex.findTopK(currentEmb, 1, excludeIds = seen)
-            if (anchors.isEmpty()) break
+            val anchor = primaryIndex.findTop1(currentEmb, excludeIds = seen, cancellationCheck = cancellationCheck)
+                ?: break
 
-            val (anchorId, anchorScore) = anchors[0]
+            val (anchorId, anchorScore) = anchor
             seen.add(anchorId)
 
-            database.getTrackById(anchorId)?.let { track ->
-                result.add(SimilarTrack(track, anchorScore, config.primaryModel))
+            val anchorTrack = database.getTrackById(anchorId)?.let { track ->
+                SimilarTrack(track, anchorScore, config.primaryModel)
+            }
+            if (anchorTrack != null) {
+                result.add(anchorTrack)
+                onResult?.invoke(anchorTrack)
             }
 
             // Expand anchor with secondary model
             secondaryIndex.getEmbeddingByTrackId(anchorId)?.let { anchorEmb ->
-                val expansions = secondaryIndex.findTopK(anchorEmb, config.expansionCount, excludeIds = seen)
+                val expansions = secondaryIndex.findTopK(anchorEmb, config.expansionCount, excludeIds = seen, cancellationCheck = cancellationCheck)
                 for ((expId, expScore) in expansions) {
                     if (result.size >= numTracks) break
                     seen.add(expId)
-                    database.getTrackById(expId)?.let { track ->
-                        result.add(SimilarTrack(track, expScore, config.secondaryModel))
+                    val expTrack = database.getTrackById(expId)?.let { track ->
+                        SimilarTrack(track, expScore, config.secondaryModel)
+                    }
+                    if (expTrack != null) {
+                        result.add(expTrack)
+                        onResult?.invoke(expTrack)
                     }
                 }
             }

@@ -36,7 +36,9 @@ data class RadioResult(
     val strategy: SearchStrategy = SearchStrategy.ANCHOR_EXPAND,
     val drift: Boolean = false,
     val timestamp: Long = System.currentTimeMillis(),
-    val queuedFileIds: Set<Long> = emptySet()
+    val queuedFileIds: Set<Long> = emptySet(),
+    val isComplete: Boolean = true,
+    val totalExpected: Int = 0
 ) {
     val queuedCount: Int get() = tracks.count { it.status == QueueStatus.QUEUED }
     val failedCount: Int get() = tracks.count { it.status != QueueStatus.QUEUED }
@@ -50,6 +52,8 @@ data class RadioResult(
 sealed class RadioUiState {
     object Idle : RadioUiState()
     data class Loading(val message: String = "Starting radio...") : RadioUiState()
+    data class Searching(val message: String) : RadioUiState()
+    data class Streaming(val result: RadioResult) : RadioUiState()
     data class Success(val result: RadioResult) : RadioUiState()
     data class Error(val message: String) : RadioUiState()
 }

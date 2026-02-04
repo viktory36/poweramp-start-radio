@@ -84,6 +84,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val trackChangeListener: (com.powerampstartradio.poweramp.PowerampTrack?) -> Unit = { track ->
         val state = RadioService.uiState.value
+        // Don't reset during active search (Searching/Streaming) — let it continue
         if (state is RadioUiState.Success) {
             // Only reset if the new track is neither the seed nor one we queued
             val result = state.result
@@ -139,6 +140,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         RadioService.startRadio(
             getApplication(), _numTracks.value, strategy, aeConfig, _drift.value
         )
+    }
+
+    fun cancelSearch() {
+        RadioService.cancelSearch()
     }
 
     fun resetRadioState() {

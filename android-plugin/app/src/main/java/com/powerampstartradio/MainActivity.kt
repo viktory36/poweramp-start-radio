@@ -69,6 +69,10 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+/** Whether the radio UI state represents an active search (any phase). */
+private fun RadioUiState.isActiveSearch(): Boolean =
+    this is RadioUiState.Loading || this is RadioUiState.Searching || this is RadioUiState.Streaming
+
 class MainActivity : ComponentActivity() {
 
     companion object {
@@ -269,6 +273,7 @@ fun MainScreen(
                             statusMessage = "Import database in Settings"
                         }
                     },
+                    onCancelSearch = { viewModel.cancelSearch() },
                     onClearAndReset = {
                         viewModel.resetRadioState()
                     },
@@ -296,6 +301,7 @@ fun HomeScreen(
     statusMessage: String,
     indexStatus: String?,
     onStartRadio: () -> Unit,
+    onCancelSearch: () -> Unit,
     onClearAndReset: () -> Unit,
     onRequestPermission: () -> Unit,
     onOpenSettings: () -> Unit,
@@ -303,11 +309,14 @@ fun HomeScreen(
     viewingSession: Int?,
     onViewSession: (Int?) -> Unit
 ) {
-    val showResults = radioState is RadioUiState.Success || viewingSession != null
-    val displaySession = if (viewingSession != null && viewingSession in sessionHistory.indices) {
-        sessionHistory[viewingSession]
-    } else {
-        sessionHistory.lastOrNull()
+    val showResults = radioState is RadioUiState.Success
+        || radioState is RadioUiState.Streaming
+        || viewingSession != null
+    val displaySession = when {
+        viewingSession != null && viewingSession in sessionHistory.indices -> sessionHistory[viewingSession]
+        radioState is RadioUiState.Streaming -> (radioState as RadioUiState.Streaming).result
+        radioState is RadioUiState.Success -> (radioState as RadioUiState.Success).result
+        else -> sessionHistory.lastOrNull()
     }
 
     Scaffold(
@@ -337,12 +346,23 @@ fun HomeScreen(
             )
         },
         floatingActionButton = {
-            ExtendedFloatingActionButton(
-                onClick = onStartRadio,
-                icon = { Icon(Icons.Default.PlayArrow, contentDescription = null) },
-                text = { Text("Start Radio") },
-                expanded = radioState !is RadioUiState.Loading
-            )
+            if (radioState.isActiveSearch()) {
+                ExtendedFloatingActionButton(
+                    onClick = onCancelSearch,
+                    icon = { Icon(Icons.Default.Clear, contentDescription = null) },
+                    text = { Text("Cancel") },
+                    containerColor = MaterialTheme.colorScheme.errorContainer,
+                    contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                    expanded = true
+                )
+            } else {
+                ExtendedFloatingActionButton(
+                    onClick = onStartRadio,
+                    icon = { Icon(Icons.Default.PlayArrow, contentDescription = null) },
+                    text = { Text("Start Radio") },
+                    expanded = true
+                )
+            }
         }
     ) { padding ->
         Box(
@@ -362,6 +382,19 @@ fun HomeScreen(
                 )
 
                 HorizontalDivider()
+
+                // Searching progress bar (non-blocking, shown under top bar)
+                if (radioState is RadioUiState.Searching) {
+                    Column {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        Text(
+                            text = (radioState as RadioUiState.Searching).message,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                        )
+                    }
+                }
 
                 // Main content area
                 Box(modifier = Modifier.weight(1f)) {
@@ -394,7 +427,7 @@ fun HomeScreen(
                         }
                     } else {
                         when (val state = radioState) {
-                            is RadioUiState.Idle -> {
+                            is RadioUiState.Idle, is RadioUiState.Searching -> {
                                 IdleContent(
                                     hasPermission = hasPermission,
                                     databaseInfo = databaseInfo,
@@ -424,13 +457,13 @@ fun HomeScreen(
                                     }
                                 }
                             }
-                            is RadioUiState.Loading, is RadioUiState.Success -> {}
+                            is RadioUiState.Loading, is RadioUiState.Success, is RadioUiState.Streaming -> {}
                         }
                     }
                 }
             }
 
-            // Loading overlay
+            // Loading overlay (brief setup only — DB load, track match, index check)
             if (radioState is RadioUiState.Loading) {
                 Box(
                     modifier = Modifier
@@ -512,6 +545,13 @@ fun SessionPage(
     val treeNodes = remember(session) { computeTreeNodes(session) }
     val listState = rememberLazyListState()
 
+    // Auto-scroll as items arrive during streaming
+    LaunchedEffect(session.tracks.size) {
+        if (!session.isComplete && session.tracks.isNotEmpty()) {
+            listState.animateScrollToItem(session.tracks.lastIndex)
+        }
+    }
+
     Column(modifier = modifier) {
         ResultsSummary(
             result = session,
@@ -543,6 +583,14 @@ fun SessionPage(
                         scrollOffset = animatedDepth
                     )
                 }
+                if (!session.isComplete) {
+                    item {
+                        StreamingProgressItem(
+                            found = session.tracks.size,
+                            total = session.totalExpected
+                        )
+                    }
+                }
             }
         } else {
             LazyColumn(
@@ -556,8 +604,38 @@ fun SessionPage(
                         treeNode = treeNodes[index]
                     )
                 }
+                if (!session.isComplete) {
+                    item {
+                        StreamingProgressItem(
+                            found = session.tracks.size,
+                            total = session.totalExpected
+                        )
+                    }
+                }
             }
         }
+    }
+}
+
+@Composable
+private fun StreamingProgressItem(found: Int, total: Int) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 12.dp),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        CircularProgressIndicator(
+            modifier = Modifier.size(16.dp),
+            strokeWidth = 2.dp
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+            text = "$found of $total found...",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
 
@@ -570,7 +648,9 @@ fun ResultsSummary(
     val seedName = result.seedTrack.title ?: "Unknown"
     val baseColor = MaterialTheme.colorScheme.onSurfaceVariant
 
-    val countText = if (result.failedCount > 0) {
+    val countText = if (!result.isComplete) {
+        "$seedName \u2014 ${result.tracks.size} of ${result.totalExpected} found..."
+    } else if (result.failedCount > 0) {
         "$seedName \u2014 ${result.queuedCount} of ${result.requestedCount} queued (${result.failedCount} not found)"
     } else {
         "$seedName \u2014 ${result.queuedCount} tracks via $strategyLabel"

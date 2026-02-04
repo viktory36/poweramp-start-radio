@@ -193,19 +193,51 @@ class EmbeddingIndex private constructor(
     }
 
     /**
+     * Find the single most similar track to a query embedding.
+     *
+     * Optimized for drift loops: simple variable comparison instead of PriorityQueue,
+     * eliminating heap allocation across 26-50 drift iterations.
+     *
+     * @param cancellationCheck called every 10K tracks to allow coroutine cancellation
+     */
+    fun findTop1(
+        query: FloatArray,
+        excludeIds: Set<Long> = emptySet(),
+        cancellationCheck: (() -> Unit)? = null
+    ): Pair<Long, Float>? {
+        var bestId = -1L
+        var bestScore = Float.NEGATIVE_INFINITY
+        for (i in 0 until numTracks) {
+            if (i % 10000 == 0) cancellationCheck?.invoke()
+            val trackId = getTrackId(i)
+            if (trackId in excludeIds) continue
+            val score = dotProduct(query, i)
+            if (score > bestScore) {
+                bestScore = score
+                bestId = trackId
+            }
+        }
+        return if (bestId >= 0) bestId to bestScore else null
+    }
+
+    /**
      * Find the top-K most similar tracks to a query embedding.
      *
      * Uses a min-heap of size K for O(N log K) scan.
+     *
+     * @param cancellationCheck called every 10K tracks to allow coroutine cancellation
      */
     fun findTopK(
         query: FloatArray,
         topK: Int,
-        excludeIds: Set<Long> = emptySet()
+        excludeIds: Set<Long> = emptySet(),
+        cancellationCheck: (() -> Unit)? = null
     ): List<Pair<Long, Float>> {
         // Min-heap: smallest similarity at top, so we can evict it when we find better
         val heap = PriorityQueue<Pair<Long, Float>>(topK + 1, compareBy { it.second })
 
         for (i in 0 until numTracks) {
+            if (i % 10000 == 0) cancellationCheck?.invoke()
             val trackId = getTrackId(i)
             if (trackId in excludeIds) continue
 
@@ -234,10 +266,14 @@ class EmbeddingIndex private constructor(
      * @param excludeIds Track IDs to exclude from all results
      * @return Map of anchor track ID to its top-K results
      */
+    /**
+     * @param cancellationCheck called every 10K tracks to allow coroutine cancellation
+     */
     fun findTopKMulti(
         queries: Map<Long, FloatArray>,
         topK: Int,
-        excludeIds: Set<Long> = emptySet()
+        excludeIds: Set<Long> = emptySet(),
+        cancellationCheck: (() -> Unit)? = null
     ): Map<Long, List<Pair<Long, Float>>> {
         if (queries.isEmpty()) return emptyMap()
 
@@ -249,6 +285,7 @@ class EmbeddingIndex private constructor(
         val queryEntries = queries.entries.toList()
 
         for (i in 0 until numTracks) {
+            if (i % 10000 == 0) cancellationCheck?.invoke()
             val trackId = getTrackId(i)
             if (trackId in excludeIds) continue
 
