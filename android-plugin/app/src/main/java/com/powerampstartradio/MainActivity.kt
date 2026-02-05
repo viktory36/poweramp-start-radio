@@ -746,8 +746,8 @@ fun SettingsScreen(
 
     val isRandomWalk = selectionMode == SelectionMode.RANDOM_WALK
 
-    // Recompute previews when any setting changes (debounced)
-    LaunchedEffect(selectionMode, driftEnabled, driftMode, anchorStrength, anchorDecay,
+    // Recompute previews when any parameter changes (debounced)
+    LaunchedEffect(driftEnabled, driftMode, anchorStrength, anchorDecay,
         momentumBeta, diversityLambda, temperature, maxPerArtist, minArtistSpacing, numTracks) {
         viewModel.clearPreviews()
         delay(500)
