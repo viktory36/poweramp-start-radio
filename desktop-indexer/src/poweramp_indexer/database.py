@@ -57,6 +57,11 @@ class EmbeddingDatabase:
         cluster_id INTEGER PRIMARY KEY,
         embedding BLOB NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS binary_data (
+        key TEXT PRIMARY KEY,
+        data BLOB NOT NULL
+    );
     """
 
     def __init__(self, db_path: Path, models: list[str] | None = None):
@@ -142,6 +147,21 @@ class EmbeddingDatabase:
             "SELECT value FROM metadata WHERE key = ?", (key,)
         ).fetchone()
         return row["value"] if row else None
+
+    def set_binary(self, key: str, data: bytes):
+        """Store a binary blob in the binary_data table."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO binary_data (key, data) VALUES (?, ?)",
+            (key, data)
+        )
+        self.conn.commit()
+
+    def get_binary(self, key: str) -> Optional[bytes]:
+        """Get a binary blob by key."""
+        row = self.conn.execute(
+            "SELECT data FROM binary_data WHERE key = ?", (key,)
+        ).fetchone()
+        return bytes(row["data"]) if row else None
 
     def add_track(
         self,

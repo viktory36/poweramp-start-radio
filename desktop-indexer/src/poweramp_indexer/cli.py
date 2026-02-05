@@ -925,12 +925,9 @@ def fuse(database: Path, output: Path, dim: int, clusters: int, knn: int, verbos
     available = db.get_available_models()
     click.echo(f"Available models: {', '.join(available) if available else 'none'}")
 
-    graph_path = db_path.parent / "graph.bin"
-
     try:
         result = fuse_embeddings(
             db, target_dim=dim, n_clusters=clusters, knn_k=knn,
-            graph_path=graph_path,
             on_progress=lambda msg: click.echo(msg)
         )
     except ValueError as e:
@@ -947,8 +944,7 @@ def fuse(database: Path, output: Path, dim: int, clusters: int, knn: int, verbos
     click.echo(f"  Tracks: {result['n_tracks']}")
     click.echo(f"  Fused dim: {result['target_dim']} ({result['variance_retained'] * 100:.2f}% variance)")
     click.echo(f"  Clusters: {result['n_clusters']}")
-    click.echo(f"  kNN graph: K={result['knn_k']}")
-    click.echo(f"  Graph file: {result['graph_path']}")
+    click.echo(f"  kNN graph: K={result['knn_k']} ({result['graph_size_mb']:.1f} MB)")
     click.echo(f"  Database size: {db_path.stat().st_size / 1024 / 1024:.1f} MB")
 
 

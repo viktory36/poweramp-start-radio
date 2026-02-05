@@ -72,6 +72,10 @@ class RecommendationEngine(
 
         // Graph index (optional, only for Random Walk)
         val graphFile = File(filesDir, "graph.bin")
+        if (!graphFile.exists() || graphFile.lastModified() < dbModified) {
+            onProgress?.invoke("Extracting kNN graph...")
+            GraphIndex.extractFromDatabase(database, graphFile)
+        }
         if (graphFile.exists() && graphIndex == null) {
             try {
                 graphIndex = GraphIndex.mmap(graphFile)

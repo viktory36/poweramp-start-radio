@@ -62,6 +62,22 @@ class GraphIndex private constructor(
                 return GraphIndex(buf, n, k, trackIdToIndex, indexToTrackId)
             }
         }
+
+        /**
+         * Extract graph binary from SQLite binary_data table and write to file.
+         * Returns true if graph was found and extracted.
+         */
+        fun extractFromDatabase(db: EmbeddingDatabase, outFile: File): Boolean {
+            return try {
+                val blob = db.getBinaryData("knn_graph") ?: return false
+                outFile.writeBytes(blob)
+                Log.i(TAG, "Extracted graph: ${blob.size / 1024 / 1024} MB")
+                true
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to extract graph from database: ${e.message}")
+                false
+            }
+        }
     }
 
     // Offset where graph data starts (after header + ID map)

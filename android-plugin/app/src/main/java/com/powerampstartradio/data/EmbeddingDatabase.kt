@@ -302,6 +302,22 @@ class EmbeddingDatabase private constructor(
         }
     }
 
+    /**
+     * Get binary data blob by key from the binary_data table.
+     */
+    fun getBinaryData(key: String): ByteArray? {
+        return try {
+            db.rawQuery(
+                "SELECT data FROM binary_data WHERE key = ?",
+                arrayOf(key)
+            ).use {
+                if (it.moveToFirst()) it.getBlob(0) else null
+            }
+        } catch (e: Exception) {
+            null // Table may not exist in older databases
+        }
+    }
+
     private fun cursorToTrack(cursor: Cursor): EmbeddedTrack? {
         return if (cursor.moveToFirst()) {
             EmbeddedTrack(

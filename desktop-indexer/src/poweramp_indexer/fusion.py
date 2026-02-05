@@ -2,7 +2,6 @@
 
 import logging
 import struct
-from pathlib import Path
 
 import numpy as np
 from scipy.linalg import svd
@@ -13,8 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 def fuse_embeddings(db: EmbeddingDatabase, target_dim: int = 512, n_clusters: int = 200,
-                    knn_k: int = 20, graph_path: Path | None = None,
-                    on_progress=None):
+                    knn_k: int = 20, on_progress=None):
     """
     Fuse MuLan + Flamingo embeddings via SVD, compute clusters and kNN graph.
 
@@ -25,14 +23,13 @@ def fuse_embeddings(db: EmbeddingDatabase, target_dim: int = 512, n_clusters: in
     4. L2-normalize
     5. Store in embeddings_fused table
     6. k-means clustering (K=n_clusters)
-    7. kNN graph (K=knn_k) stored as binary file
+    7. kNN graph (K=knn_k) stored in database as binary blob
 
     Args:
         db: Database with mulan and/or flamingo embeddings
         target_dim: Output embedding dimension (default 512)
         n_clusters: Number of k-means clusters (default 200)
         knn_k: Number of nearest neighbors for graph (default 20)
-        graph_path: Where to write graph.bin (default: next to database)
         on_progress: Callback(message) for status updates
     """
     def progress(msg):
@@ -208,14 +205,12 @@ def fuse_embeddings(db: EmbeddingDatabase, target_dim: int = 512, n_clusters: in
     progress(f"Building kNN graph (K={knn_k})...")
     neighbors, weights = _build_knn_graph(X_reduced, track_ids, knn_k, on_progress=progress)
 
-    # Write graph.bin
-    if graph_path is None:
-        graph_path = db.db_path.parent / "graph.bin"
+    # Store graph binary in database
+    graph_blob = _build_graph_binary(track_ids, neighbors, weights, knn_k)
+    db.set_binary("knn_graph", graph_blob)
 
-    _write_graph_binary(graph_path, track_ids, neighbors, weights, knn_k)
-
-    file_size_mb = graph_path.stat().st_size / 1024 / 1024
-    progress(f"Wrote graph.bin: {file_size_mb:.1f} MB")
+    graph_size_mb = len(graph_blob) / 1024 / 1024
+    progress(f"Stored kNN graph in database: {graph_size_mb:.1f} MB")
 
     return {
         "n_tracks": n_tracks,
@@ -223,7 +218,7 @@ def fuse_embeddings(db: EmbeddingDatabase, target_dim: int = 512, n_clusters: in
         "variance_retained": retained_var,
         "n_clusters": n_clusters,
         "knn_k": knn_k,
-        "graph_path": str(graph_path),
+        "graph_size_mb": graph_size_mb,
     }
 
 
@@ -346,10 +341,10 @@ def _build_knn_graph(X: np.ndarray, track_ids: np.ndarray, k: int,
     return neighbors, weights
 
 
-def _write_graph_binary(path: Path, track_ids: np.ndarray,
-                        neighbors: np.ndarray, weights: np.ndarray, k: int):
+def _build_graph_binary(track_ids: np.ndarray,
+                        neighbors: np.ndarray, weights: np.ndarray, k: int) -> bytes:
     """
-    Write kNN graph as binary file.
+    Build kNN graph as binary blob.
 
     Format:
         Header: N (uint32), K (uint32)
@@ -360,16 +355,18 @@ def _write_graph_binary(path: Path, track_ids: np.ndarray,
     keeping the graph compact.
     """
     n = len(track_ids)
+    parts = []
 
-    with open(path, 'wb') as f:
-        # Header
-        f.write(struct.pack('<II', n, k))
+    # Header
+    parts.append(struct.pack('<II', n, k))
 
-        # ID map
-        for tid in track_ids:
-            f.write(struct.pack('<q', int(tid)))
+    # ID map
+    for tid in track_ids:
+        parts.append(struct.pack('<q', int(tid)))
 
-        # Graph data
-        for i in range(n):
-            for j in range(k):
-                f.write(struct.pack('<If', int(neighbors[i, j]), float(weights[i, j])))
+    # Graph data
+    for i in range(n):
+        for j in range(k):
+            parts.append(struct.pack('<If', int(neighbors[i, j]), float(weights[i, j])))
+
+    return b''.join(parts)
