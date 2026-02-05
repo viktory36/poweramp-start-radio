@@ -174,6 +174,25 @@ fun MainScreen(
         }
     }
 
+    val graphImportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        uri?.let {
+            statusMessage = "Importing graph..."
+            try {
+                val destFile = File(context.filesDir, "graph.bin")
+                context.contentResolver.openInputStream(it)?.use { input ->
+                    destFile.outputStream().use { output -> input.copyTo(output) }
+                }
+                viewModel.refreshDatabaseInfo()
+                statusMessage = "Graph imported!"
+            } catch (e: Exception) {
+                statusMessage = "Graph import failed: ${e.message}"
+                Log.e("MainActivity", "Graph import failed", e)
+            }
+        }
+    }
+
     BackHandler(enabled = showSettings || viewingSession != null) {
         if (showSettings) showSettings = false
         else {
@@ -213,6 +232,8 @@ fun MainScreen(
             if (isSettings) {
                 SettingsScreen(viewModel = viewModel, databaseInfo = databaseInfo,
                     onImportDatabase = { importLauncher.launch(arrayOf("application/octet-stream", "*/*")) },
+                    onImportGraph = { graphImportLauncher.launch(arrayOf("application/octet-stream", "*/*")) },
+                    hasGraphFile = File(context.filesDir, "graph.bin").exists(),
                     hasPermission = hasPermission,
                     onRequestPermission = { viewModel.requestPermission() },
                     onBack = { showSettings = false })
@@ -720,6 +741,8 @@ fun SettingsScreen(
     viewModel: MainViewModel,
     databaseInfo: DatabaseInfo?,
     onImportDatabase: () -> Unit,
+    onImportGraph: () -> Unit = {},
+    hasGraphFile: Boolean = false,
     hasPermission: Boolean,
     onRequestPermission: () -> Unit,
     onBack: () -> Unit
@@ -973,6 +996,19 @@ fun SettingsScreen(
                     Spacer(modifier = Modifier.height(8.dp))
                     OutlinedButton(onClick = onImportDatabase, modifier = Modifier.fillMaxWidth()) {
                         Text(if (databaseInfo != null) "Replace Database" else "Import Database")
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    OutlinedButton(onClick = onImportGraph, modifier = Modifier.fillMaxWidth()) {
+                        Text(if (hasGraphFile) "Replace Graph (graph.bin)" else "Import Graph (graph.bin)")
+                    }
+                    if (hasGraphFile) {
+                        Text("kNN graph loaded (enables Explorer mode)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    } else {
+                        Text("Optional: enables Explorer (Random Walk) algorithm",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
             }
