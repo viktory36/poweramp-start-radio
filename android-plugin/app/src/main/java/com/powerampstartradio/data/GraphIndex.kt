@@ -65,18 +65,14 @@ class GraphIndex private constructor(
 
         /**
          * Extract graph binary from SQLite binary_data table and write to file.
-         * Returns true if graph was found and extracted.
+         * Uses chunked reading to avoid Android's ~2 MB CursorWindow limit.
          */
         fun extractFromDatabase(db: EmbeddingDatabase, outFile: File): Boolean {
-            return try {
-                val blob = db.getBinaryData("knn_graph") ?: return false
-                outFile.writeBytes(blob)
-                Log.i(TAG, "Extracted graph: ${blob.size / 1024 / 1024} MB")
-                true
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to extract graph from database: ${e.message}")
-                false
-            }
+            if (!db.hasBinaryData("knn_graph")) return false
+            val ok = db.extractBinaryToFile("knn_graph", outFile)
+            if (ok) Log.i(TAG, "Extracted graph: ${outFile.length() / 1024 / 1024} MB")
+            else Log.w(TAG, "Failed to extract graph from database")
+            return ok
         }
     }
 

@@ -32,7 +32,8 @@ object MmrSelector {
         if (selectedEmbeddings.isEmpty()) return candidates.first()
 
         var bestId = -1L
-        var bestScore = Float.NEGATIVE_INFINITY
+        var bestRelevance = 0f
+        var bestMmrScore = Float.NEGATIVE_INFINITY
 
         for ((trackId, relevance) in candidates) {
             val emb = index.getEmbeddingByTrackId(trackId) ?: continue
@@ -46,13 +47,14 @@ object MmrSelector {
 
             val mmrScore = lambda * relevance - (1f - lambda) * maxSimToSelected
 
-            if (mmrScore > bestScore) {
-                bestScore = mmrScore
+            if (mmrScore > bestMmrScore) {
+                bestMmrScore = mmrScore
+                bestRelevance = relevance
                 bestId = trackId
             }
         }
 
-        return if (bestId >= 0) bestId to bestScore else null
+        return if (bestId >= 0) bestId to bestRelevance else null
     }
 
     /**

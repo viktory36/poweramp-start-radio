@@ -303,18 +303,50 @@ class EmbeddingDatabase private constructor(
     }
 
     /**
-     * Get binary data blob by key from the binary_data table.
+     * Check if a binary data key exists in the binary_data table.
+     * Does NOT read the blob — safe for large entries.
      */
-    fun getBinaryData(key: String): ByteArray? {
+    fun hasBinaryData(key: String): Boolean {
         return try {
             db.rawQuery(
-                "SELECT data FROM binary_data WHERE key = ?",
+                "SELECT 1 FROM binary_data WHERE key = ?",
+                arrayOf(key)
+            ).use { it.moveToFirst() }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Extract a binary data blob to a file, reading in chunks to avoid
+     * Android's ~2 MB CursorWindow limit.
+     */
+    fun extractBinaryToFile(key: String, outFile: File): Boolean {
+        return try {
+            val length = db.rawQuery(
+                "SELECT length(data) FROM binary_data WHERE key = ?",
                 arrayOf(key)
             ).use {
-                if (it.moveToFirst()) it.getBlob(0) else null
+                if (it.moveToFirst()) it.getLong(0) else return false
             }
+
+            val chunkSize = 1_000_000 // 1 MB chunks
+            FileOutputStream(outFile).use { fos ->
+                var offset = 1 // SQL substr is 1-indexed
+                while (offset <= length) {
+                    val chunk = db.rawQuery(
+                        "SELECT substr(data, ?, ?) FROM binary_data WHERE key = ?",
+                        arrayOf(offset.toString(), chunkSize.toString(), key)
+                    ).use { cursor ->
+                        if (cursor.moveToFirst()) cursor.getBlob(0) else null
+                    } ?: break
+                    fos.write(chunk)
+                    offset += chunkSize
+                }
+            }
+            true
         } catch (e: Exception) {
-            null // Table may not exist in older databases
+            false
         }
     }
 
