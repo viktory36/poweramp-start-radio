@@ -244,6 +244,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         version = db.getMetadata("version"),
                         sizeKb = dbFile.length() / 1024,
                         hasFused = db.hasFusedEmbeddings,
+                        hasGraph = db.getBinaryData("knn_graph") != null,
                         embeddingTable = db.embeddingTable,
                     )
                     db.close()
@@ -269,5 +270,6 @@ data class DatabaseInfo(
     val version: String?,
     val sizeKb: Long,
     val hasFused: Boolean = false,
+    val hasGraph: Boolean = false,
     val embeddingTable: String = "embeddings_fused",
 )
