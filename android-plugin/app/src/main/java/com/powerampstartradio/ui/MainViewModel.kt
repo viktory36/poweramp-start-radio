@@ -90,10 +90,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _previews = MutableStateFlow<Map<SelectionMode, List<String>>>(emptyMap())
     val previews: StateFlow<Map<SelectionMode, List<String>>> = _previews.asStateFlow()
 
-    private val _previewsLoading = MutableStateFlow(false)
-    val previewsLoading: StateFlow<Boolean> = _previewsLoading.asStateFlow()
+    private val _previewsLoading = MutableStateFlow<Set<SelectionMode>>(emptySet())
+    val previewsLoading: StateFlow<Set<SelectionMode>> = _previewsLoading.asStateFlow()
 
-    private var previewJob: Job? = null
+    private val previewJobs = mutableMapOf<SelectionMode, Job>()
 
     val radioState: StateFlow<RadioUiState> = RadioService.uiState
     val sessionHistory: StateFlow<List<RadioResult>> = RadioService.sessionHistory
@@ -213,59 +213,62 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         RadioService.clearHistory()
     }
 
-    fun clearPreviews() {
-        previewJob?.cancel()
-        _previews.value = emptyMap()
-        _previewsLoading.value = true
+    fun clearPreview(mode: SelectionMode) {
+        previewJobs[mode]?.cancel()
+        _previews.value = _previews.value - mode
+        _previewsLoading.value = _previewsLoading.value + mode
     }
 
-    fun computePreviews() {
-        previewJob?.cancel()
-        _previewsLoading.value = true
-        previewJob = viewModelScope.launch(Dispatchers.IO) {
-            val currentTrack = PowerampReceiver.currentTrack
-            if (currentTrack == null) {
-                _previewsLoading.value = false
-                return@launch
+    fun computePreview(mode: SelectionMode) {
+        previewJobs[mode]?.cancel()
+        _previewsLoading.value = _previewsLoading.value + mode
+        previewJobs[mode] = viewModelScope.launch(Dispatchers.IO) {
+            val result = runPreviewForMode(mode)
+            if (result != null) {
+                _previews.value = _previews.value + (mode to result)
             }
-            val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
-            if (!dbFile.exists()) {
-                _previewsLoading.value = false
-                return@launch
-            }
-
-            try {
-                val db = EmbeddingDatabase.open(dbFile)
-                val matcher = TrackMatcher(db)
-                val match = matcher.findMatch(currentTrack)
-                if (match == null || match.matchType == TrackMatcher.MatchType.NOT_FOUND) {
-                    db.close()
-                    _previewsLoading.value = false
-                    return@launch
-                }
-                val seedId = match.embeddedTrack.id
-
-                val engine = RecommendationEngine(db, getApplication<Application>().filesDir)
-                engine.ensureIndices()
-
-                val results = mutableMapOf<SelectionMode, List<String>>()
-                val baseConfig = buildConfig().copy(numTracks = 10)
-
-                for (mode in SelectionMode.entries) {
-                    try {
-                        val config = baseConfig.copy(selectionMode = mode)
-                        val tracks = engine.generatePlaylist(seedId, config)
-                        results[mode] = tracks.map { t ->
-                            "${t.track.title ?: "?"} \u2013 ${t.track.artist ?: "?"}"
-                        }
-                    } catch (_: Exception) { }
-                }
-
-                db.close()
-                _previews.value = results
-            } catch (_: Exception) { }
-            _previewsLoading.value = false
+            _previewsLoading.value = _previewsLoading.value - mode
         }
+    }
+
+    private suspend fun runPreviewForMode(mode: SelectionMode): List<String>? {
+        val currentTrack = PowerampReceiver.currentTrack ?: return null
+        val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
+        if (!dbFile.exists()) return null
+
+        return try {
+            val db = EmbeddingDatabase.open(dbFile)
+            val matcher = TrackMatcher(db)
+            val match = matcher.findMatch(currentTrack)
+            if (match == null || match.matchType == TrackMatcher.MatchType.NOT_FOUND) {
+                db.close()
+                return null
+            }
+            val seedId = match.embeddedTrack.id
+
+            val engine = RecommendationEngine(db, getApplication<Application>().filesDir)
+            engine.ensureIndices()
+
+            val config = buildConfig().copy(numTracks = 10, selectionMode = mode)
+            val tracks = engine.generatePlaylist(seedId, config)
+            db.close()
+            tracks.map { t -> "${t.track.title ?: "?"} \u2013 ${t.track.artist ?: "?"}" }
+        } catch (_: Exception) { null }
+    }
+
+    fun resetToDefaults() {
+        val defaults = RadioConfig()
+        setNumTracks(defaults.numTracks)
+        setSelectionMode(defaults.selectionMode)
+        setDriftEnabled(defaults.driftEnabled)
+        setDriftMode(defaults.driftMode)
+        setAnchorStrength(defaults.anchorStrength)
+        setAnchorDecay(defaults.anchorDecay)
+        setMomentumBeta(defaults.momentumBeta)
+        setDiversityLambda(defaults.diversityLambda)
+        setTemperature(defaults.temperature)
+        setMaxPerArtist(defaults.maxPerArtist)
+        setMinArtistSpacing(defaults.minArtistSpacing)
     }
 
     fun prepareIndices() {

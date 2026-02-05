@@ -746,12 +746,29 @@ fun SettingsScreen(
 
     val isRandomWalk = selectionMode == SelectionMode.RANDOM_WALK
 
-    // Recompute previews when any parameter changes (debounced)
-    LaunchedEffect(driftEnabled, driftMode, anchorStrength, anchorDecay,
-        momentumBeta, diversityLambda, temperature, maxPerArtist, minArtistSpacing, numTracks) {
-        viewModel.clearPreviews()
+    // Group keys by what affects each mode
+    val commonKeys = remember(numTracks, maxPerArtist, minArtistSpacing) { Any() }
+    val driftKeys = remember(driftEnabled, driftMode, anchorStrength, anchorDecay, momentumBeta) { Any() }
+
+    LaunchedEffect(commonKeys, driftKeys, diversityLambda) {
+        viewModel.clearPreview(SelectionMode.MMR)
         delay(500)
-        viewModel.computePreviews()
+        viewModel.computePreview(SelectionMode.MMR)
+    }
+    LaunchedEffect(commonKeys, driftKeys) {
+        viewModel.clearPreview(SelectionMode.DPP)
+        delay(500)
+        viewModel.computePreview(SelectionMode.DPP)
+    }
+    LaunchedEffect(commonKeys, anchorStrength) {
+        viewModel.clearPreview(SelectionMode.RANDOM_WALK)
+        delay(500)
+        viewModel.computePreview(SelectionMode.RANDOM_WALK)
+    }
+    LaunchedEffect(commonKeys, driftKeys, temperature) {
+        viewModel.clearPreview(SelectionMode.TEMPERATURE)
+        delay(500)
+        viewModel.computePreview(SelectionMode.TEMPERATURE)
     }
 
     Scaffold(
@@ -792,7 +809,7 @@ fun SettingsScreen(
                         description = "Picks similar tracks, then penalizes each candidate by how " +
                             "close it is to tracks already chosen.",
                         preview = previews[SelectionMode.MMR],
-                        isLoading = previewsLoading,
+                        isLoading = SelectionMode.MMR in previewsLoading,
                         selected = selectionMode == SelectionMode.MMR,
                         onClick = { viewModel.setSelectionMode(SelectionMode.MMR) }
                     )
@@ -801,7 +818,7 @@ fun SettingsScreen(
                         description = "Picks a set where every track is relevant and every pair is " +
                             "dissimilar. Unlike MMR, considers all pairwise interactions at once.",
                         preview = previews[SelectionMode.DPP],
-                        isLoading = previewsLoading,
+                        isLoading = SelectionMode.DPP in previewsLoading,
                         selected = selectionMode == SelectionMode.DPP,
                         onClick = { viewModel.setSelectionMode(SelectionMode.DPP) }
                     )
@@ -812,7 +829,7 @@ fun SettingsScreen(
                             "appears even if A and C aren't directly similar." +
                             if (databaseInfo?.hasGraph != true) " (requires kNN graph in database)" else "",
                         preview = previews[SelectionMode.RANDOM_WALK],
-                        isLoading = previewsLoading,
+                        isLoading = SelectionMode.RANDOM_WALK in previewsLoading,
                         selected = selectionMode == SelectionMode.RANDOM_WALK,
                         onClick = { viewModel.setSelectionMode(SelectionMode.RANDOM_WALK) }
                     )
@@ -821,7 +838,7 @@ fun SettingsScreen(
                         description = "Samples randomly from top candidates instead of always " +
                             "taking the best match. Non-deterministic \u2014 different results each run.",
                         preview = previews[SelectionMode.TEMPERATURE],
-                        isLoading = previewsLoading,
+                        isLoading = SelectionMode.TEMPERATURE in previewsLoading,
                         selected = selectionMode == SelectionMode.TEMPERATURE,
                         onClick = { viewModel.setSelectionMode(SelectionMode.TEMPERATURE) }
                     )
@@ -1055,6 +1072,13 @@ fun SettingsScreen(
                             Text("Grant Poweramp Access")
                         }
                     }
+                }
+            }
+
+            item { HorizontalDivider() }
+            item {
+                TextButton(onClick = { viewModel.resetToDefaults() }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Reset to Defaults")
                 }
             }
 
