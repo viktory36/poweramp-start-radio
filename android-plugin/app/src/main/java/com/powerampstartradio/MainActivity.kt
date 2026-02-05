@@ -46,6 +46,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.delay
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.poweramp.PowerampHelper
@@ -739,10 +740,15 @@ fun SettingsScreen(
     val minArtistSpacing by viewModel.minArtistSpacing.collectAsState()
     val numTracks by viewModel.numTracks.collectAsState()
     val previews by viewModel.previews.collectAsState()
+    val previewsLoading by viewModel.previewsLoading.collectAsState()
 
     val isRandomWalk = selectionMode == SelectionMode.RANDOM_WALK
 
-    LaunchedEffect(Unit) {
+    // Recompute previews when any setting changes (debounced)
+    LaunchedEffect(selectionMode, driftEnabled, driftMode, anchorStrength, anchorDecay,
+        momentumBeta, diversityLambda, temperature, maxPerArtist, minArtistSpacing, numTracks) {
+        viewModel.clearPreviews()
+        delay(500)
         viewModel.computePreviews()
     }
 
@@ -784,6 +790,7 @@ fun SettingsScreen(
                         description = "Picks similar tracks, then penalizes each candidate by how " +
                             "close it is to tracks already chosen.",
                         preview = previews[SelectionMode.MMR],
+                        isLoading = previewsLoading,
                         selected = selectionMode == SelectionMode.MMR,
                         onClick = { viewModel.setSelectionMode(SelectionMode.MMR) }
                     )
@@ -792,24 +799,27 @@ fun SettingsScreen(
                         description = "Picks a set where every track is relevant and every pair is " +
                             "dissimilar. Unlike MMR, considers all pairwise interactions at once.",
                         preview = previews[SelectionMode.DPP],
+                        isLoading = previewsLoading,
                         selected = selectionMode == SelectionMode.DPP,
                         onClick = { viewModel.setSelectionMode(SelectionMode.DPP) }
                     )
                     AlgorithmOption(
-                        label = "Random Walk",
+                        label = "Random Walk (Personalized PageRank)",
                         description = "Hops between neighbors on a similarity graph. Reaches tracks " +
                             "through indirect chains \u2014 A similar to B, B similar to C, so C " +
                             "appears even if A and C aren't directly similar." +
                             if (databaseInfo?.hasGraph != true) " (requires kNN graph in database)" else "",
                         preview = previews[SelectionMode.RANDOM_WALK],
+                        isLoading = previewsLoading,
                         selected = selectionMode == SelectionMode.RANDOM_WALK,
                         onClick = { viewModel.setSelectionMode(SelectionMode.RANDOM_WALK) }
                     )
                     AlgorithmOption(
-                        label = "Temperature Sampling",
+                        label = "Temperature Sampling (Gumbel-Max)",
                         description = "Samples randomly from top candidates instead of always " +
                             "taking the best match. Non-deterministic \u2014 different results each run.",
                         preview = previews[SelectionMode.TEMPERATURE],
+                        isLoading = previewsLoading,
                         selected = selectionMode == SelectionMode.TEMPERATURE,
                         onClick = { viewModel.setSelectionMode(SelectionMode.TEMPERATURE) }
                     )
@@ -820,10 +830,10 @@ fun SettingsScreen(
             if (selectionMode == SelectionMode.MMR) {
                 item {
                     Column {
-                        Text("Similarity vs. Variety: ${(diversityLambda * 100).roundToInt()}%",
+                        Text("Lambda (\u03bb): ${(diversityLambda * 100).roundToInt()}%",
                             style = MaterialTheme.typography.titleSmall)
                         Text("Low = diversity penalty dominates, picks spread apart. " +
-                            "High = similarity dominates, picks cluster closer.",
+                            "High = relevance dominates, picks cluster closer.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Slider(value = diversityLambda, onValueChange = { viewModel.setDiversityLambda(it) },
@@ -836,7 +846,7 @@ fun SettingsScreen(
             if (selectionMode == SelectionMode.TEMPERATURE) {
                 item {
                     Column {
-                        Text("Temperature: ${String.format("%.2f", temperature)}",
+                        Text("Temperature (\u03c4): ${String.format("%.2f", temperature)}",
                             style = MaterialTheme.typography.titleSmall)
                         Text("Low = nearly deterministic, takes the top matches. " +
                             "High = samples more uniformly across candidates.",
@@ -852,7 +862,7 @@ fun SettingsScreen(
             if (isRandomWalk) {
                 item {
                     Column {
-                        Text("Restart Probability: ${(anchorStrength * 100).roundToInt()}%",
+                        Text("Restart Probability (\u03b1): ${(anchorStrength * 100).roundToInt()}%",
                             style = MaterialTheme.typography.titleSmall)
                         Text("How often the walk jumps back to the seed. " +
                             "High = resets frequently, stays local. " +
@@ -871,7 +881,7 @@ fun SettingsScreen(
 
                 item {
                     Column {
-                        Text("Drift", style = MaterialTheme.typography.titleMedium)
+                        Text("Query Drift", style = MaterialTheme.typography.titleMedium)
                         Spacer(modifier = Modifier.height(4.dp))
 
                         Row(modifier = Modifier.fillMaxWidth().selectable(
@@ -889,7 +899,7 @@ fun SettingsScreen(
 
                         AnimatedVisibility(visible = driftEnabled) {
                             Column(modifier = Modifier.padding(start = 16.dp, top = 8.dp)) {
-                                Text("Drift Style", style = MaterialTheme.typography.titleSmall)
+                                Text("Drift Mode", style = MaterialTheme.typography.titleSmall)
                                 Spacer(modifier = Modifier.height(4.dp))
                                 Column(modifier = Modifier.selectableGroup()) {
                                     Row(modifier = Modifier.fillMaxWidth().selectable(
@@ -900,9 +910,9 @@ fun SettingsScreen(
                                         RadioButton(selected = driftMode == DriftMode.SEED_INTERPOLATION, onClick = null)
                                         Spacer(modifier = Modifier.width(8.dp))
                                         Column {
-                                            Text("Anchored", style = MaterialTheme.typography.bodyMedium)
+                                            Text("Seed Interpolation", style = MaterialTheme.typography.bodyMedium)
                                             Text("Blends the seed with the latest pick to decide what to search " +
-                                                "for next. Anchor strength controls the blend ratio.",
+                                                "for next. Alpha controls the blend ratio.",
                                                 style = MaterialTheme.typography.bodySmall,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
                                         }
@@ -915,7 +925,7 @@ fun SettingsScreen(
                                         RadioButton(selected = driftMode == DriftMode.MOMENTUM, onClick = null)
                                         Spacer(modifier = Modifier.width(8.dp))
                                         Column {
-                                            Text("Momentum", style = MaterialTheme.typography.bodyMedium)
+                                            Text("EMA Momentum", style = MaterialTheme.typography.bodyMedium)
                                             Text("Running average of all picks so far. " +
                                                 "Search direction changes gradually, not abruptly.",
                                                 style = MaterialTheme.typography.bodySmall,
@@ -927,7 +937,7 @@ fun SettingsScreen(
                                 // Anchored parameters
                                 AnimatedVisibility(visible = driftMode == DriftMode.SEED_INTERPOLATION) {
                                     Column(modifier = Modifier.padding(top = 8.dp)) {
-                                        Text("Anchor Strength: ${(anchorStrength * 100).roundToInt()}%",
+                                        Text("Alpha (\u03b1): ${(anchorStrength * 100).roundToInt()}%",
                                             style = MaterialTheme.typography.titleSmall)
                                         Text("Weight of the seed in the blend. " +
                                             "Low = latest pick dominates. High = seed dominates.",
@@ -936,8 +946,8 @@ fun SettingsScreen(
                                         Slider(value = anchorStrength, onValueChange = { viewModel.setAnchorStrength(it) },
                                             valueRange = 0f..1f)
 
-                                        Text("Anchor Decay", style = MaterialTheme.typography.titleSmall)
-                                        Text("Whether the anchor weakens as the queue progresses.",
+                                        Text("Decay Schedule", style = MaterialTheme.typography.titleSmall)
+                                        Text("Whether alpha weakens as the queue progresses.",
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                                         Spacer(modifier = Modifier.height(4.dp))
@@ -970,10 +980,10 @@ fun SettingsScreen(
                                 // Momentum parameters
                                 AnimatedVisibility(visible = driftMode == DriftMode.MOMENTUM) {
                                     Column(modifier = Modifier.padding(top = 8.dp)) {
-                                        Text("Momentum: ${(momentumBeta * 100).roundToInt()}%",
+                                        Text("Beta (\u03b2): ${(momentumBeta * 100).roundToInt()}%",
                                             style = MaterialTheme.typography.titleSmall)
-                                        Text("How slowly the search direction changes. " +
-                                            "High = averages over many past picks. " +
+                                        Text("EMA smoothing factor. " +
+                                            "High = averages over many past picks, direction changes slowly. " +
                                             "Low = reacts quickly to each new pick.",
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1055,7 +1065,7 @@ fun SettingsScreen(
 @Composable
 private fun AlgorithmOption(
     label: String, description: String, selected: Boolean, onClick: () -> Unit,
-    preview: List<String>? = null
+    preview: List<String>? = null, isLoading: Boolean = false
 ) {
     Row(modifier = Modifier.fillMaxWidth().selectable(selected = selected, onClick = onClick,
         role = Role.RadioButton).padding(vertical = 6.dp),
@@ -1068,11 +1078,17 @@ private fun AlgorithmOption(
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (!preview.isNullOrEmpty()) {
                 Text(
-                    text = preview.joinToString("  \u00b7  "),
+                    text = preview.joinToString(" \u2192 "),
                     style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
                     maxLines = 1,
                     modifier = Modifier.padding(top = 2.dp).basicMarquee(iterations = Int.MAX_VALUE)
+                )
+            } else if (isLoading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.padding(top = 4.dp).size(10.dp),
+                    strokeWidth = 1.dp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
                 )
             }
         }

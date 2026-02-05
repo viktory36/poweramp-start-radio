@@ -11,6 +11,7 @@ import com.powerampstartradio.poweramp.TrackMatcher
 import com.powerampstartradio.services.RadioService
 import com.powerampstartradio.similarity.RecommendationEngine
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -88,6 +89,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _previews = MutableStateFlow<Map<SelectionMode, List<String>>>(emptyMap())
     val previews: StateFlow<Map<SelectionMode, List<String>>> = _previews.asStateFlow()
+
+    private val _previewsLoading = MutableStateFlow(false)
+    val previewsLoading: StateFlow<Boolean> = _previewsLoading.asStateFlow()
+
+    private var previewJob: Job? = null
 
     val radioState: StateFlow<RadioUiState> = RadioService.uiState
     val sessionHistory: StateFlow<List<RadioResult>> = RadioService.sessionHistory
@@ -207,11 +213,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         RadioService.clearHistory()
     }
 
+    fun clearPreviews() {
+        previewJob?.cancel()
+        _previews.value = emptyMap()
+        _previewsLoading.value = true
+    }
+
     fun computePreviews() {
-        viewModelScope.launch(Dispatchers.IO) {
-            val currentTrack = PowerampReceiver.currentTrack ?: return@launch
+        previewJob?.cancel()
+        _previewsLoading.value = true
+        previewJob = viewModelScope.launch(Dispatchers.IO) {
+            val currentTrack = PowerampReceiver.currentTrack
+            if (currentTrack == null) {
+                _previewsLoading.value = false
+                return@launch
+            }
             val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
-            if (!dbFile.exists()) return@launch
+            if (!dbFile.exists()) {
+                _previewsLoading.value = false
+                return@launch
+            }
 
             try {
                 val db = EmbeddingDatabase.open(dbFile)
@@ -219,6 +240,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val match = matcher.findMatch(currentTrack)
                 if (match == null || match.matchType == TrackMatcher.MatchType.NOT_FOUND) {
                     db.close()
+                    _previewsLoading.value = false
                     return@launch
                 }
                 val seedId = match.embeddedTrack.id
@@ -227,7 +249,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 engine.ensureIndices()
 
                 val results = mutableMapOf<SelectionMode, List<String>>()
-                val baseConfig = buildConfig().copy(numTracks = 3, driftEnabled = false)
+                val baseConfig = buildConfig().copy(numTracks = 10)
 
                 for (mode in SelectionMode.entries) {
                     try {
@@ -242,6 +264,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 db.close()
                 _previews.value = results
             } catch (_: Exception) { }
+            _previewsLoading.value = false
         }
     }
 
