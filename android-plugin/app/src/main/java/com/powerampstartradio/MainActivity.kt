@@ -370,6 +370,7 @@ fun HomeScreen(
                             is RadioUiState.Idle, is RadioUiState.Searching -> {
                                 IdleContent(hasPermission = hasPermission, databaseInfo = databaseInfo,
                                     statusMessage = statusMessage, indexStatus = indexStatus,
+                                    isIdle = radioState is RadioUiState.Idle,
                                     onRequestPermission = onRequestPermission, modifier = Modifier.fillMaxSize())
                             }
                             is RadioUiState.Error -> {
@@ -680,7 +681,8 @@ fun SessionHistoryDrawer(sessions: List<RadioResult>, onSessionTap: (Int) -> Uni
 @Composable
 fun IdleContent(
     hasPermission: Boolean, databaseInfo: DatabaseInfo?, statusMessage: String,
-    indexStatus: String?, onRequestPermission: () -> Unit, modifier: Modifier = Modifier
+    indexStatus: String?, isIdle: Boolean = true, onRequestPermission: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
     Column(modifier = modifier.fillMaxWidth().padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -709,7 +711,7 @@ fun IdleContent(
             Text(statusMessage, style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        if (hasPermission && databaseInfo != null) {
+        if (isIdle && hasPermission && databaseInfo != null && statusMessage.isEmpty()) {
             Text("Ready when you are!", style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.primary)
         }
