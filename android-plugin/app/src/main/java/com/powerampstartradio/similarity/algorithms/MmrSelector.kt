@@ -86,21 +86,21 @@ object MmrSelector {
 
         // Track max-sim-to-selected for each candidate (incrementally updated)
         val maxSimToSelected = FloatArray(candidates.size) { Float.NEGATIVE_INFINITY }
-        val candidateList = candidates.toList()
+        // Pre-build trackId -> original index map for O(1) lookup
+        val tidToOrigIdx = HashMap<Long, Int>(candidates.size)
+        for (i in candidates.indices) tidToOrigIdx[candidates[i].first] = i
 
         for (step in 0 until numSelect) {
             if (remaining.isEmpty()) break
 
             var bestIdx = -1
             var bestScore = Float.NEGATIVE_INFINITY
-            var bestOrigIdx = -1
 
             for (i in remaining.indices) {
                 val (trackId, relevance) = remaining[i]
                 val emb = embCache[trackId] ?: continue
 
-                // Find original index for maxSimToSelected tracking
-                val origIdx = candidateList.indexOfFirst { it.first == trackId }
+                val origIdx = tidToOrigIdx[trackId] ?: continue
 
                 // Update max sim with the most recently selected track
                 if (selectedEmbeddings.isNotEmpty()) {
@@ -117,7 +117,6 @@ object MmrSelector {
                 if (mmrScore > bestScore) {
                     bestScore = mmrScore
                     bestIdx = i
-                    bestOrigIdx = origIdx
                 }
             }
 

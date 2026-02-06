@@ -61,6 +61,7 @@ object DppSelector {
         // the marginal gain of adding each candidate.
 
         val selected = mutableListOf<Int>()
+        val selectedSet = HashSet<Int>()
         val dim = embeddings.firstOrNull { it.isNotEmpty() }?.size ?: return emptyList()
 
         // c[i][j] = Cholesky factor entries for candidate i at step j
@@ -79,7 +80,7 @@ object DppSelector {
             var bestGain = -1f
 
             for (i in 0 until n) {
-                if (!validMask[i] || i in selected.map { it }) continue
+                if (!validMask[i] || i in selectedSet) continue
                 if (diagRemaining[i] > bestGain) {
                     bestGain = diagRemaining[i]
                     bestIdx = i
@@ -89,12 +90,13 @@ object DppSelector {
             if (bestIdx < 0 || bestGain <= 1e-10f) break
 
             selected.add(bestIdx)
+            selectedSet.add(bestIdx)
 
             // Update Cholesky factors for remaining candidates
             val sqrtGain = sqrt(bestGain)
 
             for (i in 0 until n) {
-                if (!validMask[i] || i in selected.map { it }) continue
+                if (!validMask[i] || i in selectedSet) continue
 
                 // L[i][bestIdx] = q[i] * q[bestIdx] * dot(emb_i, emb_bestIdx)
                 val kernelVal = quality[i] * quality[bestIdx] * dotProduct(embeddings[i], embeddings[bestIdx])

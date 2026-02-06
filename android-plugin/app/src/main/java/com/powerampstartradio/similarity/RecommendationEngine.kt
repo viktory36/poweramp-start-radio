@@ -116,10 +116,17 @@ class RecommendationEngine(
             return@withContext randomWalkPlaylist(seedTrackId, config, onProgress, onResult)
         }
 
-        if (config.driftEnabled) {
-            driftPlaylist(seedTrackId, seedEmb, index, config, onProgress, onResult, cancellationCheck)
+        // DPP in drift mode is degenerate (k=1 selection = pure greedy max similarity,
+        // identical to MMR lambda=1). Force batch mode for DPP.
+        val effectiveConfig = if (config.selectionMode == SelectionMode.DPP && config.driftEnabled) {
+            Log.w(TAG, "DPP+drift is degenerate; forcing batch mode")
+            config.copy(driftEnabled = false)
+        } else config
+
+        if (effectiveConfig.driftEnabled) {
+            driftPlaylist(seedTrackId, seedEmb, index, effectiveConfig, onProgress, onResult, cancellationCheck)
         } else {
-            batchPlaylist(seedTrackId, seedEmb, index, config, onProgress, cancellationCheck)
+            batchPlaylist(seedTrackId, seedEmb, index, effectiveConfig, onProgress, cancellationCheck)
         }
     }
 

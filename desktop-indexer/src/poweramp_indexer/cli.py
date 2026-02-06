@@ -1236,5 +1236,45 @@ def extract_encoder(output: Path, verbose: bool):
     click.echo(f"  poweramp-indexer scan /path/to/music --model flamingo -o embeddings_flamingo.db")
 
 
+@cli.command()
+@click.argument("database", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--seeds", "-s", type=int, default=200, help="Number of seed tracks (default: 200)")
+@click.option("--quick", "-q", is_flag=True, help="Quick mode: 20 seeds, reduced knob grid")
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
+def audit(database: Path, seeds: int, quick: bool, verbose: bool):
+    """Run exhaustive algorithm audit against a fused embedding database.
+
+    Tests every recommendation algorithm (MMR, DPP, Temperature, Random Walk)
+    and drift mode against diverse seed tracks from the full corpus.
+    Validates monotonicity, diversity, degeneracy, and post-filter correctness.
+
+    DATABASE: Path to embeddings database with fused embeddings
+
+    Examples:
+
+      poweramp-indexer audit embeddings.db
+      poweramp-indexer audit embeddings.db --quick
+      poweramp-indexer audit embeddings.db --seeds 50
+    """
+    if verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if quick:
+        seeds = min(seeds, 20)
+
+    from .audit import run_audit
+
+    click.echo(f"Database: {database}")
+    click.echo(f"Seeds: {seeds}, Quick: {quick}")
+    click.echo()
+
+    validations, _ = run_audit(database, n_seeds=seeds, quick=quick)
+
+    # Exit with non-zero if any validation failed
+    failed = sum(1 for v in validations if not v.passed)
+    if failed > 0:
+        raise SystemExit(1)
+
+
 if __name__ == "__main__":
     cli()

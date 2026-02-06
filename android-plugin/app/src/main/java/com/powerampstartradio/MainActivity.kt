@@ -745,6 +745,7 @@ fun SettingsScreen(
     val previewsLoading by viewModel.previewsLoading.collectAsState()
 
     val isRandomWalk = selectionMode == SelectionMode.RANDOM_WALK
+    val isDpp = selectionMode == SelectionMode.DPP
 
     // Group keys by what affects each mode
     val commonKeys = remember(numTracks, maxPerArtist, minArtistSpacing) { Any() }
@@ -755,7 +756,7 @@ fun SettingsScreen(
         delay(500)
         viewModel.computePreview(SelectionMode.MMR)
     }
-    LaunchedEffect(commonKeys, driftKeys) {
+    LaunchedEffect(commonKeys) {
         viewModel.clearPreview(SelectionMode.DPP)
         delay(500)
         viewModel.computePreview(SelectionMode.DPP)
@@ -894,8 +895,10 @@ fun SettingsScreen(
                 }
             }
 
-            // Drift — not applicable to Random Walk
-            if (!isRandomWalk) {
+            // Drift — not applicable to Random Walk or DPP
+            // (DPP in drift mode is degenerate: k=1 selection = pure greedy max,
+            //  identical to MMR lambda=1. DPP's value is batch-only pairwise diversity.)
+            if (!isRandomWalk && !isDpp) {
                 item { HorizontalDivider() }
 
                 item {
