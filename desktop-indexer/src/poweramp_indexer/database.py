@@ -1,5 +1,7 @@
 """SQLite database management for embeddings storage."""
 
+from __future__ import annotations
+
 import logging
 import sqlite3
 import struct

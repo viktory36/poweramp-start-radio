@@ -64,16 +64,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _momentumBeta = MutableStateFlow(prefs.getFloat("momentum_beta", 0.7f))
     val momentumBeta: StateFlow<Float> = _momentumBeta.asStateFlow()
 
-    private val _diversityLambda = MutableStateFlow(prefs.getFloat("diversity_lambda", 0.6f))
+    private val _diversityLambda = MutableStateFlow(prefs.getFloat("diversity_lambda", 0.4f))
     val diversityLambda: StateFlow<Float> = _diversityLambda.asStateFlow()
 
-    private val _temperature = MutableStateFlow(prefs.getFloat("temperature", 0.1f))
+    private val _temperature = MutableStateFlow(prefs.getFloat("temperature", 0.05f))
     val temperature: StateFlow<Float> = _temperature.asStateFlow()
 
     private val _maxPerArtist = MutableStateFlow(prefs.getInt("max_per_artist", 3))
     val maxPerArtist: StateFlow<Int> = _maxPerArtist.asStateFlow()
 
-    private val _minArtistSpacing = MutableStateFlow(prefs.getInt("min_artist_spacing", 5))
+    private val _minArtistSpacing = MutableStateFlow(prefs.getInt("min_artist_spacing", 3))
     val minArtistSpacing: StateFlow<Int> = _minArtistSpacing.asStateFlow()
 
     // --- Database & permission state ---

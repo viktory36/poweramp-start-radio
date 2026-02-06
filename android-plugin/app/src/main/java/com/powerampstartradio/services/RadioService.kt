@@ -172,10 +172,10 @@ class RadioService : Service() {
                 DecaySchedule.valueOf(intent.getStringExtra(EXTRA_ANCHOR_DECAY) ?: DecaySchedule.EXPONENTIAL.name)
             } catch (e: IllegalArgumentException) { DecaySchedule.EXPONENTIAL },
             momentumBeta = intent.getFloatExtra(EXTRA_MOMENTUM_BETA, 0.7f),
-            diversityLambda = intent.getFloatExtra(EXTRA_DIVERSITY_LAMBDA, 0.6f),
-            temperature = intent.getFloatExtra(EXTRA_TEMPERATURE, 0.1f),
+            diversityLambda = intent.getFloatExtra(EXTRA_DIVERSITY_LAMBDA, 0.4f),
+            temperature = intent.getFloatExtra(EXTRA_TEMPERATURE, 0.05f),
             maxPerArtist = intent.getIntExtra(EXTRA_MAX_PER_ARTIST, 3),
-            minArtistSpacing = intent.getIntExtra(EXTRA_MIN_ARTIST_SPACING, 5),
+            minArtistSpacing = intent.getIntExtra(EXTRA_MIN_ARTIST_SPACING, 3),
         )
     }
 
