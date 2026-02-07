@@ -537,12 +537,6 @@ data class TreeNodeInfo(
 private fun computeTreeNodes(session: RadioResult): List<TreeNodeInfo> {
     if (session.tracks.isEmpty()) return emptyList()
 
-    // Batch modes (no drift): no rails
-    if (!session.config.driftEnabled) {
-        return session.tracks.map { TreeNodeInfo(depth = 0, rails = emptyList()) }
-    }
-
-    // Drift modes: read provenance from each track
     return session.tracks.mapIndexed { index, track ->
         val rails = track.provenance.influences.map { influence ->
             ActiveRail(
