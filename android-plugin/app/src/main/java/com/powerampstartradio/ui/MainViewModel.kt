@@ -219,6 +219,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _previewsLoading.value = _previewsLoading.value + mode
     }
 
+    fun invalidatePreview(mode: SelectionMode) {
+        previewJobs[mode]?.cancel()
+        _previews.value = _previews.value - mode
+        _previewsLoading.value = _previewsLoading.value - mode
+    }
+
     fun computePreview(mode: SelectionMode) {
         previewJobs[mode]?.cancel()
         _previewsLoading.value = _previewsLoading.value + mode

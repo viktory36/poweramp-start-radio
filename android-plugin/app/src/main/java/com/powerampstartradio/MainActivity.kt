@@ -46,7 +46,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import kotlinx.coroutines.delay
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.poweramp.PowerampHelper
@@ -441,8 +440,7 @@ fun CompactNowPlayingHeader(
 
 @Composable
 fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
-    var treeNodes by remember { mutableStateOf(computeTreeNodes(session)) }
-    LaunchedEffect(session) { treeNodes = computeTreeNodes(session) }
+    val treeNodes = remember(session) { computeTreeNodes(session) }
 
     val listState = rememberLazyListState()
     val hasDriftRails = session.config.driftEnabled
@@ -458,7 +456,7 @@ fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
 
     // Scroll offset squishes old rail columns off-screen as you scroll down
     val scrollOffset: (() -> Float)? = if (hasDriftRails) {
-        remember<() -> Float> {
+        remember(treeNodes) {
             { (treeNodes.getOrNull(listState.firstVisibleItemIndex)?.depth ?: 0).toFloat() }
         }
     } else null
@@ -743,29 +741,22 @@ fun SettingsScreen(
     val driftKeys = remember(driftEnabled, driftMode, anchorStrength, anchorDecay, momentumBeta) { Any() }
     val expandedPeek = remember { mutableStateMapOf<SelectionMode, Boolean>() }
 
+    // Invalidate stale previews when relevant settings change (lazy — computed on peek click)
     LaunchedEffect(commonKeys, driftKeys, diversityLambda) {
-        viewModel.clearPreview(SelectionMode.MMR)
+        viewModel.invalidatePreview(SelectionMode.MMR)
         expandedPeek[SelectionMode.MMR] = false
-        delay(500)
-        viewModel.computePreview(SelectionMode.MMR)
     }
     LaunchedEffect(commonKeys) {
-        viewModel.clearPreview(SelectionMode.DPP)
+        viewModel.invalidatePreview(SelectionMode.DPP)
         expandedPeek[SelectionMode.DPP] = false
-        delay(500)
-        viewModel.computePreview(SelectionMode.DPP)
     }
     LaunchedEffect(commonKeys, anchorStrength) {
-        viewModel.clearPreview(SelectionMode.RANDOM_WALK)
+        viewModel.invalidatePreview(SelectionMode.RANDOM_WALK)
         expandedPeek[SelectionMode.RANDOM_WALK] = false
-        delay(500)
-        viewModel.computePreview(SelectionMode.RANDOM_WALK)
     }
     LaunchedEffect(commonKeys, driftKeys, temperature) {
-        viewModel.clearPreview(SelectionMode.TEMPERATURE)
+        viewModel.invalidatePreview(SelectionMode.TEMPERATURE)
         expandedPeek[SelectionMode.TEMPERATURE] = false
-        delay(500)
-        viewModel.computePreview(SelectionMode.TEMPERATURE)
     }
 
     Scaffold(
@@ -824,6 +815,7 @@ fun SettingsScreen(
                         selected = selectionMode == SelectionMode.MMR,
                         expanded = expandedPeek[SelectionMode.MMR] == true,
                         onToggleExpanded = { expandedPeek[SelectionMode.MMR] = !(expandedPeek[SelectionMode.MMR] ?: false) },
+                        onRequestPreview = { viewModel.computePreview(SelectionMode.MMR) },
                         previewInfo = "\u03bb=${(diversityLambda * 100).roundToInt()}%$driftInfo",
                         onClick = { viewModel.setSelectionMode(SelectionMode.MMR) }
                     )
@@ -836,6 +828,7 @@ fun SettingsScreen(
                         selected = selectionMode == SelectionMode.DPP,
                         expanded = expandedPeek[SelectionMode.DPP] == true,
                         onToggleExpanded = { expandedPeek[SelectionMode.DPP] = !(expandedPeek[SelectionMode.DPP] ?: false) },
+                        onRequestPreview = { viewModel.computePreview(SelectionMode.DPP) },
                         onClick = { viewModel.setSelectionMode(SelectionMode.DPP) }
                     )
                     AlgorithmOption(
@@ -849,6 +842,7 @@ fun SettingsScreen(
                         selected = selectionMode == SelectionMode.RANDOM_WALK,
                         expanded = expandedPeek[SelectionMode.RANDOM_WALK] == true,
                         onToggleExpanded = { expandedPeek[SelectionMode.RANDOM_WALK] = !(expandedPeek[SelectionMode.RANDOM_WALK] ?: false) },
+                        onRequestPreview = { viewModel.computePreview(SelectionMode.RANDOM_WALK) },
                         previewInfo = "\u03b1=${(anchorStrength * 100).roundToInt()}%",
                         onClick = { viewModel.setSelectionMode(SelectionMode.RANDOM_WALK) }
                     )
@@ -861,6 +855,7 @@ fun SettingsScreen(
                         selected = selectionMode == SelectionMode.TEMPERATURE,
                         expanded = expandedPeek[SelectionMode.TEMPERATURE] == true,
                         onToggleExpanded = { expandedPeek[SelectionMode.TEMPERATURE] = !(expandedPeek[SelectionMode.TEMPERATURE] ?: false) },
+                        onRequestPreview = { viewModel.computePreview(SelectionMode.TEMPERATURE) },
                         previewInfo = "\u03c4=${String.format("%.2f", temperature)}$driftInfo",
                         onClick = { viewModel.setSelectionMode(SelectionMode.TEMPERATURE) }
                     )
@@ -1116,6 +1111,7 @@ private fun AlgorithmOption(
     label: String, description: String, selected: Boolean, onClick: () -> Unit,
     preview: List<String>? = null, isLoading: Boolean = false,
     expanded: Boolean = false, onToggleExpanded: () -> Unit = {},
+    onRequestPreview: () -> Unit = {},
     previewInfo: String = ""
 ) {
     Row(modifier = Modifier.fillMaxWidth().selectable(selected = selected, onClick = onClick,
@@ -1127,18 +1123,31 @@ private fun AlgorithmOption(
             Text(label, style = MaterialTheme.typography.bodyMedium)
             Text(description, style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (!preview.isNullOrEmpty()) {
-                TextButton(
-                    onClick = onToggleExpanded,
-                    contentPadding = PaddingValues(0.dp),
-                    modifier = Modifier.fillMaxWidth().height(28.dp)
-                ) {
-                    val toggle = if (expanded) "Hide \u25B4" else "Peek \u25BE"
-                    val text = if (previewInfo.isEmpty()) toggle else "$toggle $previewInfo"
-                    Text(text, style = MaterialTheme.typography.labelSmall,
-                        modifier = Modifier.fillMaxWidth())
-                }
-                AnimatedVisibility(visible = expanded) {
+            TextButton(
+                onClick = {
+                    if (!expanded && preview.isNullOrEmpty() && !isLoading) {
+                        onRequestPreview()
+                    }
+                    onToggleExpanded()
+                },
+                contentPadding = PaddingValues(0.dp),
+                modifier = Modifier.fillMaxWidth().height(28.dp)
+            ) {
+                val toggle = if (expanded) "Hide \u25B4" else "Peek \u25BE"
+                val text = if (previewInfo.isEmpty()) toggle else "$toggle $previewInfo"
+                Text(text, style = MaterialTheme.typography.labelSmall,
+                    modifier = Modifier.fillMaxWidth())
+            }
+            AnimatedVisibility(visible = expanded) {
+                if (isLoading) {
+                    Box(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                        contentAlignment = Alignment.CenterStart) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(14.dp), strokeWidth = 1.5.dp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                        )
+                    }
+                } else if (!preview.isNullOrEmpty()) {
                     Column(
                         modifier = Modifier
                             .heightIn(max = 200.dp)
@@ -1153,12 +1162,6 @@ private fun AlgorithmOption(
                         }
                     }
                 }
-            } else if (isLoading) {
-                CircularProgressIndicator(
-                    modifier = Modifier.padding(top = 4.dp).size(10.dp),
-                    strokeWidth = 1.dp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
-                )
             }
         }
     }
@@ -1180,5 +1183,5 @@ private fun humanSelectionMode(mode: SelectionMode, drift: Boolean = false): Str
         SelectionMode.RANDOM_WALK -> "random walk"
         SelectionMode.TEMPERATURE -> "temperature"
     }
-    return if (drift) "$base drift" else base
+    return if (drift && mode != SelectionMode.DPP) "$base drift" else base
 }

@@ -229,7 +229,10 @@ class RadioService : Service() {
 
                 updateNotification("Searching for similar tracks...")
 
-                if (config.driftEnabled) {
+                // DPP+drift is degenerate (forced to batch in RecommendationEngine),
+                // so use batch path here too to avoid streaming/return-value mismatch.
+                val effectiveDrift = config.driftEnabled && config.selectionMode != SelectionMode.DPP
+                if (effectiveDrift) {
                     // Drift path: streaming results
                     val streamingTracks = mutableListOf<QueuedTrackResult>()
                     val seenFileIds = mutableSetOf<Long>()
