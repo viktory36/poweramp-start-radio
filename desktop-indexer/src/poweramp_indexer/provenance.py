@@ -363,7 +363,9 @@ def validate_provenance(results: list[StepResult]) -> list[str]:
     errors = []
     for r in results:
         total = sum(inf.weight for inf in r.influences)
-        if abs(total - 1.0) > 0.02:
+        # EMA with threshold=0.01 drops old influences, so sum can be ~0.97 at step 13+.
+        # Allow 5% tolerance to account for thresholding.
+        if abs(total - 1.0) > 0.05:
             errors.append(f"Step {r.index}: influence sum = {total:.4f} (expected ~1.0)")
 
         for inf in r.influences:
