@@ -11,8 +11,11 @@ import com.powerampstartradio.similarity.algorithms.MmrSelector
 import com.powerampstartradio.similarity.algorithms.PostFilter
 import com.powerampstartradio.similarity.algorithms.RandomWalkSelector
 import com.powerampstartradio.similarity.algorithms.TemperatureSelector
+import com.powerampstartradio.ui.DriftMode
+import com.powerampstartradio.ui.Influence
 import com.powerampstartradio.ui.RadioConfig
 import com.powerampstartradio.ui.SelectionMode
+import com.powerampstartradio.ui.TrackProvenance
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
@@ -25,6 +28,7 @@ import kotlin.coroutines.coroutineContext
 data class SimilarTrack(
     val track: EmbeddedTrack,
     val similarity: Float,
+    val provenance: TrackProvenance = TrackProvenance(),
 )
 
 /**
@@ -131,6 +135,52 @@ class RecommendationEngine(
     }
 
     /**
+     * Compute provenance for a track based on the query that produced it.
+     *
+     * For seed interpolation: the query was `alpha * seed + (1-alpha) * prev_track`,
+     * so the track has exactly 2 influences — seed (weight=seedWeight) and
+     * previous track (weight=1-seedWeight).
+     *
+     * For EMA momentum: the query is a weighted sum of all predecessors,
+     * so every prior track + seed has an influence with geometrically decaying weights.
+     *
+     * @param resultIndex 0-based index of this track in the result list
+     * @param seedWeight Exact seed weight from the DriftResult that produced the current query
+     *                   (1.0 for the first track, since query = pure seed)
+     * @param config Radio configuration
+     */
+    private fun computeProvenance(
+        resultIndex: Int,
+        seedWeight: Float,
+        config: RadioConfig
+    ): TrackProvenance {
+        if (resultIndex == 0) return TrackProvenance()  // 100% seed
+
+        return when (config.driftMode) {
+            DriftMode.SEED_INTERPOLATION -> {
+                // Query was: seedWeight * seed + (1-seedWeight) * track_{i-1}
+                TrackProvenance(listOf(
+                    Influence(-1, seedWeight),
+                    Influence(resultIndex - 1, 1f - seedWeight)
+                ))
+            }
+            DriftMode.MOMENTUM -> {
+                val beta = config.momentumBeta
+                val influences = mutableListOf<Influence>()
+                // Seed contribution: beta^(resultIndex)
+                val sw = Math.pow(beta.toDouble(), resultIndex.toDouble()).toFloat()
+                if (sw > 0.01f) influences.add(Influence(-1, sw))
+                // Track j contributes beta^(resultIndex - j - 1) * (1 - beta)
+                for (j in 0 until resultIndex) {
+                    val w = Math.pow(beta.toDouble(), (resultIndex - j - 1).toDouble()).toFloat() * (1f - beta)
+                    if (w > 0.01f) influences.add(Influence(j, w))
+                }
+                TrackProvenance(influences)
+            }
+        }
+    }
+
+    /**
      * Drift mode: per-step selection with evolving query.
      */
     private suspend fun driftPlaylist(
@@ -148,6 +198,9 @@ class RecommendationEngine(
         val seen = mutableSetOf(seedTrackId)
         var query = seedEmb
         var emaState: FloatArray? = null
+        // Track the seed weight of the current query for provenance.
+        // Initial query = pure seed, so seedWeight = 1.0
+        var currentSeedWeight = 1f
 
         for (step in 0 until config.numTracks) {
             coroutineContext.ensureActive()
@@ -168,6 +221,7 @@ class RecommendationEngine(
             seen.add(trackId)
 
             val track = database.getTrackById(trackId) ?: continue
+            val provenance = computeProvenance(result.size, currentSeedWeight, config)
 
             // Check artist constraints
             if (!PostFilter.canAdd(track, selectedTracks, config.maxPerArtist, config.minArtistSpacing)) {
@@ -183,25 +237,26 @@ class RecommendationEngine(
                     val (fbId, fbScore) = fallback
                     seen.add(fbId)
                     val fbTrack = database.getTrackById(fbId) ?: continue
-                    val similarTrack = SimilarTrack(fbTrack, fbScore)
+                    val similarTrack = SimilarTrack(fbTrack, fbScore, provenance)
                     result.add(similarTrack)
                     selectedTracks.add(fbTrack)
                     index.getEmbeddingByTrackId(fbId)?.let { selectedEmbeddings.add(it) }
                     onResult?.invoke(similarTrack)
 
                     val currentEmb = index.getEmbeddingByTrackId(fbId) ?: continue
-                    val (newQuery, newEma) = DriftEngine.updateQuery(
+                    val driftResult = DriftEngine.updateQuery(
                         seedEmb, currentEmb, emaState, step, config.numTracks, config
                     )
-                    query = newQuery
-                    emaState = newEma
+                    query = driftResult.query
+                    emaState = driftResult.emaState
+                    currentSeedWeight = driftResult.seedWeight
                     continue
                 }
                 // No valid fallback — skip this step
                 continue
             }
 
-            val similarTrack = SimilarTrack(track, score)
+            val similarTrack = SimilarTrack(track, score, provenance)
             result.add(similarTrack)
             selectedTracks.add(track)
             index.getEmbeddingByTrackId(trackId)?.let { selectedEmbeddings.add(it) }
@@ -209,11 +264,12 @@ class RecommendationEngine(
 
             // Update query for next step
             val currentEmb = index.getEmbeddingByTrackId(trackId) ?: break
-            val (newQuery, newEma) = DriftEngine.updateQuery(
+            val driftResult = DriftEngine.updateQuery(
                 seedEmb, currentEmb, emaState, step, config.numTracks, config
             )
-            query = newQuery
-            emaState = newEma
+            query = driftResult.query
+            emaState = driftResult.emaState
+            currentSeedWeight = driftResult.seedWeight
         }
 
         Log.d(TAG, "Drift: ${result.size} tracks")

@@ -7,6 +7,19 @@ import kotlin.math.exp
 import kotlin.math.sqrt
 
 /**
+ * Result of a drift query update, including provenance metadata.
+ *
+ * @param query The new query embedding for the next search step
+ * @param emaState Updated EMA state to pass to next call
+ * @param seedWeight The exact mathematical weight of the seed on this step's query
+ */
+data class DriftResult(
+    val query: FloatArray,
+    val emaState: FloatArray,
+    val seedWeight: Float,
+)
+
+/**
  * Manages query evolution across drift steps.
  *
  * Two modes:
@@ -26,7 +39,7 @@ object DriftEngine {
      * @param step Current step index (0-based)
      * @param totalSteps Total planned steps
      * @param config Radio configuration with drift parameters
-     * @return (newQuery, newEmaState) — newEmaState should be passed to next call
+     * @return DriftResult with new query, EMA state, and seed weight for provenance
      */
     fun updateQuery(
         seedEmb: FloatArray,
@@ -35,17 +48,20 @@ object DriftEngine {
         step: Int,
         totalSteps: Int,
         config: RadioConfig
-    ): Pair<FloatArray, FloatArray> {
+    ): DriftResult {
         return when (config.driftMode) {
             DriftMode.SEED_INTERPOLATION -> {
                 val alpha = computeAlpha(config.anchorStrength, step, totalSteps, config.anchorDecay)
                 val query = interpolate(seedEmb, currentEmb, alpha)
-                query to currentEmb
+                DriftResult(query, currentEmb, seedWeight = alpha)
             }
             DriftMode.MOMENTUM -> {
                 val prev = emaState ?: seedEmb
-                val ema = momentum(prev, currentEmb, config.momentumBeta)
-                ema to ema
+                val beta = config.momentumBeta
+                val ema = momentum(prev, currentEmb, beta)
+                // Seed weight in EMA: beta^(step+1) — seed contribution decays geometrically
+                val seedWeight = Math.pow(beta.toDouble(), (step + 1).toDouble()).toFloat()
+                DriftResult(ema, ema, seedWeight = seedWeight)
             }
         }
     }
@@ -59,7 +75,7 @@ object DriftEngine {
      * @param decay Decay schedule
      * @return Effective alpha at this step
      */
-    private fun computeAlpha(baseAlpha: Float, step: Int, totalSteps: Int, decay: DecaySchedule): Float {
+    internal fun computeAlpha(baseAlpha: Float, step: Int, totalSteps: Int, decay: DecaySchedule): Float {
         if (totalSteps <= 1) return baseAlpha
         val progress = step.toFloat() / (totalSteps - 1).toFloat()  // 0..1
 

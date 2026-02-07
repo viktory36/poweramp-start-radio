@@ -287,6 +287,7 @@ class RadioService : Service() {
                                 track = similarTrack.track,
                                 similarity = similarTrack.similarity,
                                 status = status,
+                                provenance = similarTrack.provenance,
                             ))
 
                             _uiState.value = RadioUiState.Streaming(RadioResult(
@@ -366,6 +367,7 @@ class RadioService : Service() {
                             track = mapped.similarTrack.track,
                             similarity = mapped.similarTrack.similarity,
                             status = status,
+                            provenance = mapped.similarTrack.provenance,
                         )
                     }
 

@@ -60,12 +60,33 @@ enum class QueueStatus {
 }
 
 /**
+ * A single influence on a track's selection.
+ *
+ * @param sourceIndex -1 = seed track, 0..N-1 = index in result list
+ * @param weight Exact mathematical influence weight (sums to ~1.0 per track)
+ */
+data class Influence(
+    val sourceIndex: Int,
+    val weight: Float,
+)
+
+/**
+ * Full provenance for a queued track — every influence that shaped its selection.
+ *
+ * Batch modes: seed only. Seed interp: seed + previous track. EMA: all predecessors.
+ */
+data class TrackProvenance(
+    val influences: List<Influence> = listOf(Influence(-1, 1f))
+)
+
+/**
  * Result of attempting to queue a single similar track.
  */
 data class QueuedTrackResult(
     val track: EmbeddedTrack,
     val similarity: Float,
     val status: QueueStatus,
+    val provenance: TrackProvenance = TrackProvenance(),
 )
 
 /**

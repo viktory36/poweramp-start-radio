@@ -1276,5 +1276,112 @@ def audit(database: Path, seeds: int, quick: bool, verbose: bool):
         raise SystemExit(1)
 
 
+@cli.command()
+@click.argument("database", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--seed", "-s", "seed_query", default=None, help="Seed track query (artist, title)")
+@click.option("--random", "-r", "use_random", is_flag=True, help="Pick a random seed track")
+@click.option("--mode", "-m", type=click.Choice(["mmr", "temperature"]), default="mmr", help="Selection algorithm")
+@click.option("--drift", "-d", type=click.Choice(["interp", "ema"]), default="interp", help="Drift mode")
+@click.option("--alpha", "-a", type=float, default=0.4, help="Anchor strength (seed interpolation)")
+@click.option("--beta", "-b", type=float, default=0.7, help="EMA momentum beta")
+@click.option("--decay", type=click.Choice(["none", "linear", "exp", "step"]), default="none", help="Anchor decay schedule")
+@click.option("--temperature", "-t", "temp", type=float, default=0.05, help="Temperature (for temperature mode)")
+@click.option("--lambda", "lambda_", type=float, default=0.4, help="MMR diversity lambda")
+@click.option("--tracks", "-n", type=int, default=20, help="Number of tracks to generate")
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
+def provenance(database: Path, seed_query: str, use_random: bool, mode: str,
+               drift: str, alpha: float, beta: float, decay: str, temp: float,
+               lambda_: float, tracks: int, verbose: bool):
+    """Verify provenance math against a real embedding database.
+
+    Computes the theoretical influence weights for each drift step, runs
+    brute-force cosine search, and validates invariants. Prints a formatted
+    table and ASCII rail diagram.
+
+    DATABASE: Path to embeddings database with fused embeddings
+
+    Examples:
+
+      poweramp-indexer provenance fused.db --random --drift interp --alpha 0.4
+      poweramp-indexer provenance fused.db --seed "queen bohemian" --drift ema --beta 0.7
+      poweramp-indexer provenance fused.db --random --drift interp --decay linear --tracks 30
+    """
+    if verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    from .provenance import (
+        load_corpus, run_provenance, validate_provenance,
+        format_table, format_rail_diagram,
+    )
+
+    if not seed_query and not use_random:
+        raise click.UsageError("Provide --seed QUERY or --random")
+
+    db = EmbeddingDatabase(database)
+
+    click.echo(f"Database: {database}")
+    click.echo(f"Mode: {mode}, Drift: {drift}")
+    if drift == "interp":
+        click.echo(f"Alpha: {alpha}, Decay: {decay}")
+    else:
+        click.echo(f"Beta: {beta}")
+    click.echo()
+
+    corpus = load_corpus(db, on_progress=lambda msg: click.echo(msg))
+
+    # Find seed track
+    if seed_query:
+        matches = db.search_tracks(seed_query)
+        if not matches:
+            click.echo(f"No tracks found matching: {seed_query}")
+            db.close()
+            return
+        seed_track = matches[0]
+        click.echo(f"Seed: {format_track(seed_track)}")
+    else:
+        seed_track = db.get_random_track()
+        if not seed_track:
+            click.echo("Database is empty")
+            db.close()
+            return
+        click.echo(f"Seed (random): {format_track(seed_track)}")
+
+    seed_tid = seed_track["id"]
+    click.echo()
+
+    results = run_provenance(
+        corpus, seed_tid,
+        mode=mode, drift=drift,
+        alpha=alpha, beta=beta, decay=decay,
+        temperature=temp, lambda_=lambda_,
+        num_tracks=tracks,
+        on_progress=lambda msg: click.echo(f"  {msg}"),
+    )
+
+    click.echo()
+    click.echo(format_table(
+        results,
+        seed_artist=seed_track.get("artist"),
+        seed_title=seed_track.get("title"),
+    ))
+
+    click.echo()
+    click.echo("Rail diagram:")
+    click.echo(format_rail_diagram(results))
+
+    # Validate
+    click.echo()
+    errors = validate_provenance(results)
+    if errors:
+        click.echo(f"VALIDATION FAILED ({len(errors)} errors):")
+        for err in errors:
+            click.echo(f"  {err}")
+        raise SystemExit(1)
+    else:
+        click.echo(f"Validation passed: {len(results)} steps, all influence sums ~1.0")
+
+    db.close()
+
+
 if __name__ == "__main__":
     cli()
