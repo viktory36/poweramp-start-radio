@@ -15,14 +15,14 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Clear
@@ -720,7 +720,7 @@ fun IdleContent(
 
 // ---- Settings Screen ----
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
     viewModel: MainViewModel,
@@ -750,24 +750,29 @@ fun SettingsScreen(
     // Group keys by what affects each mode
     val commonKeys = remember(numTracks, maxPerArtist, minArtistSpacing) { Any() }
     val driftKeys = remember(driftEnabled, driftMode, anchorStrength, anchorDecay, momentumBeta) { Any() }
+    val expandedPeek = remember { mutableStateMapOf<SelectionMode, Boolean>() }
 
     LaunchedEffect(commonKeys, driftKeys, diversityLambda) {
         viewModel.clearPreview(SelectionMode.MMR)
+        expandedPeek[SelectionMode.MMR] = false
         delay(500)
         viewModel.computePreview(SelectionMode.MMR)
     }
     LaunchedEffect(commonKeys) {
         viewModel.clearPreview(SelectionMode.DPP)
+        expandedPeek[SelectionMode.DPP] = false
         delay(500)
         viewModel.computePreview(SelectionMode.DPP)
     }
     LaunchedEffect(commonKeys, anchorStrength) {
         viewModel.clearPreview(SelectionMode.RANDOM_WALK)
+        expandedPeek[SelectionMode.RANDOM_WALK] = false
         delay(500)
         viewModel.computePreview(SelectionMode.RANDOM_WALK)
     }
     LaunchedEffect(commonKeys, driftKeys, temperature) {
         viewModel.clearPreview(SelectionMode.TEMPERATURE)
+        expandedPeek[SelectionMode.TEMPERATURE] = false
         delay(500)
         viewModel.computePreview(SelectionMode.TEMPERATURE)
     }
@@ -812,6 +817,8 @@ fun SettingsScreen(
                         preview = previews[SelectionMode.MMR],
                         isLoading = SelectionMode.MMR in previewsLoading,
                         selected = selectionMode == SelectionMode.MMR,
+                        expanded = expandedPeek[SelectionMode.MMR] == true,
+                        onToggleExpanded = { expandedPeek[SelectionMode.MMR] = !(expandedPeek[SelectionMode.MMR] ?: false) },
                         onClick = { viewModel.setSelectionMode(SelectionMode.MMR) }
                     )
                     AlgorithmOption(
@@ -821,6 +828,8 @@ fun SettingsScreen(
                         preview = previews[SelectionMode.DPP],
                         isLoading = SelectionMode.DPP in previewsLoading,
                         selected = selectionMode == SelectionMode.DPP,
+                        expanded = expandedPeek[SelectionMode.DPP] == true,
+                        onToggleExpanded = { expandedPeek[SelectionMode.DPP] = !(expandedPeek[SelectionMode.DPP] ?: false) },
                         onClick = { viewModel.setSelectionMode(SelectionMode.DPP) }
                     )
                     AlgorithmOption(
@@ -832,6 +841,8 @@ fun SettingsScreen(
                         preview = previews[SelectionMode.RANDOM_WALK],
                         isLoading = SelectionMode.RANDOM_WALK in previewsLoading,
                         selected = selectionMode == SelectionMode.RANDOM_WALK,
+                        expanded = expandedPeek[SelectionMode.RANDOM_WALK] == true,
+                        onToggleExpanded = { expandedPeek[SelectionMode.RANDOM_WALK] = !(expandedPeek[SelectionMode.RANDOM_WALK] ?: false) },
                         onClick = { viewModel.setSelectionMode(SelectionMode.RANDOM_WALK) }
                     )
                     AlgorithmOption(
@@ -841,6 +852,8 @@ fun SettingsScreen(
                         preview = previews[SelectionMode.TEMPERATURE],
                         isLoading = SelectionMode.TEMPERATURE in previewsLoading,
                         selected = selectionMode == SelectionMode.TEMPERATURE,
+                        expanded = expandedPeek[SelectionMode.TEMPERATURE] == true,
+                        onToggleExpanded = { expandedPeek[SelectionMode.TEMPERATURE] = !(expandedPeek[SelectionMode.TEMPERATURE] ?: false) },
                         onClick = { viewModel.setSelectionMode(SelectionMode.TEMPERATURE) }
                     )
                 }
@@ -1090,11 +1103,11 @@ fun SettingsScreen(
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun AlgorithmOption(
     label: String, description: String, selected: Boolean, onClick: () -> Unit,
-    preview: List<String>? = null, isLoading: Boolean = false
+    preview: List<String>? = null, isLoading: Boolean = false,
+    expanded: Boolean = false, onToggleExpanded: () -> Unit = {}
 ) {
     Row(modifier = Modifier.fillMaxWidth().selectable(selected = selected, onClick = onClick,
         role = Role.RadioButton).padding(vertical = 6.dp),
@@ -1106,13 +1119,29 @@ private fun AlgorithmOption(
             Text(description, style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (!preview.isNullOrEmpty()) {
-                Text(
-                    text = preview.joinToString(" \u2192 "),
-                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
-                    maxLines = 1,
-                    modifier = Modifier.padding(top = 2.dp).basicMarquee(iterations = Int.MAX_VALUE)
-                )
+                TextButton(
+                    onClick = onToggleExpanded,
+                    contentPadding = PaddingValues(0.dp),
+                    modifier = Modifier.height(28.dp)
+                ) {
+                    Text(if (expanded) "Hide \u25B4" else "Peek \u25BE",
+                        style = MaterialTheme.typography.labelSmall)
+                }
+                AnimatedVisibility(visible = expanded) {
+                    Column(
+                        modifier = Modifier
+                            .heightIn(max = 200.dp)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                        preview.forEachIndexed { i, track ->
+                            Text(
+                                text = "${i + 1}. $track",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                            )
+                        }
+                    }
+                }
             } else if (isLoading) {
                 CircularProgressIndicator(
                     modifier = Modifier.padding(top = 4.dp).size(10.dp),
