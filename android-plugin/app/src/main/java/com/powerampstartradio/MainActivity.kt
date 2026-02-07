@@ -819,6 +819,7 @@ fun SettingsScreen(
                         selected = selectionMode == SelectionMode.MMR,
                         expanded = expandedPeek[SelectionMode.MMR] == true,
                         onToggleExpanded = { expandedPeek[SelectionMode.MMR] = !(expandedPeek[SelectionMode.MMR] ?: false) },
+                        previewInfo = "\u03bb=${(diversityLambda * 100).roundToInt()}%",
                         onClick = { viewModel.setSelectionMode(SelectionMode.MMR) }
                     )
                     AlgorithmOption(
@@ -843,6 +844,7 @@ fun SettingsScreen(
                         selected = selectionMode == SelectionMode.RANDOM_WALK,
                         expanded = expandedPeek[SelectionMode.RANDOM_WALK] == true,
                         onToggleExpanded = { expandedPeek[SelectionMode.RANDOM_WALK] = !(expandedPeek[SelectionMode.RANDOM_WALK] ?: false) },
+                        previewInfo = "\u03b1=${(anchorStrength * 100).roundToInt()}%",
                         onClick = { viewModel.setSelectionMode(SelectionMode.RANDOM_WALK) }
                     )
                     AlgorithmOption(
@@ -854,6 +856,7 @@ fun SettingsScreen(
                         selected = selectionMode == SelectionMode.TEMPERATURE,
                         expanded = expandedPeek[SelectionMode.TEMPERATURE] == true,
                         onToggleExpanded = { expandedPeek[SelectionMode.TEMPERATURE] = !(expandedPeek[SelectionMode.TEMPERATURE] ?: false) },
+                        previewInfo = "\u03c4=${String.format("%.2f", temperature)}",
                         onClick = { viewModel.setSelectionMode(SelectionMode.TEMPERATURE) }
                     )
                 }
@@ -1107,7 +1110,8 @@ fun SettingsScreen(
 private fun AlgorithmOption(
     label: String, description: String, selected: Boolean, onClick: () -> Unit,
     preview: List<String>? = null, isLoading: Boolean = false,
-    expanded: Boolean = false, onToggleExpanded: () -> Unit = {}
+    expanded: Boolean = false, onToggleExpanded: () -> Unit = {},
+    previewInfo: String = ""
 ) {
     Row(modifier = Modifier.fillMaxWidth().selectable(selected = selected, onClick = onClick,
         role = Role.RadioButton).padding(vertical = 6.dp),
@@ -1122,10 +1126,12 @@ private fun AlgorithmOption(
                 TextButton(
                     onClick = onToggleExpanded,
                     contentPadding = PaddingValues(0.dp),
-                    modifier = Modifier.height(28.dp)
+                    modifier = Modifier.fillMaxWidth().height(28.dp)
                 ) {
-                    Text(if (expanded) "Hide \u25B4" else "Peek \u25BE",
-                        style = MaterialTheme.typography.labelSmall)
+                    val toggle = if (expanded) "Hide \u25B4" else "Peek \u25BE"
+                    val text = if (previewInfo.isEmpty()) toggle else "$toggle $previewInfo"
+                    Text(text, style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.fillMaxWidth())
                 }
                 AnimatedVisibility(visible = expanded) {
                     Column(
