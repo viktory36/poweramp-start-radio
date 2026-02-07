@@ -37,7 +37,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
@@ -233,12 +232,10 @@ class RadioService : Service() {
                 // so use batch path here too to avoid streaming/return-value mismatch.
                 val effectiveDrift = config.driftEnabled && config.selectionMode != SelectionMode.DPP
                 if (effectiveDrift) {
-                    // Drift path: streaming results
+                    // Drift path: stream search results to UI, then batch-queue.
+                    // Poweramp content provider ops are decoupled from the search loop
+                    // to prevent Poweramp blocking from stalling the drift computation.
                     val streamingTracks = mutableListOf<QueuedTrackResult>()
-                    val seenFileIds = mutableSetOf<Long>()
-                    val queuedFileIds = mutableSetOf<Long>()
-                    var isFirstTrack = true
-                    var queuedSinceFlush = 0
 
                     _uiState.value = RadioUiState.Streaming(RadioResult(
                         seedTrack = currentTrack,
@@ -249,47 +246,18 @@ class RadioService : Service() {
                         totalExpected = config.numTracks
                     ))
 
-                    eng.generatePlaylist(
+                    val similarTracks = eng.generatePlaylist(
                         seedTrackId = matchResult.embeddedTrack.id,
                         config = config,
                         onProgress = { message ->
                             updateNotification(message)
                         },
                         onResult = { similarTrack ->
-                            val fileId = withContext(Dispatchers.IO) {
-                                matcher.mapSingleTrackToFileId(this@RadioService, similarTrack, seenFileIds)
-                            }
-
-                            val status = if (fileId != null) {
-                                val added = withContext(Dispatchers.IO) {
-                                    if (isFirstTrack) {
-                                        isFirstTrack = false
-                                        PowerampHelper.replaceQueue(this@RadioService, currentTrack.realId, listOf(fileId))
-                                    } else {
-                                        PowerampHelper.addTracksToQueue(this@RadioService, listOf(fileId))
-                                    }
-                                }
-                                if (added > 0) {
-                                    queuedFileIds.add(fileId)
-                                    queuedSinceFlush++
-                                    if (queuedSinceFlush >= 5) {
-                                        queuedSinceFlush = 0
-                                        withContext(Dispatchers.IO) {
-                                            PowerampHelper.reloadData(this@RadioService)
-                                        }
-                                    }
-                                    QueueStatus.QUEUED
-                                } else {
-                                    QueueStatus.QUEUE_FAILED
-                                }
-                            } else {
-                                QueueStatus.NOT_IN_LIBRARY
-                            }
-
+                            // UI streaming only — no Poweramp content provider calls
                             streamingTracks.add(QueuedTrackResult(
                                 track = similarTrack.track,
                                 similarity = similarTrack.similarity,
-                                status = status,
+                                status = QueueStatus.QUEUED,  // optimistic
                                 provenance = similarTrack.provenance,
                             ))
 
@@ -298,19 +266,56 @@ class RadioService : Service() {
                                 matchType = matchResult.matchType,
                                 tracks = streamingTracks.toList(),
                                 config = config,
-                                queuedFileIds = queuedFileIds.toSet(),
                                 isComplete = false,
                                 totalExpected = config.numTracks
                             ))
                         }
                     )
 
+                    if (similarTracks.isEmpty()) {
+                        _uiState.value = RadioUiState.Error("No similar tracks found")
+                        updateNotification("No similar tracks found")
+                        toast("No similar tracks found")
+                        stopSelfDelayed()
+                        return@launch
+                    }
+
+                    // Batch-queue all tracks (same logic as non-drift path)
+                    updateNotification("Queuing ${similarTracks.size} tracks...")
+                    val mappedTracks = matcher.mapSimilarTracksToFileIds(this@RadioService, similarTracks)
+                    val fileIds = mappedTracks.mapNotNull { it.fileId }
+
+                    if (fileIds.isEmpty()) {
+                        _uiState.value = RadioUiState.Error("Could not find tracks in Poweramp library")
+                        updateNotification("Could not find tracks in Poweramp library")
+                        toast("Could not find tracks in Poweramp library")
+                        stopSelfDelayed()
+                        return@launch
+                    }
+
+                    val queuedCount = PowerampHelper.replaceQueue(this@RadioService, currentTrack.realId, fileIds)
+                    val queuedFileIds = fileIds.take(queuedCount).toSet()
+
+                    val trackResults = mappedTracks.map { mapped ->
+                        val status = when {
+                            mapped.fileId == null -> QueueStatus.NOT_IN_LIBRARY
+                            mapped.fileId in queuedFileIds -> QueueStatus.QUEUED
+                            else -> QueueStatus.QUEUE_FAILED
+                        }
+                        QueuedTrackResult(
+                            track = mapped.similarTrack.track,
+                            similarity = mapped.similarTrack.similarity,
+                            status = status,
+                            provenance = mapped.similarTrack.provenance,
+                        )
+                    }
+
                     val finalResult = RadioResult(
                         seedTrack = currentTrack,
                         matchType = matchResult.matchType,
-                        tracks = streamingTracks.toList(),
+                        tracks = trackResults,
                         config = config,
-                        queuedFileIds = queuedFileIds.toSet(),
+                        queuedFileIds = queuedFileIds,
                         isComplete = true,
                         totalExpected = config.numTracks
                     )
