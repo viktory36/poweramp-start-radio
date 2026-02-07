@@ -809,6 +809,20 @@ fun SettingsScreen(
                 Text("Selection Algorithm", style = MaterialTheme.typography.titleMedium)
                 Spacer(modifier = Modifier.height(4.dp))
 
+                val driftInfo = if (!driftEnabled) "" else when (driftMode) {
+                    DriftMode.SEED_INTERPOLATION -> {
+                        val decay = when (anchorDecay) {
+                            DecaySchedule.NONE -> ""
+                            DecaySchedule.LINEAR -> " linear"
+                            DecaySchedule.EXPONENTIAL -> " exp"
+                            DecaySchedule.STEP -> " step"
+                        }
+                        " + drift(\u03b1=${(anchorStrength * 100).roundToInt()}%$decay)"
+                    }
+                    DriftMode.MOMENTUM ->
+                        " + drift(EMA \u03b2=${(momentumBeta * 100).roundToInt()}%)"
+                }
+
                 Column(modifier = Modifier.selectableGroup()) {
                     AlgorithmOption(
                         label = "MMR (Maximal Marginal Relevance)",
@@ -819,7 +833,7 @@ fun SettingsScreen(
                         selected = selectionMode == SelectionMode.MMR,
                         expanded = expandedPeek[SelectionMode.MMR] == true,
                         onToggleExpanded = { expandedPeek[SelectionMode.MMR] = !(expandedPeek[SelectionMode.MMR] ?: false) },
-                        previewInfo = "\u03bb=${(diversityLambda * 100).roundToInt()}%",
+                        previewInfo = "\u03bb=${(diversityLambda * 100).roundToInt()}%$driftInfo",
                         onClick = { viewModel.setSelectionMode(SelectionMode.MMR) }
                     )
                     AlgorithmOption(
@@ -856,7 +870,7 @@ fun SettingsScreen(
                         selected = selectionMode == SelectionMode.TEMPERATURE,
                         expanded = expandedPeek[SelectionMode.TEMPERATURE] == true,
                         onToggleExpanded = { expandedPeek[SelectionMode.TEMPERATURE] = !(expandedPeek[SelectionMode.TEMPERATURE] ?: false) },
-                        previewInfo = "\u03c4=${String.format("%.2f", temperature)}",
+                        previewInfo = "\u03c4=${String.format("%.2f", temperature)}$driftInfo",
                         onClick = { viewModel.setSelectionMode(SelectionMode.TEMPERATURE) }
                     )
                 }
