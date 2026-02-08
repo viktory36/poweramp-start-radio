@@ -70,11 +70,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _temperature = MutableStateFlow(prefs.getFloat("temperature", 0.05f))
     val temperature: StateFlow<Float> = _temperature.asStateFlow()
 
-    private val _maxPerArtist = MutableStateFlow(prefs.getInt("max_per_artist", 3))
+    private val _maxPerArtist = MutableStateFlow(prefs.getInt("max_per_artist", 8))
     val maxPerArtist: StateFlow<Int> = _maxPerArtist.asStateFlow()
 
-    private val _minArtistSpacing = MutableStateFlow(prefs.getInt("min_artist_spacing", 3))
+    private val _minArtistSpacing = MutableStateFlow(prefs.getInt("min_artist_spacing", 2))
     val minArtistSpacing: StateFlow<Int> = _minArtistSpacing.asStateFlow()
+
+    private val _candidatePoolSize = MutableStateFlow(prefs.getInt("candidate_pool_size", 200))
+    val candidatePoolSize: StateFlow<Int> = _candidatePoolSize.asStateFlow()
 
     // --- Database & permission state ---
 
@@ -126,6 +129,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun buildConfig(): RadioConfig = RadioConfig(
         numTracks = _numTracks.value,
+        candidatePoolSize = _candidatePoolSize.value,
         selectionMode = _selectionMode.value,
         driftEnabled = _driftEnabled.value,
         driftMode = _driftMode.value,
@@ -193,6 +197,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setMinArtistSpacing(value: Int) {
         _minArtistSpacing.value = value
         prefs.edit().putInt("min_artist_spacing", value).apply()
+    }
+
+    fun setCandidatePoolSize(value: Int) {
+        _candidatePoolSize.value = value
+        prefs.edit().putInt("candidate_pool_size", value).apply()
     }
 
     // --- Actions ---
@@ -265,6 +274,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun resetToDefaults() {
         val defaults = RadioConfig()
         setNumTracks(defaults.numTracks)
+        setCandidatePoolSize(defaults.candidatePoolSize)
         setSelectionMode(defaults.selectionMode)
         setDriftEnabled(defaults.driftEnabled)
         setDriftMode(defaults.driftMode)

@@ -23,11 +23,22 @@ import java.io.File
 import kotlin.coroutines.coroutineContext
 
 /**
+ * Result of a selector: which track was picked and where it ranked in the candidate pool.
+ */
+data class SelectedTrack(
+    val trackId: Long,
+    val score: Float,
+    val candidateRank: Int,  // 1-based position in sorted candidate list
+)
+
+/**
  * Result of a similarity search.
  */
 data class SimilarTrack(
     val track: EmbeddedTrack,
     val similarity: Float,
+    val similarityToSeed: Float,
+    val candidateRank: Int? = null,
     val provenance: TrackProvenance = TrackProvenance(),
 )
 
@@ -217,11 +228,16 @@ class RecommendationEngine(
                 candidates, selectedEmbeddings, index, config
             ) ?: break
 
-            val (trackId, score) = selected
+            val trackId = selected.trackId
+            val score = selected.score
             seen.add(trackId)
 
             val track = database.getTrackById(trackId) ?: continue
             val provenance = computeProvenance(result.size, currentSeedWeight, config)
+
+            // Compute similarityToSeed via dot product with original seed
+            val trackEmb = index.getEmbeddingByTrackId(trackId)
+            val simToSeed = if (trackEmb != null) dotProduct(seedEmb, trackEmb) else score
 
             // Check artist constraints
             if (!PostFilter.canAdd(track, selectedTracks, config.maxPerArtist, config.minArtistSpacing)) {
@@ -237,10 +253,12 @@ class RecommendationEngine(
                     val (fbId, fbScore) = fallback
                     seen.add(fbId)
                     val fbTrack = database.getTrackById(fbId) ?: continue
-                    val similarTrack = SimilarTrack(fbTrack, fbScore, provenance)
+                    val fbEmb = index.getEmbeddingByTrackId(fbId)
+                    val fbSimToSeed = if (fbEmb != null) dotProduct(seedEmb, fbEmb) else fbScore
+                    val similarTrack = SimilarTrack(fbTrack, fbScore, fbSimToSeed, provenance = provenance)
                     result.add(similarTrack)
                     selectedTracks.add(fbTrack)
-                    index.getEmbeddingByTrackId(fbId)?.let { selectedEmbeddings.add(it) }
+                    fbEmb?.let { selectedEmbeddings.add(it) }
                     onResult?.invoke(similarTrack)
 
                     val currentEmb = index.getEmbeddingByTrackId(fbId) ?: continue
@@ -256,17 +274,16 @@ class RecommendationEngine(
                 continue
             }
 
-            val similarTrack = SimilarTrack(track, score, provenance)
+            val similarTrack = SimilarTrack(track, score, simToSeed, selected.candidateRank, provenance)
             result.add(similarTrack)
             selectedTracks.add(track)
             onResult?.invoke(similarTrack)
 
             // Update query for next step
-            val currentEmb = index.getEmbeddingByTrackId(trackId)
-            if (currentEmb != null) {
-                selectedEmbeddings.add(currentEmb)
+            if (trackEmb != null) {
+                selectedEmbeddings.add(trackEmb)
                 val driftResult = DriftEngine.updateQuery(
-                    seedEmb, currentEmb, emaState, step, config.numTracks, config
+                    seedEmb, trackEmb, emaState, step, config.numTracks, config
                 )
                 query = driftResult.query
                 emaState = driftResult.emaState
@@ -302,7 +319,7 @@ class RecommendationEngine(
 
         // Stage 2: Select using algorithm
         onProgress?.invoke("Selecting tracks...")
-        val selected = when (config.selectionMode) {
+        val selected: List<SelectedTrack> = when (config.selectionMode) {
             SelectionMode.MMR -> MmrSelector.selectBatch(
                 candidates, config.numTracks, index, config.diversityLambda
             )
@@ -312,22 +329,26 @@ class RecommendationEngine(
             SelectionMode.TEMPERATURE -> TemperatureSelector.selectBatch(
                 candidates, config.numTracks, config.temperature
             )
-            SelectionMode.RANDOM_WALK -> candidates.take(config.numTracks) // Shouldn't reach here
+            SelectionMode.RANDOM_WALK -> candidates.take(config.numTracks).mapIndexed { i, (id, score) ->
+                SelectedTrack(id, score, candidateRank = i + 1)
+            }
         }
 
-        // Resolve track metadata
-        val tracks = selected.mapNotNull { (trackId, score) ->
-            database.getTrackById(trackId)?.let { it to score }
+        // Resolve track metadata and build SimilarTrack with new fields
+        // In batch mode query IS seed, so similarityToSeed = score
+        val tracks = selected.mapNotNull { sel ->
+            database.getTrackById(sel.trackId)?.let { track ->
+                SimilarTrack(
+                    track = track,
+                    similarity = sel.score,
+                    similarityToSeed = sel.score,
+                    candidateRank = sel.candidateRank,
+                )
+            }
         }
 
         // Stage 3: Post-filter artist constraints
-        val filtered = PostFilter.enforceBatch(
-            tracks.map { (track, score) -> track to score },
-            config.maxPerArtist,
-            config.minArtistSpacing
-        )
-
-        return filtered.map { (track, score) -> SimilarTrack(track, score) }
+        return PostFilter.enforceBatch(tracks, config.maxPerArtist, config.minArtistSpacing)
     }
 
     /**
@@ -340,9 +361,10 @@ class RecommendationEngine(
         onResult: (suspend (SimilarTrack) -> Unit)?
     ): List<SimilarTrack> {
         val graph = graphIndex
+        val index = embeddingIndex
         if (graph == null) {
             Log.w(TAG, "No graph.bin available, falling back to embedding search")
-            val index = embeddingIndex ?: return emptyList()
+            if (index == null) return emptyList()
             val seedEmb = index.getEmbeddingByTrackId(seedTrackId) ?: return emptyList()
             val ctx = coroutineContext
             val cancellationCheck: () -> Unit = { ctx.ensureActive() }
@@ -354,9 +376,24 @@ class RecommendationEngine(
         val alpha = config.anchorStrength  // Reuse anchor strength as restart probability
         val ranking = RandomWalkSelector.computeRanking(graph, seedTrackId, alpha)
 
-        // Resolve tracks and post-filter
-        val tracks = ranking.take(config.candidatePoolSize).mapNotNull { (trackId, score) ->
-            database.getTrackById(trackId)?.let { it to score }
+        val seedEmb = index?.getEmbeddingByTrackId(seedTrackId)
+
+        // Resolve tracks, compute similarityToSeed, and post-filter
+        val ranked = ranking.take(config.candidatePoolSize)
+        val tracks = ranked.indices.mapNotNull { i ->
+            val (trackId, score) = ranked[i]
+            database.getTrackById(trackId)?.let { track ->
+                val simToSeed = if (seedEmb != null && index != null) {
+                    val emb = index.getEmbeddingByTrackId(trackId)
+                    if (emb != null) dotProduct(seedEmb, emb) else 0f
+                } else 0f
+                SimilarTrack(
+                    track = track,
+                    similarity = score,
+                    similarityToSeed = simToSeed,
+                    candidateRank = i + 1,
+                )
+            }
         }
 
         val filtered = PostFilter.enforceBatch(
@@ -365,17 +402,15 @@ class RecommendationEngine(
             config.minArtistSpacing
         ).take(config.numTracks)
 
-        val result = filtered.map { (track, score) -> SimilarTrack(track, score) }
-
         // Stream results if callback provided
         onResult?.let { callback ->
-            for (track in result) {
+            for (track in filtered) {
                 callback(track)
             }
         }
 
-        Log.d(TAG, "Random walk: ${result.size} tracks")
-        return result
+        Log.d(TAG, "Random walk: ${filtered.size} tracks")
+        return filtered
     }
 
     /**
@@ -387,7 +422,7 @@ class RecommendationEngine(
         selectedEmbeddings: List<FloatArray>,
         index: EmbeddingIndex,
         config: RadioConfig
-    ): Pair<Long, Float>? {
+    ): SelectedTrack? {
         return when (config.selectionMode) {
             SelectionMode.MMR -> MmrSelector.selectOne(
                 candidates, selectedEmbeddings, index, config.diversityLambda
@@ -399,7 +434,15 @@ class RecommendationEngine(
             SelectionMode.TEMPERATURE -> TemperatureSelector.selectOne(
                 candidates, config.temperature
             )
-            SelectionMode.RANDOM_WALK -> candidates.firstOrNull()
+            SelectionMode.RANDOM_WALK -> candidates.firstOrNull()?.let {
+                SelectedTrack(it.first, it.second, candidateRank = 1)
+            }
         }
+    }
+
+    private fun dotProduct(a: FloatArray, b: FloatArray): Float {
+        var sum = 0f
+        for (i in a.indices) sum += a[i] * b[i]
+        return sum
     }
 }

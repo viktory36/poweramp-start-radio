@@ -1,6 +1,7 @@
 package com.powerampstartradio.similarity.algorithms
 
 import com.powerampstartradio.data.EmbeddingIndex
+import com.powerampstartradio.similarity.SelectedTrack
 import kotlin.math.sqrt
 
 /**
@@ -27,14 +28,14 @@ object DppSelector {
      * @param numSelect How many to select
      * @param index Embedding index for looking up embeddings
      * @param qualityExponent Exponent for quality scores (higher = prefer more relevant)
-     * @return Selected tracks as (trackId, relevance) pairs in selection order
+     * @return Selected tracks in selection order
      */
     fun selectBatch(
         candidates: List<Pair<Long, Float>>,
         numSelect: Int,
         index: EmbeddingIndex,
         qualityExponent: Float = 1.0f
-    ): List<Pair<Long, Float>> {
+    ): List<SelectedTrack> {
         if (candidates.isEmpty()) return emptyList()
         val n = candidates.size
         val k = minOf(numSelect, n)
@@ -118,7 +119,10 @@ object DppSelector {
             choleskyFactors[bestIdx][step] = sqrtGain
         }
 
-        return selected.map { idx -> candidates[idx] }
+        return selected.map { idx ->
+            val (trackId, relevance) = candidates[idx]
+            SelectedTrack(trackId, relevance, candidateRank = idx + 1)
+        }
     }
 
     private fun dotProduct(a: FloatArray, b: FloatArray): Float {

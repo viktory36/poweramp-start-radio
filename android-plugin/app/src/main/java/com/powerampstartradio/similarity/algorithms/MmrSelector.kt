@@ -1,6 +1,7 @@
 package com.powerampstartradio.similarity.algorithms
 
 import com.powerampstartradio.data.EmbeddingIndex
+import com.powerampstartradio.similarity.SelectedTrack
 
 /**
  * Maximal Marginal Relevance (MMR) selector.
@@ -20,22 +21,27 @@ object MmrSelector {
      * @param selectedEmbeddings Embeddings of already-selected tracks
      * @param index Embedding index for looking up candidate embeddings
      * @param lambda Relevance-diversity tradeoff (0..1)
-     * @return (trackId, mmrScore) of the best candidate, or null
+     * @return SelectedTrack of the best candidate, or null
      */
     fun selectOne(
         candidates: List<Pair<Long, Float>>,
         selectedEmbeddings: List<FloatArray>,
         index: EmbeddingIndex,
         lambda: Float
-    ): Pair<Long, Float>? {
+    ): SelectedTrack? {
         if (candidates.isEmpty()) return null
-        if (selectedEmbeddings.isEmpty()) return candidates.first()
+        if (selectedEmbeddings.isEmpty()) {
+            val (id, score) = candidates.first()
+            return SelectedTrack(id, score, candidateRank = 1)
+        }
 
+        var bestIdx = -1
         var bestId = -1L
         var bestRelevance = 0f
         var bestMmrScore = Float.NEGATIVE_INFINITY
 
-        for ((trackId, relevance) in candidates) {
+        for (i in candidates.indices) {
+            val (trackId, relevance) = candidates[i]
             val emb = index.getEmbeddingByTrackId(trackId) ?: continue
 
             // Max similarity to any already-selected track
@@ -49,12 +55,13 @@ object MmrSelector {
 
             if (mmrScore > bestMmrScore) {
                 bestMmrScore = mmrScore
+                bestIdx = i
                 bestRelevance = relevance
                 bestId = trackId
             }
         }
 
-        return if (bestId >= 0) bestId to bestRelevance else null
+        return if (bestId >= 0) SelectedTrack(bestId, bestRelevance, candidateRank = bestIdx + 1) else null
     }
 
     /**
@@ -64,17 +71,17 @@ object MmrSelector {
      * @param numSelect How many to select
      * @param index Embedding index
      * @param lambda Relevance-diversity tradeoff
-     * @return Selected tracks as (trackId, similarity) pairs in selection order
+     * @return Selected tracks in selection order
      */
     fun selectBatch(
         candidates: List<Pair<Long, Float>>,
         numSelect: Int,
         index: EmbeddingIndex,
         lambda: Float
-    ): List<Pair<Long, Float>> {
+    ): List<SelectedTrack> {
         if (candidates.isEmpty()) return emptyList()
 
-        val result = mutableListOf<Pair<Long, Float>>()
+        val result = mutableListOf<SelectedTrack>()
         val selectedEmbeddings = mutableListOf<FloatArray>()
         val remaining = candidates.toMutableList()
 
@@ -124,7 +131,8 @@ object MmrSelector {
 
             val (selectedId, selectedSim) = remaining.removeAt(bestIdx)
             val selectedEmb = embCache[selectedId] ?: continue
-            result.add(selectedId to selectedSim)
+            val origIdx = tidToOrigIdx[selectedId] ?: continue
+            result.add(SelectedTrack(selectedId, selectedSim, candidateRank = origIdx + 1))
             selectedEmbeddings.add(selectedEmb)
         }
 

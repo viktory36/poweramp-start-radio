@@ -15,7 +15,9 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -472,15 +474,22 @@ fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
                     Canvas(modifier = Modifier.size(8.dp)) {
                         drawRect(color = primary)
                     }
-                    Text("= your seed", style = MaterialTheme.typography.labelSmall,
+                    Text("seed", style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                 }
                 Row(verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Canvas(modifier = Modifier.size(8.dp)) {
-                        drawRect(color = trackColor(primary, 1, colorTotal))
+                    // Small gradient swatch showing early/mid/late queue colors
+                    Canvas(modifier = Modifier.width(24.dp).height(8.dp)) {
+                        val earlyColor = trackColor(primary, 0, colorTotal)
+                        val midColor = trackColor(primary, colorTotal / 2, colorTotal)
+                        val lateColor = trackColor(primary, colorTotal - 1, colorTotal)
+                        val segW = size.width / 3f
+                        drawRect(color = earlyColor, topLeft = Offset(0f, 0f), size = Size(segW, size.height))
+                        drawRect(color = midColor, topLeft = Offset(segW, 0f), size = Size(segW, size.height))
+                        drawRect(color = lateColor, topLeft = Offset(segW * 2f, 0f), size = Size(segW, size.height))
                     }
-                    Text("= track that influenced this pick", style = MaterialTheme.typography.labelSmall,
+                    Text("queue position", style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                 }
             }
@@ -516,22 +525,23 @@ private fun StreamingProgressItem(found: Int, total: Int) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ResultsSummary(result: RadioResult, modifier: Modifier = Modifier) {
     val modeLabel = humanSelectionMode(result.config.selectionMode, result.config.driftEnabled)
     val seedName = result.seedTrack.title
 
     val countText = if (!result.isComplete) {
-        "$seedName \u2014 ${result.tracks.size} of ${result.totalExpected} found..."
+        "$seedName - ${result.tracks.size} of ${result.totalExpected} found..."
     } else if (result.failedCount > 0) {
-        "$seedName \u2014 ${result.queuedCount} of ${result.requestedCount} queued (${result.failedCount} not found)"
+        "$seedName - ${result.queuedCount} of ${result.requestedCount} queued (${result.failedCount} not found)"
     } else {
-        "$seedName \u2014 ${result.queuedCount} tracks via $modeLabel"
+        "$seedName - ${result.queuedCount} tracks via $modeLabel"
     }
 
     Text(text = countText, style = MaterialTheme.typography.labelMedium,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = modifier.fillMaxWidth(), maxLines = 1, overflow = TextOverflow.Ellipsis)
+        modifier = modifier.fillMaxWidth().basicMarquee(), maxLines = 1)
 }
 
 // ---- Influence strip provenance visualization ----
@@ -602,6 +612,7 @@ fun TrackResultRow(
     session: RadioResult? = null
 ) {
     var expanded by remember { mutableStateOf(false) }
+    val isPageRank = session?.config?.selectionMode == SelectionMode.RANDOM_WALK
 
     Column(modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }) {
         Row(modifier = Modifier.fillMaxWidth(),
@@ -612,13 +623,6 @@ fun TrackResultRow(
                     totalTracks = totalTracks
                 )
                 Spacer(modifier = Modifier.width(6.dp))
-            } else {
-                // Batch mode: similarity bar
-                SimilarityBar(
-                    similarity = trackResult.similarity,
-                    modifier = Modifier
-                )
-                Spacer(modifier = Modifier.width(6.dp))
             }
             Column(modifier = Modifier.weight(1f).padding(vertical = 2.dp, horizontal = 4.dp)) {
                 Text(text = trackResult.track.title ?: "Unknown", style = MaterialTheme.typography.bodyMedium,
@@ -627,8 +631,12 @@ fun TrackResultRow(
                     color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
 
-            val pct = (trackResult.similarity * 100).roundToInt()
-            Text(text = "$pct%", fontFamily = FontFamily.Monospace,
+            val label = if (isPageRank) {
+                "#${index + 1}"
+            } else {
+                "${(trackResult.similarityToSeed * 100).roundToInt()}%"
+            }
+            Text(text = label, fontFamily = FontFamily.Monospace,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 10.sp, textAlign = TextAlign.End, modifier = Modifier.padding(horizontal = 2.dp))
         }
@@ -638,28 +646,9 @@ fun TrackResultRow(
                 trackResult = trackResult,
                 index = index,
                 session = session,
-                modifier = Modifier.padding(start = 46.dp, top = 2.dp, bottom = 4.dp)
+                modifier = Modifier.padding(start = if (showProvenance) 46.dp else 4.dp, top = 2.dp, bottom = 4.dp)
             )
         }
-    }
-}
-
-@Composable
-private fun SimilarityBar(
-    similarity: Float,
-    modifier: Modifier = Modifier
-) {
-    val primary = MaterialTheme.colorScheme.primary
-    val bgColor = primary.copy(alpha = 0.12f)
-    val fillFraction = similarity.coerceIn(0f, 1f)
-
-    Canvas(modifier = modifier
-        .width(40.dp)
-        .height(12.dp)
-        .clip(RoundedCornerShape(3.dp))
-    ) {
-        drawRect(color = bgColor, size = Size(size.width, size.height))
-        drawRect(color = primary, size = Size(size.width * fillFraction, size.height))
     }
 }
 
@@ -670,25 +659,25 @@ private fun TrackExplanation(
     session: RadioResult?,
     modifier: Modifier = Modifier
 ) {
-    val pct = (trackResult.similarity * 100).roundToInt()
+    val seedPct = (trackResult.similarityToSeed * 100).roundToInt()
     val hasDrift = trackResult.provenance.influences.size > 1
-    val isExplorer = session?.config?.selectionMode == SelectionMode.RANDOM_WALK
-    val mode = session?.let { humanSelectionMode(it.config.selectionMode, it.config.driftEnabled) } ?: ""
+    val isPageRank = session?.config?.selectionMode == SelectionMode.RANDOM_WALK
     val seedTitle = session?.seedTrack?.title ?: "seed"
+    val poolSize = session?.config?.candidatePoolSize ?: 200
 
     Column(modifier = modifier) {
-        if (isExplorer) {
-            Text("Found through similarity chains, not direct match.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text("Connected to your seed through intermediate tracks.",
+        // Every expansion starts with similarity to seed
+        Text("$seedPct% match to \"$seedTitle\"",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+        if (isPageRank) {
+            Text("PageRank rank #${index + 1}",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         } else if (hasDrift && session != null) {
-            Text("$pct% match",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text("Search was shaped by:",
+            // Drift: show blend breakdown
+            Text("Search blended:",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
 
@@ -700,33 +689,29 @@ private fun TrackExplanation(
             for (inf in significantInfluences) {
                 val weightPct = (inf.weight * 100).roundToInt()
                 val sourceName = if (inf.sourceIndex == -1) {
-                    "Seed: \"$seedTitle\""
+                    "seed ($weightPct%)"
                 } else {
                     val trackInfo = session.tracks.getOrNull(inf.sourceIndex)
                     if (trackInfo != null) {
-                        "#${inf.sourceIndex + 1}: \"${trackInfo.track.title ?: "Unknown"}\" by ${trackInfo.track.artist ?: "Unknown"}"
+                        "\"${trackInfo.track.title ?: "Unknown"}\" ($weightPct%)"
                     } else {
-                        "#${inf.sourceIndex + 1}"
+                        "#${inf.sourceIndex + 1} ($weightPct%)"
                     }
                 }
-                Text("  $sourceName \u2014 $weightPct%",
+                Text("  $sourceName",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             if (collapsedCount > 0) {
-                Text("  (+ $collapsedCount earlier tracks)",
+                Text("  + $collapsedCount earlier",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
             }
-        } else {
-            Text("$pct% similar to \"$seedTitle\"",
+        } else if (trackResult.candidateRank != null) {
+            // Batch mode with candidate rank
+            Text("Similarity rank #${trackResult.candidateRank} of $poolSize",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (mode.isNotEmpty()) {
-                Text("Selected from ${session?.config?.candidatePoolSize ?: 200} candidates using $mode mode.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
         }
     }
 }
@@ -839,6 +824,7 @@ fun SettingsScreen(
     val temperature by viewModel.temperature.collectAsState()
     val maxPerArtist by viewModel.maxPerArtist.collectAsState()
     val minArtistSpacing by viewModel.minArtistSpacing.collectAsState()
+    val candidatePoolSize by viewModel.candidatePoolSize.collectAsState()
     val numTracks by viewModel.numTracks.collectAsState()
     val previews by viewModel.previews.collectAsState()
     val previewsLoading by viewModel.previewsLoading.collectAsState()
@@ -847,11 +833,11 @@ fun SettingsScreen(
     val isDpp = selectionMode == SelectionMode.DPP
 
     // Group keys by what affects each mode
-    val commonKeys = remember(numTracks, maxPerArtist, minArtistSpacing) { Any() }
+    val commonKeys = remember(numTracks, candidatePoolSize, maxPerArtist, minArtistSpacing) { Any() }
     val driftKeys = remember(driftEnabled, driftMode, anchorStrength, anchorDecay, momentumBeta) { Any() }
     val expandedPeek = remember { mutableStateMapOf<SelectionMode, Boolean>() }
 
-    // Invalidate stale previews when relevant settings change (lazy — computed on peek click)
+    // Invalidate stale previews when relevant settings change (lazy - computed on peek click)
     LaunchedEffect(commonKeys, driftKeys, diversityLambda) {
         viewModel.invalidatePreview(SelectionMode.MMR)
         expandedPeek[SelectionMode.MMR] = false
@@ -894,6 +880,20 @@ fun SettingsScreen(
                 }
             }
 
+            // Candidate pool size
+            item {
+                Column {
+                    Text("Candidate Pool: $candidatePoolSize", style = MaterialTheme.typography.titleSmall)
+                    Text("How many top matches to consider before the algorithm selects from them. Larger pools give algorithms more material to work with.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Slider(value = candidatePoolSize.toFloat(),
+                        onValueChange = { viewModel.setCandidatePoolSize((it / 100).roundToInt() * 100) },
+                        valueRange = 100f..1000f,
+                        steps = 8)
+                }
+            }
+
             item { HorizontalDivider() }
 
             // Selection algorithm
@@ -909,18 +909,16 @@ fun SettingsScreen(
                             DecaySchedule.EXPONENTIAL -> ", quick start"
                             DecaySchedule.STEP -> ", halfway"
                         }
-                        " + Evolving (Anchored ${(anchorStrength * 100).roundToInt()}%$decay)"
+                        " + drift (anchored ${(anchorStrength * 100).roundToInt()}%$decay)"
                     }
                     DriftMode.MOMENTUM ->
-                        " + Evolving (Flowing ${(momentumBeta * 100).roundToInt()}%)"
+                        " + drift (flowing ${(momentumBeta * 100).roundToInt()}%)"
                 }
 
                 Column(modifier = Modifier.selectableGroup()) {
                     AlgorithmOption(
-                        label = "Balanced",
-                        description = "Similar to your seed, but avoids repeating the same sound. " +
-                            "The default \u2014 good for most listening.",
-                        technicalName = "MMR",
+                        label = "MMR",
+                        description = "Starts with the closest matches to the seed, then skips candidates that sound too similar to tracks already picked. Each pick is evaluated against the full queue so far.",
                         preview = previews[SelectionMode.MMR],
                         isLoading = SelectionMode.MMR in previewsLoading,
                         selected = selectionMode == SelectionMode.MMR,
@@ -931,10 +929,8 @@ fun SettingsScreen(
                         onClick = { viewModel.setSelectionMode(SelectionMode.MMR) }
                     )
                     AlgorithmOption(
-                        label = "Wide Net",
-                        description = "Maximizes variety while staying relevant. Picks tracks that " +
-                            "sound different from each other, not just from your seed.",
-                        technicalName = "DPP",
+                        label = "DPP",
+                        description = "Looks at the full candidate pool at once. Scores every possible pair of tracks on both relevance to the seed and how different they sound from each other. Relevance and diversity are always balanced, the algorithm cannot trade one for the other.",
                         preview = previews[SelectionMode.DPP],
                         isLoading = SelectionMode.DPP in previewsLoading,
                         selected = selectionMode == SelectionMode.DPP,
@@ -944,11 +940,9 @@ fun SettingsScreen(
                         onClick = { viewModel.setSelectionMode(SelectionMode.DPP) }
                     )
                     AlgorithmOption(
-                        label = "Explorer",
-                        description = "Follows chains of similarity \u2014 A sounds like B, B sounds " +
-                            "like C, so C appears even if it doesn't directly resemble your seed." +
+                        label = "Personalized PageRank",
+                        description = "Walks a similarity graph starting from the seed. At each step, hops to a similar neighbor or jumps back to the seed. Tracks visited more often rank higher. Surfaces tracks reachable through multiple paths of similarity, even if not directly similar to the seed." +
                             if (databaseInfo?.hasGraph != true) " (requires similarity graph in database)" else "",
-                        technicalName = "Personalized PageRank",
                         preview = previews[SelectionMode.RANDOM_WALK],
                         isLoading = SelectionMode.RANDOM_WALK in previewsLoading,
                         selected = selectionMode == SelectionMode.RANDOM_WALK,
@@ -959,10 +953,8 @@ fun SettingsScreen(
                         onClick = { viewModel.setSelectionMode(SelectionMode.RANDOM_WALK) }
                     )
                     AlgorithmOption(
-                        label = "Shuffle",
-                        description = "Randomly picks from the top candidates. Different playlist " +
-                            "every time you run it from the same song.",
-                        technicalName = "Gumbel-Max",
+                        label = "Gumbel-Max",
+                        description = "Takes the top candidates by similarity to the seed, then randomly picks from them with a bias toward the closest matches. Different playlist each run from the same seed.",
                         preview = previews[SelectionMode.TEMPERATURE],
                         isLoading = SelectionMode.TEMPERATURE in previewsLoading,
                         selected = selectionMode == SelectionMode.TEMPERATURE,
@@ -975,13 +967,13 @@ fun SettingsScreen(
                 }
             }
 
-            // Similarity vs. Variety — only for MMR (Balanced)
+            // Similarity vs. Variety - only for MMR
             if (selectionMode == SelectionMode.MMR) {
                 item {
                     Column {
                         Text("Similarity vs. Variety: ${(diversityLambda * 100).roundToInt()}%",
                             style = MaterialTheme.typography.titleSmall)
-                        Text("How much the playlist favors close matches over new sounds.",
+                        Text("All the way up: no penalty, picks the most similar tracks. All the way down: strong penalty, spreads picks apart even if individually less similar.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -996,13 +988,13 @@ fun SettingsScreen(
                 }
             }
 
-            // Randomness — only for Shuffle mode
+            // Randomness - only for Gumbel-Max
             if (selectionMode == SelectionMode.TEMPERATURE) {
                 item {
                     Column {
                         Text("Randomness: ${String.format("%.2f", temperature)}",
                             style = MaterialTheme.typography.titleSmall)
-                        Text("Low = nearly the same playlist each time. High = more surprises.",
+                        Text("Low = nearly the same playlist each time. High = flattens the bias, picks further from the top.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1017,14 +1009,13 @@ fun SettingsScreen(
                 }
             }
 
-            // Return Frequency — only for Explorer mode
+            // Return Frequency - only for PageRank
             if (isRandomWalk) {
                 item {
                     Column {
                         Text("Return Frequency: ${(anchorStrength * 100).roundToInt()}%",
                             style = MaterialTheme.typography.titleSmall)
-                        Text("How often the walk jumps back to your seed. " +
-                            "Low = explores further. High = stays nearby.",
+                        Text("How often the walk jumps back to the seed instead of continuing to the next neighbor. Low = wanders further through the graph. High = stays in the immediate neighborhood.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1039,15 +1030,13 @@ fun SettingsScreen(
                 }
             }
 
-            // Drift — not applicable to Random Walk or DPP
-            // (DPP in drift mode is degenerate: k=1 selection = pure greedy max,
-            //  identical to MMR lambda=1. DPP's value is batch-only pairwise diversity.)
+            // Drift - not applicable to Random Walk or DPP
             if (!isRandomWalk && !isDpp) {
                 item { HorizontalDivider() }
 
                 item {
                     Column {
-                        Text("Playlist Evolution", style = MaterialTheme.typography.titleMedium)
+                        Text("Drift", style = MaterialTheme.typography.titleMedium)
                         Spacer(modifier = Modifier.height(4.dp))
 
                         Row(modifier = Modifier.fillMaxWidth().selectable(
@@ -1056,17 +1045,15 @@ fun SettingsScreen(
                             Checkbox(checked = driftEnabled, onCheckedChange = null)
                             Spacer(modifier = Modifier.width(8.dp))
                             Column {
-                                Text("Evolving playlist", style = MaterialTheme.typography.bodyMedium)
-                                Text("Each track influences what comes next \u2014 the playlist gradually " +
-                                    "drifts from your starting song. When off, every track is picked " +
-                                    "based on the seed alone.",
+                                Text("Drifting playlist", style = MaterialTheme.typography.bodyMedium)
+                                Text("After each pick, the search shifts toward that track. The next search looks for tracks similar to a blend of the seed and recent picks, not just the seed. Over time this moves the playlist in a new direction.",
                                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                         }
 
                         AnimatedVisibility(visible = driftEnabled) {
                             Column(modifier = Modifier.padding(start = 16.dp, top = 8.dp)) {
-                                Text("Evolution style", style = MaterialTheme.typography.titleSmall)
+                                Text("Drift style", style = MaterialTheme.typography.titleSmall)
                                 Spacer(modifier = Modifier.height(4.dp))
                                 Column(modifier = Modifier.selectableGroup()) {
                                     Row(modifier = Modifier.fillMaxWidth().selectable(
@@ -1078,8 +1065,7 @@ fun SettingsScreen(
                                         Spacer(modifier = Modifier.width(8.dp))
                                         Column {
                                             Text("Anchored", style = MaterialTheme.typography.bodyMedium)
-                                            Text("Blends the seed with the latest pick. Your starting song " +
-                                                "always has some pull.",
+                                            Text("Each search blends the seed with the most recent pick. The seed always contributes, controlled by the Seed Influence slider.",
                                                 style = MaterialTheme.typography.bodySmall,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
                                         }
@@ -1093,8 +1079,7 @@ fun SettingsScreen(
                                         Spacer(modifier = Modifier.width(8.dp))
                                         Column {
                                             Text("Flowing", style = MaterialTheme.typography.bodyMedium)
-                                            Text("Running average of everything picked so far. Direction " +
-                                                "shifts gradually and smoothly.",
+                                            Text("Each search uses a running average of all picks so far. Direction changes gradually rather than jumping based on a single pick.",
                                                 style = MaterialTheme.typography.bodySmall,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
                                         }
@@ -1106,8 +1091,7 @@ fun SettingsScreen(
                                     Column(modifier = Modifier.padding(top = 8.dp)) {
                                         Text("Seed Influence: ${(anchorStrength * 100).roundToInt()}%",
                                             style = MaterialTheme.typography.titleSmall)
-                                        Text("How much your starting song shapes later picks. " +
-                                            "Low = the playlist wanders. High = it stays close.",
+                                        Text("How much the seed contributes to each search. Low = recent picks dominate, the playlist wanders. High = the seed dominates, the playlist stays close.",
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1155,8 +1139,7 @@ fun SettingsScreen(
                                     Column(modifier = Modifier.padding(top = 8.dp)) {
                                         Text("Smoothing: ${(momentumBeta * 100).roundToInt()}%",
                                             style = MaterialTheme.typography.titleSmall)
-                                        Text("How gradually the playlist changes direction. " +
-                                            "High = smooth, slow shifts. Low = reacts quickly to each pick.",
+                                        Text("How much of the history each search averages over. High = averages many past picks, direction changes slowly. Low = mostly the last few picks, reacts quickly.",
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1209,7 +1192,7 @@ fun SettingsScreen(
                             (if (databaseInfo.embeddingDim != null) " (${databaseInfo.embeddingDim}d)" else ""))
                         Text("Table: ${databaseInfo.embeddingTable}")
                         if (databaseInfo.hasFused) Text("Fused embeddings: yes")
-                        Text("Similarity graph: ${if (databaseInfo.hasGraph) "yes \u2014 Explorer mode available" else "not found \u2014 Explorer will fall back to Balanced"}")
+                        Text("Similarity graph: ${if (databaseInfo.hasGraph) "yes - PageRank mode available" else "not found - PageRank will fall back to MMR"}")
                         Text("Size: ${databaseInfo.sizeKb} KB")
                     } else {
                         Text("No database imported", color = MaterialTheme.colorScheme.error)
@@ -1249,7 +1232,6 @@ fun SettingsScreen(
 @Composable
 private fun AlgorithmOption(
     label: String, description: String, selected: Boolean, onClick: () -> Unit,
-    technicalName: String = "",
     preview: List<String>? = null, isLoading: Boolean = false,
     expanded: Boolean = false, onToggleExpanded: () -> Unit = {},
     onRequestPreview: () -> Unit = {},
@@ -1264,10 +1246,6 @@ private fun AlgorithmOption(
             Text(label, style = MaterialTheme.typography.bodyMedium)
             Text(description, style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (technicalName.isNotEmpty()) {
-                Text(technicalName, style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f))
-            }
             TextButton(
                 onClick = {
                     if (!expanded && preview.isNullOrEmpty() && !isLoading) {
@@ -1323,10 +1301,10 @@ private fun humanMatchType(matchType: TrackMatcher.MatchType): String = when (ma
 
 private fun humanSelectionMode(mode: SelectionMode, drift: Boolean = false): String {
     val base = when (mode) {
-        SelectionMode.MMR -> "Balanced"
-        SelectionMode.DPP -> "Wide Net"
-        SelectionMode.RANDOM_WALK -> "Explorer"
-        SelectionMode.TEMPERATURE -> "Shuffle"
+        SelectionMode.MMR -> "MMR"
+        SelectionMode.DPP -> "DPP"
+        SelectionMode.RANDOM_WALK -> "PageRank"
+        SelectionMode.TEMPERATURE -> "Gumbel-Max"
     }
-    return if (drift && mode != SelectionMode.DPP && mode != SelectionMode.RANDOM_WALK) "$base + Evolving" else base
+    return if (drift && mode != SelectionMode.DPP && mode != SelectionMode.RANDOM_WALK) "$base + drift" else base
 }

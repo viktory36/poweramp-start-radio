@@ -1,6 +1,7 @@
 package com.powerampstartradio.similarity.algorithms
 
 import com.powerampstartradio.data.EmbeddedTrack
+import com.powerampstartradio.similarity.SimilarTrack
 
 /**
  * Post-selection filter for artist/album diversity constraints.
@@ -45,21 +46,21 @@ object PostFilter {
      * Filter a batch of selected tracks to enforce artist constraints.
      * Preserves order, dropping tracks that violate constraints.
      *
-     * @param tracks Ordered list of (track, similarity) pairs
+     * @param tracks Ordered list of SimilarTrack
      * @param maxPerArtist Maximum tracks per artist
      * @param minSpacing Minimum positions between same-artist tracks
      * @return Filtered list preserving order
      */
     fun enforceBatch(
-        tracks: List<Pair<EmbeddedTrack, Float>>,
+        tracks: List<SimilarTrack>,
         maxPerArtist: Int,
         minSpacing: Int
-    ): List<Pair<EmbeddedTrack, Float>> {
-        val result = mutableListOf<Pair<EmbeddedTrack, Float>>()
+    ): List<SimilarTrack> {
+        val result = mutableListOf<SimilarTrack>()
         val artistCounts = mutableMapOf<String, Int>()
 
-        for ((track, score) in tracks) {
-            val artist = track.artist?.lowercase()
+        for (st in tracks) {
+            val artist = st.track.artist?.lowercase()
 
             // Check max per artist
             if (artist != null) {
@@ -70,10 +71,10 @@ object PostFilter {
             // Check spacing
             if (artist != null && minSpacing > 0 && result.isNotEmpty()) {
                 val recentWindow = result.takeLast(minSpacing)
-                if (recentWindow.any { it.first.artist?.lowercase() == artist }) continue
+                if (recentWindow.any { it.track.artist?.lowercase() == artist }) continue
             }
 
-            result.add(track to score)
+            result.add(st)
             if (artist != null) {
                 artistCounts[artist] = (artistCounts[artist] ?: 0) + 1
             }

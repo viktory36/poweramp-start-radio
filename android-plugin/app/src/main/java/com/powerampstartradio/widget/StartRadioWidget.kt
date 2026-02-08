@@ -114,6 +114,7 @@ class StartRadioAction : ActionCallback {
 
         val config = RadioConfig(
             numTracks = prefs.getInt("num_tracks", RadioService.DEFAULT_NUM_TRACKS),
+            candidatePoolSize = prefs.getInt("candidate_pool_size", 200),
             selectionMode = try {
                 SelectionMode.valueOf(prefs.getString("selection_mode", SelectionMode.MMR.name)!!)
             } catch (e: IllegalArgumentException) { SelectionMode.MMR },
@@ -126,10 +127,10 @@ class StartRadioAction : ActionCallback {
                 DecaySchedule.valueOf(prefs.getString("anchor_decay", DecaySchedule.EXPONENTIAL.name)!!)
             } catch (e: IllegalArgumentException) { DecaySchedule.EXPONENTIAL },
             momentumBeta = prefs.getFloat("momentum_beta", 0.7f),
-            diversityLambda = prefs.getFloat("diversity_lambda", 0.6f),
-            temperature = prefs.getFloat("temperature", 0.1f),
-            maxPerArtist = prefs.getInt("max_per_artist", 3),
-            minArtistSpacing = prefs.getInt("min_artist_spacing", 5),
+            diversityLambda = prefs.getFloat("diversity_lambda", 0.4f),
+            temperature = prefs.getFloat("temperature", 0.05f),
+            maxPerArtist = prefs.getInt("max_per_artist", 8),
+            minArtistSpacing = prefs.getInt("min_artist_spacing", 2),
         )
 
         RadioService.startRadio(context, config, showToasts = true)

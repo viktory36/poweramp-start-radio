@@ -74,6 +74,7 @@ class RadioService : Service() {
         const val EXTRA_TEMPERATURE = "temperature"
         const val EXTRA_MAX_PER_ARTIST = "max_per_artist"
         const val EXTRA_MIN_ARTIST_SPACING = "min_artist_spacing"
+        const val EXTRA_CANDIDATE_POOL_SIZE = "candidate_pool_size"
 
         const val DEFAULT_NUM_TRACKS = 50
 
@@ -103,6 +104,7 @@ class RadioService : Service() {
                 putExtra(EXTRA_TEMPERATURE, config.temperature)
                 putExtra(EXTRA_MAX_PER_ARTIST, config.maxPerArtist)
                 putExtra(EXTRA_MIN_ARTIST_SPACING, config.minArtistSpacing)
+                putExtra(EXTRA_CANDIDATE_POOL_SIZE, config.candidatePoolSize)
             }
             context.startForegroundService(intent)
         }
@@ -177,8 +179,9 @@ class RadioService : Service() {
             momentumBeta = intent.getFloatExtra(EXTRA_MOMENTUM_BETA, 0.7f),
             diversityLambda = intent.getFloatExtra(EXTRA_DIVERSITY_LAMBDA, 0.4f),
             temperature = intent.getFloatExtra(EXTRA_TEMPERATURE, 0.05f),
-            maxPerArtist = intent.getIntExtra(EXTRA_MAX_PER_ARTIST, 3),
-            minArtistSpacing = intent.getIntExtra(EXTRA_MIN_ARTIST_SPACING, 3),
+            maxPerArtist = intent.getIntExtra(EXTRA_MAX_PER_ARTIST, 8),
+            minArtistSpacing = intent.getIntExtra(EXTRA_MIN_ARTIST_SPACING, 2),
+            candidatePoolSize = intent.getIntExtra(EXTRA_CANDIDATE_POOL_SIZE, 200),
         )
     }
 
@@ -288,6 +291,8 @@ class RadioService : Service() {
                             streamingTracks.add(QueuedTrackResult(
                                 track = similarTrack.track,
                                 similarity = similarTrack.similarity,
+                                similarityToSeed = similarTrack.similarityToSeed,
+                                candidateRank = similarTrack.candidateRank,
                                 status = if (fileId != null) QueueStatus.QUEUED else QueueStatus.NOT_IN_LIBRARY,
                                 provenance = similarTrack.provenance,
                             ))
@@ -383,6 +388,8 @@ class RadioService : Service() {
                         QueuedTrackResult(
                             track = mapped.similarTrack.track,
                             similarity = mapped.similarTrack.similarity,
+                            similarityToSeed = mapped.similarTrack.similarityToSeed,
+                            candidateRank = mapped.similarTrack.candidateRank,
                             status = status,
                             provenance = mapped.similarTrack.provenance,
                         )
