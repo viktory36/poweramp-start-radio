@@ -135,13 +135,14 @@ class RecommendationEngine(
     }
 
     /**
-     * Compute nearest-neighbor diversity provenance for a batch of tracks.
+     * Compute normalized diversity score for a batch of tracks.
      *
-     * For each track, finds the closest sibling in the selection. The strip
-     * then shows: primary = uniqueness (1 - nn_sim), colored = redundancy with
-     * nearest neighbor (nn_sim). Wider primary → more diverse pick.
+     * For each track, finds the max cosine similarity to any other selected
+     * track (nearest-neighbor similarity). Diversity = 1 - nn_sim. Scores
+     * are normalized so the most diverse track fills the strip and the least
+     * diverse shows a minimal bar. The strip acts as a diversity meter.
      */
-    private fun nnProvenance(
+    private fun diversityProvenance(
         filtered: List<Pair<com.powerampstartradio.data.EmbeddedTrack, Float>>,
         index: EmbeddingIndex
     ): List<TrackProvenance> {
@@ -149,24 +150,32 @@ class RecommendationEngine(
 
         val embs = filtered.map { (track, _) -> index.getEmbeddingByTrackId(track.id) }
 
-        return filtered.indices.map { i ->
-            val a = embs[i]
-            if (a == null) return@map TrackProvenance()
-            var maxSim = -1f
-            var nnIdx = 0
-            for (j in filtered.indices) {
-                if (j == i) continue
+        // Compute max NN similarity per track (symmetric — each pair computed once)
+        val maxNnSim = FloatArray(filtered.size) { -1f }
+        for (i in filtered.indices) {
+            val a = embs[i] ?: continue
+            for (j in i + 1 until filtered.size) {
                 val b = embs[j] ?: continue
                 var dot = 0f
                 for (d in a.indices) dot += a[d] * b[d]
-                if (dot > maxSim) { maxSim = dot; nnIdx = j }
+                if (dot > maxNnSim[i]) maxNnSim[i] = dot
+                if (dot > maxNnSim[j]) maxNnSim[j] = dot
             }
-            if (maxSim >= 0f) {
-                TrackProvenance(listOf(
-                    Influence(-1, 1f - maxSim),
-                    Influence(nnIdx, maxSim)
-                ))
-            } else TrackProvenance()
+        }
+
+        // Diversity = 1 - maxNnSim, normalized to [0.15, 1.0]
+        val rawDiv = FloatArray(filtered.size) { i ->
+            if (maxNnSim[i] >= 0f) 1f - maxNnSim[i] else 0f
+        }
+        val minDiv = rawDiv.filter { it > 0f }.minOrNull() ?: 0f
+        val maxDiv = rawDiv.maxOrNull() ?: 1f
+        val range = maxDiv - minDiv
+
+        return filtered.indices.map { i ->
+            val normalized = if (range > 0.001f) {
+                0.15f + 0.85f * (rawDiv[i] - minDiv) / range
+            } else 1f
+            TrackProvenance(listOf(Influence(-1, normalized)))
         }
     }
 
@@ -363,7 +372,7 @@ class RecommendationEngine(
             config.minArtistSpacing
         )
 
-        val provenance = nnProvenance(filtered, index)
+        val provenance = diversityProvenance(filtered, index)
         return filtered.mapIndexed { i, (track, score) ->
             SimilarTrack(track, score, provenance[i])
         }
@@ -405,7 +414,7 @@ class RecommendationEngine(
         ).take(config.numTracks)
 
         val index = embeddingIndex
-        val provenance = if (index != null) nnProvenance(filtered, index)
+        val provenance = if (index != null) diversityProvenance(filtered, index)
             else filtered.map { TrackProvenance() }
         val result = filtered.mapIndexed { i, (track, score) ->
             SimilarTrack(track, score, provenance[i])

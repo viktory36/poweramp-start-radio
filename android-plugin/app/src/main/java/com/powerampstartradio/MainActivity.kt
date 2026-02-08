@@ -446,7 +446,7 @@ fun CompactNowPlayingHeader(
 @Composable
 fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
     val listState = rememberLazyListState()
-    val showProvenance = session.tracks.any { it.provenance.influences.size > 1 }
+    val showProvenance = session.tracks.size > 1
     // Use target queue size so colors stay stable as tracks stream in
     val colorTotal = maxOf(session.config.numTracks, session.tracks.size)
 
@@ -539,11 +539,16 @@ fun InfluenceStrip(
         }
     }
 
+    val bgColor = primary.copy(alpha = 0.12f)
+
     Canvas(modifier = modifier
         .width(40.dp)
         .height(12.dp)
         .clip(RoundedCornerShape(3.dp))
     ) {
+        // Background — visible as "empty" portion for diversity meter
+        drawRect(color = bgColor, size = Size(size.width, size.height))
+
         val sorted = provenance.influences
             .zip(segmentColors)
             .sortedBy { it.first.sourceIndex }
@@ -589,7 +594,10 @@ fun TrackResultRow(
                 color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
 
-        val scoreColor = if (showProvenance) {
+        // Identity-colored scores only for drift (multi-influence) provenance;
+        // batch diversity uses similarity gradient since there's no cross-reference
+        val hasDriftChain = trackResult.provenance.influences.size > 1
+        val scoreColor = if (hasDriftChain) {
             trackColor(primary, index, totalTracks)
         } else {
             val normalized = trackResult.similarity.coerceIn(0f, 1f)
