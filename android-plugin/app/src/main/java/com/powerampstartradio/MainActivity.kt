@@ -35,7 +35,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
@@ -61,6 +64,7 @@ import com.powerampstartradio.ui.QueuedTrackResult
 import com.powerampstartradio.ui.RadioResult
 import com.powerampstartradio.ui.RadioUiState
 import com.powerampstartradio.ui.SelectionMode
+import com.powerampstartradio.ui.TrackProvenance
 import com.powerampstartradio.ui.theme.PowerampStartRadioTheme
 import kotlinx.coroutines.launch
 import java.io.File
@@ -440,10 +444,8 @@ fun CompactNowPlayingHeader(
 
 @Composable
 fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
-    val treeNodes = remember(session) { computeTreeNodes(session) }
-
     val listState = rememberLazyListState()
-    val hasDriftRails = session.config.driftEnabled
+    val showProvenance = session.config.driftEnabled
 
     LaunchedEffect(session.tracks.size) {
         if (!session.isComplete && session.tracks.isNotEmpty()) {
@@ -454,22 +456,19 @@ fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
         }
     }
 
-    // Scroll offset squishes old rail columns off-screen as you scroll down
-    val scrollOffset: (() -> Float)? = if (hasDriftRails) {
-        remember(treeNodes) {
-            { (treeNodes.getOrNull(listState.firstVisibleItemIndex)?.depth ?: 0).toFloat() }
-        }
-    } else null
-
     Column(modifier = modifier) {
         ResultsSummary(result = session,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
 
         LazyColumn(state = listState, modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)) {
-            items(treeNodes.size) { index ->
-                TrackResultRow(trackResult = session.tracks[index],
-                    treeNode = treeNodes[index], scrollOffset = scrollOffset)
+            items(session.tracks.size) { index ->
+                TrackResultRow(
+                    trackResult = session.tracks[index],
+                    index = index,
+                    totalTracks = session.tracks.size,
+                    showProvenance = showProvenance
+                )
             }
             if (!session.isComplete) {
                 item { StreamingProgressItem(found = session.tracks.size, total = session.totalExpected) }
@@ -508,58 +507,83 @@ fun ResultsSummary(result: RadioResult, modifier: Modifier = Modifier) {
         modifier = modifier.fillMaxWidth(), maxLines = 1, overflow = TextOverflow.Ellipsis)
 }
 
-// ---- Rail-based tree node computation ----
+// ---- Influence strip provenance visualization ----
 
-private const val TREE_INDENT_DP = 5f
+private fun trackColor(primary: Color, index: Int, total: Int): Color {
+    if (total <= 1) return primary
+    val hsl = FloatArray(3)
+    androidx.core.graphics.ColorUtils.colorToHSL(primary.toArgb(), hsl)
+    hsl[0] = (hsl[0] + (index.toFloat() / total) * 180f) % 360f
+    return Color(androidx.core.graphics.ColorUtils.HSLToColor(hsl))
+}
 
-/**
- * A single vertical rail in the provenance diagram.
- *
- * @param column 0 = seed, j+1 = track j
- * @param alpha Exact influence weight — drawn as line opacity
- */
-data class ActiveRail(
-    val column: Int,
-    val alpha: Float,
-)
-
-/**
- * Rail-based tree node: each row's complete visual specification.
- *
- * @param depth This track's column position (= track index + 1)
- * @param rails All active rails at this row, with their influence weights
- */
-data class TreeNodeInfo(
-    val depth: Int,
-    val rails: List<ActiveRail>,
-)
-
-private fun computeTreeNodes(session: RadioResult): List<TreeNodeInfo> {
-    if (session.tracks.isEmpty()) return emptyList()
-
-    return session.tracks.mapIndexed { index, track ->
-        val rails = track.provenance.influences.map { influence ->
-            ActiveRail(
-                column = if (influence.sourceIndex == -1) 0 else influence.sourceIndex + 1,
-                alpha = influence.weight
-            )
-        }
-        TreeNodeInfo(depth = index + 1, rails = rails)
+@Composable
+fun TrackIdentityDot(index: Int, totalTracks: Int) {
+    val primary = MaterialTheme.colorScheme.primary
+    val color = remember(primary, index, totalTracks) {
+        trackColor(primary, index, totalTracks)
+    }
+    Canvas(modifier = Modifier.size(8.dp)) {
+        drawCircle(color = color)
     }
 }
 
-// ---- Track Result Row with Canvas Rail Lines ----
+@Composable
+fun InfluenceStrip(
+    provenance: TrackProvenance,
+    totalTracks: Int,
+    modifier: Modifier = Modifier
+) {
+    val primary = MaterialTheme.colorScheme.primary
+    val density = LocalDensity.current
+    val stripWidthPx = with(density) { 32.dp.toPx() }
+
+    val segmentColors = remember(primary, totalTracks, provenance) {
+        provenance.influences.map { influence ->
+            if (influence.sourceIndex == -1) primary
+            else trackColor(primary, influence.sourceIndex, totalTracks)
+        }
+    }
+
+    Canvas(modifier = modifier.width(32.dp).fillMaxHeight().clipToBounds()) {
+        val sorted = provenance.influences
+            .zip(segmentColors)
+            .sortedBy { it.first.sourceIndex }
+        var x = 0f
+
+        for ((influence, color) in sorted) {
+            val segWidth = influence.weight * stripWidthPx
+            if (segWidth < 0.5f) continue
+            drawRect(
+                color = color,
+                topLeft = Offset(x, 0f),
+                size = Size(segWidth, size.height)
+            )
+            x += segWidth
+        }
+    }
+}
+
+// ---- Track Result Row ----
 
 @Composable
 fun TrackResultRow(
     trackResult: QueuedTrackResult,
-    treeNode: TreeNodeInfo? = null,
-    scrollOffset: (() -> Float)? = null
+    index: Int,
+    totalTracks: Int,
+    showProvenance: Boolean
 ) {
     Row(modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
         verticalAlignment = Alignment.CenterVertically) {
-        if (treeNode != null && treeNode.rails.isNotEmpty()) {
-            TreeLines(node = treeNode, scrollOffset = scrollOffset, modifier = Modifier.fillMaxHeight())
+        if (showProvenance) {
+            TrackIdentityDot(index = index, totalTracks = totalTracks)
+            Spacer(modifier = Modifier.width(4.dp))
+            InfluenceStrip(
+                provenance = trackResult.provenance,
+                totalTracks = totalTracks,
+                modifier = Modifier.fillMaxHeight()
+            )
+            Spacer(modifier = Modifier.width(4.dp))
         }
         Column(modifier = Modifier.weight(1f).padding(vertical = 2.dp, horizontal = 4.dp)) {
             Text(text = trackResult.track.title ?: "Unknown", style = MaterialTheme.typography.bodyMedium,
@@ -575,44 +599,6 @@ fun TrackResultRow(
 
         Text(text = "($scoreText)", fontFamily = FontFamily.Monospace, color = scoreColor,
             fontSize = 9.sp, textAlign = TextAlign.End, modifier = Modifier.padding(horizontal = 2.dp))
-    }
-}
-
-@Composable
-fun TreeLines(node: TreeNodeInfo, scrollOffset: (() -> Float)? = null, modifier: Modifier = Modifier) {
-    val baseColor = MaterialTheme.colorScheme.primary
-    val density = LocalDensity.current
-    val indentPx = with(density) { TREE_INDENT_DP.dp.toPx() }
-    val lineWidthPx = with(density) { 1.dp.toPx() }
-    val offset = scrollOffset?.invoke() ?: 0f
-    val maxColumn = node.rails.maxOfOrNull { it.column } ?: 0
-    val visibleLevels = ((maxColumn + 1) - offset).coerceAtLeast(1f)
-    val canvasWidth = with(density) { (visibleLevels * TREE_INDENT_DP).dp }
-    val scrollPx = offset * indentPx
-
-    Canvas(modifier = modifier.width(canvasWidth).clipToBounds()) {
-        val midY = size.height / 2
-        val sortedRails = node.rails.sortedBy { it.column }
-
-        // 1. Vertical rail lines — each at its own influence-weight opacity
-        for (rail in sortedRails) {
-            val x = rail.column * indentPx + indentPx / 2 - scrollPx
-            val color = baseColor.copy(alpha = rail.alpha.coerceAtLeast(0.08f))
-            drawLine(color, Offset(x, 0f), Offset(x, size.height), lineWidthPx)
-        }
-
-        // 2. Segmented horizontal connector — each segment inherits its rail's opacity
-        for (i in sortedRails.indices) {
-            val rail = sortedRails[i]
-            val startX = rail.column * indentPx + indentPx / 2 - scrollPx
-            val endX = if (i < sortedRails.lastIndex) {
-                sortedRails[i + 1].column * indentPx + indentPx / 2 - scrollPx
-            } else {
-                size.width
-            }
-            val color = baseColor.copy(alpha = rail.alpha.coerceAtLeast(0.08f))
-            drawLine(color, Offset(startX, midY), Offset(endX, midY), lineWidthPx)
-        }
     }
 }
 
