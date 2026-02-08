@@ -446,7 +446,7 @@ fun CompactNowPlayingHeader(
 @Composable
 fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
     val listState = rememberLazyListState()
-    val showProvenance = session.tracks.size > 1
+    val showProvenance = session.tracks.any { it.provenance.influences.size > 1 }
     // Use target queue size so colors stay stable as tracks stream in
     val colorTotal = maxOf(session.config.numTracks, session.tracks.size)
 

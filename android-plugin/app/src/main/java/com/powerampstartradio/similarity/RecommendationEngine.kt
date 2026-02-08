@@ -135,51 +135,6 @@ class RecommendationEngine(
     }
 
     /**
-     * Compute normalized diversity score for a batch of tracks.
-     *
-     * For each track, finds the max cosine similarity to any other selected
-     * track (nearest-neighbor similarity). Diversity = 1 - nn_sim. Scores
-     * are normalized so the most diverse track fills the strip and the least
-     * diverse shows a minimal bar. The strip acts as a diversity meter.
-     */
-    private fun diversityProvenance(
-        filtered: List<Pair<com.powerampstartradio.data.EmbeddedTrack, Float>>,
-        index: EmbeddingIndex
-    ): List<TrackProvenance> {
-        if (filtered.size <= 1) return filtered.map { TrackProvenance() }
-
-        val embs = filtered.map { (track, _) -> index.getEmbeddingByTrackId(track.id) }
-
-        // Compute max NN similarity per track (symmetric — each pair computed once)
-        val maxNnSim = FloatArray(filtered.size) { -1f }
-        for (i in filtered.indices) {
-            val a = embs[i] ?: continue
-            for (j in i + 1 until filtered.size) {
-                val b = embs[j] ?: continue
-                var dot = 0f
-                for (d in a.indices) dot += a[d] * b[d]
-                if (dot > maxNnSim[i]) maxNnSim[i] = dot
-                if (dot > maxNnSim[j]) maxNnSim[j] = dot
-            }
-        }
-
-        // Diversity = 1 - maxNnSim, normalized to [0.15, 1.0]
-        val rawDiv = FloatArray(filtered.size) { i ->
-            if (maxNnSim[i] >= 0f) 1f - maxNnSim[i] else 0f
-        }
-        val minDiv = rawDiv.filter { it > 0f }.minOrNull() ?: 0f
-        val maxDiv = rawDiv.maxOrNull() ?: 1f
-        val range = maxDiv - minDiv
-
-        return filtered.indices.map { i ->
-            val normalized = if (range > 0.001f) {
-                0.15f + 0.85f * (rawDiv[i] - minDiv) / range
-            } else 1f
-            TrackProvenance(listOf(Influence(-1, normalized)))
-        }
-    }
-
-    /**
      * Compute provenance for a track based on the query that produced it.
      *
      * For seed interpolation: the query was `alpha * seed + (1-alpha) * prev_track`,
@@ -372,10 +327,7 @@ class RecommendationEngine(
             config.minArtistSpacing
         )
 
-        val provenance = diversityProvenance(filtered, index)
-        return filtered.mapIndexed { i, (track, score) ->
-            SimilarTrack(track, score, provenance[i])
-        }
+        return filtered.map { (track, score) -> SimilarTrack(track, score) }
     }
 
     /**
@@ -413,12 +365,7 @@ class RecommendationEngine(
             config.minArtistSpacing
         ).take(config.numTracks)
 
-        val index = embeddingIndex
-        val provenance = if (index != null) diversityProvenance(filtered, index)
-            else filtered.map { TrackProvenance() }
-        val result = filtered.mapIndexed { i, (track, score) ->
-            SimilarTrack(track, score, provenance[i])
-        }
+        val result = filtered.map { (track, score) -> SimilarTrack(track, score) }
 
         // Stream results if callback provided
         onResult?.let { callback ->
