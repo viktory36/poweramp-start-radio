@@ -446,7 +446,7 @@ fun CompactNowPlayingHeader(
 @Composable
 fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
     val listState = rememberLazyListState()
-    val showProvenance = session.config.driftEnabled
+    val showProvenance = session.tracks.any { it.provenance.influences.size > 1 }
 
     LaunchedEffect(session.tracks.size) {
         if (!session.isComplete && session.tracks.isNotEmpty()) {

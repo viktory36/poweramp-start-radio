@@ -135,6 +135,42 @@ class RecommendationEngine(
     }
 
     /**
+     * Compute nearest-neighbor diversity provenance for a batch of tracks.
+     *
+     * For each track, finds the closest sibling in the selection. The strip
+     * then shows: primary = uniqueness (1 - nn_sim), colored = redundancy with
+     * nearest neighbor (nn_sim). Wider primary → more diverse pick.
+     */
+    private fun nnProvenance(
+        filtered: List<Pair<com.powerampstartradio.data.EmbeddedTrack, Float>>,
+        index: EmbeddingIndex
+    ): List<TrackProvenance> {
+        if (filtered.size <= 1) return filtered.map { TrackProvenance() }
+
+        val embs = filtered.map { (track, _) -> index.getEmbeddingByTrackId(track.id) }
+
+        return filtered.indices.map { i ->
+            val a = embs[i]
+            if (a == null) return@map TrackProvenance()
+            var maxSim = -1f
+            var nnIdx = 0
+            for (j in filtered.indices) {
+                if (j == i) continue
+                val b = embs[j] ?: continue
+                var dot = 0f
+                for (d in a.indices) dot += a[d] * b[d]
+                if (dot > maxSim) { maxSim = dot; nnIdx = j }
+            }
+            if (maxSim >= 0f) {
+                TrackProvenance(listOf(
+                    Influence(-1, 1f - maxSim),
+                    Influence(nnIdx, maxSim)
+                ))
+            } else TrackProvenance()
+        }
+    }
+
+    /**
      * Compute provenance for a track based on the query that produced it.
      *
      * For seed interpolation: the query was `alpha * seed + (1-alpha) * prev_track`,
@@ -327,7 +363,10 @@ class RecommendationEngine(
             config.minArtistSpacing
         )
 
-        return filtered.map { (track, score) -> SimilarTrack(track, score) }
+        val provenance = nnProvenance(filtered, index)
+        return filtered.mapIndexed { i, (track, score) ->
+            SimilarTrack(track, score, provenance[i])
+        }
     }
 
     /**
@@ -365,7 +404,12 @@ class RecommendationEngine(
             config.minArtistSpacing
         ).take(config.numTracks)
 
-        val result = filtered.map { (track, score) -> SimilarTrack(track, score) }
+        val index = embeddingIndex
+        val provenance = if (index != null) nnProvenance(filtered, index)
+            else filtered.map { TrackProvenance() }
+        val result = filtered.mapIndexed { i, (track, score) ->
+            SimilarTrack(track, score, provenance[i])
+        }
 
         // Stream results if callback provided
         onResult?.let { callback ->
