@@ -259,17 +259,19 @@ class RecommendationEngine(
             val similarTrack = SimilarTrack(track, score, provenance)
             result.add(similarTrack)
             selectedTracks.add(track)
-            index.getEmbeddingByTrackId(trackId)?.let { selectedEmbeddings.add(it) }
             onResult?.invoke(similarTrack)
 
             // Update query for next step
-            val currentEmb = index.getEmbeddingByTrackId(trackId) ?: break
-            val driftResult = DriftEngine.updateQuery(
-                seedEmb, currentEmb, emaState, step, config.numTracks, config
-            )
-            query = driftResult.query
-            emaState = driftResult.emaState
-            currentSeedWeight = driftResult.seedWeight
+            val currentEmb = index.getEmbeddingByTrackId(trackId)
+            if (currentEmb != null) {
+                selectedEmbeddings.add(currentEmb)
+                val driftResult = DriftEngine.updateQuery(
+                    seedEmb, currentEmb, emaState, step, config.numTracks, config
+                )
+                query = driftResult.query
+                emaState = driftResult.emaState
+                currentSeedWeight = driftResult.seedWeight
+            }
         }
 
         Log.d(TAG, "Drift: ${result.size} tracks")

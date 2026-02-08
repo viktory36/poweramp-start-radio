@@ -132,6 +132,7 @@ class RadioService : Service() {
     private var embeddingDb: EmbeddingDatabase? = null
     private var engine: RecommendationEngine? = null
     private var showToasts: Boolean = false
+    private var stopJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -141,6 +142,8 @@ class RadioService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START_RADIO -> {
+                stopJob?.cancel()
+                stopJob = null
                 showToasts = intent.getBooleanExtra(EXTRA_SHOW_TOASTS, false)
                 val config = extractConfig(intent)
                 startForeground(NOTIFICATION_ID, createNotification("Starting radio..."))
@@ -450,7 +453,8 @@ class RadioService : Service() {
     }
 
     private fun stopSelfDelayed() {
-        serviceScope.launch {
+        stopJob?.cancel()
+        stopJob = serviceScope.launch {
             kotlinx.coroutines.delay(3000)
             stopSelf()
         }
@@ -494,5 +498,7 @@ class RadioService : Service() {
         super.onDestroy()
         serviceScope.cancel()
         embeddingDb?.close()
+        embeddingDb = null
+        engine = null
     }
 }

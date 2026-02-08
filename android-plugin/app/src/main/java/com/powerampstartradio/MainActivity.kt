@@ -32,7 +32,8 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
-import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -514,18 +515,9 @@ private fun trackColor(primary: Color, index: Int, total: Int): Color {
     val hsl = FloatArray(3)
     androidx.core.graphics.ColorUtils.colorToHSL(primary.toArgb(), hsl)
     hsl[0] = (hsl[0] + (index.toFloat() / total) * 180f) % 360f
+    hsl[1] = maxOf(hsl[1], 0.5f)               // Ensure vivid colors
+    hsl[2] = hsl[2].coerceIn(0.35f, 0.65f)     // Readable on both themes
     return Color(androidx.core.graphics.ColorUtils.HSLToColor(hsl))
-}
-
-@Composable
-fun TrackIdentityDot(index: Int, totalTracks: Int) {
-    val primary = MaterialTheme.colorScheme.primary
-    val color = remember(primary, index, totalTracks) {
-        trackColor(primary, index, totalTracks)
-    }
-    Canvas(modifier = Modifier.size(8.dp)) {
-        drawCircle(color = color)
-    }
 }
 
 @Composable
@@ -536,7 +528,7 @@ fun InfluenceStrip(
 ) {
     val primary = MaterialTheme.colorScheme.primary
     val density = LocalDensity.current
-    val stripWidthPx = with(density) { 32.dp.toPx() }
+    val stripWidthPx = with(density) { 40.dp.toPx() }
 
     val segmentColors = remember(primary, totalTracks, provenance) {
         provenance.influences.map { influence ->
@@ -545,7 +537,11 @@ fun InfluenceStrip(
         }
     }
 
-    Canvas(modifier = modifier.width(32.dp).fillMaxHeight().clipToBounds()) {
+    Canvas(modifier = modifier
+        .width(40.dp)
+        .height(12.dp)
+        .clip(RoundedCornerShape(3.dp))
+    ) {
         val sorted = provenance.influences
             .zip(segmentColors)
             .sortedBy { it.first.sourceIndex }
@@ -573,17 +569,16 @@ fun TrackResultRow(
     totalTracks: Int,
     showProvenance: Boolean
 ) {
-    Row(modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
+    val primary = MaterialTheme.colorScheme.primary
+
+    Row(modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically) {
         if (showProvenance) {
-            TrackIdentityDot(index = index, totalTracks = totalTracks)
-            Spacer(modifier = Modifier.width(4.dp))
             InfluenceStrip(
                 provenance = trackResult.provenance,
-                totalTracks = totalTracks,
-                modifier = Modifier.fillMaxHeight()
+                totalTracks = totalTracks
             )
-            Spacer(modifier = Modifier.width(4.dp))
+            Spacer(modifier = Modifier.width(6.dp))
         }
         Column(modifier = Modifier.weight(1f).padding(vertical = 2.dp, horizontal = 4.dp)) {
             Text(text = trackResult.track.title ?: "Unknown", style = MaterialTheme.typography.bodyMedium,
@@ -592,9 +587,12 @@ fun TrackResultRow(
                 color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
 
-        val normalized = trackResult.similarity.coerceIn(0f, 1f)
-        val vivid = MaterialTheme.colorScheme.primary
-        val scoreColor = lerp(vivid.copy(alpha = 0.15f), vivid, normalized)
+        val scoreColor = if (showProvenance) {
+            trackColor(primary, index, totalTracks)
+        } else {
+            val normalized = trackResult.similarity.coerceIn(0f, 1f)
+            lerp(primary.copy(alpha = 0.15f), primary, normalized)
+        }
         val scoreText = String.format("%.3f", trackResult.similarity).removePrefix("0")
 
         Text(text = "($scoreText)", fontFamily = FontFamily.Monospace, color = scoreColor,
