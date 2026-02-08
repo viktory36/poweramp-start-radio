@@ -447,6 +447,8 @@ fun CompactNowPlayingHeader(
 fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
     val listState = rememberLazyListState()
     val showProvenance = session.tracks.any { it.provenance.influences.size > 1 }
+    // Use target queue size so colors stay stable as tracks stream in
+    val colorTotal = maxOf(session.config.numTracks, session.tracks.size)
 
     LaunchedEffect(session.tracks.size) {
         if (!session.isComplete && session.tracks.isNotEmpty()) {
@@ -467,7 +469,7 @@ fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
                 TrackResultRow(
                     trackResult = session.tracks[index],
                     index = index,
-                    totalTracks = session.tracks.size,
+                    totalTracks = colorTotal,
                     showProvenance = showProvenance
                 )
             }
