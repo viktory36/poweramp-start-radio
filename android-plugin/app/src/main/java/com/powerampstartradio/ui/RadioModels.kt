@@ -89,6 +89,31 @@ data class QueuedTrackResult(
     val candidateRank: Int? = null,
     val status: QueueStatus,
     val provenance: TrackProvenance = TrackProvenance(),
+    // Algorithm-specific per-track metadata
+    val algorithmScore: Float? = null,
+    val redundancyPenalty: Float? = null,
+    val nearestSelectedId: Long? = null,
+    val bypassed: Int? = null,
+    val marginalGain: Float? = null,
+    val effectiveProbability: Float? = null,
+    val queryDriftDistance: Float? = null,
+)
+
+/**
+ * Aggregate statistics about a generated queue, computed after all tracks are selected.
+ */
+data class QueueStats(
+    val uniqueArtists: Int = 0,
+    val similarityMin: Float = 0f,
+    val similarityMax: Float = 0f,
+    val similarityMean: Float = 0f,
+    val postFilterDropCount: Int = 0,
+    val postFilterDropReasons: Map<String, Int> = emptyMap(), // artist -> count dropped
+    // Temperature-specific
+    val scoreSpread: Float? = null,  // max-min candidate score in pool
+    val effectiveChoices: Float? = null,  // exp(entropy) of softmax distribution
+    // PageRank-specific
+    val reachabilityRadius: Int? = null,  // how many nodes the walk reached
 )
 
 /**
@@ -102,7 +127,8 @@ data class RadioResult(
     val timestamp: Long = System.currentTimeMillis(),
     val queuedFileIds: Set<Long> = emptySet(),
     val isComplete: Boolean = true,
-    val totalExpected: Int = 0
+    val totalExpected: Int = 0,
+    val queueStats: QueueStats? = null,
 ) {
     val queuedCount: Int get() = tracks.count { it.status == QueueStatus.QUEUED }
     val failedCount: Int get() = tracks.count { it.status != QueueStatus.QUEUED }

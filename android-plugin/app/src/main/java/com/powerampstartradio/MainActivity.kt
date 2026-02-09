@@ -539,9 +539,31 @@ fun ResultsSummary(result: RadioResult, modifier: Modifier = Modifier) {
         "$seedName - ${result.queuedCount} tracks via $modeLabel"
     }
 
-    Text(text = countText, style = MaterialTheme.typography.labelMedium,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = modifier.fillMaxWidth().basicMarquee(), maxLines = 1)
+    Column(modifier = modifier.fillMaxWidth()) {
+        Text(text = countText, style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.basicMarquee(), maxLines = 1)
+
+        val stats = result.queueStats
+        if (stats != null && result.isComplete) {
+            val parts = mutableListOf<String>()
+            parts.add("${stats.uniqueArtists} artists")
+            parts.add("${(stats.similarityMin * 100).roundToInt()}-${(stats.similarityMax * 100).roundToInt()}% similar")
+            if (stats.postFilterDropCount > 0) {
+                parts.add("${stats.postFilterDropCount} filtered out")
+            }
+            if (stats.effectiveChoices != null) {
+                parts.add("~${stats.effectiveChoices.roundToInt()} effective choices")
+            }
+            if (stats.reachabilityRadius != null) {
+                parts.add("${stats.reachabilityRadius} nodes reached")
+            }
+            Text(text = parts.joinToString(" · "),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+    }
 }
 
 // ---- Influence strip provenance visualization ----
@@ -661,7 +683,7 @@ private fun TrackExplanation(
 ) {
     val seedPct = (trackResult.similarityToSeed * 100).roundToInt()
     val hasDrift = trackResult.provenance.influences.size > 1
-    val isPageRank = session?.config?.selectionMode == SelectionMode.RANDOM_WALK
+    val mode = session?.config?.selectionMode
     val seedTitle = session?.seedTrack?.title ?: "seed"
     val poolSize = session?.config?.candidatePoolSize ?: 200
 
@@ -671,12 +693,108 @@ private fun TrackExplanation(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
 
-        if (isPageRank) {
-            Text("PageRank rank #${index + 1}",
+        // Algorithm-specific explanation
+        when (mode) {
+            SelectionMode.MMR -> {
+                if (trackResult.candidateRank != null) {
+                    Text("Similarity rank #${trackResult.candidateRank} of $poolSize",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                val bypassed = trackResult.bypassed
+                if (bypassed != null && bypassed > 0) {
+                    Text("Chosen over $bypassed closer match${if (bypassed > 1) "es" else ""} — skipped for redundancy",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                val penalty = trackResult.redundancyPenalty
+                if (penalty != null) {
+                    val penaltyPct = (penalty * 100).roundToInt()
+                    val nearestTrack = trackResult.nearestSelectedId?.let { nearestId ->
+                        session?.tracks?.find { it.track.id == nearestId }
+                    }
+                    val nearestName = nearestTrack?.track?.title
+                        ?: nearestTrack?.track?.artist
+                    val nearestText = if (nearestName != null) " (nearest: \"$nearestName\")" else ""
+                    Text("Redundancy: ${penaltyPct}% similar to queue$nearestText",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                val algoScore = trackResult.algorithmScore
+                if (algoScore != null) {
+                    val lambda = session?.config?.diversityLambda ?: 0f
+                    Text("MMR composite: ${String.format("%.3f", algoScore)} (λ=${String.format("%.1f", lambda)})",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f))
+                }
+            }
+            SelectionMode.DPP -> {
+                if (trackResult.candidateRank != null) {
+                    Text("Similarity rank #${trackResult.candidateRank} of $poolSize",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                val gain = trackResult.marginalGain
+                if (gain != null) {
+                    val gainPct = (gain * 100).roundToInt()
+                    Text("Added $gainPct% new sonic territory to the queue",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            SelectionMode.RANDOM_WALK -> {
+                Text("PageRank rank #${index + 1}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                val stats = session?.queueStats
+                if (stats?.reachabilityRadius != null) {
+                    val alpha = session.config.anchorStrength
+                    Text("Walk reached ${stats.reachabilityRadius} nodes (α=${(alpha * 100).roundToInt()}%)",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            SelectionMode.TEMPERATURE -> {
+                if (trackResult.candidateRank != null) {
+                    Text("Similarity rank #${trackResult.candidateRank} of $poolSize",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                val prob = trackResult.effectiveProbability
+                if (prob != null) {
+                    val probText = if (prob >= 0.01f) String.format("%.1f%%", prob * 100)
+                        else String.format("%.2f%%", prob * 100)
+                    Text("Had $probText chance of being picked",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                val stats = session?.queueStats
+                if (stats?.effectiveChoices != null) {
+                    Text("~${stats.effectiveChoices.roundToInt()} effective candidates at τ=${String.format("%.2f", session.config.temperature)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            null -> {
+                if (trackResult.candidateRank != null) {
+                    Text("Similarity rank #${trackResult.candidateRank} of $poolSize",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+
+        // Drift distance (applicable to any drifting algorithm)
+        val driftDist = trackResult.queryDriftDistance
+        if (driftDist != null && driftDist > 0.005f) {
+            Text("Query had drifted ${(driftDist * 100).roundToInt()}% from seed",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
-        } else if (hasDrift && session != null) {
-            // Drift: show blend breakdown
+        }
+
+        // Drift blend breakdown
+        if (hasDrift && session != null) {
             Text("Search blended:",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -707,11 +825,6 @@ private fun TrackExplanation(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
             }
-        } else if (trackResult.candidateRank != null) {
-            // Batch mode with candidate rank
-            Text("Similarity rank #${trackResult.candidateRank} of $poolSize",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }

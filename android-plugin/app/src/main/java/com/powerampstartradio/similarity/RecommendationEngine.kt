@@ -13,6 +13,9 @@ import com.powerampstartradio.similarity.algorithms.RandomWalkSelector
 import com.powerampstartradio.similarity.algorithms.TemperatureSelector
 import com.powerampstartradio.ui.DriftMode
 import com.powerampstartradio.ui.Influence
+import com.powerampstartradio.ui.QueueStats
+import com.powerampstartradio.ui.QueueStatus
+import com.powerampstartradio.ui.QueuedTrackResult
 import com.powerampstartradio.ui.RadioConfig
 import com.powerampstartradio.ui.SelectionMode
 import com.powerampstartradio.ui.TrackProvenance
@@ -24,11 +27,27 @@ import kotlin.coroutines.coroutineContext
 
 /**
  * Result of a selector: which track was picked and where it ranked in the candidate pool.
+ *
+ * Algorithm-specific fields are nullable — each algorithm populates only its own fields.
  */
 data class SelectedTrack(
     val trackId: Long,
     val score: Float,
     val candidateRank: Int,  // 1-based position in sorted candidate list
+    // MMR: the composite score that determined selection (lambda * relevance - (1-lambda) * maxSim)
+    val algorithmScore: Float? = null,
+    // MMR: similarity to the most similar already-selected track (the redundancy penalty input)
+    val redundancyPenalty: Float? = null,
+    // MMR: which already-selected track was most similar (trackId)
+    val nearestSelectedId: Long? = null,
+    // MMR: how many higher-similarity candidates were skipped due to redundancy
+    val bypassed: Int? = null,
+    // DPP: marginal gain (Cholesky diagonal residual) — fraction of new info this track added
+    val marginalGain: Float? = null,
+    // Temperature: softmax probability of being selected
+    val effectiveProbability: Float? = null,
+    // Drift: 1 - dot(query, seed) at the step this track was selected
+    val queryDriftDistance: Float? = null,
 )
 
 /**
@@ -40,7 +59,32 @@ data class SimilarTrack(
     val similarityToSeed: Float,
     val candidateRank: Int? = null,
     val provenance: TrackProvenance = TrackProvenance(),
-)
+    // Algorithm-specific per-track metadata (passed through from SelectedTrack)
+    val algorithmScore: Float? = null,
+    val redundancyPenalty: Float? = null,
+    val nearestSelectedId: Long? = null,
+    val bypassed: Int? = null,
+    val marginalGain: Float? = null,
+    val effectiveProbability: Float? = null,
+    val queryDriftDistance: Float? = null,
+) {
+    /** Convert to QueuedTrackResult for the UI layer, preserving all algorithm metadata. */
+    fun toQueuedResult(status: QueueStatus): QueuedTrackResult = QueuedTrackResult(
+        track = track,
+        similarity = similarity,
+        similarityToSeed = similarityToSeed,
+        candidateRank = candidateRank,
+        status = status,
+        provenance = provenance,
+        algorithmScore = algorithmScore,
+        redundancyPenalty = redundancyPenalty,
+        nearestSelectedId = nearestSelectedId,
+        bypassed = bypassed,
+        marginalGain = marginalGain,
+        effectiveProbability = effectiveProbability,
+        queryDriftDistance = queryDriftDistance,
+    )
+}
 
 /**
  * Unified recommendation engine using fused embeddings.
@@ -61,6 +105,12 @@ class RecommendationEngine(
 
     private var embeddingIndex: EmbeddingIndex? = null
     private var graphIndex: GraphIndex? = null
+
+    // Transient state from the last generatePlaylist call, used to build QueueStats
+    private var lastFilterResult: PostFilter.FilterResult? = null
+    private var lastReachabilityRadius: Int? = null
+    private var lastScoreSpread: Float? = null
+    private var lastEffectiveChoices: Float? = null
 
     /**
      * Ensure mmap'd indices are ready. Extracts from SQLite if needed (one-time).
@@ -116,6 +166,11 @@ class RecommendationEngine(
         onResult: (suspend (SimilarTrack) -> Unit)? = null
     ): List<SimilarTrack> = withContext(Dispatchers.Default) {
         ensureIndices()
+        // Reset transient stats
+        lastFilterResult = null
+        lastReachabilityRadius = null
+        lastScoreSpread = null
+        lastEffectiveChoices = null
 
         val index = embeddingIndex ?: return@withContext emptyList()
         val cancellationCheck: () -> Unit = { coroutineContext.ensureActive() }
@@ -155,17 +210,21 @@ class RecommendationEngine(
      * For EMA momentum: the query is a weighted sum of all predecessors,
      * so every prior track + seed has an influence with geometrically decaying weights.
      *
-     * @param resultIndex 0-based index of this track in the result list
+     * @param driftStep 0-based drift step (loop iteration), used for EMA weight calculation.
+     *                  This is the actual step counter, not result.size, because PostFilter
+     *                  may skip tracks causing result.size to diverge from step.
+     * @param resultIndex 0-based index of this track in the result list (for influence refs)
      * @param seedWeight Exact seed weight from the DriftResult that produced the current query
      *                   (1.0 for the first track, since query = pure seed)
      * @param config Radio configuration
      */
     private fun computeProvenance(
+        driftStep: Int,
         resultIndex: Int,
         seedWeight: Float,
         config: RadioConfig
     ): TrackProvenance {
-        if (resultIndex == 0) return TrackProvenance()  // 100% seed
+        if (driftStep == 0) return TrackProvenance()  // 100% seed
 
         return when (config.driftMode) {
             DriftMode.SEED_INTERPOLATION -> {
@@ -178,10 +237,11 @@ class RecommendationEngine(
             DriftMode.MOMENTUM -> {
                 val beta = config.momentumBeta
                 val influences = mutableListOf<Influence>()
-                // Seed contribution: beta^(resultIndex)
-                val sw = Math.pow(beta.toDouble(), resultIndex.toDouble()).toFloat()
+                // Seed contribution: beta^(driftStep)
+                val sw = Math.pow(beta.toDouble(), driftStep.toDouble()).toFloat()
                 if (sw > 0.01f) influences.add(Influence(-1, sw))
-                // Track j contributes beta^(resultIndex - j - 1) * (1 - beta)
+                // Track j contributes beta^(driftStep - j - 1) * (1 - beta)
+                // Use resultIndex for influence refs (pointing to actual result positions)
                 for (j in 0 until resultIndex) {
                     val w = Math.pow(beta.toDouble(), (resultIndex - j - 1).toDouble()).toFloat() * (1f - beta)
                     if (w > 0.01f) influences.add(Influence(j, w))
@@ -206,6 +266,7 @@ class RecommendationEngine(
         val result = mutableListOf<SimilarTrack>()
         val selectedTracks = mutableListOf<EmbeddedTrack>()
         val selectedEmbeddings = mutableListOf<FloatArray>()
+        val selectedTrackIds = mutableListOf<Long>()
         val seen = mutableSetOf(seedTrackId)
         var query = seedEmb
         var emaState: FloatArray? = null
@@ -217,6 +278,9 @@ class RecommendationEngine(
             coroutineContext.ensureActive()
             onProgress?.invoke("Finding track ${step + 1}/${config.numTracks}...")
 
+            // Compute drift distance: how far current query is from seed
+            val driftDist = 1f - dotProduct(query, seedEmb)
+
             // Retrieve candidates for current query
             val poolSize = minOf(config.candidatePoolSize, 50)  // Smaller pool per drift step
             val candidates = index.findTopK(query, poolSize, excludeIds = seen, cancellationCheck = cancellationCheck)
@@ -225,7 +289,7 @@ class RecommendationEngine(
 
             // Select one using configured algorithm
             val selected = selectOneFromCandidates(
-                candidates, selectedEmbeddings, index, config
+                candidates, selectedEmbeddings, selectedTrackIds, index, config
             ) ?: break
 
             val trackId = selected.trackId
@@ -233,7 +297,7 @@ class RecommendationEngine(
             seen.add(trackId)
 
             val track = database.getTrackById(trackId) ?: continue
-            val provenance = computeProvenance(result.size, currentSeedWeight, config)
+            val provenance = computeProvenance(step, result.size, currentSeedWeight, config)
 
             // Compute similarityToSeed via dot product with original seed
             val trackEmb = index.getEmbeddingByTrackId(trackId)
@@ -255,9 +319,11 @@ class RecommendationEngine(
                     val fbTrack = database.getTrackById(fbId) ?: continue
                     val fbEmb = index.getEmbeddingByTrackId(fbId)
                     val fbSimToSeed = if (fbEmb != null) dotProduct(seedEmb, fbEmb) else fbScore
-                    val similarTrack = SimilarTrack(fbTrack, fbScore, fbSimToSeed, provenance = provenance)
+                    val similarTrack = SimilarTrack(fbTrack, fbScore, fbSimToSeed,
+                        provenance = provenance, queryDriftDistance = driftDist)
                     result.add(similarTrack)
                     selectedTracks.add(fbTrack)
+                    selectedTrackIds.add(fbId)
                     fbEmb?.let { selectedEmbeddings.add(it) }
                     onResult?.invoke(similarTrack)
 
@@ -274,9 +340,16 @@ class RecommendationEngine(
                 continue
             }
 
-            val similarTrack = SimilarTrack(track, score, simToSeed, selected.candidateRank, provenance)
+            val similarTrack = SimilarTrack(track, score, simToSeed, selected.candidateRank, provenance,
+                algorithmScore = selected.algorithmScore,
+                redundancyPenalty = selected.redundancyPenalty,
+                nearestSelectedId = selected.nearestSelectedId,
+                bypassed = selected.bypassed,
+                effectiveProbability = selected.effectiveProbability,
+                queryDriftDistance = driftDist)
             result.add(similarTrack)
             selectedTracks.add(track)
+            selectedTrackIds.add(trackId)
             onResult?.invoke(similarTrack)
 
             // Update query for next step
@@ -318,18 +391,20 @@ class RecommendationEngine(
         if (candidates.isEmpty()) return emptyList()
 
         // Stage 2: Select using algorithm
+        // Over-request by 40% to compensate for PostFilter artist constraint drops
         onProgress?.invoke("Selecting tracks...")
+        val selectCount = minOf((config.numTracks * 1.4f).toInt() + 1, candidates.size)
         val selected: List<SelectedTrack> = when (config.selectionMode) {
             SelectionMode.MMR -> MmrSelector.selectBatch(
-                candidates, config.numTracks, index, config.diversityLambda
+                candidates, selectCount, index, config.diversityLambda
             )
             SelectionMode.DPP -> DppSelector.selectBatch(
-                candidates, config.numTracks, index
+                candidates, selectCount, index
             )
             SelectionMode.TEMPERATURE -> TemperatureSelector.selectBatch(
-                candidates, config.numTracks, config.temperature
+                candidates, selectCount, config.temperature
             )
-            SelectionMode.RANDOM_WALK -> candidates.take(config.numTracks).mapIndexed { i, (id, score) ->
+            SelectionMode.RANDOM_WALK -> candidates.take(selectCount).mapIndexed { i, (id, score) ->
                 SelectedTrack(id, score, candidateRank = i + 1)
             }
         }
@@ -343,12 +418,26 @@ class RecommendationEngine(
                     similarity = sel.score,
                     similarityToSeed = sel.score,
                     candidateRank = sel.candidateRank,
+                    algorithmScore = sel.algorithmScore,
+                    redundancyPenalty = sel.redundancyPenalty,
+                    nearestSelectedId = sel.nearestSelectedId,
+                    bypassed = sel.bypassed,
+                    marginalGain = sel.marginalGain,
+                    effectiveProbability = sel.effectiveProbability,
                 )
             }
         }
 
-        // Stage 3: Post-filter artist constraints
-        return PostFilter.enforceBatch(tracks, config.maxPerArtist, config.minArtistSpacing)
+        // Compute temperature-specific stats before filtering
+        if (config.selectionMode == SelectionMode.TEMPERATURE) {
+            lastScoreSpread = TemperatureSelector.computeScoreSpread(candidates)
+            lastEffectiveChoices = TemperatureSelector.computeEffectiveChoices(candidates, config.temperature)
+        }
+
+        // Stage 3: Post-filter artist constraints, then trim to requested count
+        val filterResult = PostFilter.enforceBatch(tracks, config.maxPerArtist, config.minArtistSpacing)
+        lastFilterResult = filterResult
+        return filterResult.tracks.take(config.numTracks)
     }
 
     /**
@@ -374,12 +463,15 @@ class RecommendationEngine(
 
         onProgress?.invoke("Computing random walk...")
         val alpha = config.anchorStrength  // Reuse anchor strength as restart probability
-        val ranking = RandomWalkSelector.computeRanking(graph, seedTrackId, alpha)
+        val rankingResult = RandomWalkSelector.computeRanking(graph, seedTrackId, alpha)
 
         val seedEmb = index?.getEmbeddingByTrackId(seedTrackId)
 
+        // Store reachability for QueueStats
+        lastReachabilityRadius = rankingResult.reachabilityRadius
+
         // Resolve tracks, compute similarityToSeed, and post-filter
-        val ranked = ranking.take(config.candidatePoolSize)
+        val ranked = rankingResult.ranking.take(config.candidatePoolSize)
         val tracks = ranked.indices.mapNotNull { i ->
             val (trackId, score) = ranked[i]
             database.getTrackById(trackId)?.let { track ->
@@ -396,11 +488,12 @@ class RecommendationEngine(
             }
         }
 
-        val filtered = PostFilter.enforceBatch(
+        val filterResult = PostFilter.enforceBatch(
             tracks,
             config.maxPerArtist,
             config.minArtistSpacing
-        ).take(config.numTracks)
+        )
+        val filtered = filterResult.tracks.take(config.numTracks)
 
         // Stream results if callback provided
         onResult?.let { callback ->
@@ -420,12 +513,13 @@ class RecommendationEngine(
     private fun selectOneFromCandidates(
         candidates: List<Pair<Long, Float>>,
         selectedEmbeddings: List<FloatArray>,
+        selectedTrackIds: List<Long> = emptyList(),
         index: EmbeddingIndex,
         config: RadioConfig
     ): SelectedTrack? {
         return when (config.selectionMode) {
             SelectionMode.MMR -> MmrSelector.selectOne(
-                candidates, selectedEmbeddings, index, config.diversityLambda
+                candidates, selectedEmbeddings, selectedTrackIds, index, config.diversityLambda
             )
             SelectionMode.DPP -> {
                 // DPP in single-select mode: use batch of 1
@@ -438,6 +532,28 @@ class RecommendationEngine(
                 SelectedTrack(it.first, it.second, candidateRank = 1)
             }
         }
+    }
+
+    /**
+     * Build QueueStats from the last generatePlaylist call.
+     * Call after generatePlaylist returns to get aggregate statistics.
+     */
+    fun computeQueueStats(tracks: List<SimilarTrack>, config: RadioConfig): QueueStats {
+        val sims = tracks.map { it.similarityToSeed }
+        val uniqueArtists = tracks.mapNotNull { it.track.artist?.lowercase() }.distinct().size
+        val filterResult = lastFilterResult
+
+        return QueueStats(
+            uniqueArtists = uniqueArtists,
+            similarityMin = sims.minOrNull() ?: 0f,
+            similarityMax = sims.maxOrNull() ?: 0f,
+            similarityMean = if (sims.isNotEmpty()) sims.average().toFloat() else 0f,
+            postFilterDropCount = filterResult?.dropCount ?: 0,
+            postFilterDropReasons = filterResult?.dropReasons ?: emptyMap(),
+            scoreSpread = lastScoreSpread,
+            effectiveChoices = lastEffectiveChoices,
+            reachabilityRadius = lastReachabilityRadius,
+        )
     }
 
     private fun dotProduct(a: FloatArray, b: FloatArray): Float {

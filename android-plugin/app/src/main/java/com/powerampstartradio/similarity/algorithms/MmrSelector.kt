@@ -26,19 +26,22 @@ object MmrSelector {
     fun selectOne(
         candidates: List<Pair<Long, Float>>,
         selectedEmbeddings: List<FloatArray>,
+        selectedTrackIds: List<Long> = emptyList(),
         index: EmbeddingIndex,
         lambda: Float
     ): SelectedTrack? {
         if (candidates.isEmpty()) return null
         if (selectedEmbeddings.isEmpty()) {
             val (id, score) = candidates.first()
-            return SelectedTrack(id, score, candidateRank = 1)
+            return SelectedTrack(id, score, candidateRank = 1, algorithmScore = score)
         }
 
         var bestIdx = -1
         var bestId = -1L
         var bestRelevance = 0f
         var bestMmrScore = Float.NEGATIVE_INFINITY
+        var bestMaxSim = 0f
+        var bestNearestId = -1L
 
         for (i in candidates.indices) {
             val (trackId, relevance) = candidates[i]
@@ -46,9 +49,13 @@ object MmrSelector {
 
             // Max similarity to any already-selected track
             var maxSimToSelected = Float.NEGATIVE_INFINITY
-            for (sel in selectedEmbeddings) {
-                val sim = dotProduct(emb, sel)
-                if (sim > maxSimToSelected) maxSimToSelected = sim
+            var nearestSelIdx = -1
+            for (j in selectedEmbeddings.indices) {
+                val sim = dotProduct(emb, selectedEmbeddings[j])
+                if (sim > maxSimToSelected) {
+                    maxSimToSelected = sim
+                    nearestSelIdx = j
+                }
             }
 
             val mmrScore = lambda * relevance - (1f - lambda) * maxSimToSelected
@@ -58,10 +65,24 @@ object MmrSelector {
                 bestIdx = i
                 bestRelevance = relevance
                 bestId = trackId
+                bestMaxSim = maxSimToSelected
+                bestNearestId = if (nearestSelIdx >= 0 && nearestSelIdx < selectedTrackIds.size)
+                    selectedTrackIds[nearestSelIdx] else -1L
             }
         }
 
-        return if (bestId >= 0) SelectedTrack(bestId, bestRelevance, candidateRank = bestIdx + 1) else null
+        if (bestId < 0) return null
+
+        // Count how many candidates with higher relevance were bypassed
+        val bypassed = candidates.count { (_, rel) -> rel > bestRelevance }
+
+        return SelectedTrack(
+            bestId, bestRelevance, candidateRank = bestIdx + 1,
+            algorithmScore = bestMmrScore,
+            redundancyPenalty = bestMaxSim,
+            nearestSelectedId = if (bestNearestId >= 0) bestNearestId else null,
+            bypassed = bypassed
+        )
     }
 
     /**
@@ -97,11 +118,17 @@ object MmrSelector {
         val tidToOrigIdx = HashMap<Long, Int>(candidates.size)
         for (i in candidates.indices) tidToOrigIdx[candidates[i].first] = i
 
+        // Track which selected track is nearest for each candidate
+        val nearestSelectedIdx = IntArray(candidates.size) { -1 }
+        val selectedTrackIds = mutableListOf<Long>()
+
         for (step in 0 until numSelect) {
             if (remaining.isEmpty()) break
 
             var bestIdx = -1
             var bestScore = Float.NEGATIVE_INFINITY
+            var bestPenalty = 0f
+            var bestNearestSelIdx = -1
 
             for (i in remaining.indices) {
                 val (trackId, relevance) = remaining[i]
@@ -115,6 +142,7 @@ object MmrSelector {
                     val sim = dotProduct(emb, lastSelected)
                     if (sim > maxSimToSelected[origIdx]) {
                         maxSimToSelected[origIdx] = sim
+                        nearestSelectedIdx[origIdx] = selectedEmbeddings.size - 1
                     }
                 }
 
@@ -124,6 +152,8 @@ object MmrSelector {
                 if (mmrScore > bestScore) {
                     bestScore = mmrScore
                     bestIdx = i
+                    bestPenalty = penalty
+                    bestNearestSelIdx = nearestSelectedIdx[origIdx]
                 }
             }
 
@@ -132,8 +162,22 @@ object MmrSelector {
             val (selectedId, selectedSim) = remaining.removeAt(bestIdx)
             val selectedEmb = embCache[selectedId] ?: continue
             val origIdx = tidToOrigIdx[selectedId] ?: continue
-            result.add(SelectedTrack(selectedId, selectedSim, candidateRank = origIdx + 1))
+
+            // Count bypassed: candidates with higher relevance that weren't picked
+            val bypassed = remaining.count { (_, rel) -> rel > selectedSim }
+
+            val nearestId = if (bestNearestSelIdx >= 0 && bestNearestSelIdx < selectedTrackIds.size)
+                selectedTrackIds[bestNearestSelIdx] else null
+
+            result.add(SelectedTrack(
+                selectedId, selectedSim, candidateRank = origIdx + 1,
+                algorithmScore = bestScore,
+                redundancyPenalty = bestPenalty,
+                nearestSelectedId = nearestId,
+                bypassed = bypassed
+            ))
             selectedEmbeddings.add(selectedEmb)
+            selectedTrackIds.add(selectedId)
         }
 
         return result

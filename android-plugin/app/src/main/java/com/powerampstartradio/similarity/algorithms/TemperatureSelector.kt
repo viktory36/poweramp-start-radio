@@ -1,6 +1,7 @@
 package com.powerampstartradio.similarity.algorithms
 
 import com.powerampstartradio.similarity.SelectedTrack
+import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.random.Random
 
@@ -35,7 +36,7 @@ object TemperatureSelector {
                 if (candidates[i].second > candidates[bestIdx].second) bestIdx = i
             }
             val (id, score) = candidates[bestIdx]
-            return SelectedTrack(id, score, candidateRank = bestIdx + 1)
+            return SelectedTrack(id, score, candidateRank = bestIdx + 1, effectiveProbability = 1f)
         }
 
         var bestIdx = -1
@@ -51,7 +52,8 @@ object TemperatureSelector {
 
         if (bestIdx < 0) return null
         val (id, score) = candidates[bestIdx]
-        return SelectedTrack(id, score, candidateRank = bestIdx + 1)
+        val prob = computeSoftmaxProbability(candidates, bestIdx, temperature)
+        return SelectedTrack(id, score, candidateRank = bestIdx + 1, effectiveProbability = prob)
     }
 
     /**
@@ -77,7 +79,7 @@ object TemperatureSelector {
 
         if (temperature <= 1e-6f) {
             return remaining.sortedByDescending { it.score }.take(numSelect).map {
-                SelectedTrack(it.trackId, it.score, candidateRank = it.origIndex + 1)
+                SelectedTrack(it.trackId, it.score, candidateRank = it.origIndex + 1, effectiveProbability = 1f)
             }
         }
 
@@ -97,10 +99,70 @@ object TemperatureSelector {
 
             if (bestIdx < 0) break
             val picked = remaining.removeAt(bestIdx)
-            result.add(SelectedTrack(picked.trackId, picked.score, candidateRank = picked.origIndex + 1))
+            // Compute softmax probability among remaining candidates at the time of selection
+            val remainingPairs = remaining.map { it.trackId to it.score } + (picked.trackId to picked.score)
+            val probIdx = remainingPairs.indexOfFirst { it.first == picked.trackId }
+            val prob = computeSoftmaxProbability(remainingPairs, probIdx, temperature)
+            result.add(SelectedTrack(picked.trackId, picked.score, candidateRank = picked.origIndex + 1,
+                effectiveProbability = prob))
         }
 
         return result
+    }
+
+    /**
+     * Compute the softmax probability of candidate at targetIdx.
+     * P(i) = exp(score_i / T) / sum(exp(score_j / T))
+     * Uses log-sum-exp trick for numerical stability.
+     */
+    private fun computeSoftmaxProbability(
+        candidates: List<Pair<Long, Float>>,
+        targetIdx: Int,
+        temperature: Float
+    ): Float {
+        if (candidates.isEmpty() || temperature <= 1e-6f) return 1f
+        val maxScore = candidates.maxOf { it.second }
+        var sumExp = 0.0
+        for ((_, score) in candidates) {
+            sumExp += exp(((score - maxScore) / temperature).toDouble())
+        }
+        val targetExp = exp(((candidates[targetIdx].second - maxScore) / temperature).toDouble())
+        return (targetExp / sumExp).toFloat()
+    }
+
+    /**
+     * Compute score spread (max - min) across candidates.
+     */
+    fun computeScoreSpread(candidates: List<Pair<Long, Float>>): Float {
+        if (candidates.size < 2) return 0f
+        var min = Float.MAX_VALUE
+        var max = Float.MIN_VALUE
+        for ((_, score) in candidates) {
+            if (score < min) min = score
+            if (score > max) max = score
+        }
+        return max - min
+    }
+
+    /**
+     * Compute effective number of choices: exp(entropy) of the softmax distribution.
+     * Returns 1 when deterministic, approaches N when uniform.
+     */
+    fun computeEffectiveChoices(candidates: List<Pair<Long, Float>>, temperature: Float): Float {
+        if (candidates.size < 2 || temperature <= 1e-6f) return 1f
+        val maxScore = candidates.maxOf { it.second }
+        var sumExp = 0.0
+        val exps = DoubleArray(candidates.size)
+        for (i in candidates.indices) {
+            exps[i] = exp(((candidates[i].second - maxScore) / temperature).toDouble())
+            sumExp += exps[i]
+        }
+        var entropy = 0.0
+        for (i in candidates.indices) {
+            val p = exps[i] / sumExp
+            if (p > 1e-12) entropy -= p * ln(p)
+        }
+        return exp(entropy).toFloat()
     }
 
     /**

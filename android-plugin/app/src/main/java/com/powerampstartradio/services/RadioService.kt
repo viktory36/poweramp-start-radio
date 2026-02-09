@@ -79,7 +79,9 @@ class RadioService : Service() {
         const val DEFAULT_NUM_TRACKS = 50
 
         private var activeJob: Job? = null
-        val isSearchActive: Boolean get() = activeJob?.isActive == true
+            @Synchronized get
+            @Synchronized set
+        val isSearchActive: Boolean @Synchronized get() = activeJob?.isActive == true
 
         private val _uiState = MutableStateFlow<RadioUiState>(RadioUiState.Idle)
         val uiState: StateFlow<RadioUiState> = _uiState.asStateFlow()
@@ -288,13 +290,8 @@ class RadioService : Service() {
                                 this@RadioService, similarTrack, seenFileIds
                             )
 
-                            streamingTracks.add(QueuedTrackResult(
-                                track = similarTrack.track,
-                                similarity = similarTrack.similarity,
-                                similarityToSeed = similarTrack.similarityToSeed,
-                                candidateRank = similarTrack.candidateRank,
+                            streamingTracks.add(similarTrack.toQueuedResult(
                                 status = if (fileId != null) QueueStatus.QUEUED else QueueStatus.NOT_IN_LIBRARY,
-                                provenance = similarTrack.provenance,
                             ))
 
                             _uiState.value = RadioUiState.Streaming(RadioResult(
@@ -324,6 +321,13 @@ class RadioService : Service() {
                     queueChannel.close()
                     queueJob.join()
 
+                    // Reconstruct SimilarTracks from streaming results for stats computation
+                    val similarTracksForStats = streamingTracks.map { qtr ->
+                        SimilarTrack(qtr.track, qtr.similarity, qtr.similarityToSeed,
+                            qtr.candidateRank, qtr.provenance)
+                    }
+                    val driftQueueStats = eng.computeQueueStats(similarTracksForStats, config)
+
                     val finalResult = RadioResult(
                         seedTrack = currentTrack,
                         matchType = matchResult.matchType,
@@ -331,7 +335,8 @@ class RadioService : Service() {
                         config = config,
                         queuedFileIds = queuedFileIds.toSet(),
                         isComplete = true,
-                        totalExpected = config.numTracks
+                        totalExpected = config.numTracks,
+                        queueStats = driftQueueStats,
                     )
 
                     _uiState.value = RadioUiState.Success(finalResult)
@@ -385,22 +390,18 @@ class RadioService : Service() {
                             mapped.fileId in queuedFileIds -> QueueStatus.QUEUED
                             else -> QueueStatus.QUEUE_FAILED
                         }
-                        QueuedTrackResult(
-                            track = mapped.similarTrack.track,
-                            similarity = mapped.similarTrack.similarity,
-                            similarityToSeed = mapped.similarTrack.similarityToSeed,
-                            candidateRank = mapped.similarTrack.candidateRank,
-                            status = status,
-                            provenance = mapped.similarTrack.provenance,
-                        )
+                        mapped.similarTrack.toQueuedResult(status = status)
                     }
+
+                    val queueStats = eng.computeQueueStats(similarTracks, config)
 
                     val radioResult = RadioResult(
                         seedTrack = currentTrack,
                         matchType = matchResult.matchType,
                         tracks = trackResults,
                         config = config,
-                        queuedFileIds = queuedFileIds
+                        queuedFileIds = queuedFileIds,
+                        queueStats = queueStats,
                     )
 
                     _uiState.value = RadioUiState.Success(radioResult)

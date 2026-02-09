@@ -26,13 +26,21 @@ object RandomWalkSelector {
      * @param additionalSeeds Optional additional seed tracks for multi-seed restart
      * @return Map of trackId to PageRank score, sorted by score descending
      */
+    /**
+     * Result of PageRank computation including ranking and metadata.
+     */
+    data class RankingResult(
+        val ranking: List<Pair<Long, Float>>,
+        val reachabilityRadius: Int,  // Total unique nodes visited
+    )
+
     fun computeRanking(
         graph: GraphIndex,
         seedTrackId: Long,
         alpha: Float = 0.5f,
         iterations: Int = 30,
         additionalSeeds: List<Long> = emptyList()
-    ): List<Pair<Long, Float>> {
+    ): RankingResult {
         val n = graph.numNodes
 
         // Build restart vector
@@ -82,10 +90,12 @@ object RandomWalkSelector {
         }
 
         // Sort by score, exclude seeds
+        val reachabilityRadius = pi.size
         val seedSet = allSeeds.toSet()
-        return pi.entries
+        val ranking = pi.entries
             .filter { it.key !in seedSet }
             .sortedByDescending { it.value }
             .map { it.key to it.value }
+        return RankingResult(ranking, reachabilityRadius)
     }
 }

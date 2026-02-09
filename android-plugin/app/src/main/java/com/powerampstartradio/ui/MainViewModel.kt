@@ -33,12 +33,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _selectionMode = MutableStateFlow(
         try {
             val stored = prefs.getString("selection_mode", null)
-            if (stored != null) SelectionMode.valueOf(stored)
-            else {
-                // Migrate from old search_strategy pref
-                val old = prefs.getString("search_strategy", null)
-                if (old != null) SelectionMode.MMR else SelectionMode.MMR
-            }
+            if (stored != null) SelectionMode.valueOf(stored) else SelectionMode.MMR
         } catch (e: IllegalArgumentException) { SelectionMode.MMR }
     )
     val selectionMode: StateFlow<SelectionMode> = _selectionMode.asStateFlow()
@@ -251,12 +246,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
         if (!dbFile.exists()) return null
 
+        var db: EmbeddingDatabase? = null
         return try {
-            val db = EmbeddingDatabase.open(dbFile)
+            db = EmbeddingDatabase.open(dbFile)
             val matcher = TrackMatcher(db)
             val match = matcher.findMatch(currentTrack)
             if (match == null || match.matchType == TrackMatcher.MatchType.NOT_FOUND) {
-                db.close()
                 return null
             }
             val seedId = match.embeddedTrack.id
@@ -266,9 +261,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
             val config = buildConfig().copy(numTracks = 10, selectionMode = mode)
             val tracks = engine.generatePlaylist(seedId, config)
-            db.close()
             tracks.map { t -> "${t.track.title ?: "?"} \u2013 ${t.track.artist ?: "?"}" }
         } catch (_: Exception) { null }
+        finally { db?.close() }
     }
 
     fun resetToDefaults() {
@@ -316,6 +311,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun refreshDatabaseInfo() {
+        TrackMatcher.invalidateCache()
         viewModelScope.launch {
             val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
             if (dbFile.exists()) {

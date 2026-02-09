@@ -43,21 +43,33 @@ object PostFilter {
     }
 
     /**
+     * Result of batch filtering, including statistics about what was dropped.
+     */
+    data class FilterResult(
+        val tracks: List<SimilarTrack>,
+        val dropCount: Int,
+        val dropReasons: Map<String, Int>,  // artist -> count dropped
+    )
+
+    /**
      * Filter a batch of selected tracks to enforce artist constraints.
      * Preserves order, dropping tracks that violate constraints.
+     * Returns both filtered list and drop statistics.
      *
      * @param tracks Ordered list of SimilarTrack
      * @param maxPerArtist Maximum tracks per artist
      * @param minSpacing Minimum positions between same-artist tracks
-     * @return Filtered list preserving order
+     * @return FilterResult with filtered list and drop stats
      */
     fun enforceBatch(
         tracks: List<SimilarTrack>,
         maxPerArtist: Int,
         minSpacing: Int
-    ): List<SimilarTrack> {
+    ): FilterResult {
         val result = mutableListOf<SimilarTrack>()
         val artistCounts = mutableMapOf<String, Int>()
+        val dropReasons = mutableMapOf<String, Int>()
+        var dropCount = 0
 
         for (st in tracks) {
             val artist = st.track.artist?.lowercase()
@@ -65,13 +77,21 @@ object PostFilter {
             // Check max per artist
             if (artist != null) {
                 val count = artistCounts.getOrDefault(artist, 0)
-                if (count >= maxPerArtist) continue
+                if (count >= maxPerArtist) {
+                    dropCount++
+                    dropReasons[artist] = (dropReasons[artist] ?: 0) + 1
+                    continue
+                }
             }
 
             // Check spacing
             if (artist != null && minSpacing > 0 && result.isNotEmpty()) {
                 val recentWindow = result.takeLast(minSpacing)
-                if (recentWindow.any { it.track.artist?.lowercase() == artist }) continue
+                if (recentWindow.any { it.track.artist?.lowercase() == artist }) {
+                    dropCount++
+                    dropReasons[artist] = (dropReasons[artist] ?: 0) + 1
+                    continue
+                }
             }
 
             result.add(st)
@@ -80,6 +100,6 @@ object PostFilter {
             }
         }
 
-        return result
+        return FilterResult(result, dropCount, dropReasons)
     }
 }

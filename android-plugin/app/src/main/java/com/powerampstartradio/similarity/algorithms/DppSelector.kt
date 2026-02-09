@@ -63,6 +63,7 @@ object DppSelector {
 
         val selected = mutableListOf<Int>()
         val selectedSet = HashSet<Int>()
+        val marginalGains = mutableListOf<Float>()  // Store bestGain per selection step
         val dim = embeddings.firstOrNull { it.isNotEmpty() }?.size ?: return emptyList()
 
         // c[i][j] = Cholesky factor entries for candidate i at step j
@@ -92,6 +93,7 @@ object DppSelector {
 
             selected.add(bestIdx)
             selectedSet.add(bestIdx)
+            marginalGains.add(bestGain)
 
             // Update Cholesky factors for remaining candidates
             val sqrtGain = sqrt(bestGain)
@@ -119,9 +121,15 @@ object DppSelector {
             choleskyFactors[bestIdx][step] = sqrtGain
         }
 
-        return selected.map { idx ->
+        return selected.mapIndexed { step, idx ->
             val (trackId, relevance) = candidates[idx]
-            SelectedTrack(trackId, relevance, candidateRank = idx + 1)
+            val gain = marginalGains.getOrNull(step)
+            val qualitySq = quality[idx] * quality[idx]
+            SelectedTrack(
+                trackId, relevance, candidateRank = idx + 1,
+                // marginalGain normalized to 0..1: fraction of quality^2 that survived
+                marginalGain = if (gain != null && qualitySq > 1e-10f) gain / qualitySq else null
+            )
         }
     }
 

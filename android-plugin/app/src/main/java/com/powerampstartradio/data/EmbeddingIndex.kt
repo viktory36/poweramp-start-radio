@@ -119,7 +119,9 @@ class EmbeddingIndex private constructor(
                     buf.putLong(idOffset, trackId)
 
                     // Write embedding blob bytes directly (already little-endian float32)
-                    val embOffset = (embeddingsStart + i.toLong() * expectedBlobSize).toInt()
+                    val embOffsetLong = embeddingsStart + i.toLong() * expectedBlobSize
+                    check(embOffsetLong <= Int.MAX_VALUE) { "Embedding offset exceeds 2GB buffer limit at index $i" }
+                    val embOffset = embOffsetLong.toInt()
                     buf.position(embOffset)
                     buf.put(blob)
 
@@ -177,7 +179,9 @@ class EmbeddingIndex private constructor(
      * Since embeddings are L2-normalized, this equals cosine similarity.
      */
     fun dotProduct(query: FloatArray, index: Int): Float {
-        val offset = (embeddingsOffset + index.toLong() * dim * 4).toInt()
+        val offsetLong = embeddingsOffset + index.toLong() * dim * 4
+        check(offsetLong <= Int.MAX_VALUE) { "Embedding offset exceeds 2GB buffer limit at index $index" }
+        val offset = offsetLong.toInt()
         var dot = 0f
         for (d in 0 until dim) {
             dot += query[d] * buffer.getFloat(offset + d * 4)
@@ -248,7 +252,9 @@ class EmbeddingIndex private constructor(
      */
     fun getEmbeddingByTrackId(trackId: Long): FloatArray? {
         val index = trackIdToIndex[trackId] ?: return null
-        val offset = (embeddingsOffset + index.toLong() * dim * 4).toInt()
+        val offsetLong = embeddingsOffset + index.toLong() * dim * 4
+        check(offsetLong <= Int.MAX_VALUE) { "Embedding offset exceeds 2GB buffer limit at index $index" }
+        val offset = offsetLong.toInt()
         val result = FloatArray(dim)
         for (d in 0 until dim) {
             result[d] = buffer.getFloat(offset + d * 4)

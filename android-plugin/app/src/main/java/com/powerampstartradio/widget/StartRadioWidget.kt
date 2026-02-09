@@ -43,7 +43,7 @@ class StartRadioWidget : GlanceAppWidget() {
                 modifier = GlanceModifier
                     .fillMaxSize()
                     .cornerRadius(16.dp)
-                    .background(Color(0xFF1A1B2E))
+                    .background(ColorProvider(Color(0xFFF5F0EB), Color(0xFF1A1B2E)))
                     .padding(14.dp)
                     .clickable(actionRunCallback<StartRadioAction>()),
                 verticalAlignment = Alignment.CenterVertically,
@@ -53,7 +53,7 @@ class StartRadioWidget : GlanceAppWidget() {
                     Text(
                         text = "▶",
                         style = TextStyle(
-                            color = ColorProvider(Color(0xFF89B4FA), Color(0xFF89B4FA)),
+                            color = ColorProvider(Color(0xFF3B6CE7), Color(0xFF89B4FA)),
                             fontSize = 18.sp,
                             fontWeight = FontWeight.Bold
                         )
@@ -62,7 +62,7 @@ class StartRadioWidget : GlanceAppWidget() {
                     Text(
                         text = "Start Radio",
                         style = TextStyle(
-                            color = ColorProvider(Color.White, Color.White),
+                            color = ColorProvider(Color(0xFF1A1B2E), Color.White),
                             fontSize = 15.sp,
                             fontWeight = FontWeight.Medium
                         )
@@ -76,7 +76,7 @@ class StartRadioWidget : GlanceAppWidget() {
                         Text(
                             text = title,
                             style = TextStyle(
-                                color = ColorProvider(Color(0xFFCDD6F4), Color(0xFFCDD6F4)),
+                                color = ColorProvider(Color(0xFF2E3040), Color(0xFFCDD6F4)),
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Medium
                             ),
@@ -89,7 +89,7 @@ class StartRadioWidget : GlanceAppWidget() {
                         Text(
                             text = subtitle,
                             style = TextStyle(
-                                color = ColorProvider(Color(0xFF9399B2), Color(0xFF9399B2)),
+                                color = ColorProvider(Color(0xFF5C5F77), Color(0xFF9399B2)),
                                 fontSize = 11.sp
                             ),
                             maxLines = 1

@@ -9,6 +9,7 @@ import com.powerampstartradio.widget.StartRadioWidget
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * Receives track change broadcasts from Poweramp.
@@ -30,8 +31,8 @@ class PowerampReceiver : BroadcastReceiver() {
         var isPlaying: Boolean = false
             private set
 
-        // Listeners for track changes
-        private val trackChangeListeners = mutableListOf<(PowerampTrack?) -> Unit>()
+        // Listeners for track changes (thread-safe: add/remove/notify may come from any thread)
+        private val trackChangeListeners = CopyOnWriteArrayList<(PowerampTrack?) -> Unit>()
 
         fun addTrackChangeListener(listener: (PowerampTrack?) -> Unit) {
             trackChangeListeners.add(listener)

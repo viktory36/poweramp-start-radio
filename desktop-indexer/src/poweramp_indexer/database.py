@@ -79,6 +79,7 @@ class EmbeddingDatabase:
         self.db_path = db_path
         self.conn = sqlite3.connect(str(db_path))
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA foreign_keys = ON")
         self._init_schema(models)
 
     def _init_schema(self, models: list[str] | None):
@@ -223,11 +224,16 @@ class EmbeddingDatabase:
 
         if missing:
             logger.info(f"Removing {len(missing)} tracks with missing files")
-            placeholders = ",".join("?" * len(missing))
-            self.conn.execute(
-                f"DELETE FROM tracks WHERE file_path IN ({placeholders})",
-                list(missing)
-            )
+            missing_list = list(missing)
+            # Batch deletes to stay within SQLite's variable limit
+            batch_size = 500
+            for i in range(0, len(missing_list), batch_size):
+                batch = missing_list[i:i + batch_size]
+                placeholders = ",".join("?" * len(batch))
+                self.conn.execute(
+                    f"DELETE FROM tracks WHERE file_path IN ({placeholders})",
+                    batch
+                )
             self.conn.commit()
 
     def count_tracks(self) -> int:
