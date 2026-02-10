@@ -3,6 +3,7 @@ package com.powerampstartradio.ui
 import com.powerampstartradio.data.EmbeddedTrack
 import com.powerampstartradio.poweramp.PowerampTrack
 import com.powerampstartradio.poweramp.TrackMatcher
+import kotlin.math.pow
 
 /**
  * User-selectable recommendation algorithm.
@@ -66,7 +67,7 @@ fun temperatureToSlider(value: Float): Float {
 
 fun sliderToTemperature(position: Float): Float {
     val ratio = TEMPERATURE_MAX / TEMPERATURE_MIN
-    val scaled = TEMPERATURE_MIN * kotlin.math.pow(ratio.toDouble(), position.toDouble())
+    val scaled = TEMPERATURE_MIN * ratio.toDouble().pow(position.toDouble()).toFloat()
     return clampTemperature(scaled.toFloat())
 }
 
