@@ -586,7 +586,26 @@ def run_batch_pipeline(
 
     if mode == "random_walk":
         ranking = personalized_pagerank(corpus, seed_tid, alpha=alpha)
-        tracks = ranking[:pool_size]
+        seed_idx = corpus.tid_to_idx.get(seed_tid)
+        if seed_idx is None:
+            return []
+        seed_emb = corpus.embeddings[seed_idx]
+
+        ranked = ranking[:pool_size]
+        max_score = ranked[0][1] if ranked else 0.0
+        blended = []
+        for tid, score in ranked:
+            idx = corpus.tid_to_idx.get(tid)
+            if idx is None:
+                continue
+            sim = float(np.dot(corpus.embeddings[idx], seed_emb))
+            pr_norm = score / max_score if max_score > 0 else 0.0
+            sim_norm = max(0.0, (sim + 1.0) / 2.0)
+            combined = (1.0 - alpha) * pr_norm + alpha * sim_norm
+            blended.append((tid, combined))
+
+        blended.sort(key=lambda x: x[1], reverse=True)
+        tracks = blended[:pool_size]
         return post_filter(tracks, corpus, max_per_artist, min_spacing)[:num_tracks]
 
     candidates = find_top_k(corpus, seed_emb, pool_size, exclude_ids={seed_tid})

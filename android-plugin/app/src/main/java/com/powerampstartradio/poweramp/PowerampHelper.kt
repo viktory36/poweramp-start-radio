@@ -82,6 +82,7 @@ object PowerampHelper {
         }
         // Use implicit intent (don't set explicit component)
         try {
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             context.startActivity(intent)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to request data permission", e)

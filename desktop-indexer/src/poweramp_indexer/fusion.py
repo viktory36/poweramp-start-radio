@@ -331,6 +331,8 @@ def _build_knn_graph(X: np.ndarray, track_ids: np.ndarray, k: int,
             total = top_k_sims.sum()
             if total > 0:
                 top_k_sims /= total
+            else:
+                top_k_sims[:] = 1.0 / len(top_k_sims)
 
             neighbors[i] = top_k_idx
             weights[i] = top_k_sims

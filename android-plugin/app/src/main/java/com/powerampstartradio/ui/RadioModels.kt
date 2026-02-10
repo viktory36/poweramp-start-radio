@@ -50,6 +50,26 @@ data class RadioConfig(
     val minArtistSpacing: Int = 2,
 )
 
+const val TEMPERATURE_MIN = 0.01f
+const val TEMPERATURE_MAX = 0.2f
+
+fun clampTemperature(value: Float): Float {
+    return value.coerceIn(TEMPERATURE_MIN, TEMPERATURE_MAX)
+}
+
+fun temperatureToSlider(value: Float): Float {
+    val clamped = clampTemperature(value)
+    val ratio = TEMPERATURE_MAX / TEMPERATURE_MIN
+    return (kotlin.math.ln((clamped / TEMPERATURE_MIN).toDouble()) /
+        kotlin.math.ln(ratio.toDouble())).toFloat()
+}
+
+fun sliderToTemperature(position: Float): Float {
+    val ratio = TEMPERATURE_MAX / TEMPERATURE_MIN
+    val scaled = TEMPERATURE_MIN * kotlin.math.pow(ratio.toDouble(), position.toDouble())
+    return clampTemperature(scaled.toFloat())
+}
+
 /**
  * Status of a single track in the queue operation.
  */

@@ -61,6 +61,7 @@ class RecommendationEngine(
 
     private var embeddingIndex: EmbeddingIndex? = null
     private var graphIndex: GraphIndex? = null
+    private var indexDbModified: Long? = null
 
     /**
      * Ensure mmap'd indices are ready. Extracts from SQLite if needed (one-time).
@@ -70,12 +71,17 @@ class RecommendationEngine(
     ) = withContext(Dispatchers.IO) {
         val dbFile = File(filesDir, "embeddings.db")
         val dbModified = dbFile.lastModified()
+        if (indexDbModified != null && dbModified != indexDbModified) {
+            embeddingIndex = null
+            graphIndex = null
+        }
 
         // Embedding index
         val embFile = File(filesDir, "fused.emb")
         if (!embFile.exists() || embFile.lastModified() < dbModified) {
             Log.i(TAG, "Extracting embedding index (one-time)...")
             onProgress?.invoke("Extracting embedding index...")
+            embeddingIndex = null
             EmbeddingIndex.extractFromDatabase(database, embFile) { cur, total ->
                 onProgress?.invoke("Extracting: $cur / $total")
             }
@@ -89,6 +95,7 @@ class RecommendationEngine(
         val graphFile = File(filesDir, "graph.bin")
         if (!graphFile.exists() || graphFile.lastModified() < dbModified) {
             onProgress?.invoke("Extracting kNN graph...")
+            graphIndex = null
             GraphIndex.extractFromDatabase(database, graphFile)
         }
         if (graphFile.exists() && graphIndex == null) {
@@ -98,6 +105,8 @@ class RecommendationEngine(
                 Log.w(TAG, "Failed to load graph.bin: ${e.message}")
             }
         }
+
+        indexDbModified = dbModified
     }
 
     /**
@@ -218,8 +227,12 @@ class RecommendationEngine(
             onProgress?.invoke("Finding track ${step + 1}/${config.numTracks}...")
 
             // Retrieve candidates for current query
-            val poolSize = minOf(config.candidatePoolSize, 50)  // Smaller pool per drift step
-            val candidates = index.findTopK(query, poolSize, excludeIds = seen, cancellationCheck = cancellationCheck)
+            val candidates = index.findTopK(
+                query,
+                config.candidatePoolSize,
+                excludeIds = seen,
+                cancellationCheck = cancellationCheck
+            )
 
             if (candidates.isEmpty()) break
 
@@ -375,26 +388,46 @@ class RecommendationEngine(
         onProgress?.invoke("Computing random walk...")
         val alpha = config.anchorStrength  // Reuse anchor strength as restart probability
         val ranking = RandomWalkSelector.computeRanking(graph, seedTrackId, alpha)
+        if (ranking.isEmpty()) {
+            Log.w(TAG, "Random walk produced no results; falling back to embedding search")
+            if (index == null) return emptyList()
+            val seedEmbFallback = index.getEmbeddingByTrackId(seedTrackId) ?: return emptyList()
+            val ctx = coroutineContext
+            val cancellationCheck: () -> Unit = { ctx.ensureActive() }
+            return batchPlaylist(seedTrackId, seedEmbFallback, index,
+                config.copy(selectionMode = SelectionMode.MMR), onProgress, cancellationCheck)
+        }
 
         val seedEmb = index?.getEmbeddingByTrackId(seedTrackId)
 
         // Resolve tracks, compute similarityToSeed, and post-filter
         val ranked = ranking.take(config.candidatePoolSize)
-        val tracks = ranked.indices.mapNotNull { i ->
-            val (trackId, score) = ranked[i]
-            database.getTrackById(trackId)?.let { track ->
-                val simToSeed = if (seedEmb != null && index != null) {
-                    val emb = index.getEmbeddingByTrackId(trackId)
-                    if (emb != null) dotProduct(seedEmb, emb) else 0f
-                } else 0f
+        val maxScore = ranked.firstOrNull()?.second ?: 0f
+        data class RankedCandidate(
+            val track: EmbeddedTrack,
+            val combinedScore: Float,
+            val simToSeed: Float,
+        )
+
+        val tracks = ranked.mapNotNull { (trackId, score) ->
+            val track = database.getTrackById(trackId) ?: return@mapNotNull null
+            val simToSeed = if (seedEmb != null && index != null) {
+                val emb = index.getEmbeddingByTrackId(trackId)
+                if (emb != null) dotProduct(seedEmb, emb) else 0f
+            } else 0f
+            val prNorm = if (maxScore > 0f) score / maxScore else 0f
+            val simNorm = ((simToSeed + 1f) / 2f).coerceIn(0f, 1f)
+            val combined = (1f - alpha) * prNorm + alpha * simNorm
+            RankedCandidate(track, combined, simToSeed)
+        }.sortedByDescending { it.combinedScore }
+            .mapIndexed { i, cand ->
                 SimilarTrack(
-                    track = track,
-                    similarity = score,
-                    similarityToSeed = simToSeed,
+                    track = cand.track,
+                    similarity = cand.combinedScore,
+                    similarityToSeed = cand.simToSeed,
                     candidateRank = i + 1,
                 )
             }
-        }
 
         val filtered = PostFilter.enforceBatch(
             tracks,

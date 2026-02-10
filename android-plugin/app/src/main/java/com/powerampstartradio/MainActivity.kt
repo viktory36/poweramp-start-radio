@@ -68,6 +68,8 @@ import com.powerampstartradio.ui.RadioResult
 import com.powerampstartradio.ui.RadioUiState
 import com.powerampstartradio.ui.SelectionMode
 import com.powerampstartradio.ui.TrackProvenance
+import com.powerampstartradio.ui.sliderToTemperature
+import com.powerampstartradio.ui.temperatureToSlider
 import com.powerampstartradio.ui.theme.PowerampStartRadioTheme
 import kotlinx.coroutines.launch
 import java.io.File
@@ -451,6 +453,7 @@ fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
     val showProvenance = session.tracks.any { it.provenance.influences.size > 1 }
     // Use target queue size so colors stay stable as tracks stream in
     val colorTotal = maxOf(session.config.numTracks, session.tracks.size)
+    val metrics = remember(session.tracks) { computeSessionMetrics(session.tracks) }
 
     LaunchedEffect(session.tracks.size) {
         if (!session.isComplete && session.tracks.isNotEmpty()) {
@@ -464,6 +467,23 @@ fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
     Column(modifier = modifier) {
         ResultsSummary(result = session,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+
+        Text(
+            text = formatConfigSummary(session.config),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp)
+        )
+
+        if (metrics != null) {
+            Row(
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                MetricChip(label = "Avg seed", value = "${metrics.avgSeedSimilarityPct}%")
+                MetricChip(label = "Artists", value = metrics.uniqueArtists.toString())
+            }
+        }
 
         if (showProvenance) {
             Row(modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
@@ -671,8 +691,16 @@ private fun TrackExplanation(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
 
+        session?.let { activeSession ->
+            Text(
+                "Selected by ${formatSelectionDetail(activeSession.config)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
         if (isPageRank) {
-            Text("PageRank rank #${index + 1}",
+            Text("Blended PageRank rank #${index + 1}",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         } else if (hasDrift && session != null) {
@@ -709,7 +737,7 @@ private fun TrackExplanation(
             }
         } else if (trackResult.candidateRank != null) {
             // Batch mode with candidate rank
-            Text("Similarity rank #${trackResult.candidateRank} of $poolSize",
+            Text("Seed-similarity rank #${trackResult.candidateRank} of $poolSize",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
@@ -941,7 +969,7 @@ fun SettingsScreen(
                     )
                     AlgorithmOption(
                         label = "Personalized PageRank",
-                        description = "Walks a similarity graph starting from the seed. At each step, hops to a similar neighbor or jumps back to the seed. Tracks visited more often rank higher. Surfaces tracks reachable through multiple paths of similarity, even if not directly similar to the seed." +
+                        description = "Walks a similarity graph starting from the seed. At each step, hops to a similar neighbor or jumps back to the seed. Tracks visited more often rank higher. Final ranking blends walk score with seed similarity based on Return Frequency." +
                             if (databaseInfo?.hasGraph != true) " (requires similarity graph in database)" else "",
                         preview = previews[SelectionMode.RANDOM_WALK],
                         isLoading = SelectionMode.RANDOM_WALK in previewsLoading,
@@ -994,14 +1022,19 @@ fun SettingsScreen(
                     Column {
                         Text("Randomness: ${String.format("%.2f", temperature)}",
                             style = MaterialTheme.typography.titleSmall)
-                        Text("Low = nearly the same playlist each time. High = flattens the bias, picks further from the top.",
+                        Text("Low = nearly the same playlist each time. High = flattens the bias, picks further from the top. Uses a log scale (0.01-0.2).",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text("Predictable", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
-                            Slider(value = temperature, onValueChange = { viewModel.setTemperature(it) },
-                                valueRange = 0f..1f, modifier = Modifier.weight(1f))
+                            val sliderValue = remember(temperature) { temperatureToSlider(temperature) }
+                            Slider(
+                                value = sliderValue,
+                                onValueChange = { viewModel.setTemperature(sliderToTemperature(it)) },
+                                valueRange = 0f..1f,
+                                modifier = Modifier.weight(1f)
+                            )
                             Text("Surprising", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                         }
@@ -1015,7 +1048,7 @@ fun SettingsScreen(
                     Column {
                         Text("Return Frequency: ${(anchorStrength * 100).roundToInt()}%",
                             style = MaterialTheme.typography.titleSmall)
-                        Text("How often the walk jumps back to the seed instead of continuing to the next neighbor. Low = wanders further through the graph. High = stays in the immediate neighborhood.",
+                        Text("How often the walk jumps back to the seed instead of continuing to the next neighbor. Also increases how much the final ranking favors direct seed similarity.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1307,4 +1340,73 @@ private fun humanSelectionMode(mode: SelectionMode, drift: Boolean = false): Str
         SelectionMode.TEMPERATURE -> "Gumbel-Max"
     }
     return if (drift && mode != SelectionMode.DPP && mode != SelectionMode.RANDOM_WALK) "$base + drift" else base
+}
+
+private data class SessionMetrics(
+    val avgSeedSimilarityPct: Int,
+    val uniqueArtists: Int,
+)
+
+private fun computeSessionMetrics(tracks: List<QueuedTrackResult>): SessionMetrics? {
+    if (tracks.isEmpty()) return null
+    val sims = tracks.map { it.similarityToSeed }
+    val avg = sims.average()
+    val avgPct = (avg * 100).roundToInt()
+    val uniqueArtists = tracks.mapNotNull { it.track.artist?.lowercase() }.toSet().size
+    return SessionMetrics(avgSeedSimilarityPct = avgPct, uniqueArtists = uniqueArtists)
+}
+
+@Composable
+private fun MetricChip(label: String, value: String) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(12.dp)
+    ) {
+        Text(
+            text = "$label: $value",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+        )
+    }
+}
+
+private fun formatConfigSummary(config: com.powerampstartradio.ui.RadioConfig): String {
+    val parts = mutableListOf<String>()
+    parts.add(formatSelectionDetail(config))
+    parts.add("pool ${config.candidatePoolSize}")
+
+    if (config.selectionMode == SelectionMode.RANDOM_WALK) {
+        parts.add("return ${(config.anchorStrength * 100).roundToInt()}%")
+    }
+
+    if (config.driftEnabled && config.selectionMode != SelectionMode.DPP && config.selectionMode != SelectionMode.RANDOM_WALK) {
+        parts.add(formatDriftDetail(config))
+    }
+
+    return parts.joinToString(" \u00b7 ")
+}
+
+private fun formatSelectionDetail(config: com.powerampstartradio.ui.RadioConfig): String {
+    return when (config.selectionMode) {
+        SelectionMode.MMR -> "MMR lambda=${String.format(Locale.US, "%.2f", config.diversityLambda)}"
+        SelectionMode.DPP -> "DPP"
+        SelectionMode.RANDOM_WALK -> "PageRank"
+        SelectionMode.TEMPERATURE -> "Gumbel-Max T=${String.format(Locale.US, "%.2f", config.temperature)}"
+    }
+}
+
+private fun formatDriftDetail(config: com.powerampstartradio.ui.RadioConfig): String {
+    return when (config.driftMode) {
+        DriftMode.SEED_INTERPOLATION -> {
+            val decay = when (config.anchorDecay) {
+                DecaySchedule.NONE -> "none"
+                DecaySchedule.LINEAR -> "linear"
+                DecaySchedule.EXPONENTIAL -> "exp"
+                DecaySchedule.STEP -> "step"
+            }
+            "drift anchored ${(config.anchorStrength * 100).roundToInt()}% ($decay)"
+        }
+        DriftMode.MOMENTUM -> "drift flowing ${(config.momentumBeta * 100).roundToInt()}%"
+    }
 }
