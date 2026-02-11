@@ -121,6 +121,13 @@ class RecommendationEngine(
         val index = embeddingIndex ?: return@withContext emptyList()
         val cancellationCheck: () -> Unit = { coroutineContext.ensureActive() }
 
+        // Auto-compute pool size: 2% of library, floor 100
+        val poolConfig = if (config.candidatePoolSize <= 0) {
+            val autoPool = (index.numTracks * 0.02f).toInt().coerceAtLeast(100)
+            Log.d(TAG, "Auto pool size: $autoPool (${index.numTracks} tracks)")
+            config.copy(candidatePoolSize = autoPool)
+        } else config
+
         val seedEmb = index.getEmbeddingByTrackId(seedTrackId)
         if (seedEmb == null) {
             Log.e(TAG, "Seed track $seedTrackId has no embedding")
@@ -128,16 +135,16 @@ class RecommendationEngine(
         }
 
         // Random Walk mode uses graph, not embedding scan
-        if (config.selectionMode == SelectionMode.RANDOM_WALK) {
-            return@withContext randomWalkPlaylist(seedTrackId, config, onProgress, onResult)
+        if (poolConfig.selectionMode == SelectionMode.RANDOM_WALK) {
+            return@withContext randomWalkPlaylist(seedTrackId, poolConfig, onProgress, onResult)
         }
 
         // DPP in drift mode is degenerate (k=1 selection = pure greedy max similarity,
         // identical to MMR lambda=1). Force batch mode for DPP.
-        val effectiveConfig = if (config.selectionMode == SelectionMode.DPP && config.driftEnabled) {
+        val effectiveConfig = if (poolConfig.selectionMode == SelectionMode.DPP && poolConfig.driftEnabled) {
             Log.w(TAG, "DPP+drift is degenerate; forcing batch mode")
-            config.copy(driftEnabled = false)
-        } else config
+            poolConfig.copy(driftEnabled = false)
+        } else poolConfig
 
         if (effectiveConfig.driftEnabled) {
             driftPlaylist(seedTrackId, seedEmb, index, effectiveConfig, onProgress, onResult, cancellationCheck)

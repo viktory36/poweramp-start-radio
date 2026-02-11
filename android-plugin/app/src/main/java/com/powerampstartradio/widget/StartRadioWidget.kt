@@ -114,7 +114,7 @@ class StartRadioAction : ActionCallback {
 
         val config = RadioConfig(
             numTracks = prefs.getInt("num_tracks", RadioService.DEFAULT_NUM_TRACKS),
-            candidatePoolSize = prefs.getInt("candidate_pool_size", 200),
+            // candidatePoolSize auto-computed by RecommendationEngine
             selectionMode = try {
                 SelectionMode.valueOf(prefs.getString("selection_mode", SelectionMode.MMR.name)!!)
             } catch (e: IllegalArgumentException) { SelectionMode.MMR },

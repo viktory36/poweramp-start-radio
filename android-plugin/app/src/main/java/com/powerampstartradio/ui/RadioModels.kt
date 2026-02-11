@@ -37,7 +37,7 @@ enum class DecaySchedule {
  */
 data class RadioConfig(
     val numTracks: Int = 50,
-    val candidatePoolSize: Int = 200,
+    val candidatePoolSize: Int = 0,  // 0 = auto (2% of library, floor 100)
     val selectionMode: SelectionMode = SelectionMode.MMR,
     val driftEnabled: Boolean = false,
     val driftMode: DriftMode = DriftMode.SEED_INTERPOLATION,

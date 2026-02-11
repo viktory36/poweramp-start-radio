@@ -40,7 +40,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -468,7 +467,6 @@ fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
             items(session.tracks.size) { index ->
                 TrackResultRow(
                     trackResult = session.tracks[index],
-                    index = index,
                     session = session
                 )
             }
@@ -527,11 +525,9 @@ fun QueueMetricsSummary(metrics: QueueMetrics, modifier: Modifier = Modifier) {
 @Composable
 fun TrackResultRow(
     trackResult: QueuedTrackResult,
-    index: Int,
     session: RadioResult? = null
 ) {
     var expanded by remember { mutableStateOf(false) }
-    val isPageRank = session?.config?.selectionMode == SelectionMode.RANDOM_WALK
     val isFailed = trackResult.status != QueueStatus.QUEUED
 
     Column(modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }) {
@@ -542,18 +538,6 @@ fun TrackResultRow(
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(text = trackResult.track.artist ?: "Unknown", style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
-
-            if (isFailed) {
-                Text(text = "\u2014", fontFamily = FontFamily.Monospace,
-                    color = MaterialTheme.colorScheme.error.copy(alpha = 0.6f),
-                    fontSize = 10.sp, textAlign = TextAlign.End, modifier = Modifier.padding(horizontal = 2.dp))
-            } else {
-                val label = if (isPageRank) "#${index + 1}"
-                    else "${(trackResult.similarityToSeed * 100).roundToInt()}%"
-                Text(text = label, fontFamily = FontFamily.Monospace,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    fontSize = 10.sp, textAlign = TextAlign.End, modifier = Modifier.padding(horizontal = 2.dp))
             }
         }
 
@@ -590,24 +574,11 @@ private fun TrackExplanation(
             Text("Not in Poweramp library",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error.copy(alpha = 0.8f))
-        } else if (session != null) {
-            val isPageRank = session.config.selectionMode == SelectionMode.RANDOM_WALK
-            val seedPct = (trackResult.similarityToSeed * 100).roundToInt()
+        } else if (session != null && trackResult.candidateRank != null) {
+            val poolSize = session.config.candidatePoolSize
             val subtleColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
-
-            if (isPageRank) {
-                Text("${seedPct}% similar to seed",
-                    style = MaterialTheme.typography.bodySmall, color = subtleColor)
-            } else if (trackResult.candidateRank != null) {
-                val poolSize = session.config.candidatePoolSize
-                val queryPct = (trackResult.similarity * 100).roundToInt()
-                val line = if (session.config.driftEnabled) {
-                    "#${trackResult.candidateRank} of $poolSize \u00b7 ${seedPct}% seed \u00b7 ${queryPct}% inspiree"
-                } else {
-                    "#${trackResult.candidateRank} of $poolSize by similarity"
-                }
-                Text(line, style = MaterialTheme.typography.bodySmall, color = subtleColor)
-            }
+            Text("was #${trackResult.candidateRank} of $poolSize checked",
+                style = MaterialTheme.typography.bodySmall, color = subtleColor)
         }
     }
 }
@@ -720,7 +691,6 @@ fun SettingsScreen(
     val temperature by viewModel.temperature.collectAsState()
     val maxPerArtist by viewModel.maxPerArtist.collectAsState()
     val minArtistSpacing by viewModel.minArtistSpacing.collectAsState()
-    val candidatePoolSize by viewModel.candidatePoolSize.collectAsState()
     val numTracks by viewModel.numTracks.collectAsState()
     val previews by viewModel.previews.collectAsState()
     val previewsLoading by viewModel.previewsLoading.collectAsState()
@@ -729,7 +699,7 @@ fun SettingsScreen(
     val isDpp = selectionMode == SelectionMode.DPP
 
     // Group keys by what affects each mode
-    val commonKeys = remember(numTracks, candidatePoolSize, maxPerArtist, minArtistSpacing) { Any() }
+    val commonKeys = remember(numTracks, maxPerArtist, minArtistSpacing) { Any() }
     val driftKeys = remember(driftEnabled, driftMode, anchorStrength, anchorDecay, momentumBeta) { Any() }
     val expandedPeek = remember { mutableStateMapOf<SelectionMode, Boolean>() }
 
@@ -773,20 +743,6 @@ fun SettingsScreen(
                     Text("Queue Size: $numTracks tracks", style = MaterialTheme.typography.titleMedium)
                     Slider(value = numTracks.toFloat(), onValueChange = { viewModel.setNumTracks(it.toInt()) },
                         valueRange = 10f..100f, steps = 8)
-                }
-            }
-
-            // Candidate pool size
-            item {
-                Column {
-                    Text("Candidate Pool: $candidatePoolSize", style = MaterialTheme.typography.titleSmall)
-                    Text("How many top matches to consider before the algorithm selects from them. Larger pools give algorithms more material to work with.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Slider(value = candidatePoolSize.toFloat(),
-                        onValueChange = { viewModel.setCandidatePoolSize((it / 100).roundToInt() * 100) },
-                        valueRange = 100f..1000f,
-                        steps = 8)
                 }
             }
 

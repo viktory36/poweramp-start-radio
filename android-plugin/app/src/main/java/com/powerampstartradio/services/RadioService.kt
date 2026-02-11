@@ -74,7 +74,7 @@ class RadioService : Service() {
         const val EXTRA_TEMPERATURE = "temperature"
         const val EXTRA_MAX_PER_ARTIST = "max_per_artist"
         const val EXTRA_MIN_ARTIST_SPACING = "min_artist_spacing"
-        const val EXTRA_CANDIDATE_POOL_SIZE = "candidate_pool_size"
+        @Deprecated("Pool size is now auto-computed") const val EXTRA_CANDIDATE_POOL_SIZE = "candidate_pool_size"
 
         const val DEFAULT_NUM_TRACKS = 50
 
@@ -104,7 +104,7 @@ class RadioService : Service() {
                 putExtra(EXTRA_TEMPERATURE, config.temperature)
                 putExtra(EXTRA_MAX_PER_ARTIST, config.maxPerArtist)
                 putExtra(EXTRA_MIN_ARTIST_SPACING, config.minArtistSpacing)
-                putExtra(EXTRA_CANDIDATE_POOL_SIZE, config.candidatePoolSize)
+                // candidatePoolSize is auto-computed in performRadio
             }
             context.startForegroundService(intent)
         }
@@ -181,7 +181,7 @@ class RadioService : Service() {
             temperature = intent.getFloatExtra(EXTRA_TEMPERATURE, 0.05f),
             maxPerArtist = intent.getIntExtra(EXTRA_MAX_PER_ARTIST, 8),
             minArtistSpacing = intent.getIntExtra(EXTRA_MIN_ARTIST_SPACING, 3),
-            candidatePoolSize = intent.getIntExtra(EXTRA_CANDIDATE_POOL_SIZE, 200),
+            // candidatePoolSize auto-computed in performRadio
         )
     }
 
@@ -232,6 +232,12 @@ class RadioService : Service() {
                     _uiState.value = RadioUiState.Loading(message)
                     updateNotification(message)
                 }
+
+                // Resolve auto pool size so RadioResult carries the actual value
+                val config = if (config.candidatePoolSize <= 0) {
+                    val autoPool = (db.getTrackCount() * 0.02f).toInt().coerceAtLeast(100)
+                    config.copy(candidatePoolSize = autoPool)
+                } else config
 
                 updateNotification("Searching for similar tracks...")
 
