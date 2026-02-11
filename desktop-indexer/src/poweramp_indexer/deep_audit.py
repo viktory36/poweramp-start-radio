@@ -86,11 +86,19 @@ def load_multi_model(
     progress("Loading MuLan embeddings...")
     mulan_db = EmbeddingDatabase(mulan_db_path)
 
-    # MuLan DB uses 'embeddings' table (legacy) or 'embeddings_mulan'
-    mulan_models = mulan_db.get_available_models()
-    mulan_model = mulan_models[0] if mulan_models else "mulan"
+    # Detect table name: legacy DBs use 'embeddings', newer use 'embeddings_mulan'
+    mulan_table = "embeddings_mulan"
+    tables = [r[0] for r in mulan_db.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'embeddings%'"
+    ).fetchall()]
+    if "embeddings_mulan" in tables:
+        mulan_table = "embeddings_mulan"
+    elif "embeddings" in tables:
+        mulan_table = "embeddings"
+    progress(f"  Using table: {mulan_table}")
+
     mulan_rows = mulan_db.conn.execute(
-        f"SELECT track_id, embedding FROM embeddings_{mulan_model}"
+        f"SELECT track_id, embedding FROM [{mulan_table}]"
     ).fetchall()
     mulan_by_tid = {}
     for row in mulan_rows:
