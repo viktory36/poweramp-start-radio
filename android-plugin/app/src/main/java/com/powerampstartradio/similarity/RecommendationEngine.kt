@@ -13,6 +13,7 @@ import com.powerampstartradio.similarity.algorithms.RandomWalkSelector
 import com.powerampstartradio.similarity.algorithms.TemperatureSelector
 import com.powerampstartradio.ui.DriftMode
 import com.powerampstartradio.ui.Influence
+import com.powerampstartradio.ui.QueueMetrics
 import com.powerampstartradio.ui.RadioConfig
 import com.powerampstartradio.ui.SelectionMode
 import com.powerampstartradio.ui.TrackProvenance
@@ -438,6 +439,34 @@ class RecommendationEngine(
                 SelectedTrack(it.first, it.second, candidateRank = 1)
             }
         }
+    }
+
+    /**
+     * Compute quality metrics for a completed queue.
+     *
+     * @param tracks The queued tracks with similarity scores
+     * @return QueueMetrics with artist count, cluster spread, and sim range
+     */
+    fun computeQueueMetrics(tracks: List<SimilarTrack>): QueueMetrics {
+        if (tracks.isEmpty()) return QueueMetrics(0, 0, 0 to 0)
+
+        // Unique artists
+        val artists = tracks.mapNotNull { it.track.artist?.lowercase() }.toSet()
+
+        // Cluster spread
+        val clusterAssignments = database.loadClusterAssignments()
+        val clusters = tracks.mapNotNull { clusterAssignments[it.track.id] }.toSet()
+
+        // Similarity range (as percentage)
+        val sims = tracks.map { it.similarityToSeed }
+        val minSim = (sims.min() * 100).toInt()
+        val maxSim = (sims.max() * 100).toInt()
+
+        return QueueMetrics(
+            uniqueArtists = artists.size,
+            clusterSpread = clusters.size,
+            simRange = minSim to maxSim,
+        )
     }
 
     private fun dotProduct(a: FloatArray, b: FloatArray): Float {

@@ -92,6 +92,19 @@ data class QueuedTrackResult(
 )
 
 /**
+ * Queue quality metrics computed from embeddings after playlist generation.
+ *
+ * @param uniqueArtists Number of distinct artists in the queue
+ * @param clusterSpread Number of distinct style clusters represented
+ * @param simRange Pair of (min, max) similarity to seed, as percentages
+ */
+data class QueueMetrics(
+    val uniqueArtists: Int,
+    val clusterSpread: Int,
+    val simRange: Pair<Int, Int>,
+)
+
+/**
  * Complete result of a "Start Radio" operation.
  */
 data class RadioResult(
@@ -102,7 +115,8 @@ data class RadioResult(
     val timestamp: Long = System.currentTimeMillis(),
     val queuedFileIds: Set<Long> = emptySet(),
     val isComplete: Boolean = true,
-    val totalExpected: Int = 0
+    val totalExpected: Int = 0,
+    val metrics: QueueMetrics? = null
 ) {
     val queuedCount: Int get() = tracks.count { it.status == QueueStatus.QUEUED }
     val failedCount: Int get() = tracks.count { it.status != QueueStatus.QUEUED }

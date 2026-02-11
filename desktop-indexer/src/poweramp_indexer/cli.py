@@ -1240,13 +1240,21 @@ def extract_encoder(output: Path, verbose: bool):
 @click.argument("database", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--seeds", "-s", type=int, default=200, help="Number of seed tracks (default: 200)")
 @click.option("--quick", "-q", is_flag=True, help="Quick mode: 20 seeds, reduced knob grid")
+@click.option("--deep", is_flag=True, help="Deep audit: multi-model comparison, temperature analysis, embedding profiling")
+@click.option("--raw-data", type=click.Path(exists=True, file_okay=False, path_type=Path), default=None,
+              help="Directory with mulan/flamingo/merged DBs (default: audit_raw_data/ next to DATABASE)")
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
-def audit(database: Path, seeds: int, quick: bool, verbose: bool):
+def audit(database: Path, seeds: int, quick: bool, deep: bool, raw_data: Path | None, verbose: bool):
     """Run exhaustive algorithm audit against a fused embedding database.
 
     Tests every recommendation algorithm (MMR, DPP, Temperature, Random Walk)
     and drift mode against diverse seed tracks from the full corpus.
     Validates monotonicity, diversity, degeneracy, and post-filter correctness.
+
+    With --deep: multi-model quality comparison, temperature transformation
+    analysis, embedding space profiling, and knob sensitivity sweeps.
+    Requires audit_raw_data/ with embeddings_mulan.db and
+    embeddings-flam-mulan-full-reduced.db.
 
     DATABASE: Path to embeddings database with fused embeddings
 
@@ -1255,25 +1263,35 @@ def audit(database: Path, seeds: int, quick: bool, verbose: bool):
       poweramp-indexer audit embeddings.db
       poweramp-indexer audit embeddings.db --quick
       poweramp-indexer audit embeddings.db --seeds 50
+      poweramp-indexer audit embeddings.db --deep
+      poweramp-indexer audit embeddings.db --deep --quick --seeds 50
     """
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    if quick:
+    if quick and not deep:
         seeds = min(seeds, 20)
 
-    from .audit import run_audit
-
     click.echo(f"Database: {database}")
-    click.echo(f"Seeds: {seeds}, Quick: {quick}")
+    click.echo(f"Seeds: {seeds}, Quick: {quick}, Deep: {deep}")
     click.echo()
 
-    validations, _ = run_audit(database, n_seeds=seeds, quick=quick)
+    if deep:
+        from .deep_audit import run_deep_audit
+        run_deep_audit(
+            fused_db_path=database,
+            raw_data_dir=raw_data,
+            n_seeds=seeds,
+            quick=quick,
+        )
+    else:
+        from .audit import run_audit
+        validations, _ = run_audit(database, n_seeds=seeds, quick=quick)
 
-    # Exit with non-zero if any validation failed
-    failed = sum(1 for v in validations if not v.passed)
-    if failed > 0:
-        raise SystemExit(1)
+        # Exit with non-zero if any validation failed
+        failed = sum(1 for v in validations if not v.passed)
+        if failed > 0:
+            raise SystemExit(1)
 
 
 @cli.command()

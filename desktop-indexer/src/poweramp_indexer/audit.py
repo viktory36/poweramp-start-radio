@@ -380,12 +380,30 @@ def dpp_select_batch(
     return [candidates[idx] for idx in selected]
 
 
+def _compute_rank_scores(candidates: list[tuple[int, float]]) -> list[float]:
+    """Compute rank-based scores: (1 - rank/N) mapped to [0, 1].
+    Rank 0 (best) maps to ~1.0, rank N-1 (worst) maps to ~0.0."""
+    n = len(candidates)
+    if n == 0:
+        return []
+    # Argsort by score descending
+    sorted_indices = sorted(range(n), key=lambda i: candidates[i][1], reverse=True)
+    rank_scores = [0.0] * n
+    for rank, orig_idx in enumerate(sorted_indices):
+        rank_scores[orig_idx] = 1.0 - rank / n
+    return rank_scores
+
+
 def temperature_select_one(
     candidates: list[tuple[int, float]],
     temperature: float,
     rng: np.random.Generator | None = None
 ) -> tuple[int, float] | None:
-    """Gumbel-max single selection — faithful port from TemperatureSelector.selectOne()."""
+    """Gumbel-max single selection with rank-based transform — faithful port from TemperatureSelector.selectOne().
+
+    Uses rank-based scores instead of raw cosine similarity to give the
+    temperature knob meaningful dynamic range (raw scores cluster 0.93-0.96).
+    """
     if not candidates:
         return None
     if temperature <= 1e-6:
@@ -394,14 +412,16 @@ def temperature_select_one(
     if rng is None:
         rng = np.random.default_rng()
 
+    rank_scores = _compute_rank_scores(candidates)
+
     best_id = -1
     best_orig_score = 0.0
     best_perturbed = -np.inf
 
-    for (tid, score) in candidates:
+    for i, (tid, score) in enumerate(candidates):
         u = np.clip(rng.random(), 1e-10, 1 - 1e-10)
         gumbel = -np.log(-np.log(u))
-        perturbed = score / temperature + gumbel
+        perturbed = rank_scores[i] / temperature + gumbel
         if perturbed > best_perturbed:
             best_perturbed = perturbed
             best_id = tid
@@ -416,7 +436,10 @@ def temperature_select_batch(
     temperature: float,
     rng: np.random.Generator | None = None
 ) -> list[tuple[int, float]]:
-    """Gumbel-max batch (w/o replacement) — port from TemperatureSelector.selectBatch()."""
+    """Gumbel-max batch (w/o replacement) with rank-based transform — port from TemperatureSelector.selectBatch().
+
+    Recomputes rank scores among remaining candidates each step.
+    """
     if not candidates:
         return []
     if temperature <= 1e-6:
@@ -428,14 +451,17 @@ def temperature_select_batch(
     remaining = list(candidates)
     result = []
 
-    for _ in range(min(num_select, len(candidates))):
+    for step in range(min(num_select, len(candidates))):
+        # Recompute rank scores among remaining
+        rank_scores = _compute_rank_scores(remaining)
+
         best_idx = -1
         best_perturbed = -np.inf
 
         for i, (tid, score) in enumerate(remaining):
             u = np.clip(rng.random(), 1e-10, 1 - 1e-10)
             gumbel = -np.log(-np.log(u))
-            perturbed = score / temperature + gumbel
+            perturbed = rank_scores[i] / temperature + gumbel
             if perturbed > best_perturbed:
                 best_perturbed = perturbed
                 best_idx = i

@@ -64,6 +64,7 @@ import com.powerampstartradio.ui.DecaySchedule
 import com.powerampstartradio.ui.DriftMode
 import com.powerampstartradio.ui.MainViewModel
 import com.powerampstartradio.ui.QueuedTrackResult
+import com.powerampstartradio.ui.QueueMetrics
 import com.powerampstartradio.ui.RadioResult
 import com.powerampstartradio.ui.RadioUiState
 import com.powerampstartradio.ui.SelectionMode
@@ -465,6 +466,13 @@ fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
         ResultsSummary(result = session,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
 
+        if (session.isComplete && session.metrics != null) {
+            QueueMetricsSummary(
+                metrics = session.metrics,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp)
+            )
+        }
+
         if (showProvenance) {
             Row(modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -542,6 +550,19 @@ fun ResultsSummary(result: RadioResult, modifier: Modifier = Modifier) {
     Text(text = countText, style = MaterialTheme.typography.labelMedium,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = modifier.fillMaxWidth().basicMarquee(), maxLines = 1)
+}
+
+@Composable
+fun QueueMetricsSummary(metrics: QueueMetrics, modifier: Modifier = Modifier) {
+    val text = "${metrics.uniqueArtists} artists \u00b7 " +
+        "${metrics.clusterSpread} styles \u00b7 " +
+        "${metrics.simRange.first}\u2013${metrics.simRange.second}% match"
+    Text(
+        text = text,
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+        modifier = modifier
+    )
 }
 
 // ---- Influence strip provenance visualization ----

@@ -324,6 +324,15 @@ class RadioService : Service() {
                     queueChannel.close()
                     queueJob.join()
 
+                    // Compute queue quality metrics from embeddings
+                    val driftSimilarTracks = streamingTracks.map { qtr ->
+                        SimilarTrack(
+                            track = qtr.track, similarity = qtr.similarity,
+                            similarityToSeed = qtr.similarityToSeed
+                        )
+                    }
+                    val driftMetrics = eng.computeQueueMetrics(driftSimilarTracks)
+
                     val finalResult = RadioResult(
                         seedTrack = currentTrack,
                         matchType = matchResult.matchType,
@@ -331,7 +340,8 @@ class RadioService : Service() {
                         config = config,
                         queuedFileIds = queuedFileIds.toSet(),
                         isComplete = true,
-                        totalExpected = config.numTracks
+                        totalExpected = config.numTracks,
+                        metrics = driftMetrics
                     )
 
                     _uiState.value = RadioUiState.Success(finalResult)
@@ -395,12 +405,16 @@ class RadioService : Service() {
                         )
                     }
 
+                    // Compute queue quality metrics from embeddings
+                    val batchMetrics = eng.computeQueueMetrics(similarTracks)
+
                     val radioResult = RadioResult(
                         seedTrack = currentTrack,
                         matchType = matchResult.matchType,
                         tracks = trackResults,
                         config = config,
-                        queuedFileIds = queuedFileIds
+                        queuedFileIds = queuedFileIds,
+                        metrics = batchMetrics
                     )
 
                     _uiState.value = RadioUiState.Success(radioResult)
