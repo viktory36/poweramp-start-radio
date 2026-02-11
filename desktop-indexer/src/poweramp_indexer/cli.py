@@ -253,6 +253,221 @@ def _scan_flamingo(music_path: Path, output: Path, skip_existing: bool, audio_fi
 
 @cli.command()
 @click.argument("music_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--output", "-o", type=click.Path(path_type=Path), default=Path("embeddings.db"),
+              help="Output database file path")
+@click.option("--database", "-d", type=click.Path(exists=True, path_type=Path), default=None,
+              help="Existing database to update (skips existing files)")
+@click.option("--mulan-only", is_flag=True, help="Only generate MuLan embeddings (skip Flamingo + fuse)")
+@click.option("--dim", default=512, help="Target fused dimension (default: 512)")
+@click.option("--skip-existing/--no-skip-existing", default=True, help="Skip files already in the database")
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
+def build(music_path: Path, output: Path, database: Path, mulan_only: bool, dim: int,
+          skip_existing: bool, verbose: bool):
+    """One-command pipeline: scan with all models, reduce, and fuse.
+
+    Scans with MuLan, optionally scans with Flamingo, reduces Flamingo
+    dimensions, and fuses everything into a single embedding space.
+
+    MUSIC_PATH: Path to your music library folder
+
+    Examples:
+
+      poweramp-indexer build /path/to/music
+      poweramp-indexer build /path/to/music --mulan-only
+      poweramp-indexer build /path/to/music -d existing.db -o updated.db
+    """
+    import shutil
+    import struct
+
+    import numpy as np
+
+    if verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    # Open or create database
+    if database is not None:
+        if output != database:
+            shutil.copy2(database, output)
+        db = EmbeddingDatabase(output)
+        available = db.get_available_models()
+        click.echo(f"Existing database: {database} ({db.count_tracks()} tracks, models: {', '.join(available) or 'none'})")
+    else:
+        models = ["mulan"] if mulan_only else ["mulan", "flamingo"]
+        db = EmbeddingDatabase(output, models=models)
+
+    # Discover audio files
+    click.echo(f"Scanning: {music_path}")
+    audio_files = list(scan_music_directory(music_path))
+    click.echo(f"Found {len(audio_files)} audio files")
+    if not audio_files:
+        click.echo("No audio files found. Exiting.")
+        db.close()
+        return
+
+    # --- Step 1: MuLan ---
+    mulan_files = audio_files
+    if skip_existing:
+        existing = db.get_existing_paths(model="mulan")
+        mulan_files = [f for f in audio_files if str(f) not in existing]
+        if existing:
+            click.echo(f"MuLan: skipping {len(audio_files) - len(mulan_files)} existing")
+
+    mulan_new = 0
+    if mulan_files:
+        click.echo(f"\nMuLan: {len(mulan_files)} files to index")
+        click.echo("Loading MuLan model...")
+        generator = create_mulan_generator()
+
+        def store_mulan(filepath, metadata, embedding):
+            db.add_track(metadata, embedding, model="mulan")
+            if (store_mulan.count % 10) == 0:
+                db.commit()
+            store_mulan.count += 1
+        store_mulan.count = 0
+
+        ok, fail = _process_files(mulan_files, generator.load_audio,
+                                  generator.generate_from_audio, store_mulan, "MuLan")
+        db.commit()
+        mulan_new = ok
+        click.echo(f"  MuLan: {ok} indexed, {fail} failed")
+        generator.unload_model()
+    else:
+        click.echo("MuLan: all files already indexed")
+
+    # --- Step 2: Flamingo (unless --mulan-only) ---
+    flamingo_new = 0
+    if not mulan_only:
+        from .embeddings_flamingo import DEFAULT_ENCODER_DIR
+
+        # Auto-extract encoder if missing
+        encoder_file = DEFAULT_ENCODER_DIR / "model.safetensors"
+        if not encoder_file.exists():
+            click.echo("\nFlamingo encoder not found, extracting...")
+            from click import Context
+            ctx = Context(extract_encoder, info_name="extract-encoder")
+            ctx.invoke(extract_encoder, output=None, verbose=verbose)
+
+        flam_files = audio_files
+        if skip_existing:
+            existing = db.get_existing_paths(model="flamingo")
+            flam_files = [f for f in audio_files if str(f) not in existing]
+            if existing:
+                click.echo(f"Flamingo: skipping {len(audio_files) - len(flam_files)} existing")
+
+        if flam_files:
+            click.echo(f"\nFlamingo: {len(flam_files)} files to index")
+            click.echo("Loading Music Flamingo encoder...")
+            try:
+                generator = create_flamingo_generator()
+            except FileNotFoundError as e:
+                click.echo(f"Error loading Flamingo: {e}")
+                click.echo("Continuing with MuLan only.")
+                mulan_only = True  # skip fuse step
+            else:
+                def store_flam(filepath, metadata, embedding):
+                    track_id = db.get_track_id_by_path(str(filepath))
+                    if track_id is not None:
+                        db.add_embedding(track_id, "flamingo", embedding)
+                    else:
+                        db.add_track(metadata, embedding, model="flamingo")
+                    if (store_flam.count % 10) == 0:
+                        db.commit()
+                    store_flam.count += 1
+                store_flam.count = 0
+
+                ok, fail = _process_files(flam_files, generator.load_audio,
+                                          generator.generate_from_audio, store_flam, "Flamingo")
+                db.commit()
+                flamingo_new = ok
+                click.echo(f"  Flamingo: {ok} indexed, {fail} failed")
+                generator.unload_model()
+        else:
+            click.echo("Flamingo: all files already indexed")
+
+        # --- Step 3: Reduce Flamingo if needed ---
+        if not mulan_only:
+            table = db._table_name("flamingo")
+            try:
+                sample = db.conn.execute(f"SELECT embedding FROM [{table}] LIMIT 1").fetchone()
+            except Exception:
+                sample = None
+
+            if sample is not None:
+                original_dim = len(sample[0]) // 4
+                if original_dim > dim:
+                    click.echo(f"\nReducing Flamingo: {original_dim}d -> {dim}d")
+                    count = db.conn.execute(f"SELECT COUNT(*) FROM [{table}]").fetchone()[0]
+
+                    X = np.empty((count, original_dim), dtype=np.float32)
+                    track_ids = np.empty(count, dtype=np.int64)
+                    cursor = db.conn.execute(f"SELECT track_id, embedding FROM [{table}]")
+                    for i, (tid, blob) in enumerate(cursor):
+                        track_ids[i] = tid
+                        X[i] = np.frombuffer(blob, dtype=np.float32)
+
+                    G = X.astype(np.float64).T @ X.astype(np.float64)
+                    eigenvalues, eigenvectors = np.linalg.eigh(G)
+                    idx = np.argsort(eigenvalues)[::-1]
+                    eigenvalues = np.maximum(eigenvalues[idx], 0)
+                    eigenvectors = eigenvectors[:, idx]
+
+                    retained = eigenvalues[:dim].sum() / eigenvalues.sum()
+                    click.echo(f"  Variance retained: {retained * 100:.2f}%")
+
+                    V_k = eigenvectors[:, :dim].astype(np.float32)
+                    X_reduced = X @ V_k
+                    norms = np.linalg.norm(X_reduced, axis=1, keepdims=True)
+                    X_reduced = X_reduced / np.maximum(norms, 1e-10)
+
+                    db.conn.execute("BEGIN")
+                    try:
+                        for i in range(count):
+                            blob = struct.pack(f"{dim}f", *X_reduced[i])
+                            db.conn.execute(f"UPDATE [{table}] SET embedding = ? WHERE track_id = ?",
+                                            (blob, int(track_ids[i])))
+                        proj_blob = V_k.tobytes()
+                        db.conn.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+                                        ("flamingo_projection", proj_blob))
+                        db.conn.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+                                        ("flamingo_original_dim", str(original_dim)))
+                        db.conn.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+                                        ("flamingo_reduced_dim", str(dim)))
+                        db.conn.execute("COMMIT")
+                    except Exception:
+                        db.conn.execute("ROLLBACK")
+                        raise
+                    click.echo(f"  Flamingo reduced to {dim}d")
+
+    # --- Step 4: Fuse (if both models present) ---
+    available = db.get_available_models()
+    if "mulan" in available and "flamingo" in available and not mulan_only:
+        click.echo(f"\nFusing MuLan + Flamingo -> {dim}d")
+        from .fusion import fuse_embeddings
+
+        try:
+            result = fuse_embeddings(db, target_dim=dim, on_progress=lambda msg: click.echo(f"  {msg}"))
+            click.echo(f"  Fused: {result['n_tracks']} tracks, {result['variance_retained'] * 100:.2f}% variance")
+        except ValueError as e:
+            click.echo(f"  Fusion error: {e}")
+
+    # Update metadata
+    db.set_metadata("version", __version__)
+    db.set_metadata("source_path", str(music_path))
+    available = db.get_available_models()
+    db.set_metadata("model", ",".join(available))
+
+    total = db.count_tracks()
+    db.close()
+
+    click.echo(f"\nBuild complete!")
+    click.echo(f"  Total tracks: {total}")
+    click.echo(f"  Models: {', '.join(available)}")
+    click.echo(f"  New: {mulan_new} (MuLan) + {flamingo_new} (Flamingo)")
+    click.echo(f"  Database size: {output.stat().st_size / 1024 / 1024:.1f} MB")
+
+
+@cli.command()
+@click.argument("music_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option(
     "--database", "-d",
     type=click.Path(exists=True, path_type=Path),
@@ -405,6 +620,19 @@ def update(music_path: Path, database: Path, remove_missing: bool, verbose: bool
         click.echo(f"\n  Added: {successful}")
         click.echo(f"  Failed: {failed}")
         generator.unload_model()
+
+    # Auto-re-fuse if fused embeddings exist and new tracks were added
+    if "fused" in db.get_available_models():
+        click.echo("\nRe-fusing embeddings with new tracks...")
+        from .fusion import fuse_embeddings
+
+        fused_dim = int(db.get_metadata("fused_dim") or "512")
+        try:
+            result = fuse_embeddings(db, target_dim=fused_dim,
+                                     on_progress=lambda msg: click.echo(f"  {msg}"))
+            click.echo(f"  Re-fused: {result['n_tracks']} tracks")
+        except ValueError as e:
+            click.echo(f"  Re-fuse error: {e}")
 
     # Update metadata
     db.set_metadata("version", __version__)

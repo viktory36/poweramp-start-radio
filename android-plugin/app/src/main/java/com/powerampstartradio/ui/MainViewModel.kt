@@ -43,7 +43,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
     val selectionMode: StateFlow<SelectionMode> = _selectionMode.asStateFlow()
 
-    private val _driftEnabled = MutableStateFlow(prefs.getBoolean("drift_enabled", true))
+    private val _driftEnabled = MutableStateFlow(prefs.getBoolean("drift_enabled", false))
     val driftEnabled: StateFlow<Boolean> = _driftEnabled.asStateFlow()
 
     private val _driftMode = MutableStateFlow(
@@ -73,7 +73,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _maxPerArtist = MutableStateFlow(prefs.getInt("max_per_artist", 8))
     val maxPerArtist: StateFlow<Int> = _maxPerArtist.asStateFlow()
 
-    private val _minArtistSpacing = MutableStateFlow(prefs.getInt("min_artist_spacing", 2))
+    private val _minArtistSpacing = MutableStateFlow(prefs.getInt("min_artist_spacing", 3))
     val minArtistSpacing: StateFlow<Int> = _minArtistSpacing.asStateFlow()
 
     private val _candidatePoolSize = MutableStateFlow(prefs.getInt("candidate_pool_size", 200))
@@ -330,6 +330,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         hasFused = db.hasFusedEmbeddings,
                         hasGraph = db.hasBinaryData("knn_graph"),
                         embeddingTable = db.embeddingTable,
+                        availableModels = db.getAvailableModels(),
                     )
                     db.close()
                     _databaseInfo.value = info
@@ -356,4 +357,5 @@ data class DatabaseInfo(
     val hasFused: Boolean = false,
     val hasGraph: Boolean = false,
     val embeddingTable: String = "embeddings_fused",
+    val availableModels: List<Pair<String, Int>> = emptyList(),
 )

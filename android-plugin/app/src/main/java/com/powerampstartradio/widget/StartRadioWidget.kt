@@ -118,7 +118,7 @@ class StartRadioAction : ActionCallback {
             selectionMode = try {
                 SelectionMode.valueOf(prefs.getString("selection_mode", SelectionMode.MMR.name)!!)
             } catch (e: IllegalArgumentException) { SelectionMode.MMR },
-            driftEnabled = prefs.getBoolean("drift_enabled", true),
+            driftEnabled = prefs.getBoolean("drift_enabled", false),
             driftMode = try {
                 DriftMode.valueOf(prefs.getString("drift_mode", DriftMode.SEED_INTERPOLATION.name)!!)
             } catch (e: IllegalArgumentException) { DriftMode.SEED_INTERPOLATION },
@@ -130,7 +130,7 @@ class StartRadioAction : ActionCallback {
             diversityLambda = prefs.getFloat("diversity_lambda", 0.4f),
             temperature = prefs.getFloat("temperature", 0.05f),
             maxPerArtist = prefs.getInt("max_per_artist", 8),
-            minArtistSpacing = prefs.getInt("min_artist_spacing", 2),
+            minArtistSpacing = prefs.getInt("min_artist_spacing", 3),
         )
 
         RadioService.startRadio(context, config, showToasts = true)

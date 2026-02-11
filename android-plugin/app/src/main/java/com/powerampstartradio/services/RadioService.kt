@@ -168,7 +168,7 @@ class RadioService : Service() {
             selectionMode = try {
                 SelectionMode.valueOf(intent.getStringExtra(EXTRA_SELECTION_MODE) ?: SelectionMode.MMR.name)
             } catch (e: IllegalArgumentException) { SelectionMode.MMR },
-            driftEnabled = intent.getBooleanExtra(EXTRA_DRIFT_ENABLED, true),
+            driftEnabled = intent.getBooleanExtra(EXTRA_DRIFT_ENABLED, false),
             driftMode = try {
                 DriftMode.valueOf(intent.getStringExtra(EXTRA_DRIFT_MODE) ?: DriftMode.SEED_INTERPOLATION.name)
             } catch (e: IllegalArgumentException) { DriftMode.SEED_INTERPOLATION },
@@ -180,7 +180,7 @@ class RadioService : Service() {
             diversityLambda = intent.getFloatExtra(EXTRA_DIVERSITY_LAMBDA, 0.4f),
             temperature = intent.getFloatExtra(EXTRA_TEMPERATURE, 0.05f),
             maxPerArtist = intent.getIntExtra(EXTRA_MAX_PER_ARTIST, 8),
-            minArtistSpacing = intent.getIntExtra(EXTRA_MIN_ARTIST_SPACING, 2),
+            minArtistSpacing = intent.getIntExtra(EXTRA_MIN_ARTIST_SPACING, 3),
             candidatePoolSize = intent.getIntExtra(EXTRA_CANDIDATE_POOL_SIZE, 200),
         )
     }

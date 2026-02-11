@@ -36,6 +36,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -63,6 +64,7 @@ import com.powerampstartradio.ui.DatabaseInfo
 import com.powerampstartradio.ui.DecaySchedule
 import com.powerampstartradio.ui.DriftMode
 import com.powerampstartradio.ui.MainViewModel
+import com.powerampstartradio.ui.QueueStatus
 import com.powerampstartradio.ui.QueuedTrackResult
 import com.powerampstartradio.ui.QueueMetrics
 import com.powerampstartradio.ui.RadioResult
@@ -555,7 +557,6 @@ fun ResultsSummary(result: RadioResult, modifier: Modifier = Modifier) {
 @Composable
 fun QueueMetricsSummary(metrics: QueueMetrics, modifier: Modifier = Modifier) {
     val text = "${metrics.uniqueArtists} artists \u00b7 " +
-        "${metrics.clusterSpread} styles \u00b7 " +
         "${metrics.simRange.first}\u2013${metrics.simRange.second}% match"
     Text(
         text = text,
@@ -635,8 +636,10 @@ fun TrackResultRow(
     var expanded by remember { mutableStateOf(false) }
     val isPageRank = session?.config?.selectionMode == SelectionMode.RANDOM_WALK
 
+    val isFailed = trackResult.status != QueueStatus.QUEUED
+
     Column(modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }) {
-        Row(modifier = Modifier.fillMaxWidth(),
+        Row(modifier = Modifier.fillMaxWidth().alpha(if (isFailed) 0.45f else 1f),
             verticalAlignment = Alignment.CenterVertically) {
             if (showProvenance) {
                 InfluenceStrip(
@@ -652,14 +655,20 @@ fun TrackResultRow(
                     color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
 
-            val label = if (isPageRank) {
-                "#${index + 1}"
+            if (isFailed) {
+                Text(text = "—", fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.error.copy(alpha = 0.6f),
+                    fontSize = 10.sp, textAlign = TextAlign.End, modifier = Modifier.padding(horizontal = 2.dp))
             } else {
-                "${(trackResult.similarityToSeed * 100).roundToInt()}%"
+                val label = if (isPageRank) {
+                    "#${index + 1}"
+                } else {
+                    "${(trackResult.similarityToSeed * 100).roundToInt()}%"
+                }
+                Text(text = label, fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 10.sp, textAlign = TextAlign.End, modifier = Modifier.padding(horizontal = 2.dp))
             }
-            Text(text = label, fontFamily = FontFamily.Monospace,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                fontSize = 10.sp, textAlign = TextAlign.End, modifier = Modifier.padding(horizontal = 2.dp))
         }
 
         AnimatedVisibility(visible = expanded) {
@@ -687,7 +696,27 @@ private fun TrackExplanation(
     val poolSize = session?.config?.candidatePoolSize ?: 200
 
     Column(modifier = modifier) {
-        // Every expansion starts with similarity to seed
+        // Album + duration
+        val album = trackResult.track.album
+        val dur = trackResult.track.durationMs
+        val durStr = "${dur / 60000}:${((dur % 60000) / 1000).toString().padStart(2, '0')}"
+        val metaLine = listOfNotNull(
+            album?.takeIf { it.isNotBlank() },
+            durStr
+        ).joinToString(" · ")
+        if (metaLine.isNotEmpty()) {
+            Text(metaLine, style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
+        }
+
+        // Not in library warning
+        if (trackResult.status != QueueStatus.QUEUED) {
+            Text("Not in Poweramp library",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error.copy(alpha = 0.8f))
+        }
+
+        // Similarity to seed
         Text("$seedPct% match to \"$seedTitle\"",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -727,6 +756,14 @@ private fun TrackExplanation(
                 Text("  + $collapsedCount earlier",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
+            }
+
+            // Show query match when drift has moved away from seed
+            val querySim = (trackResult.similarity * 100).roundToInt()
+            if (querySim != seedPct) {
+                Text("$querySim% match to current direction",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         } else if (trackResult.candidateRank != null) {
             // Batch mode with candidate rank
@@ -1061,117 +1098,38 @@ fun SettingsScreen(
                         Spacer(modifier = Modifier.height(4.dp))
 
                         Row(modifier = Modifier.fillMaxWidth().selectable(
-                            selected = driftEnabled, onClick = { viewModel.setDriftEnabled(!driftEnabled) }, role = Role.Checkbox
+                            selected = driftEnabled, onClick = {
+                                val enabling = !driftEnabled
+                                viewModel.setDriftEnabled(enabling)
+                                if (enabling) {
+                                    viewModel.setDriftMode(DriftMode.SEED_INTERPOLATION)
+                                    viewModel.setAnchorDecay(DecaySchedule.EXPONENTIAL)
+                                }
+                            }, role = Role.Checkbox
                         ).padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                             Checkbox(checked = driftEnabled, onCheckedChange = null)
                             Spacer(modifier = Modifier.width(8.dp))
                             Column {
                                 Text("Drifting playlist", style = MaterialTheme.typography.bodyMedium)
-                                Text("After each pick, the search shifts toward that track. The next search looks for tracks similar to a blend of the seed and recent picks, not just the seed. Over time this moves the playlist in a new direction.",
+                                Text("After each pick, the search shifts toward that track. Over time the playlist moves in a new direction away from the seed.",
                                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                         }
 
                         AnimatedVisibility(visible = driftEnabled) {
                             Column(modifier = Modifier.padding(start = 16.dp, top = 8.dp)) {
-                                Text("Drift style", style = MaterialTheme.typography.titleSmall)
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Column(modifier = Modifier.selectableGroup()) {
-                                    Row(modifier = Modifier.fillMaxWidth().selectable(
-                                        selected = driftMode == DriftMode.SEED_INTERPOLATION,
-                                        onClick = { viewModel.setDriftMode(DriftMode.SEED_INTERPOLATION) },
-                                        role = Role.RadioButton
-                                    ).padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                                        RadioButton(selected = driftMode == DriftMode.SEED_INTERPOLATION, onClick = null)
-                                        Spacer(modifier = Modifier.width(8.dp))
-                                        Column {
-                                            Text("Anchored", style = MaterialTheme.typography.bodyMedium)
-                                            Text("Each search blends the seed with the most recent pick. The seed always contributes, controlled by the Seed Influence slider.",
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
-                                    }
-                                    Row(modifier = Modifier.fillMaxWidth().selectable(
-                                        selected = driftMode == DriftMode.MOMENTUM,
-                                        onClick = { viewModel.setDriftMode(DriftMode.MOMENTUM) },
-                                        role = Role.RadioButton
-                                    ).padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                                        RadioButton(selected = driftMode == DriftMode.MOMENTUM, onClick = null)
-                                        Spacer(modifier = Modifier.width(8.dp))
-                                        Column {
-                                            Text("Flowing", style = MaterialTheme.typography.bodyMedium)
-                                            Text("Each search uses a running average of all picks so far. Direction changes gradually rather than jumping based on a single pick.",
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
-                                    }
-                                }
-
-                                // Anchored parameters
-                                AnimatedVisibility(visible = driftMode == DriftMode.SEED_INTERPOLATION) {
-                                    Column(modifier = Modifier.padding(top = 8.dp)) {
-                                        Text("Seed Influence: ${(anchorStrength * 100).roundToInt()}%",
-                                            style = MaterialTheme.typography.titleSmall)
-                                        Text("How much the seed contributes to each search. Low = recent picks dominate, the playlist wanders. High = the seed dominates, the playlist stays close.",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                            Text("Wanders further", style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
-                                            Slider(value = anchorStrength, onValueChange = { viewModel.setAnchorStrength(it) },
-                                                valueRange = 0f..1f, modifier = Modifier.weight(1f))
-                                            Text("Stays close", style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
-                                        }
-
-                                        Text("Fade schedule", style = MaterialTheme.typography.titleSmall)
-                                        Text("How the seed's influence weakens over time.",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        Spacer(modifier = Modifier.height(4.dp))
-                                        Column(modifier = Modifier.selectableGroup()) {
-                                            for (schedule in DecaySchedule.entries) {
-                                                val (label, desc) = when (schedule) {
-                                                    DecaySchedule.NONE -> "None" to "Same influence throughout"
-                                                    DecaySchedule.LINEAR -> "Gradual" to "Weakens steadily toward the end"
-                                                    DecaySchedule.EXPONENTIAL -> "Quick start" to "Weakens quickly at first, then levels off"
-                                                    DecaySchedule.STEP -> "Halfway" to "Full influence for the first half, then drops"
-                                                }
-                                                Row(modifier = Modifier.fillMaxWidth().selectable(
-                                                    selected = anchorDecay == schedule,
-                                                    onClick = { viewModel.setAnchorDecay(schedule) },
-                                                    role = Role.RadioButton
-                                                ).padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-                                                    RadioButton(selected = anchorDecay == schedule, onClick = null)
-                                                    Spacer(modifier = Modifier.width(8.dp))
-                                                    Column {
-                                                        Text(label, style = MaterialTheme.typography.bodyMedium)
-                                                        Text(desc, style = MaterialTheme.typography.bodySmall,
-                                                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Momentum parameters
-                                AnimatedVisibility(visible = driftMode == DriftMode.MOMENTUM) {
-                                    Column(modifier = Modifier.padding(top = 8.dp)) {
-                                        Text("Smoothing: ${(momentumBeta * 100).roundToInt()}%",
-                                            style = MaterialTheme.typography.titleSmall)
-                                        Text("How much of the history each search averages over. High = averages many past picks, direction changes slowly. Low = mostly the last few picks, reacts quickly.",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                            Text("Reactive", style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
-                                            Slider(value = momentumBeta, onValueChange = { viewModel.setMomentumBeta(it) },
-                                                valueRange = 0.1f..0.95f, modifier = Modifier.weight(1f))
-                                            Text("Steady", style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
-                                        }
-                                    }
+                                Text("Seed Influence: ${(anchorStrength * 100).roundToInt()}%",
+                                    style = MaterialTheme.typography.titleSmall)
+                                Text("How much the original seed contributes vs. recent picks. Low = wanders far, high = stays close to seed.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text("Wanders", style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
+                                    Slider(value = anchorStrength, onValueChange = { viewModel.setAnchorStrength(it) },
+                                        valueRange = 0f..1f, modifier = Modifier.weight(1f))
+                                    Text("Stays close", style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                                 }
                             }
                         }
@@ -1209,12 +1167,31 @@ fun SettingsScreen(
                     Text("Database", style = MaterialTheme.typography.titleMedium)
                     Spacer(modifier = Modifier.height(8.dp))
                     if (databaseInfo != null) {
-                        Text("${databaseInfo.trackCount} tracks, ${databaseInfo.embeddingCount} embeddings" +
-                            (if (databaseInfo.embeddingDim != null) " (${databaseInfo.embeddingDim}d)" else ""))
-                        Text("Table: ${databaseInfo.embeddingTable}")
-                        if (databaseInfo.hasFused) Text("Fused embeddings: yes")
-                        Text("Similarity graph: ${if (databaseInfo.hasGraph) "yes - PageRank mode available" else "not found - PageRank will fall back to MMR"}")
-                        Text("Size: ${databaseInfo.sizeKb} KB")
+                        val trackCountFmt = "%,d".format(databaseInfo.trackCount)
+                        val dimLabel = if (databaseInfo.embeddingDim != null) "${databaseInfo.embeddingDim}-dim" else ""
+                        val modelNames = databaseInfo.availableModels.map { it.first }
+                        val modelLine = if (databaseInfo.hasFused && modelNames.containsAll(listOf("mulan", "flamingo"))) {
+                            "Models: MuLan + Flamingo \u2192 Fused"
+                        } else if (databaseInfo.hasFused) {
+                            "Models: Fused"
+                        } else if (modelNames.size == 1) {
+                            val name = modelNames.first().replaceFirstChar { it.uppercase() }
+                            "Single model: $name"
+                        } else {
+                            "Models: ${modelNames.joinToString(", ") { it.replaceFirstChar { c -> c.uppercase() } }}"
+                        }
+                        val embType = if (databaseInfo.hasFused) "fused" else modelNames.firstOrNull()?.replaceFirstChar { it.uppercase() } ?: "unknown"
+                        Text("$trackCountFmt tracks \u00b7 $dimLabel $embType embeddings",
+                            style = MaterialTheme.typography.bodyMedium)
+                        Text(modelLine, style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(if (databaseInfo.hasGraph) "Similarity graph: available (PageRank enabled)"
+                            else "No similarity graph (PageRank will fall back to MMR)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("Size: ${databaseInfo.sizeKb / 1024} MB",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                     } else {
                         Text("No database imported", color = MaterialTheme.colorScheme.error)
                     }

@@ -39,7 +39,7 @@ data class RadioConfig(
     val numTracks: Int = 50,
     val candidatePoolSize: Int = 200,
     val selectionMode: SelectionMode = SelectionMode.MMR,
-    val driftEnabled: Boolean = true,
+    val driftEnabled: Boolean = false,
     val driftMode: DriftMode = DriftMode.SEED_INTERPOLATION,
     val anchorStrength: Float = 0.5f,
     val anchorDecay: DecaySchedule = DecaySchedule.EXPONENTIAL,
@@ -47,7 +47,7 @@ data class RadioConfig(
     val diversityLambda: Float = 0.4f,     // Audit: 0.4 = +4 artists, -0.01 sim vs 0.6
     val temperature: Float = 0.05f,         // Audit: 0.1+ all equivalent; 0.05 is the effective edge
     val maxPerArtist: Int = 8,
-    val minArtistSpacing: Int = 2,
+    val minArtistSpacing: Int = 3,          // Audit: spacing=3 vs 5 (5 drops queue to ~44)
 )
 
 /**

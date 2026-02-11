@@ -147,6 +147,28 @@ class EmbeddingDatabase private constructor(
     }
 
     /**
+     * Get available embedding models and their row counts.
+     * Returns list of (model_name, count) for embedding tables that have data.
+     */
+    fun getAvailableModels(): List<Pair<String, Int>> {
+        val models = mutableListOf<Pair<String, Int>>()
+        val tables = getTableNames()
+        for (table in tables) {
+            if (!table.startsWith("embeddings_")) continue
+            val model = table.removePrefix("embeddings_")
+            try {
+                db.rawQuery("SELECT COUNT(*) FROM [$table]", null).use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val count = cursor.getInt(0)
+                        if (count > 0) models.add(model to count)
+                    }
+                }
+            } catch (_: Exception) { }
+        }
+        return models
+    }
+
+    /**
      * Get a track by its metadata key (primary matching method).
      * Tries in order:
      * 1. Exact artist|album|title match
