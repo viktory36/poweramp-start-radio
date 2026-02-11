@@ -68,7 +68,6 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /** Whether the radio UI state represents an active search (any phase). */
@@ -601,16 +600,13 @@ private fun TrackExplanation(
                     style = MaterialTheme.typography.bodySmall, color = subtleColor)
             } else if (trackResult.candidateRank != null) {
                 val poolSize = session.config.candidatePoolSize
-                val rankBasis = if (session.config.driftEnabled) "direction" else "similarity"
-                Text("#${trackResult.candidateRank} of $poolSize by $rankBasis",
-                    style = MaterialTheme.typography.bodySmall, color = subtleColor)
-            }
-
-            // Drift: show query similarity when meaningfully different from seed
-            val queryPct = (trackResult.similarity * 100).roundToInt()
-            if (session.config.driftEnabled && abs(queryPct - seedPct) > 3) {
-                Text("${queryPct}% match to current direction",
-                    style = MaterialTheme.typography.bodySmall, color = subtleColor)
+                val queryPct = (trackResult.similarity * 100).roundToInt()
+                val line = if (session.config.driftEnabled) {
+                    "#${trackResult.candidateRank} of $poolSize \u00b7 ${seedPct}% seed \u00b7 ${queryPct}% inspiree"
+                } else {
+                    "#${trackResult.candidateRank} of $poolSize by similarity"
+                }
+                Text(line, style = MaterialTheme.typography.bodySmall, color = subtleColor)
             }
         }
     }
