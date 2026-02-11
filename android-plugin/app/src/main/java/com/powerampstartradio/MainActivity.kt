@@ -14,7 +14,6 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
@@ -37,8 +36,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
@@ -466,13 +463,6 @@ fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
             )
         }
 
-        if (session.tracks.size >= 2) {
-            SimilarityProfile(
-                tracks = session.tracks,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
-            )
-        }
-
         LazyColumn(state = listState, modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)) {
             items(session.tracks.size) { index ->
@@ -530,39 +520,6 @@ fun QueueMetricsSummary(metrics: QueueMetrics, modifier: Modifier = Modifier) {
         color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
         modifier = modifier
     )
-}
-
-// ---- Similarity Profile bar chart ----
-
-@Composable
-fun SimilarityProfile(tracks: List<QueuedTrackResult>, modifier: Modifier = Modifier) {
-    val barColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)
-    val failedColor = MaterialTheme.colorScheme.error.copy(alpha = 0.3f)
-    val bgColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.08f)
-
-    // Rescale to actual min-max so the shape variation is visible
-    val sims = tracks.map { it.similarityToSeed.toFloat() }
-    val minSim = sims.min()
-    val maxSim = sims.max()
-    val range = (maxSim - minSim).coerceAtLeast(0.01f)
-
-    Canvas(modifier = modifier.fillMaxWidth().height(32.dp)) {
-        drawRect(color = bgColor)
-        if (tracks.isEmpty()) return@Canvas
-        val barWidth = size.width / tracks.size
-        tracks.forEachIndexed { i, track ->
-            val isFailed = track.status != QueueStatus.QUEUED
-            // Map min→10% height, max→100% height
-            val normalized = ((track.similarityToSeed.toFloat() - minSim) / range)
-                .coerceIn(0f, 1f) * 0.9f + 0.1f
-            val barHeight = normalized * size.height
-            drawRect(
-                color = if (isFailed) failedColor else barColor,
-                topLeft = Offset(i * barWidth, size.height - barHeight),
-                size = Size(barWidth, barHeight)
-            )
-        }
-    }
 }
 
 // ---- Track Result Row ----
