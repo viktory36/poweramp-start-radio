@@ -35,16 +35,11 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -70,7 +65,6 @@ import com.powerampstartradio.ui.QueueMetrics
 import com.powerampstartradio.ui.RadioResult
 import com.powerampstartradio.ui.RadioUiState
 import com.powerampstartradio.ui.SelectionMode
-import com.powerampstartradio.ui.TrackProvenance
 import com.powerampstartradio.ui.theme.PowerampStartRadioTheme
 import kotlinx.coroutines.launch
 import java.io.File
@@ -451,9 +445,6 @@ fun CompactNowPlayingHeader(
 @Composable
 fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
     val listState = rememberLazyListState()
-    val showProvenance = session.tracks.any { it.provenance.influences.size > 1 }
-    // Use target queue size so colors stay stable as tracks stream in
-    val colorTotal = maxOf(session.config.numTracks, session.tracks.size)
 
     LaunchedEffect(session.tracks.size) {
         if (!session.isComplete && session.tracks.isNotEmpty()) {
@@ -475,34 +466,11 @@ fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
             )
         }
 
-        if (showProvenance) {
-            Row(modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                val primary = MaterialTheme.colorScheme.primary
-                Row(verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Canvas(modifier = Modifier.size(8.dp)) {
-                        drawRect(color = primary)
-                    }
-                    Text("seed", style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
-                }
-                Row(verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    // Small gradient swatch showing early/mid/late queue colors
-                    Canvas(modifier = Modifier.width(24.dp).height(8.dp)) {
-                        val earlyColor = trackColor(primary, 0, colorTotal)
-                        val midColor = trackColor(primary, colorTotal / 2, colorTotal)
-                        val lateColor = trackColor(primary, colorTotal - 1, colorTotal)
-                        val segW = size.width / 3f
-                        drawRect(color = earlyColor, topLeft = Offset(0f, 0f), size = Size(segW, size.height))
-                        drawRect(color = midColor, topLeft = Offset(segW, 0f), size = Size(segW, size.height))
-                        drawRect(color = lateColor, topLeft = Offset(segW * 2f, 0f), size = Size(segW, size.height))
-                    }
-                    Text("queue position", style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
-                }
-            }
+        if (session.tracks.size >= 2) {
+            SimilarityProfile(
+                tracks = session.tracks,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+            )
         }
 
         LazyColumn(state = listState, modifier = Modifier.fillMaxSize(),
@@ -511,8 +479,6 @@ fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
                 TrackResultRow(
                     trackResult = session.tracks[index],
                     index = index,
-                    totalTracks = colorTotal,
-                    showProvenance = showProvenance,
                     session = session
                 )
             }
@@ -566,59 +532,26 @@ fun QueueMetricsSummary(metrics: QueueMetrics, modifier: Modifier = Modifier) {
     )
 }
 
-// ---- Influence strip provenance visualization ----
-
-private fun trackColor(primary: Color, index: Int, total: Int): Color {
-    if (total <= 1) return primary
-    val hsl = FloatArray(3)
-    androidx.core.graphics.ColorUtils.colorToHSL(primary.toArgb(), hsl)
-    hsl[0] = (hsl[0] + (index.toFloat() / total) * 180f) % 360f
-    hsl[1] = maxOf(hsl[1], 0.5f)               // Ensure vivid colors
-    hsl[2] = hsl[2].coerceIn(0.35f, 0.65f)     // Readable on both themes
-    return Color(androidx.core.graphics.ColorUtils.HSLToColor(hsl))
-}
+// ---- Similarity Profile bar chart ----
 
 @Composable
-fun InfluenceStrip(
-    provenance: TrackProvenance,
-    totalTracks: Int,
-    modifier: Modifier = Modifier
-) {
-    val primary = MaterialTheme.colorScheme.primary
-    val density = LocalDensity.current
-    val stripWidthPx = with(density) { 40.dp.toPx() }
+fun SimilarityProfile(tracks: List<QueuedTrackResult>, modifier: Modifier = Modifier) {
+    val barColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)
+    val failedColor = MaterialTheme.colorScheme.error.copy(alpha = 0.3f)
+    val bgColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.08f)
 
-    val segmentColors = remember(primary, totalTracks, provenance) {
-        provenance.influences.map { influence ->
-            if (influence.sourceIndex == -1) primary
-            else trackColor(primary, influence.sourceIndex, totalTracks)
-        }
-    }
-
-    val bgColor = primary.copy(alpha = 0.12f)
-
-    Canvas(modifier = modifier
-        .width(40.dp)
-        .height(12.dp)
-        .clip(RoundedCornerShape(3.dp))
-    ) {
-        // Background — visible as "empty" portion for diversity meter
-        drawRect(color = bgColor, size = Size(size.width, size.height))
-
-        val sorted = provenance.influences
-            .zip(segmentColors)
-            .sortedBy { it.first.sourceIndex }
-        var x = 0f
-
-        for ((influence, color) in sorted) {
-            val segWidth = influence.weight * stripWidthPx
-            if (segWidth < 0.5f) continue
+    Canvas(modifier = modifier.fillMaxWidth().height(32.dp)) {
+        drawRect(color = bgColor)
+        if (tracks.isEmpty()) return@Canvas
+        val barWidth = size.width / tracks.size
+        tracks.forEachIndexed { i, track ->
+            val isFailed = track.status != QueueStatus.QUEUED
+            val barHeight = track.similarityToSeed * size.height
             drawRect(
-                color = color,
-                topLeft = Offset(x, 0f),
-                size = Size(segWidth, size.height)
+                color = if (isFailed) failedColor else barColor,
+                topLeft = Offset(i * barWidth, size.height - barHeight),
+                size = Size(barWidth, barHeight)
             )
-            x += segWidth
         }
     }
 }
@@ -629,25 +562,15 @@ fun InfluenceStrip(
 fun TrackResultRow(
     trackResult: QueuedTrackResult,
     index: Int,
-    totalTracks: Int,
-    showProvenance: Boolean,
     session: RadioResult? = null
 ) {
     var expanded by remember { mutableStateOf(false) }
     val isPageRank = session?.config?.selectionMode == SelectionMode.RANDOM_WALK
-
     val isFailed = trackResult.status != QueueStatus.QUEUED
 
     Column(modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }) {
         Row(modifier = Modifier.fillMaxWidth().alpha(if (isFailed) 0.45f else 1f),
             verticalAlignment = Alignment.CenterVertically) {
-            if (showProvenance) {
-                InfluenceStrip(
-                    provenance = trackResult.provenance,
-                    totalTracks = totalTracks
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-            }
             Column(modifier = Modifier.weight(1f).padding(vertical = 2.dp, horizontal = 4.dp)) {
                 Text(text = trackResult.track.title ?: "Unknown", style = MaterialTheme.typography.bodyMedium,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -656,15 +579,12 @@ fun TrackResultRow(
             }
 
             if (isFailed) {
-                Text(text = "—", fontFamily = FontFamily.Monospace,
+                Text(text = "\u2014", fontFamily = FontFamily.Monospace,
                     color = MaterialTheme.colorScheme.error.copy(alpha = 0.6f),
                     fontSize = 10.sp, textAlign = TextAlign.End, modifier = Modifier.padding(horizontal = 2.dp))
             } else {
-                val label = if (isPageRank) {
-                    "#${index + 1}"
-                } else {
-                    "${(trackResult.similarityToSeed * 100).roundToInt()}%"
-                }
+                val label = if (isPageRank) "#${index + 1}"
+                    else "${(trackResult.similarityToSeed * 100).roundToInt()}%"
                 Text(text = label, fontFamily = FontFamily.Monospace,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     fontSize = 10.sp, textAlign = TextAlign.End, modifier = Modifier.padding(horizontal = 2.dp))
@@ -674,9 +594,7 @@ fun TrackResultRow(
         AnimatedVisibility(visible = expanded) {
             TrackExplanation(
                 trackResult = trackResult,
-                index = index,
-                session = session,
-                modifier = Modifier.padding(start = if (showProvenance) 46.dp else 4.dp, top = 2.dp, bottom = 4.dp)
+                modifier = Modifier.padding(start = 4.dp, top = 2.dp, bottom = 4.dp)
             )
         }
     }
@@ -685,91 +603,25 @@ fun TrackResultRow(
 @Composable
 private fun TrackExplanation(
     trackResult: QueuedTrackResult,
-    index: Int,
-    session: RadioResult?,
     modifier: Modifier = Modifier
 ) {
-    val seedPct = (trackResult.similarityToSeed * 100).roundToInt()
-    val hasDrift = trackResult.provenance.influences.size > 1
-    val isPageRank = session?.config?.selectionMode == SelectionMode.RANDOM_WALK
-    val seedTitle = session?.seedTrack?.title ?: "seed"
-    val poolSize = session?.config?.candidatePoolSize ?: 200
-
     Column(modifier = modifier) {
-        // Album + duration
         val album = trackResult.track.album
         val dur = trackResult.track.durationMs
         val durStr = "${dur / 60000}:${((dur % 60000) / 1000).toString().padStart(2, '0')}"
         val metaLine = listOfNotNull(
             album?.takeIf { it.isNotBlank() },
             durStr
-        ).joinToString(" · ")
+        ).joinToString(" \u00b7 ")
         if (metaLine.isNotEmpty()) {
             Text(metaLine, style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
         }
 
-        // Not in library warning
         if (trackResult.status != QueueStatus.QUEUED) {
             Text("Not in Poweramp library",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error.copy(alpha = 0.8f))
-        }
-
-        // Similarity to seed
-        Text("$seedPct% match to \"$seedTitle\"",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant)
-
-        if (isPageRank) {
-            Text("PageRank rank #${index + 1}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-        } else if (hasDrift && session != null) {
-            // Drift: show blend breakdown
-            Text("Search blended:",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-
-            val significantInfluences = trackResult.provenance.influences
-                .filter { it.weight >= 0.05f }
-                .sortedByDescending { it.weight }
-            val collapsedCount = trackResult.provenance.influences.count { it.weight < 0.05f }
-
-            for (inf in significantInfluences) {
-                val weightPct = (inf.weight * 100).roundToInt()
-                val sourceName = if (inf.sourceIndex == -1) {
-                    "seed ($weightPct%)"
-                } else {
-                    val trackInfo = session.tracks.getOrNull(inf.sourceIndex)
-                    if (trackInfo != null) {
-                        "\"${trackInfo.track.title ?: "Unknown"}\" ($weightPct%)"
-                    } else {
-                        "#${inf.sourceIndex + 1} ($weightPct%)"
-                    }
-                }
-                Text("  $sourceName",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            if (collapsedCount > 0) {
-                Text("  + $collapsedCount earlier",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
-            }
-
-            // Show query match when drift has moved away from seed
-            val querySim = (trackResult.similarity * 100).roundToInt()
-            if (querySim != seedPct) {
-                Text("$querySim% match to current direction",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        } else if (trackResult.candidateRank != null) {
-            // Batch mode with candidate rank
-            Text("Similarity rank #${trackResult.candidateRank} of $poolSize",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
