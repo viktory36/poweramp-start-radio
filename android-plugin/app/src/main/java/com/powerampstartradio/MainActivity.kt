@@ -68,6 +68,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /** Whether the radio UI state represents an active search (any phase). */
@@ -560,6 +561,7 @@ fun TrackResultRow(
         AnimatedVisibility(visible = expanded) {
             TrackExplanation(
                 trackResult = trackResult,
+                session = session,
                 modifier = Modifier.padding(start = 4.dp, top = 2.dp, bottom = 4.dp)
             )
         }
@@ -569,6 +571,7 @@ fun TrackResultRow(
 @Composable
 private fun TrackExplanation(
     trackResult: QueuedTrackResult,
+    session: RadioResult? = null,
     modifier: Modifier = Modifier
 ) {
     Column(modifier = modifier) {
@@ -588,6 +591,26 @@ private fun TrackExplanation(
             Text("Not in Poweramp library",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error.copy(alpha = 0.8f))
+        } else if (session != null) {
+            val isPageRank = session.config.selectionMode == SelectionMode.RANDOM_WALK
+            val seedPct = (trackResult.similarityToSeed * 100).roundToInt()
+            val subtleColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+
+            if (isPageRank) {
+                Text("${seedPct}% similar to seed",
+                    style = MaterialTheme.typography.bodySmall, color = subtleColor)
+            } else if (trackResult.candidateRank != null) {
+                val poolSize = session.config.candidatePoolSize
+                Text("#${trackResult.candidateRank} of $poolSize by similarity",
+                    style = MaterialTheme.typography.bodySmall, color = subtleColor)
+            }
+
+            // Drift: show query similarity when meaningfully different from seed
+            val queryPct = (trackResult.similarity * 100).roundToInt()
+            if (session.config.driftEnabled && abs(queryPct - seedPct) > 3) {
+                Text("${queryPct}% match to current direction",
+                    style = MaterialTheme.typography.bodySmall, color = subtleColor)
+            }
         }
     }
 }
