@@ -219,8 +219,7 @@ class RecommendationEngine(
             onProgress?.invoke("Finding track ${step + 1}/${config.numTracks}...")
 
             // Retrieve candidates for current query
-            val poolSize = minOf(config.candidatePoolSize, 50)  // Smaller pool per drift step
-            val candidates = index.findTopK(query, poolSize, excludeIds = seen, cancellationCheck = cancellationCheck)
+            val candidates = index.findTopK(query, config.candidatePoolSize, excludeIds = seen, cancellationCheck = cancellationCheck)
 
             if (candidates.isEmpty()) break
 
