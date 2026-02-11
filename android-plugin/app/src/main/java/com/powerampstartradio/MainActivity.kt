@@ -601,7 +601,8 @@ private fun TrackExplanation(
                     style = MaterialTheme.typography.bodySmall, color = subtleColor)
             } else if (trackResult.candidateRank != null) {
                 val poolSize = session.config.candidatePoolSize
-                Text("#${trackResult.candidateRank} of $poolSize by similarity",
+                val rankBasis = if (session.config.driftEnabled) "direction" else "similarity"
+                Text("#${trackResult.candidateRank} of $poolSize by $rankBasis",
                     style = MaterialTheme.typography.bodySmall, color = subtleColor)
             }
 
