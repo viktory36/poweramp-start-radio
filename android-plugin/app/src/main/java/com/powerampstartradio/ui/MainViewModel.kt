@@ -67,9 +67,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _diversityLambda = MutableStateFlow(prefs.getFloat("diversity_lambda", 0.4f))
     val diversityLambda: StateFlow<Float> = _diversityLambda.asStateFlow()
 
-    private val _temperature = MutableStateFlow(prefs.getFloat("temperature", 0.05f))
-    val temperature: StateFlow<Float> = _temperature.asStateFlow()
-
     private val _maxPerArtist = MutableStateFlow(prefs.getInt("max_per_artist", 8))
     val maxPerArtist: StateFlow<Int> = _maxPerArtist.asStateFlow()
 
@@ -134,7 +131,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         anchorDecay = _anchorDecay.value,
         momentumBeta = _momentumBeta.value,
         diversityLambda = _diversityLambda.value,
-        temperature = _temperature.value,
         maxPerArtist = _maxPerArtist.value,
         minArtistSpacing = _minArtistSpacing.value,
     )
@@ -179,11 +175,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setDiversityLambda(value: Float) {
         _diversityLambda.value = value
         prefs.edit().putFloat("diversity_lambda", value).apply()
-    }
-
-    fun setTemperature(value: Float) {
-        _temperature.value = value
-        prefs.edit().putFloat("temperature", value).apply()
     }
 
     fun setMaxPerArtist(value: Int) {
@@ -273,7 +264,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         setAnchorDecay(defaults.anchorDecay)
         setMomentumBeta(defaults.momentumBeta)
         setDiversityLambda(defaults.diversityLambda)
-        setTemperature(defaults.temperature)
         setMaxPerArtist(defaults.maxPerArtist)
         setMinArtistSpacing(defaults.minArtistSpacing)
     }

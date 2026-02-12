@@ -71,7 +71,6 @@ class RadioService : Service() {
         const val EXTRA_ANCHOR_DECAY = "anchor_decay"
         const val EXTRA_MOMENTUM_BETA = "momentum_beta"
         const val EXTRA_DIVERSITY_LAMBDA = "diversity_lambda"
-        const val EXTRA_TEMPERATURE = "temperature"
         const val EXTRA_MAX_PER_ARTIST = "max_per_artist"
         const val EXTRA_MIN_ARTIST_SPACING = "min_artist_spacing"
         @Deprecated("Pool size is now auto-computed") const val EXTRA_CANDIDATE_POOL_SIZE = "candidate_pool_size"
@@ -101,7 +100,6 @@ class RadioService : Service() {
                 putExtra(EXTRA_ANCHOR_DECAY, config.anchorDecay.name)
                 putExtra(EXTRA_MOMENTUM_BETA, config.momentumBeta)
                 putExtra(EXTRA_DIVERSITY_LAMBDA, config.diversityLambda)
-                putExtra(EXTRA_TEMPERATURE, config.temperature)
                 putExtra(EXTRA_MAX_PER_ARTIST, config.maxPerArtist)
                 putExtra(EXTRA_MIN_ARTIST_SPACING, config.minArtistSpacing)
                 // candidatePoolSize is auto-computed in performRadio
@@ -178,7 +176,6 @@ class RadioService : Service() {
             } catch (e: IllegalArgumentException) { DecaySchedule.EXPONENTIAL },
             momentumBeta = intent.getFloatExtra(EXTRA_MOMENTUM_BETA, 0.7f),
             diversityLambda = intent.getFloatExtra(EXTRA_DIVERSITY_LAMBDA, 0.4f),
-            temperature = intent.getFloatExtra(EXTRA_TEMPERATURE, 0.05f),
             maxPerArtist = intent.getIntExtra(EXTRA_MAX_PER_ARTIST, 8),
             minArtistSpacing = intent.getIntExtra(EXTRA_MIN_ARTIST_SPACING, 3),
             // candidatePoolSize auto-computed in performRadio
@@ -203,7 +200,7 @@ class RadioService : Service() {
                 Log.d(TAG, "Starting radio for: ${currentTrack.title} by ${currentTrack.artist}")
                 Log.d(TAG, "Config: ${config.selectionMode.name}" +
                     (if (config.driftEnabled) " drift(${config.driftMode.name})" else "") +
-                    " lambda=${config.diversityLambda} T=${config.temperature}")
+                    " lambda=${config.diversityLambda}")
 
                 val db = getOrCreateDatabase()
                 if (db == null) {
@@ -299,6 +296,8 @@ class RadioService : Service() {
                                 similarity = similarTrack.similarity,
                                 similarityToSeed = similarTrack.similarityToSeed,
                                 candidateRank = similarTrack.candidateRank,
+                                seedRank = similarTrack.seedRank,
+                                driftRank = similarTrack.driftRank,
                                 status = if (fileId != null) QueueStatus.QUEUED else QueueStatus.NOT_IN_LIBRARY,
                                 provenance = similarTrack.provenance,
                             ))
@@ -406,6 +405,8 @@ class RadioService : Service() {
                             similarity = mapped.similarTrack.similarity,
                             similarityToSeed = mapped.similarTrack.similarityToSeed,
                             candidateRank = mapped.similarTrack.candidateRank,
+                            seedRank = mapped.similarTrack.seedRank,
+                            driftRank = mapped.similarTrack.driftRank,
                             status = status,
                             provenance = mapped.similarTrack.provenance,
                         )

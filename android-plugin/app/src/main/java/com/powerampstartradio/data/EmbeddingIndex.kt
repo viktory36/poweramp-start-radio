@@ -244,6 +244,22 @@ class EmbeddingIndex private constructor(
     }
 
     /**
+     * Compute the 1-based rank of a target track among all tracks by similarity to a reference vector.
+     * Rank 1 = most similar track in the entire corpus.
+     * Returns -1 if target track not found.
+     */
+    fun computeRankOf(reference: FloatArray, targetTrackId: Long): Int {
+        val targetIdx = trackIdToIndex[targetTrackId] ?: return -1
+        val targetSim = dotProduct(reference, targetIdx)
+        var rank = 1
+        for (i in 0 until numTracks) {
+            if (i == targetIdx) continue
+            if (dotProduct(reference, i) > targetSim) rank++
+        }
+        return rank
+    }
+
+    /**
      * Get the embedding for a specific track ID, or null if not found.
      */
     fun getEmbeddingByTrackId(trackId: Long): FloatArray? {

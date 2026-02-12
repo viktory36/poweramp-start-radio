@@ -128,7 +128,6 @@ class StartRadioAction : ActionCallback {
             } catch (e: IllegalArgumentException) { DecaySchedule.EXPONENTIAL },
             momentumBeta = prefs.getFloat("momentum_beta", 0.7f),
             diversityLambda = prefs.getFloat("diversity_lambda", 0.4f),
-            temperature = prefs.getFloat("temperature", 0.05f),
             maxPerArtist = prefs.getInt("max_per_artist", 8),
             minArtistSpacing = prefs.getInt("min_artist_spacing", 3),
         )

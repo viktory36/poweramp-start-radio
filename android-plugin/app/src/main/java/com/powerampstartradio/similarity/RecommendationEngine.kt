@@ -10,7 +10,6 @@ import com.powerampstartradio.similarity.algorithms.DriftEngine
 import com.powerampstartradio.similarity.algorithms.MmrSelector
 import com.powerampstartradio.similarity.algorithms.PostFilter
 import com.powerampstartradio.similarity.algorithms.RandomWalkSelector
-import com.powerampstartradio.similarity.algorithms.TemperatureSelector
 import com.powerampstartradio.ui.DriftMode
 import com.powerampstartradio.ui.Influence
 import com.powerampstartradio.ui.QueueMetrics
@@ -40,6 +39,8 @@ data class SimilarTrack(
     val similarity: Float,
     val similarityToSeed: Float,
     val candidateRank: Int? = null,
+    val seedRank: Int? = null,
+    val driftRank: Int? = null,
     val provenance: TrackProvenance = TrackProvenance(),
 )
 
@@ -48,7 +49,7 @@ data class SimilarTrack(
  *
  * Two-stage architecture:
  * 1. RETRIEVE: brute-force top-N candidates from fused index
- * 2. SELECT: user-configured algorithm (MMR / DPP / Random Walk / Temperature)
+ * 2. SELECT: user-configured algorithm (MMR / DPP / Random Walk)
  * Optional: DRIFT modifies query per step (seed interpolation or EMA momentum)
  * Post-filter: artist/album caps
  */
@@ -262,7 +263,14 @@ class RecommendationEngine(
                     val fbTrack = database.getTrackById(fbId) ?: continue
                     val fbEmb = index.getEmbeddingByTrackId(fbId)
                     val fbSimToSeed = if (fbEmb != null) dotProduct(seedEmb, fbEmb) else fbScore
-                    val similarTrack = SimilarTrack(fbTrack, fbScore, fbSimToSeed, provenance = provenance)
+                    val fbSeedRank = index.computeRankOf(seedEmb, fbId)
+                    val fbDriftRank = if (step > 0) {
+                        when (config.driftMode) {
+                            DriftMode.SEED_INTERPOLATION -> selectedEmbeddings.lastOrNull()?.let { index.computeRankOf(it, fbId) }
+                            DriftMode.MOMENTUM -> emaState?.let { index.computeRankOf(it, fbId) }
+                        }
+                    } else null
+                    val similarTrack = SimilarTrack(fbTrack, fbScore, fbSimToSeed, seedRank = fbSeedRank, driftRank = fbDriftRank, provenance = provenance)
                     result.add(similarTrack)
                     selectedTracks.add(fbTrack)
                     fbEmb?.let { selectedEmbeddings.add(it) }
@@ -281,7 +289,15 @@ class RecommendationEngine(
                 continue
             }
 
-            val similarTrack = SimilarTrack(track, score, simToSeed, selected.candidateRank, provenance)
+            val seedRank = index.computeRankOf(seedEmb, trackId)
+            val driftRank = if (step > 0) {
+                when (config.driftMode) {
+                    DriftMode.SEED_INTERPOLATION -> selectedEmbeddings.lastOrNull()?.let { index.computeRankOf(it, trackId) }
+                    DriftMode.MOMENTUM -> emaState?.let { index.computeRankOf(it, trackId) }
+                }
+            } else null
+
+            val similarTrack = SimilarTrack(track, score, simToSeed, selected.candidateRank, seedRank, driftRank, provenance)
             result.add(similarTrack)
             selectedTracks.add(track)
             onResult?.invoke(similarTrack)
@@ -333,9 +349,6 @@ class RecommendationEngine(
             SelectionMode.DPP -> DppSelector.selectBatch(
                 candidates, config.numTracks, index
             )
-            SelectionMode.TEMPERATURE -> TemperatureSelector.selectBatch(
-                candidates, config.numTracks, config.temperature
-            )
             SelectionMode.RANDOM_WALK -> candidates.take(config.numTracks).mapIndexed { i, (id, score) ->
                 SelectedTrack(id, score, candidateRank = i + 1)
             }
@@ -350,6 +363,7 @@ class RecommendationEngine(
                     similarity = sel.score,
                     similarityToSeed = sel.score,
                     candidateRank = sel.candidateRank,
+                    seedRank = sel.candidateRank,  // batch: pool sorted by seed similarity
                 )
             }
         }
@@ -394,11 +408,15 @@ class RecommendationEngine(
                     val emb = index.getEmbeddingByTrackId(trackId)
                     if (emb != null) dotProduct(seedEmb, emb) else 0f
                 } else 0f
+                val seedRank = if (seedEmb != null && index != null) {
+                    index.computeRankOf(seedEmb, trackId)
+                } else null
                 SimilarTrack(
                     track = track,
                     similarity = score,
                     similarityToSeed = simToSeed,
                     candidateRank = i + 1,
+                    seedRank = seedRank,
                 )
             }
         }
@@ -438,9 +456,6 @@ class RecommendationEngine(
                 // DPP in single-select mode: use batch of 1
                 DppSelector.selectBatch(candidates, 1, index).firstOrNull()
             }
-            SelectionMode.TEMPERATURE -> TemperatureSelector.selectOne(
-                candidates, config.temperature
-            )
             SelectionMode.RANDOM_WALK -> candidates.firstOrNull()?.let {
                 SelectedTrack(it.first, it.second, candidateRank = 1)
             }

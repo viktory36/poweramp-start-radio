@@ -11,7 +11,6 @@ enum class SelectionMode {
     MMR,
     DPP,
     RANDOM_WALK,
-    TEMPERATURE
 }
 
 /**
@@ -45,7 +44,6 @@ data class RadioConfig(
     val anchorDecay: DecaySchedule = DecaySchedule.EXPONENTIAL,
     val momentumBeta: Float = 0.7f,
     val diversityLambda: Float = 0.4f,     // Audit: 0.4 = +4 artists, -0.01 sim vs 0.6
-    val temperature: Float = 0.05f,         // Audit: 0.1+ all equivalent; 0.05 is the effective edge
     val maxPerArtist: Int = 8,
     val minArtistSpacing: Int = 3,          // Audit: spacing=3 vs 5 (5 drops queue to ~44)
 )
@@ -87,6 +85,8 @@ data class QueuedTrackResult(
     val similarity: Float,
     val similarityToSeed: Float,
     val candidateRank: Int? = null,
+    val seedRank: Int? = null,
+    val driftRank: Int? = null,
     val status: QueueStatus,
     val provenance: TrackProvenance = TrackProvenance(),
 )
