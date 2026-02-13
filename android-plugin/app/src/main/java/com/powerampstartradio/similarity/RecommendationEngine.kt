@@ -222,6 +222,9 @@ class RecommendationEngine(
         // Initial query = pure seed, so seedWeight = 1.0
         var currentSeedWeight = 1f
 
+        // Precompute seed similarities once — cheap rank lookups for all steps
+        val seedSims = index.computeAllSimilarities(seedEmb)
+
         for (step in 0 until config.numTracks) {
             coroutineContext.ensureActive()
             onProgress?.invoke("Finding track ${step + 1}/${config.numTracks}...")
@@ -263,11 +266,17 @@ class RecommendationEngine(
                     val fbTrack = database.getTrackById(fbId) ?: continue
                     val fbEmb = index.getEmbeddingByTrackId(fbId)
                     val fbSimToSeed = if (fbEmb != null) dotProduct(seedEmb, fbEmb) else fbScore
-                    val fbSeedRank = index.computeRankOf(seedEmb, fbId)
+                    val fbSeedRank = index.rankFromSimilarities(seedSims, fbId)
                     val fbDriftRank = if (step > 0) {
                         when (config.driftMode) {
-                            DriftMode.SEED_INTERPOLATION -> selectedEmbeddings.lastOrNull()?.let { index.computeRankOf(it, fbId) }
-                            DriftMode.MOMENTUM -> emaState?.let { index.computeRankOf(it, fbId) }
+                            DriftMode.SEED_INTERPOLATION -> selectedEmbeddings.lastOrNull()?.let { ref ->
+                                val sims = index.computeAllSimilarities(ref)
+                                index.rankFromSimilarities(sims, fbId)
+                            }
+                            DriftMode.MOMENTUM -> emaState?.let { ref ->
+                                val sims = index.computeAllSimilarities(ref)
+                                index.rankFromSimilarities(sims, fbId)
+                            }
                         }
                     } else null
                     val similarTrack = SimilarTrack(fbTrack, fbScore, fbSimToSeed, seedRank = fbSeedRank, driftRank = fbDriftRank, provenance = provenance)
@@ -289,11 +298,17 @@ class RecommendationEngine(
                 continue
             }
 
-            val seedRank = index.computeRankOf(seedEmb, trackId)
+            val seedRank = index.rankFromSimilarities(seedSims, trackId)
             val driftRank = if (step > 0) {
                 when (config.driftMode) {
-                    DriftMode.SEED_INTERPOLATION -> selectedEmbeddings.lastOrNull()?.let { index.computeRankOf(it, trackId) }
-                    DriftMode.MOMENTUM -> emaState?.let { index.computeRankOf(it, trackId) }
+                    DriftMode.SEED_INTERPOLATION -> selectedEmbeddings.lastOrNull()?.let { ref ->
+                        val sims = index.computeAllSimilarities(ref)
+                        index.rankFromSimilarities(sims, trackId)
+                    }
+                    DriftMode.MOMENTUM -> emaState?.let { ref ->
+                        val sims = index.computeAllSimilarities(ref)
+                        index.rankFromSimilarities(sims, trackId)
+                    }
                 }
             } else null
 
@@ -423,9 +438,10 @@ class RecommendationEngine(
             config.minArtistSpacing
         ).take(config.numTracks)
 
-        // Compute seedRank only for final tracks (not all 1494 candidates)
+        // One scan for all seed ranks (not N separate scans)
         val withRanks = if (seedEmb != null && index != null) {
-            filtered.map { it.copy(seedRank = index.computeRankOf(seedEmb, it.track.id)) }
+            val seedSims = index.computeAllSimilarities(seedEmb)
+            filtered.map { it.copy(seedRank = index.rankFromSimilarities(seedSims, it.track.id)) }
         } else filtered
 
         // Stream results if callback provided

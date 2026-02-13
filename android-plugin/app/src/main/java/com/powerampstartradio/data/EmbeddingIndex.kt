@@ -244,17 +244,28 @@ class EmbeddingIndex private constructor(
     }
 
     /**
-     * Compute the 1-based rank of a target track among all tracks by similarity to a reference vector.
-     * Rank 1 = most similar track in the entire corpus.
-     * Returns -1 if target track not found.
+     * Compute similarity of every track to a reference vector in one sequential scan.
+     * Returns a FloatArray indexed by internal track index (~300KB for 75K tracks).
+     * Use with [rankFromSimilarities] for O(1)-amortized rank lookups.
      */
-    fun computeRankOf(reference: FloatArray, targetTrackId: Long): Int {
-        val targetIdx = trackIdToIndex[targetTrackId] ?: return -1
-        val targetSim = dotProduct(reference, targetIdx)
-        var rank = 1
+    fun computeAllSimilarities(reference: FloatArray): FloatArray {
+        val sims = FloatArray(numTracks)
         for (i in 0 until numTracks) {
-            if (i == targetIdx) continue
-            if (dotProduct(reference, i) > targetSim) rank++
+            sims[i] = dotProduct(reference, i)
+        }
+        return sims
+    }
+
+    /**
+     * Compute 1-based rank of a target track from a precomputed similarity array.
+     * Rank 1 = most similar in the corpus. Returns -1 if track not found.
+     */
+    fun rankFromSimilarities(sims: FloatArray, targetTrackId: Long): Int {
+        val targetIdx = trackIdToIndex[targetTrackId] ?: return -1
+        val targetSim = sims[targetIdx]
+        var rank = 1
+        for (i in sims.indices) {
+            if (i != targetIdx && sims[i] > targetSim) rank++
         }
         return rank
     }
