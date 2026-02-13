@@ -511,7 +511,8 @@ fun TrackResultRow(
 private fun TrackExplanation(
     trackResult: QueuedTrackResult,
     session: RadioResult? = null,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    viewModel: MainViewModel = viewModel()
 ) {
     Column(modifier = modifier) {
         val album = trackResult.track.album
@@ -537,12 +538,23 @@ private fun TrackExplanation(
                 session.config.selectionMode != SelectionMode.DPP &&
                 session.config.selectionMode != SelectionMode.RANDOM_WALK
 
-            val text = if (isDrift && trackResult.driftRank != null) {
+            // Lazy drift rank: check pre-computed first, then cached lazy computation
+            val driftRanks by viewModel.driftRanks.collectAsState()
+            val driftRank = trackResult.driftRank ?: driftRanks[trackResult.track.id]
+
+            // Trigger lazy computation when expanded and not yet computed
+            LaunchedEffect(trackResult.track.id) {
+                if (isDrift && driftRank == null) {
+                    viewModel.requestDriftRank(trackResult.track.id)
+                }
+            }
+
+            val text = if (isDrift && driftRank != null) {
                 val driftLabel = when (session.config.driftMode) {
                     DriftMode.SEED_INTERPOLATION -> "to last"
                     DriftMode.MOMENTUM -> "to last few"
                 }
-                "was #${trackResult.seedRank} to seed \u00b7 #${trackResult.driftRank} $driftLabel"
+                "was #${trackResult.seedRank} to seed \u00b7 #$driftRank $driftLabel"
             } else if (isPageRank) {
                 "was #${trackResult.seedRank} to seed"
             } else {

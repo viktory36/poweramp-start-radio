@@ -271,6 +271,15 @@ class EmbeddingIndex private constructor(
     }
 
     /**
+     * Look up a track's similarity from a precomputed similarity array.
+     * Returns 0f if the track ID is not found in the index.
+     */
+    fun getSimFromPrecomputed(sims: FloatArray, trackId: Long): Float {
+        val idx = trackIdToIndex[trackId] ?: return 0f
+        return sims[idx]
+    }
+
+    /**
      * Get the embedding for a specific track ID, or null if not found.
      */
     fun getEmbeddingByTrackId(trackId: Long): FloatArray? {

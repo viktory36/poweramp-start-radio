@@ -42,6 +42,7 @@ data class SimilarTrack(
     val seedRank: Int? = null,
     val driftRank: Int? = null,
     val provenance: TrackProvenance = TrackProvenance(),
+    val driftReferenceEmb: FloatArray? = null,
 )
 
 /**
@@ -267,25 +268,19 @@ class RecommendationEngine(
                     val fbEmb = index.getEmbeddingByTrackId(fbId)
                     val fbSimToSeed = if (fbEmb != null) dotProduct(seedEmb, fbEmb) else fbScore
                     val fbSeedRank = index.rankFromSimilarities(seedSims, fbId)
-                    val fbDriftRank = if (step > 0) {
+                    val fbDriftRefEmb = if (step > 0) {
                         when (config.driftMode) {
-                            DriftMode.SEED_INTERPOLATION -> selectedEmbeddings.lastOrNull()?.let { ref ->
-                                val sims = index.computeAllSimilarities(ref)
-                                index.rankFromSimilarities(sims, fbId)
-                            }
-                            DriftMode.MOMENTUM -> emaState?.let { ref ->
-                                val sims = index.computeAllSimilarities(ref)
-                                index.rankFromSimilarities(sims, fbId)
-                            }
+                            DriftMode.SEED_INTERPOLATION -> selectedEmbeddings.lastOrNull()
+                            DriftMode.MOMENTUM -> emaState
                         }
                     } else null
-                    val similarTrack = SimilarTrack(fbTrack, fbScore, fbSimToSeed, seedRank = fbSeedRank, driftRank = fbDriftRank, provenance = provenance)
+                    val similarTrack = SimilarTrack(fbTrack, fbScore, fbSimToSeed, seedRank = fbSeedRank, provenance = provenance, driftReferenceEmb = fbDriftRefEmb)
                     result.add(similarTrack)
                     selectedTracks.add(fbTrack)
                     fbEmb?.let { selectedEmbeddings.add(it) }
                     onResult?.invoke(similarTrack)
 
-                    val currentEmb = index.getEmbeddingByTrackId(fbId) ?: continue
+                    val currentEmb = fbEmb ?: continue
                     val driftResult = DriftEngine.updateQuery(
                         seedEmb, currentEmb, emaState, step, config.numTracks, config
                     )
@@ -299,20 +294,14 @@ class RecommendationEngine(
             }
 
             val seedRank = index.rankFromSimilarities(seedSims, trackId)
-            val driftRank = if (step > 0) {
+            val driftRefEmb = if (step > 0) {
                 when (config.driftMode) {
-                    DriftMode.SEED_INTERPOLATION -> selectedEmbeddings.lastOrNull()?.let { ref ->
-                        val sims = index.computeAllSimilarities(ref)
-                        index.rankFromSimilarities(sims, trackId)
-                    }
-                    DriftMode.MOMENTUM -> emaState?.let { ref ->
-                        val sims = index.computeAllSimilarities(ref)
-                        index.rankFromSimilarities(sims, trackId)
-                    }
+                    DriftMode.SEED_INTERPOLATION -> selectedEmbeddings.lastOrNull()
+                    DriftMode.MOMENTUM -> emaState
                 }
             } else null
 
-            val similarTrack = SimilarTrack(track, score, simToSeed, selected.candidateRank, seedRank, driftRank, provenance)
+            val similarTrack = SimilarTrack(track, score, simToSeed, selected.candidateRank, seedRank, provenance = provenance, driftReferenceEmb = driftRefEmb)
             result.add(similarTrack)
             selectedTracks.add(track)
             onResult?.invoke(similarTrack)
@@ -364,9 +353,8 @@ class RecommendationEngine(
             SelectionMode.DPP -> DppSelector.selectBatch(
                 candidates, config.numTracks, index
             )
-            SelectionMode.RANDOM_WALK -> candidates.take(config.numTracks).mapIndexed { i, (id, score) ->
-                SelectedTrack(id, score, candidateRank = i + 1)
-            }
+            // RANDOM_WALK dispatches at generatePlaylist() before reaching batchPlaylist
+            else -> error("Unreachable: ${config.selectionMode}")
         }
 
         // Resolve track metadata and build SimilarTrack with new fields
@@ -414,16 +402,17 @@ class RecommendationEngine(
 
         val seedEmb = index?.getEmbeddingByTrackId(seedTrackId)
 
+        // Single scan serves both simToSeed and seedRank
+        val seedSims = if (seedEmb != null && index != null)
+            index.computeAllSimilarities(seedEmb) else null
+
         // PageRank uses full ranking — its discovery power comes from transitive
         // connections, so don't limit to the embedding retrieval pool size.
         val ranked = ranking
         val tracks = ranked.indices.mapNotNull { i ->
             val (trackId, score) = ranked[i]
             database.getTrackById(trackId)?.let { track ->
-                val simToSeed = if (seedEmb != null && index != null) {
-                    val emb = index.getEmbeddingByTrackId(trackId)
-                    if (emb != null) dotProduct(seedEmb, emb) else 0f
-                } else 0f
+                val simToSeed = seedSims?.let { index!!.getSimFromPrecomputed(it, trackId) } ?: 0f
                 SimilarTrack(
                     track = track,
                     similarity = score,
@@ -439,9 +428,8 @@ class RecommendationEngine(
             config.minArtistSpacing
         ).take(config.numTracks)
 
-        // One scan for all seed ranks (not N separate scans)
-        val withRanks = if (seedEmb != null && index != null) {
-            val seedSims = index.computeAllSimilarities(seedEmb)
+        // Compute seedRank only for the ~50 filtered tracks (O(N) per call)
+        val withRanks = if (seedSims != null && index != null) {
             filtered.map { it.copy(seedRank = index.rankFromSimilarities(seedSims, it.track.id)) }
         } else filtered
 
@@ -466,18 +454,10 @@ class RecommendationEngine(
         index: EmbeddingIndex,
         config: RadioConfig
     ): SelectedTrack? {
-        return when (config.selectionMode) {
-            SelectionMode.MMR -> MmrSelector.selectOne(
-                candidates, selectedEmbeddings, index, config.diversityLambda
-            )
-            SelectionMode.DPP -> {
-                // DPP in single-select mode: use batch of 1
-                DppSelector.selectBatch(candidates, 1, index).firstOrNull()
-            }
-            SelectionMode.RANDOM_WALK -> candidates.firstOrNull()?.let {
-                SelectedTrack(it.first, it.second, candidateRank = 1)
-            }
-        }
+        // Only MMR reaches here: DPP+drift is forced batch, RANDOM_WALK dispatches before drift
+        return MmrSelector.selectOne(
+            candidates, selectedEmbeddings, index, config.diversityLambda
+        )
     }
 
     /**

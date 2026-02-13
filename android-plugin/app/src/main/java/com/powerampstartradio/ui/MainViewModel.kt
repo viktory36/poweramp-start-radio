@@ -5,6 +5,7 @@ import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.powerampstartradio.data.EmbeddingDatabase
+import com.powerampstartradio.data.EmbeddingIndex
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.poweramp.TrackMatcher
@@ -94,6 +95,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val previewsLoading: StateFlow<Set<SelectionMode>> = _previewsLoading.asStateFlow()
 
     private val previewJobs = mutableMapOf<SelectionMode, Job>()
+
+    // Lazy drift rank computation (on-expand)
+    private var rankIndex: EmbeddingIndex? = null
+    private val _driftRanks = MutableStateFlow<Map<Long, Int>>(emptyMap())
+    val driftRanks: StateFlow<Map<Long, Int>> = _driftRanks.asStateFlow()
 
     val radioState: StateFlow<RadioUiState> = RadioService.uiState
     val sessionHistory: StateFlow<List<RadioResult>> = RadioService.sessionHistory
@@ -212,6 +218,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearSessionHistory() {
         RadioService.clearHistory()
+        _driftRanks.value = emptyMap()
+    }
+
+    fun requestDriftRank(trackId: Long) {
+        if (_driftRanks.value.containsKey(trackId)) return
+        val refEmb = RadioService.driftReferences.value[trackId] ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val index = getOrOpenRankIndex() ?: return@launch
+            val sims = index.computeAllSimilarities(refEmb)
+            val rank = index.rankFromSimilarities(sims, trackId)
+            _driftRanks.value = _driftRanks.value + (trackId to rank)
+        }
+    }
+
+    private fun getOrOpenRankIndex(): EmbeddingIndex? {
+        rankIndex?.let { return it }
+        val embFile = File(getApplication<Application>().filesDir, "fused.emb")
+        if (!embFile.exists()) return null
+        return try {
+            EmbeddingIndex.mmap(embFile).also { rankIndex = it }
+        } catch (_: Exception) { null }
     }
 
     fun clearPreview(mode: SelectionMode) {

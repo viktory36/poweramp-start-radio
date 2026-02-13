@@ -87,6 +87,9 @@ class RadioService : Service() {
         private val _sessionHistory = MutableStateFlow<List<RadioResult>>(emptyList())
         val sessionHistory: StateFlow<List<RadioResult>> = _sessionHistory.asStateFlow()
 
+        /** Drift reference embeddings for lazy rank computation, keyed by track ID. */
+        val driftReferences = MutableStateFlow<Map<Long, FloatArray>>(emptyMap())
+
         fun startRadio(context: Context, config: RadioConfig, showToasts: Boolean = false) {
             if (isSearchActive) return
             _uiState.value = RadioUiState.Loading()
@@ -273,6 +276,9 @@ class RadioService : Service() {
                         }
                     }
 
+                    // Clear drift references for new session
+                    driftReferences.value = emptyMap()
+
                     _uiState.value = RadioUiState.Streaming(RadioResult(
                         seedTrack = currentTrack,
                         matchType = matchResult.matchType,
@@ -293,6 +299,11 @@ class RadioService : Service() {
                             val fileId = matcher.mapSingleTrackToFileId(
                                 this@RadioService, similarTrack, seenFileIds
                             )
+
+                            // Store drift reference for lazy rank computation
+                            similarTrack.driftReferenceEmb?.let { ref ->
+                                driftReferences.value = driftReferences.value + (similarTrack.track.id to ref)
+                            }
 
                             streamingTracks.add(QueuedTrackResult(
                                 track = similarTrack.track,
