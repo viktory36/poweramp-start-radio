@@ -408,15 +408,11 @@ class RecommendationEngine(
                     val emb = index.getEmbeddingByTrackId(trackId)
                     if (emb != null) dotProduct(seedEmb, emb) else 0f
                 } else 0f
-                val seedRank = if (seedEmb != null && index != null) {
-                    index.computeRankOf(seedEmb, trackId)
-                } else null
                 SimilarTrack(
                     track = track,
                     similarity = score,
                     similarityToSeed = simToSeed,
                     candidateRank = i + 1,
-                    seedRank = seedRank,
                 )
             }
         }
@@ -427,15 +423,20 @@ class RecommendationEngine(
             config.minArtistSpacing
         ).take(config.numTracks)
 
+        // Compute seedRank only for final tracks (not all 1494 candidates)
+        val withRanks = if (seedEmb != null && index != null) {
+            filtered.map { it.copy(seedRank = index.computeRankOf(seedEmb, it.track.id)) }
+        } else filtered
+
         // Stream results if callback provided
         onResult?.let { callback ->
-            for (track in filtered) {
+            for (track in withRanks) {
                 callback(track)
             }
         }
 
-        Log.d(TAG, "Random walk: ${filtered.size} tracks")
-        return filtered
+        Log.d(TAG, "Random walk: ${withRanks.size} tracks")
+        return withRanks
     }
 
     /**
