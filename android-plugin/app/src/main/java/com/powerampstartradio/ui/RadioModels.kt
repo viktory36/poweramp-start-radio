@@ -88,6 +88,7 @@ data class QueuedTrackResult(
     val candidateRank: Int? = null,
     val seedRank: Int? = null,
     val driftRank: Int? = null,
+    val graphHops: Int? = null,
     val status: QueueStatus,
     val provenance: TrackProvenance = TrackProvenance(),
 )

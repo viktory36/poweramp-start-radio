@@ -312,6 +312,7 @@ class RadioService : Service() {
                                 candidateRank = similarTrack.candidateRank,
                                 seedRank = similarTrack.seedRank,
                                 driftRank = similarTrack.driftRank,
+                                graphHops = similarTrack.graphHops,
                                 status = if (fileId != null) QueueStatus.QUEUED else QueueStatus.NOT_IN_LIBRARY,
                                 provenance = similarTrack.provenance,
                             ))
@@ -421,6 +422,7 @@ class RadioService : Service() {
                             candidateRank = mapped.similarTrack.candidateRank,
                             seedRank = mapped.similarTrack.seedRank,
                             driftRank = mapped.similarTrack.driftRank,
+                            graphHops = mapped.similarTrack.graphHops,
                             status = status,
                             provenance = mapped.similarTrack.provenance,
                         )

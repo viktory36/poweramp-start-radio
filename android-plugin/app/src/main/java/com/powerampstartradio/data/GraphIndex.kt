@@ -108,4 +108,27 @@ class GraphIndex private constructor(
      * Check if a track exists in the graph.
      */
     fun hasTrack(trackId: Long): Boolean = trackId in trackIdToIndex
+
+    /**
+     * Compute shortest hop distance from a seed track to all reachable nodes via BFS.
+     *
+     * @return Map of trackId to hop count (seed itself is 0, direct neighbors are 1, etc.)
+     */
+    fun bfsFromSeed(seedTrackId: Long): Map<Long, Int> {
+        val distances = HashMap<Long, Int>()
+        distances[seedTrackId] = 0
+        val queue = ArrayDeque<Long>()
+        queue.add(seedTrackId)
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            val dist = distances[node]!!
+            for ((neighborId, _) in getNeighbors(node)) {
+                if (neighborId !in distances) {
+                    distances[neighborId] = dist + 1
+                    queue.add(neighborId)
+                }
+            }
+        }
+        return distances
+    }
 }

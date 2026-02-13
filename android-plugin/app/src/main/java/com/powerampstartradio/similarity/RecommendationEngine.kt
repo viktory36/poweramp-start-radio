@@ -41,6 +41,7 @@ data class SimilarTrack(
     val candidateRank: Int? = null,
     val seedRank: Int? = null,
     val driftRank: Int? = null,
+    val graphHops: Int? = null,
     val provenance: TrackProvenance = TrackProvenance(),
     val driftReferenceEmb: FloatArray? = null,
 )
@@ -400,6 +401,9 @@ class RecommendationEngine(
         val alpha = config.pageRankAlpha
         val ranking = RandomWalkSelector.computeRanking(graph, seedTrackId, alpha)
 
+        // BFS hop distances from seed for on-expand display
+        val hopDistances = graph.bfsFromSeed(seedTrackId)
+
         val seedEmb = index?.getEmbeddingByTrackId(seedTrackId)
 
         // Single scan serves both simToSeed and seedRank
@@ -418,6 +422,7 @@ class RecommendationEngine(
                     similarity = score,
                     similarityToSeed = simToSeed,
                     candidateRank = i + 1,
+                    graphHops = hopDistances[trackId],
                 )
             }
         }

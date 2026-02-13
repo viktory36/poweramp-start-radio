@@ -554,11 +554,16 @@ private fun TrackExplanation(
                     DriftMode.SEED_INTERPOLATION -> "to last"
                     DriftMode.MOMENTUM -> "to last few"
                 }
-                "was #${trackResult.seedRank} to seed \u00b7 #$driftRank $driftLabel"
+                "#${trackResult.seedRank} to seed \u00b7 #$driftRank $driftLabel"
             } else if (isPageRank) {
-                "was #${trackResult.seedRank} to seed"
+                val hopsText = when (trackResult.graphHops) {
+                    null, 0 -> ""
+                    1 -> " \u00b7 direct neighbor"
+                    else -> " \u00b7 ${trackResult.graphHops} hops"
+                }
+                "#${trackResult.seedRank} to seed$hopsText"
             } else {
-                "was #${trackResult.seedRank} most similar"
+                "#${trackResult.seedRank} to seed"
             }
             Text(text, style = MaterialTheme.typography.bodySmall, color = subtleColor)
         }
@@ -738,15 +743,15 @@ fun SettingsScreen(
                             DecaySchedule.EXPONENTIAL -> ", quick start"
                             DecaySchedule.STEP -> ", halfway"
                         }
-                        " + drift (anchored ${(anchorStrength * 100).roundToInt()}%$decay)"
+                        " + drift (seed interp ${(anchorStrength * 100).roundToInt()}%$decay)"
                     }
                     DriftMode.MOMENTUM ->
-                        " + drift (flowing ${(momentumBeta * 100).roundToInt()}%)"
+                        " + drift (momentum ${(momentumBeta * 100).roundToInt()}%)"
                 }
 
                 Column(modifier = Modifier.selectableGroup()) {
                     AlgorithmOption(
-                        label = "MMR",
+                        label = "Maximum Marginal Relevance (MMR)",
                         description = "Starts with the closest matches to the seed, then skips candidates that sound too similar to tracks already picked. Each pick is evaluated against the full queue so far.",
                         preview = previews[SelectionMode.MMR],
                         isLoading = SelectionMode.MMR in previewsLoading,
@@ -758,7 +763,7 @@ fun SettingsScreen(
                         onClick = { viewModel.setSelectionMode(SelectionMode.MMR) }
                     )
                     AlgorithmOption(
-                        label = "DPP",
+                        label = "Determinantal Point Process (DPP)",
                         description = "Looks at the full candidate pool at once. Scores every possible pair of tracks on both relevance to the seed and how different they sound from each other. Relevance and diversity are always balanced, the algorithm cannot trade one for the other.",
                         preview = previews[SelectionMode.DPP],
                         isLoading = SelectionMode.DPP in previewsLoading,
@@ -788,17 +793,17 @@ fun SettingsScreen(
             if (selectionMode == SelectionMode.MMR) {
                 item {
                     Column {
-                        Text("Similarity vs. Variety: ${(diversityLambda * 100).roundToInt()}%",
+                        Text("Similarity: ${(diversityLambda * 100).roundToInt()}%",
                             style = MaterialTheme.typography.titleSmall)
                         Text("All the way up: no penalty, picks the most similar tracks. All the way down: strong penalty, spreads picks apart even if individually less similar.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("More variety", style = MaterialTheme.typography.labelSmall,
+                            Text("Max diversity penalty", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                             Slider(value = diversityLambda, onValueChange = { viewModel.setDiversityLambda(it) },
                                 valueRange = 0f..1f, modifier = Modifier.weight(1f))
-                            Text("More similar", style = MaterialTheme.typography.labelSmall,
+                            Text("No penalty", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                         }
                     }
@@ -815,11 +820,11 @@ fun SettingsScreen(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("Explores further", style = MaterialTheme.typography.labelSmall,
+                            Text("Rarely returns", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                             Slider(value = pageRankAlpha, onValueChange = { viewModel.setPageRankAlpha(it) },
                                 valueRange = 0.05f..0.95f, modifier = Modifier.weight(1f))
-                            Text("Stays nearby", style = MaterialTheme.typography.labelSmall,
+                            Text("Returns often", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                         }
                     }
@@ -848,7 +853,7 @@ fun SettingsScreen(
                             Checkbox(checked = driftEnabled, onCheckedChange = null)
                             Spacer(modifier = Modifier.width(8.dp))
                             Column {
-                                Text("Drifting playlist", style = MaterialTheme.typography.bodyMedium)
+                                Text("Drift", style = MaterialTheme.typography.bodyMedium)
                                 Text("After each pick, the search shifts toward that track. Over time the playlist moves in a new direction away from the seed.",
                                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
@@ -867,7 +872,7 @@ fun SettingsScreen(
                                         verticalAlignment = Alignment.CenterVertically) {
                                         RadioButton(selected = driftMode == DriftMode.SEED_INTERPOLATION, onClick = null)
                                         Spacer(modifier = Modifier.width(4.dp))
-                                        Text("Anchored", style = MaterialTheme.typography.bodySmall)
+                                        Text("Seed interpolation", style = MaterialTheme.typography.bodySmall)
                                     }
                                     Row(modifier = Modifier.selectable(
                                         selected = driftMode == DriftMode.MOMENTUM,
@@ -877,38 +882,38 @@ fun SettingsScreen(
                                         verticalAlignment = Alignment.CenterVertically) {
                                         RadioButton(selected = driftMode == DriftMode.MOMENTUM, onClick = null)
                                         Spacer(modifier = Modifier.width(4.dp))
-                                        Text("Flowing", style = MaterialTheme.typography.bodySmall)
+                                        Text("Momentum", style = MaterialTheme.typography.bodySmall)
                                     }
                                 }
 
                                 Spacer(modifier = Modifier.height(4.dp))
 
                                 if (driftMode == DriftMode.SEED_INTERPOLATION) {
-                                    Text("Seed Influence: ${(anchorStrength * 100).roundToInt()}%",
+                                    Text("Seed weight: ${(anchorStrength * 100).roundToInt()}%",
                                         style = MaterialTheme.typography.titleSmall)
-                                    Text("Each pick blends the seed with the last track. High = stays near seed, low = follows the last pick.",
+                                    Text("Each query is a weighted mix of the seed and the last picked track. High = mostly seed. Low = mostly last pick.",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Text("Wanders", style = MaterialTheme.typography.labelSmall,
+                                        Text("Mostly last pick", style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                                         Slider(value = anchorStrength, onValueChange = { viewModel.setAnchorStrength(it) },
                                             valueRange = 0f..1f, modifier = Modifier.weight(1f))
-                                        Text("Stays close", style = MaterialTheme.typography.labelSmall,
+                                        Text("Mostly seed", style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                                     }
                                 } else {
-                                    Text("Memory: ${(momentumBeta * 100).roundToInt()}%",
+                                    Text("Carry-over: ${(momentumBeta * 100).roundToInt()}%",
                                         style = MaterialTheme.typography.titleSmall)
-                                    Text("Running average of recent picks. High = long memory (gradual drift), low = reacts fast to each new pick.",
+                                    Text("Each pick blends into a running average (EMA) that becomes the next search query. High carry-over means the average changes slowly and the playlist drifts gradually. Low carry-over means each new pick quickly takes over the query direction.",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Text("Reactive", style = MaterialTheme.typography.labelSmall,
+                                        Text("Latest pick dominates", style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                                         Slider(value = momentumBeta, onValueChange = { viewModel.setMomentumBeta(it) },
                                             valueRange = 0f..1f, modifier = Modifier.weight(1f))
-                                        Text("Gradual", style = MaterialTheme.typography.labelSmall,
+                                        Text("Slow to change", style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                                     }
                                 }
