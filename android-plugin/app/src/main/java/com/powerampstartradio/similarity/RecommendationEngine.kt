@@ -414,8 +414,9 @@ class RecommendationEngine(
 
         val seedEmb = index?.getEmbeddingByTrackId(seedTrackId)
 
-        // Resolve tracks, compute similarityToSeed, and post-filter
-        val ranked = ranking.take(config.candidatePoolSize)
+        // PageRank uses full ranking — its discovery power comes from transitive
+        // connections, so don't limit to the embedding retrieval pool size.
+        val ranked = ranking
         val tracks = ranked.indices.mapNotNull { i ->
             val (trackId, score) = ranked[i]
             database.getTrackById(trackId)?.let { track ->
