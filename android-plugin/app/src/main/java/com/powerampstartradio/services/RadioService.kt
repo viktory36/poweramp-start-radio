@@ -70,6 +70,7 @@ class RadioService : Service() {
         const val EXTRA_ANCHOR_STRENGTH = "anchor_strength"
         const val EXTRA_ANCHOR_DECAY = "anchor_decay"
         const val EXTRA_MOMENTUM_BETA = "momentum_beta"
+        const val EXTRA_PAGERANK_ALPHA = "pagerank_alpha"
         const val EXTRA_DIVERSITY_LAMBDA = "diversity_lambda"
         const val EXTRA_MAX_PER_ARTIST = "max_per_artist"
         const val EXTRA_MIN_ARTIST_SPACING = "min_artist_spacing"
@@ -99,6 +100,7 @@ class RadioService : Service() {
                 putExtra(EXTRA_ANCHOR_STRENGTH, config.anchorStrength)
                 putExtra(EXTRA_ANCHOR_DECAY, config.anchorDecay.name)
                 putExtra(EXTRA_MOMENTUM_BETA, config.momentumBeta)
+                putExtra(EXTRA_PAGERANK_ALPHA, config.pageRankAlpha)
                 putExtra(EXTRA_DIVERSITY_LAMBDA, config.diversityLambda)
                 putExtra(EXTRA_MAX_PER_ARTIST, config.maxPerArtist)
                 putExtra(EXTRA_MIN_ARTIST_SPACING, config.minArtistSpacing)
@@ -175,6 +177,7 @@ class RadioService : Service() {
                 DecaySchedule.valueOf(intent.getStringExtra(EXTRA_ANCHOR_DECAY) ?: DecaySchedule.EXPONENTIAL.name)
             } catch (e: IllegalArgumentException) { DecaySchedule.EXPONENTIAL },
             momentumBeta = intent.getFloatExtra(EXTRA_MOMENTUM_BETA, 0.7f),
+            pageRankAlpha = intent.getFloatExtra(EXTRA_PAGERANK_ALPHA, 0.5f),
             diversityLambda = intent.getFloatExtra(EXTRA_DIVERSITY_LAMBDA, 0.4f),
             maxPerArtist = intent.getIntExtra(EXTRA_MAX_PER_ARTIST, 8),
             minArtistSpacing = intent.getIntExtra(EXTRA_MIN_ARTIST_SPACING, 3),

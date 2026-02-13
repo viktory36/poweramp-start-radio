@@ -123,6 +123,7 @@ class StartRadioAction : ActionCallback {
                 DriftMode.valueOf(prefs.getString("drift_mode", DriftMode.SEED_INTERPOLATION.name)!!)
             } catch (e: IllegalArgumentException) { DriftMode.SEED_INTERPOLATION },
             anchorStrength = prefs.getFloat("anchor_strength", 0.5f),
+            pageRankAlpha = prefs.getFloat("pagerank_alpha", 0.5f),
             anchorDecay = try {
                 DecaySchedule.valueOf(prefs.getString("anchor_decay", DecaySchedule.EXPONENTIAL.name)!!)
             } catch (e: IllegalArgumentException) { DecaySchedule.EXPONENTIAL },

@@ -656,6 +656,7 @@ fun SettingsScreen(
     val driftMode by viewModel.driftMode.collectAsState()
     val anchorStrength by viewModel.anchorStrength.collectAsState()
     val anchorDecay by viewModel.anchorDecay.collectAsState()
+    val pageRankAlpha by viewModel.pageRankAlpha.collectAsState()
     val momentumBeta by viewModel.momentumBeta.collectAsState()
     val diversityLambda by viewModel.diversityLambda.collectAsState()
     val maxPerArtist by viewModel.maxPerArtist.collectAsState()
@@ -681,7 +682,7 @@ fun SettingsScreen(
         viewModel.invalidatePreview(SelectionMode.DPP)
         expandedPeek[SelectionMode.DPP] = false
     }
-    LaunchedEffect(commonKeys, anchorStrength) {
+    LaunchedEffect(commonKeys, pageRankAlpha) {
         viewModel.invalidatePreview(SelectionMode.RANDOM_WALK)
         expandedPeek[SelectionMode.RANDOM_WALK] = false
     }
@@ -765,7 +766,7 @@ fun SettingsScreen(
                         expanded = expandedPeek[SelectionMode.RANDOM_WALK] == true,
                         onToggleExpanded = { expandedPeek[SelectionMode.RANDOM_WALK] = !(expandedPeek[SelectionMode.RANDOM_WALK] ?: false) },
                         onRequestPreview = { viewModel.computePreview(SelectionMode.RANDOM_WALK) },
-                        previewInfo = "return ${(anchorStrength * 100).roundToInt()}%",
+                        previewInfo = "return ${(pageRankAlpha * 100).roundToInt()}%",
                         onClick = { viewModel.setSelectionMode(SelectionMode.RANDOM_WALK) }
                     )
                 }
@@ -796,7 +797,7 @@ fun SettingsScreen(
             if (isRandomWalk) {
                 item {
                     Column {
-                        Text("Return Frequency: ${(anchorStrength * 100).roundToInt()}%",
+                        Text("Return Frequency: ${(pageRankAlpha * 100).roundToInt()}%",
                             style = MaterialTheme.typography.titleSmall)
                         Text("How often the walk jumps back to the seed instead of continuing to the next neighbor. Low = wanders further through the graph. High = stays in the immediate neighborhood.",
                             style = MaterialTheme.typography.bodySmall,
@@ -804,7 +805,7 @@ fun SettingsScreen(
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text("Explores further", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
-                            Slider(value = anchorStrength, onValueChange = { viewModel.setAnchorStrength(it) },
+                            Slider(value = pageRankAlpha, onValueChange = { viewModel.setPageRankAlpha(it) },
                                 valueRange = 0.05f..0.95f, modifier = Modifier.weight(1f))
                             Text("Stays nearby", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))

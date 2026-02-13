@@ -42,6 +42,7 @@ data class RadioConfig(
     val driftMode: DriftMode = DriftMode.SEED_INTERPOLATION,
     val anchorStrength: Float = 0.5f,
     val anchorDecay: DecaySchedule = DecaySchedule.EXPONENTIAL,
+    val pageRankAlpha: Float = 0.5f,
     val momentumBeta: Float = 0.7f,
     val diversityLambda: Float = 0.4f,     // Audit: 0.4 = +4 artists, -0.01 sim vs 0.6
     val maxPerArtist: Int = 8,

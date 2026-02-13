@@ -409,7 +409,7 @@ class RecommendationEngine(
         }
 
         onProgress?.invoke("Computing random walk...")
-        val alpha = config.anchorStrength  // Reuse anchor strength as restart probability
+        val alpha = config.pageRankAlpha
         val ranking = RandomWalkSelector.computeRanking(graph, seedTrackId, alpha)
 
         val seedEmb = index?.getEmbeddingByTrackId(seedTrackId)
