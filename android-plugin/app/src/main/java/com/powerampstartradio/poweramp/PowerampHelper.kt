@@ -256,11 +256,13 @@ object PowerampHelper {
                 val durationIdx = it.getColumnIndex("duration")
 
                 while (it.moveToNext()) {
+                    val rawArtist = (it.getString(artistIdx) ?: "").lowercase().trim()
+                    val rawTitle = (it.getString(titleIdx) ?: "").lowercase().trim()
                     result.add(PowerampFileEntry(
                         id = it.getLong(idIdx),
-                        artist = normalizeNfc((it.getString(artistIdx) ?: "").lowercase().trim()),
+                        artist = normalizeNfc(normalizePowerampArtist(rawArtist)),
                         album = normalizeNfc((it.getString(albumIdx) ?: "").lowercase().trim()),
-                        title = normalizeNfc((it.getString(titleIdx) ?: "").lowercase().trim()),
+                        title = normalizeNfc(stripAudioExtension(rawTitle)),
                         durationMs = it.getInt(durationIdx) * 1000
                     ))
                 }
@@ -275,6 +277,26 @@ object PowerampHelper {
     private fun normalizeNfc(s: String): String {
         return Normalizer.normalize(s, Normalizer.Form.NFC)
     }
+
+    /** Poweramp uses "unknown artist" for untagged files; normalize to empty. */
+    private fun normalizePowerampArtist(artist: String): String {
+        return if (artist == "unknown artist") "" else artist
+    }
+
+    /** Poweramp sometimes includes the file extension in title_tag for untagged files. */
+    private fun stripAudioExtension(title: String): String {
+        val idx = title.lastIndexOf('.')
+        if (idx > 0) {
+            val ext = title.substring(idx)
+            if (ext in AUDIO_EXTENSIONS) return title.substring(0, idx)
+        }
+        return title
+    }
+
+    private val AUDIO_EXTENSIONS = setOf(
+        ".mp3", ".flac", ".opus", ".ogg", ".m4a", ".aac", ".wav",
+        ".wma", ".ape", ".wv", ".alac", ".aiff", ".aif"
+    )
 
     /**
      * Clear the Poweramp queue.
