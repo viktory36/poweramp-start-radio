@@ -329,6 +329,8 @@ fun HomeScreen(
                 CompactNowPlayingHeader(
                     currentTrack = currentTrack,
                     matchType = activeMatchType,
+                    isViewingHistory = viewingSession != null,
+                    onClick = { if (viewingSession != null) onViewSession(null) },
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                 )
 
@@ -410,10 +412,16 @@ fun HomeScreen(
 fun CompactNowPlayingHeader(
     currentTrack: PowerampTrack?,
     matchType: TrackMatcher.MatchType? = null,
+    isViewingHistory: Boolean = false,
+    onClick: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
+    val clickModifier = if (onClick != null) {
+        modifier.clickable(onClick = onClick)
+    } else modifier
+
     if (currentTrack != null) {
-        Column(modifier = modifier) {
+        Column(modifier = clickModifier) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("NOW PLAYING", style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.primary)
@@ -421,6 +429,11 @@ fun CompactNowPlayingHeader(
                     Text(" \u00b7 ${humanMatchType(matchType)}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                if (isViewingHistory) {
+                    Text(" \u00b7 tap to return",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.tertiary)
                 }
             }
             Text(text = currentTrack.title, style = MaterialTheme.typography.titleSmall,
