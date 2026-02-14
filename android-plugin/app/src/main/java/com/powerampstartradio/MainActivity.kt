@@ -633,7 +633,8 @@ fun SessionHistoryDrawer(sessions: List<RadioResult>, onSessionTap: (Int) -> Uni
             }
         } else {
             LazyColumn(modifier = Modifier.weight(1f), contentPadding = PaddingValues(vertical = 4.dp)) {
-                items(sessions.size) { index ->
+                items(sessions.size) { i ->
+                    val index = sessions.lastIndex - i
                     val session = sessions[index]
                     val timeStr = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(session.timestamp))
                     NavigationDrawerItem(
