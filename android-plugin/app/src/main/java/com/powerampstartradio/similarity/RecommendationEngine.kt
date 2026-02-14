@@ -386,10 +386,9 @@ class RecommendationEngine(
         onResult: (suspend (SimilarTrack) -> Unit)?
     ): List<SimilarTrack> {
         val graph = graphIndex
-        val index = embeddingIndex
+        val index = embeddingIndex ?: return emptyList()
         if (graph == null) {
             Log.w(TAG, "No graph.bin available, falling back to embedding search")
-            if (index == null) return emptyList()
             val seedEmb = index.getEmbeddingByTrackId(seedTrackId) ?: return emptyList()
             val ctx = coroutineContext
             val cancellationCheck: () -> Unit = { ctx.ensureActive() }
@@ -404,11 +403,10 @@ class RecommendationEngine(
         // BFS hop distances from seed for on-expand display
         val hopDistances = graph.bfsFromSeed(seedTrackId)
 
-        val seedEmb = index?.getEmbeddingByTrackId(seedTrackId)
+        val seedEmb = index.getEmbeddingByTrackId(seedTrackId)
 
         // Single scan serves both simToSeed and seedRank
-        val seedSims = if (seedEmb != null && index != null)
-            index.computeAllSimilarities(seedEmb) else null
+        val seedSims = seedEmb?.let { index.computeAllSimilarities(it) }
 
         // PageRank uses full ranking — its discovery power comes from transitive
         // connections, so don't limit to the embedding retrieval pool size.
@@ -416,7 +414,7 @@ class RecommendationEngine(
         val tracks = ranked.indices.mapNotNull { i ->
             val (trackId, score) = ranked[i]
             database.getTrackById(trackId)?.let { track ->
-                val simToSeed = seedSims?.let { index!!.getSimFromPrecomputed(it, trackId) } ?: 0f
+                val simToSeed = seedSims?.let { index.getSimFromPrecomputed(it, trackId) } ?: 0f
                 SimilarTrack(
                     track = track,
                     similarity = score,
@@ -434,7 +432,7 @@ class RecommendationEngine(
         ).take(config.numTracks)
 
         // Compute seedRank only for the ~50 filtered tracks (O(N) per call)
-        val withRanks = if (seedSims != null && index != null) {
+        val withRanks = if (seedSims != null) {
             filtered.map { it.copy(seedRank = index.rankFromSimilarities(seedSims, it.track.id)) }
         } else filtered
 

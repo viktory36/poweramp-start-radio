@@ -30,6 +30,7 @@ local.properties
 /android-plugin/.gradle/
 /android-plugin/app/.cxx/
 /android-plugin/captures/
+/android-plugin/.android-wsl-env
 .externalNativeBuild/
 .cxx/
 

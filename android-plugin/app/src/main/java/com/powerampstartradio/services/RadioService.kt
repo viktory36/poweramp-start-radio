@@ -237,7 +237,7 @@ class RadioService : Service() {
                 }
 
                 // Resolve auto pool size so RadioResult carries the actual value
-                val config = if (config.candidatePoolSize <= 0) {
+                val resolvedConfig = if (config.candidatePoolSize <= 0) {
                     val autoPool = (db.getTrackCount() * 0.02f).toInt().coerceAtLeast(100)
                     config.copy(candidatePoolSize = autoPool)
                 } else config
@@ -246,7 +246,7 @@ class RadioService : Service() {
 
                 // DPP+drift is degenerate (forced to batch in RecommendationEngine),
                 // so use batch path here too to avoid streaming/return-value mismatch.
-                val effectiveDrift = config.driftEnabled && config.selectionMode != SelectionMode.DPP
+                val effectiveDrift = resolvedConfig.driftEnabled && resolvedConfig.selectionMode != SelectionMode.DPP
                 if (effectiveDrift) {
                     // Drift path: stream search results to UI, queue to Poweramp
                     // in background batches (every 5 tracks). Queue ops are decoupled
@@ -283,14 +283,14 @@ class RadioService : Service() {
                         seedTrack = currentTrack,
                         matchType = matchResult.matchType,
                         tracks = emptyList(),
-                        config = config,
+                        config = resolvedConfig,
                         isComplete = false,
-                        totalExpected = config.numTracks
+                        totalExpected = resolvedConfig.numTracks
                     ))
 
                     eng.generatePlaylist(
                         seedTrackId = matchResult.embeddedTrack.id,
-                        config = config,
+                        config = resolvedConfig,
                         onProgress = { message ->
                             updateNotification(message)
                         },
@@ -321,9 +321,9 @@ class RadioService : Service() {
                                 seedTrack = currentTrack,
                                 matchType = matchResult.matchType,
                                 tracks = streamingTracks.toList(),
-                                config = config,
+                                config = resolvedConfig,
                                 isComplete = false,
-                                totalExpected = config.numTracks
+                                totalExpected = resolvedConfig.numTracks
                             ))
 
                             // Batch file IDs for background queuing
@@ -357,10 +357,10 @@ class RadioService : Service() {
                         seedTrack = currentTrack,
                         matchType = matchResult.matchType,
                         tracks = streamingTracks.toList(),
-                        config = config,
+                        config = resolvedConfig,
                         queuedFileIds = queuedFileIds.toSet(),
                         isComplete = true,
-                        totalExpected = config.numTracks,
+                        totalExpected = resolvedConfig.numTracks,
                         metrics = driftMetrics
                     )
 
@@ -369,9 +369,10 @@ class RadioService : Service() {
 
                     PowerampHelper.reloadData(this@RadioService)
 
-                    val message = "${finalResult.queuedCount} tracks queued"
+                    val notFound = streamingTracks.count { it.status == QueueStatus.NOT_IN_LIBRARY }
+                    val message = buildQueueResultMessage(finalResult.queuedCount, notFound)
                     updateNotification(message)
-                    Log.d(TAG, "Queue result: ${finalResult.queuedCount} queued / ${finalResult.failedCount} failed")
+                    Log.d(TAG, "Queue result: ${finalResult.queuedCount} queued / ${finalResult.failedCount} failed / $notFound not found")
                     Toast.makeText(this@RadioService, message, Toast.LENGTH_SHORT).show()
 
                 } else {
@@ -380,7 +381,7 @@ class RadioService : Service() {
 
                     val similarTracks = eng.generatePlaylist(
                         seedTrackId = matchResult.embeddedTrack.id,
-                        config = config,
+                        config = resolvedConfig,
                         onProgress = { message ->
                             _uiState.value = RadioUiState.Searching(message)
                             updateNotification(message)
@@ -435,7 +436,7 @@ class RadioService : Service() {
                         seedTrack = currentTrack,
                         matchType = matchResult.matchType,
                         tracks = trackResults,
-                        config = config,
+                        config = resolvedConfig,
                         queuedFileIds = queuedFileIds,
                         metrics = batchMetrics
                     )
@@ -445,9 +446,10 @@ class RadioService : Service() {
 
                     PowerampHelper.reloadData(this@RadioService)
 
-                    val message = "${radioResult.queuedCount} tracks queued"
+                    val notFound = trackResults.count { it.status == QueueStatus.NOT_IN_LIBRARY }
+                    val message = buildQueueResultMessage(radioResult.queuedCount, notFound)
                     updateNotification(message)
-                    Log.d(TAG, "Queue result: ${radioResult.queuedCount} queued / ${radioResult.failedCount} failed")
+                    Log.d(TAG, "Queue result: ${radioResult.queuedCount} queued / ${radioResult.failedCount} failed / $notFound not found")
                     Toast.makeText(this@RadioService, message, Toast.LENGTH_SHORT).show()
                 }
 
@@ -488,6 +490,11 @@ class RadioService : Service() {
     private fun getOrCreateEngine(db: EmbeddingDatabase): RecommendationEngine {
         engine?.let { return it }
         return RecommendationEngine(db, filesDir).also { engine = it }
+    }
+
+    private fun buildQueueResultMessage(queuedCount: Int, notFoundCount: Int): String {
+        val base = "$queuedCount tracks queued"
+        return if (notFoundCount > 0) "$base ($notFoundCount not found)" else base
     }
 
     private fun toast(message: String) {
