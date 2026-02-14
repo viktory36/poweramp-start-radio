@@ -14,7 +14,9 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -53,6 +55,7 @@ import com.powerampstartradio.ui.DatabaseInfo
 import com.powerampstartradio.ui.DecaySchedule
 import com.powerampstartradio.ui.DriftMode
 import com.powerampstartradio.ui.MainViewModel
+import com.powerampstartradio.ui.RadioConfig
 import com.powerampstartradio.ui.QueueStatus
 import com.powerampstartradio.ui.QueuedTrackResult
 import com.powerampstartradio.ui.RadioResult
@@ -451,6 +454,7 @@ fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
     Column(modifier = modifier) {
         LazyColumn(state = listState, modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)) {
+            item { SessionSeedHeader(session = session) }
             items(session.tracks.size) { index ->
                 TrackResultRow(
                     trackResult = session.tracks[index],
@@ -462,6 +466,32 @@ fun SessionPage(session: RadioResult, modifier: Modifier = Modifier) {
             }
         }
     }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun SessionSeedHeader(session: RadioResult, modifier: Modifier = Modifier) {
+    val config = session.config
+    val summary = buildString {
+        append(session.seedTrack.title)
+        append(" \u00b7 ")
+        if (!session.isComplete) {
+            append("${session.tracks.size}/${session.totalExpected}")
+        } else if (session.failedCount > 0) {
+            append("${session.queuedCount}/${session.requestedCount} queued")
+        } else {
+            append("${session.queuedCount} tracks")
+        }
+        append(" \u00b7 ")
+        append(humanModeWithKnobs(config))
+    }
+    Text(
+        text = summary,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(vertical = 4.dp).fillMaxWidth().basicMarquee(),
+        maxLines = 1
+    )
 }
 
 @Composable
@@ -1095,3 +1125,29 @@ private fun humanSelectionMode(mode: SelectionMode, drift: Boolean = false): Str
     }
     return if (drift && mode != SelectionMode.DPP && mode != SelectionMode.RANDOM_WALK) "$base + drift" else base
 }
+
+/** Mode name with knob values, e.g. "MMR λ=0.4 + drift α=0.5 exp" or "PageRank α=0.5". */
+private fun humanModeWithKnobs(config: RadioConfig): String = buildString {
+    when (config.selectionMode) {
+        SelectionMode.MMR -> {
+            append("MMR \u03bb=${formatKnob(config.diversityLambda)}")
+            if (config.driftEnabled) {
+                when (config.driftMode) {
+                    DriftMode.SEED_INTERPOLATION -> {
+                        append(" + drift \u03b1=${formatKnob(config.anchorStrength)}")
+                        if (config.anchorDecay != DecaySchedule.NONE)
+                            append(" ${config.anchorDecay.name.lowercase()}")
+                    }
+                    DriftMode.MOMENTUM -> {
+                        append(" + momentum \u03b2=${formatKnob(config.momentumBeta)}")
+                    }
+                }
+            }
+        }
+        SelectionMode.DPP -> append("DPP")
+        SelectionMode.RANDOM_WALK -> append("PageRank \u03b1=${formatKnob(config.pageRankAlpha)}")
+    }
+}
+
+private fun formatKnob(v: Float): String =
+    if (v == v.toInt().toFloat()) v.toInt().toString() else "%.2f".format(v).trimEnd('0')
