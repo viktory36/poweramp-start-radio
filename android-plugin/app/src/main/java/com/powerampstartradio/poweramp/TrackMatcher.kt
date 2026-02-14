@@ -220,7 +220,60 @@ class TrackMatcher(
             fileId = byFilenameKey[normalizedFnKey]
         }
 
+        if (fileId == null) {
+            logMissDiagnostics(track, embeddedArtist, embeddedTitle)
+        }
+
         return fileId
+    }
+
+    /**
+     * Log diagnostic info on a miss: show what we tried and what Poweramp entries
+     * contain similar text, so the metadata mismatch can be identified.
+     */
+    private fun logMissDiagnostics(track: EmbeddedTrack, embeddedArtist: String, embeddedTitle: String) {
+        val byTitle = cachedByTitle!!
+        val byFilenameKey = cachedByFilenameKey!!
+
+        // Extract distinctive words from the title for substring search
+        val words = embeddedTitle.split(Regex("\\s+"))
+            .filter { it.length >= 4 }
+            .take(3)
+
+        val fnKey = normalizeNfc(track.filenameKey)
+        val fnWords = fnKey.split(Regex("\\s+"))
+            .filter { it.length >= 4 }
+            .take(3)
+
+        // Search Poweramp titles for substring matches
+        val nearTitles = byTitle.keys
+            .filter { paTitle -> words.isNotEmpty() && words.all { w -> paTitle.contains(w) } }
+            .take(5)
+
+        // Search filename key index for substring matches
+        val nearFnKeys = byFilenameKey.keys
+            .filter { paFnKey -> fnWords.isNotEmpty() && fnWords.all { w -> paFnKey.contains(w) } }
+            .take(5)
+
+        Log.w(TAG, "MISS DIAGNOSTICS for track ${track.id}:")
+        Log.w(TAG, "  embedded: artist='$embeddedArtist' title='$embeddedTitle'")
+        Log.w(TAG, "  fnKey='$fnKey'")
+        Log.w(TAG, "  search words: $words / fnWords: $fnWords")
+        if (nearTitles.isNotEmpty()) {
+            for (t in nearTitles) {
+                val artists = byTitle[t]?.keys?.joinToString(", ") ?: "?"
+                Log.w(TAG, "  ~title: '$t' (artists: $artists)")
+            }
+        } else {
+            Log.w(TAG, "  ~title: (no Poweramp titles contain all of: $words)")
+        }
+        if (nearFnKeys.isNotEmpty()) {
+            for (k in nearFnKeys) {
+                Log.w(TAG, "  ~fnKey: '$k' → id=${byFilenameKey[k]}")
+            }
+        } else {
+            Log.w(TAG, "  ~fnKey: (no Poweramp fnKeys contain all of: $fnWords)")
+        }
     }
 
     /**
