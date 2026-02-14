@@ -98,22 +98,25 @@ def export_mulan_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
     """
     from muq import MuQMuLan
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     logger.info("Loading MuQ-MuLan model...")
     model = MuQMuLan.from_pretrained("OpenMuQ/MuQ-MuLan-large")
     model.eval()
 
     if fp16:
         model = model.half()
+    model = model.to(device)
 
     wrapper = MuLanAudioOnnxWrapper(model)
     wrapper.eval()
 
     # 10s clip at 24kHz
-    dummy_wav = torch.randn(1, 240000)
+    dummy_wav = torch.randn(1, 240000, device=device)
     if fp16:
         dummy_wav = dummy_wav.half()
 
-    logger.info(f"Exporting MuQ-MuLan to {output_path} (opset {opset}, fp16={fp16})...")
+    logger.info(f"Exporting MuQ-MuLan to {output_path} (opset {opset}, fp16={fp16}, device={device})...")
 
     try:
         torch.onnx.export(
@@ -132,10 +135,15 @@ def export_mulan_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
     except Exception as e:
         logger.warning(f"Standard ONNX export failed: {e}")
         logger.info("Trying with mel spectrogram as preprocessing step...")
-        return _export_mulan_split(model, output_path, fp16, opset)
+        return _export_mulan_split(model, output_path, fp16, opset, device)
 
     size_mb = output_path.stat().st_size / 1024 / 1024
     logger.info(f"Exported MuQ-MuLan: {size_mb:.1f} MB")
+
+    del model, wrapper
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return output_path
 
 
@@ -174,7 +182,7 @@ class MuLanPostMelWrapper(nn.Module):
         return self.mulan_inner.get_audio_latents(mel_features)
 
 
-def _export_mulan_split(model, output_path: Path, fp16: bool, opset: int):
+def _export_mulan_split(model, output_path: Path, fp16: bool, opset: int, device: str = "cpu"):
     """Fallback: export MuQ-MuLan with mel spectrogram as input.
 
     If raw waveform export fails (torch.stft ONNX issues), we split the model:
@@ -195,7 +203,7 @@ def _export_mulan_split(model, output_path: Path, fp16: bool, opset: int):
 
     handle = preproc.register_forward_hook(hook_fn)
 
-    dummy_wav = torch.randn(1, 240000)
+    dummy_wav = torch.randn(1, 240000, device=device)
     if fp16:
         dummy_wav = dummy_wav.half()
 
@@ -302,6 +310,8 @@ def export_flamingo_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
         get_flamingo_encoder_path,
     )
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     encoder_path = get_flamingo_encoder_path()
     logger.info(f"Loading Music Flamingo encoder from {encoder_path}...")
 
@@ -323,20 +333,25 @@ def export_flamingo_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
         if projector is not None:
             projector = projector.half()
 
+    encoder = encoder.to(device)
+    if projector is not None:
+        projector = projector.to(device)
+
     wrapper = FlamingoOnnxWrapper(encoder, projector)
     wrapper.eval()
 
     # Dummy inputs: single 30s chunk
     batch_size = 1
-    dummy_mel = torch.randn(batch_size, 128, 3000)
-    dummy_mask = torch.ones(batch_size, 3000, dtype=torch.long)
-    dummy_times = torch.arange(750, dtype=torch.float32).unsqueeze(0) * FRAME_DURATION_S
+    dummy_mel = torch.randn(batch_size, 128, 3000, device=device)
+    dummy_mask = torch.ones(batch_size, 3000, dtype=torch.long, device=device)
+    dummy_times = (torch.arange(750, dtype=torch.float32, device=device).unsqueeze(0)
+                   * FRAME_DURATION_S)
 
     if fp16:
         dummy_mel = dummy_mel.half()
         dummy_times = dummy_times.half()
 
-    logger.info(f"Exporting Flamingo to {output_path} (opset {opset}, fp16={fp16})...")
+    logger.info(f"Exporting Flamingo to {output_path} (opset {opset}, fp16={fp16}, device={device})...")
 
     torch.onnx.export(
         wrapper,
