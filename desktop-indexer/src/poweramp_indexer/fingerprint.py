@@ -2,11 +2,17 @@
 
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_field(value: str) -> str:
+    """Lowercase, strip, NFC-normalize, and remove pipe characters from a metadata field."""
+    return unicodedata.normalize('NFC', value.lower().strip().replace("|", "/"))
 
 
 @dataclass
@@ -22,11 +28,11 @@ class TrackMetadata:
     def metadata_key(self) -> str:
         """
         Create a metadata key for matching: "artist|album|title|duration_ms"
-        All strings are lowercased and stripped.
+        All strings are lowercased, stripped, NFC-normalized, and pipe-sanitized.
         """
-        artist = (self.artist or "").lower().strip()
-        album = (self.album or "").lower().strip()
-        title = (self.title or "").lower().strip()
+        artist = _normalize_field(self.artist or "")
+        album = _normalize_field(self.album or "")
+        title = _normalize_field(self.title or "")
         # Round duration to nearest 100ms to allow for minor variations
         duration_rounded = (self.duration_ms // 100) * 100
         return f"{artist}|{album}|{title}|{duration_rounded}"
@@ -44,7 +50,7 @@ class TrackMetadata:
         name = re.sub(r'^\d+[\.\-\s]+', '', name)
         # Normalize whitespace
         name = re.sub(r'\s+', ' ', name).strip()
-        return name
+        return unicodedata.normalize('NFC', name)
 
 
 def extract_metadata(file_path: Path) -> TrackMetadata:

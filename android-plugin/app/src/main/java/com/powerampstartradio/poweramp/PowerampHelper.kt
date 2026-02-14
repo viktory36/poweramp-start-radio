@@ -8,6 +8,7 @@ import android.content.Intent
 import android.database.Cursor
 import android.net.Uri
 import android.util.Log
+import java.text.Normalizer
 
 /**
  * Helper for interacting with Poweramp via its public API.
@@ -231,6 +232,51 @@ object PowerampHelper {
     }
 
     /**
+     * Get all file entries from Poweramp's library with NFC-normalized individual fields.
+     * Used by TrackMatcher for robust matching that doesn't depend on pipe-delimited keys.
+     */
+    fun getAllFileEntries(context: Context): List<PowerampFileEntry> {
+        val filesUri = ROOT_URI.buildUpon().appendEncodedPath("files").build()
+        val result = mutableListOf<PowerampFileEntry>()
+
+        try {
+            val cursor = context.contentResolver.query(
+                filesUri,
+                arrayOf("folder_files._id", "artist", "album", "title_tag", "folder_files.duration"),
+                null,
+                null,
+                null
+            )
+
+            cursor?.use {
+                val idIdx = it.getColumnIndex("_id")
+                val artistIdx = it.getColumnIndex("artist")
+                val albumIdx = it.getColumnIndex("album")
+                val titleIdx = it.getColumnIndex("title_tag")
+                val durationIdx = it.getColumnIndex("duration")
+
+                while (it.moveToNext()) {
+                    result.add(PowerampFileEntry(
+                        id = it.getLong(idIdx),
+                        artist = normalizeNfc((it.getString(artistIdx) ?: "").lowercase().trim()),
+                        album = normalizeNfc((it.getString(albumIdx) ?: "").lowercase().trim()),
+                        title = normalizeNfc((it.getString(titleIdx) ?: "").lowercase().trim()),
+                        durationMs = it.getInt(durationIdx) * 1000
+                    ))
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting all file entries", e)
+        }
+
+        return result
+    }
+
+    private fun normalizeNfc(s: String): String {
+        return Normalizer.normalize(s, Normalizer.Form.NFC)
+    }
+
+    /**
      * Clear the Poweramp queue.
      */
     fun clearQueue(context: Context) {
@@ -402,3 +448,15 @@ data class PowerampTrack(
             return "$a|$al|$t|$d"
         }
 }
+
+/**
+ * A Poweramp file entry with NFC-normalized individual fields.
+ * Used by TrackMatcher for robust matching without pipe-delimited key splitting.
+ */
+data class PowerampFileEntry(
+    val id: Long,
+    val artist: String,
+    val album: String,
+    val title: String,
+    val durationMs: Int
+)

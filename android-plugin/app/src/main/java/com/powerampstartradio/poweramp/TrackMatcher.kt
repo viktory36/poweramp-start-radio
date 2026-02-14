@@ -5,6 +5,7 @@ import android.util.Log
 import com.powerampstartradio.data.EmbeddedTrack
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.similarity.SimilarTrack
+import java.text.Normalizer
 
 /**
  * Matches Poweramp tracks to embedded tracks in the database.
@@ -20,19 +21,19 @@ class TrackMatcher(
     companion object {
         private const val TAG = "TrackMatcher"
 
-        // Cache the Poweramp file ID map across invocations (same app session)
-        private var cachedFileIds: Map<String, Long>? = null
-
-        // Secondary lookup indexes (built from cachedFileIds)
+        // Cache the Poweramp lookup indexes across invocations (same app session)
         private var cachedByArtistAlbumTitle: Map<String, Long>? = null
         private var cachedByArtistTitle: Map<String, Long>? = null
         private var cachedByTitle: Map<String, Map<String, Long>>? = null
+        private var cachedByFilenameKey: Map<String, Long>? = null
+        private var cachedEntryCount: Int = 0
 
         fun invalidateCache() {
-            cachedFileIds = null
             cachedByArtistAlbumTitle = null
             cachedByArtistTitle = null
             cachedByTitle = null
+            cachedByFilenameKey = null
+            cachedEntryCount = 0
         }
     }
 
@@ -126,36 +127,100 @@ class TrackMatcher(
     }
 
     /**
-     * Ensure all caches (file IDs + secondary lookup indexes) are built.
-     * No-op if already cached.
+     * Ensure all Poweramp lookup indexes are built. No-op if already cached.
+     *
+     * Builds indexes from individual Poweramp fields (not pipe-delimited keys),
+     * so pipes in artist/album/title don't corrupt matching.
      */
     private fun ensureCache(context: Context) {
-        val powerampFiles = cachedFileIds ?: PowerampHelper.getAllFileIds(context).also {
-            cachedFileIds = it
-        }
+        if (cachedByArtistAlbumTitle != null) return
 
-        if (cachedByArtistAlbumTitle == null) {
-            val byArtistAlbumTitle = mutableMapOf<String, Long>()
-            val byArtistTitle = mutableMapOf<String, Long>()
-            val byTitle = mutableMapOf<String, MutableMap<String, Long>>()
+        val entries = PowerampHelper.getAllFileEntries(context)
 
-            for ((key, id) in powerampFiles) {
-                val parts = key.split("|")
-                if (parts.size >= 3) {
-                    val artist = parts[0]
-                    val album = parts[1]
-                    val title = parts[2]
-                    byArtistAlbumTitle["$artist|$album|$title"] = id
-                    byArtistTitle["$artist|$title"] = id
-                    byTitle.getOrPut(title) { mutableMapOf() }[artist] = id
+        val byArtistAlbumTitle = HashMap<String, Long>(entries.size)
+        val byArtistTitle = HashMap<String, Long>(entries.size)
+        val byTitle = HashMap<String, MutableMap<String, Long>>()
+        val byFilenameKey = HashMap<String, Long>(entries.size * 2)
+
+        for (entry in entries) {
+            // Indexes keyed on individual NFC-normalized fields — immune to pipe corruption
+            byArtistAlbumTitle["${entry.artist}\u0000${entry.album}\u0000${entry.title}"] = entry.id
+            byArtistTitle["${entry.artist}\u0000${entry.title}"] = entry.id
+            byTitle.getOrPut(entry.title) { mutableMapOf() }[entry.artist] = entry.id
+
+            // Filename-key index: normalize Poweramp title as a filename for fallback matching.
+            // Catches cases where desktop used filename-as-title but Poweramp has the same text.
+            val normalizedTitle = normalizeAsFilename(entry.title)
+            if (normalizedTitle.isNotEmpty()) {
+                byFilenameKey[normalizedTitle] = entry.id
+            }
+            // Also index "artist - title" combined, for when the desktop filename was
+            // "Artist - Title.ext" but Poweramp split it into separate fields.
+            if (entry.artist.isNotEmpty()) {
+                val combined = normalizeAsFilename("${entry.artist} - ${entry.title}")
+                if (combined.isNotEmpty()) {
+                    byFilenameKey[combined] = entry.id
                 }
             }
-            Log.d(TAG, "Indexed ${powerampFiles.size} Poweramp tracks")
-
-            cachedByArtistAlbumTitle = byArtistAlbumTitle
-            cachedByArtistTitle = byArtistTitle
-            cachedByTitle = byTitle
         }
+
+        Log.d(TAG, "Indexed ${entries.size} Poweramp tracks " +
+            "(${byFilenameKey.size} filename keys)")
+
+        cachedByArtistAlbumTitle = byArtistAlbumTitle
+        cachedByArtistTitle = byArtistTitle
+        cachedByTitle = byTitle
+        cachedByFilenameKey = byFilenameKey
+        cachedEntryCount = entries.size
+    }
+
+    /**
+     * Resolve an embedded track to its Poweramp file ID using all matching strategies.
+     * Returns null if no match found.
+     */
+    private fun resolveFileId(track: EmbeddedTrack): Long? {
+        val byArtistAlbumTitle = cachedByArtistAlbumTitle!!
+        val byArtistTitle = cachedByArtistTitle!!
+        val byTitle = cachedByTitle!!
+        val byFilenameKey = cachedByFilenameKey!!
+
+        // Use individual fields (NFC normalized) — immune to pipes in metadata
+        val embeddedArtist = normalizeNfc((track.artist ?: "").lowercase().trim())
+        val embeddedAlbum = normalizeNfc((track.album ?: "").lowercase().trim())
+        val embeddedTitle = normalizeNfc((track.title ?: "").lowercase().trim())
+
+        // 1. Exact artist + album + title
+        var fileId = byArtistAlbumTitle["$embeddedArtist\u0000$embeddedAlbum\u0000$embeddedTitle"]
+
+        // 2. artist + title (any album)
+        if (fileId == null) {
+            fileId = byArtistTitle["$embeddedArtist\u0000$embeddedTitle"]
+        }
+
+        // 3. Fuzzy: find by title, check artist overlap
+        if (fileId == null) {
+            val candidates = byTitle[embeddedTitle]
+            if (candidates != null) {
+                if (embeddedArtist.isNotEmpty()) {
+                    candidates.entries.find { (powerampArtist, _) ->
+                        powerampArtist.contains(embeddedArtist) ||
+                            embeddedArtist.contains(powerampArtist)
+                    }?.let { (_, id) -> fileId = id }
+                } else {
+                    // No artist info — accept any match for this title
+                    candidates.values.firstOrNull()?.let { id -> fileId = id }
+                }
+            }
+        }
+
+        // 4. Filename key fallback: match embedded filenameKey against normalized
+        //    Poweramp titles (and combined "artist - title" keys).
+        if (fileId == null && track.filenameKey.isNotEmpty()) {
+            val normalizedFnKey = normalizeNfc(track.filenameKey)
+            fileId = byFilenameKey[normalizedFnKey]
+        }
+
+        return fileId
     }
 
     /**
@@ -172,51 +237,22 @@ class TrackMatcher(
         seen: MutableSet<Long>
     ): Long? {
         ensureCache(context)
-        val byArtistAlbumTitle = cachedByArtistAlbumTitle!!
-        val byArtistTitle = cachedByArtistTitle!!
-        val byTitle = cachedByTitle!!
 
-        val track = similarTrack.track
-        val parts = track.metadataKey.split("|")
-
-        if (parts.size < 3) {
-            Log.w(TAG, "MISS: bad metadata_key='${track.metadataKey}' (not enough parts)")
-            return null
-        }
-
-        val embeddedArtist = parts[0]
-        val embeddedAlbum = parts[1]
-        val embeddedTitle = parts[2]
-
-        // 1. Try exact artist|album|title
-        var fileId = byArtistAlbumTitle["$embeddedArtist|$embeddedAlbum|$embeddedTitle"]
-
-        // 2. Try artist|title (any album)
-        if (fileId == null) {
-            fileId = byArtistTitle["$embeddedArtist|$embeddedTitle"]
-        }
-
-        // 3. Fuzzy: find by title, check artist substring
-        if (fileId == null) {
-            byTitle[embeddedTitle]?.entries?.find { (powerampArtist, _) ->
-                embeddedArtist.isNotEmpty() && (
-                    powerampArtist.contains(embeddedArtist) ||
-                    embeddedArtist.contains(powerampArtist)
-                )
-            }?.let { (_, id) -> fileId = id }
-        }
+        val fileId = resolveFileId(similarTrack.track)
 
         if (fileId == null) {
-            Log.w(TAG, "MISS: embedded='$embeddedArtist|$embeddedAlbum|$embeddedTitle' — no Poweramp match")
+            Log.w(TAG, "MISS: '${similarTrack.track.artist ?: ""}' - '${similarTrack.track.title ?: ""}' " +
+                "(fnKey='${similarTrack.track.filenameKey}')")
             return null
         }
 
         if (fileId in seen) {
-            Log.d(TAG, "DUPE: embedded='$embeddedArtist|$embeddedTitle' → fileId=$fileId already queued, skipping")
+            Log.d(TAG, "DUPE: '${similarTrack.track.artist ?: ""}' - '${similarTrack.track.title ?: ""}' " +
+                "→ fileId=$fileId already queued, skipping")
             return null
         }
 
-        seen.add(fileId!!)
+        seen.add(fileId)
         return fileId
     }
 
@@ -235,31 +271,14 @@ class TrackMatcher(
 
         for (similarTrack in similarTracks) {
             val fileId = mapSingleTrackToFileId(context, similarTrack, seen)
-            // mapSingleTrackToFileId returns null for both not-found and dupes;
-            // for batch mapping we still want to include not-found tracks in results
-            // but skip dupes. Re-check to distinguish.
             if (fileId != null) {
                 result.add(MappedTrack(similarTrack, fileId))
             } else {
-                // Check if it was a dupe (fileId was found but already seen)
-                val track = similarTrack.track
-                val parts = track.metadataKey.split("|")
-                if (parts.size >= 3) {
-                    val byArtistAlbumTitle = cachedByArtistAlbumTitle!!
-                    val byArtistTitle = cachedByArtistTitle!!
-                    val byTitle = cachedByTitle!!
-                    val embeddedArtist = parts[0]
-                    val embeddedAlbum = parts[1]
-                    val embeddedTitle = parts[2]
-                    val resolvedId = byArtistAlbumTitle["$embeddedArtist|$embeddedAlbum|$embeddedTitle"]
-                        ?: byArtistTitle["$embeddedArtist|$embeddedTitle"]
-                        ?: byTitle[embeddedTitle]?.entries?.find { (pa, _) ->
-                            embeddedArtist.isNotEmpty() && (pa.contains(embeddedArtist) || embeddedArtist.contains(pa))
-                        }?.value
-                    if (resolvedId != null && resolvedId in seen) {
-                        // Dupe — skip entirely (matches old behavior: `continue`)
-                        continue
-                    }
+                // Distinguish not-found from dupe: resolve again without dedup
+                val resolvedId = resolveFileId(similarTrack.track)
+                if (resolvedId != null && resolvedId in seen) {
+                    // Dupe — skip entirely
+                    continue
                 }
                 result.add(MappedTrack(similarTrack, null))
             }
@@ -268,5 +287,24 @@ class TrackMatcher(
         val mapped = result.count { it.fileId != null }
         Log.d(TAG, "Mapped $mapped of ${similarTracks.size} similar tracks")
         return result
+    }
+
+    /** NFC-normalize a string for consistent matching across platforms. */
+    private fun normalizeNfc(s: String): String {
+        return Normalizer.normalize(s, Normalizer.Form.NFC)
+    }
+
+    /**
+     * Normalize a string the same way the desktop indexer normalizes filenames:
+     * lowercase, strip parentheticals, strip track numbers, collapse whitespace.
+     */
+    private fun normalizeAsFilename(s: String): String {
+        return normalizeNfc(
+            s.lowercase()
+                .replace(Regex("\\s*[\\(\\[].*?[\\)\\]]"), "")
+                .replace(Regex("^\\d+[.\\-\\s]+"), "")
+                .replace(Regex("\\s+"), " ")
+                .trim()
+        )
     }
 }
