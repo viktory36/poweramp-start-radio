@@ -147,63 +147,51 @@ def export_mulan_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
     return output_path
 
 
-def _find_mel_module(root_module):
-    """Find the mel/STFT feature extractor in the module tree.
-
-    Searches by class name (torchaudio MelSpectrogram, Spectrogram, etc.)
-    and by module path (muq.muq.modules.features).
-
-    Returns (dotted_name, module) or (None, None) if not found.
-    """
-    # Strategy 1: look for torchaudio mel/spectrogram transforms
-    for name, mod in root_module.named_modules():
-        class_name = type(mod).__name__
-        if class_name in ('MelSpectrogram', 'MelSTFT', 'Spectrogram'):
-            return name, mod
-
-    # Strategy 2: look for muq's feature extractor by module path
-    for name, mod in root_module.named_modules():
-        mod_path = type(mod).__module__ or ""
-        if 'features' in mod_path and hasattr(mod, '__call__'):
-            return name, mod
-
-    # Strategy 3: look by attribute name patterns
-    for name, mod in root_module.named_modules():
-        if any(x in name for x in ['preprocessing', 'feature_extract', 'mel_stft']):
-            return name, mod
-
-    return None, None
-
-
-def _replace_module_by_name(root, dotted_name, replacement):
-    """Replace a submodule identified by dotted name (e.g. 'audio.model.feat')."""
-    parts = dotted_name.split('.')
-    parent = root
-    for p in parts[:-1]:
-        parent = getattr(parent, p)
-    setattr(parent, parts[-1], replacement)
-
-
 class MuLanPostMelWrapper(nn.Module):
-    """Fallback wrapper that takes mel features instead of raw waveform.
+    """Fallback wrapper that takes normalized mel features as input.
 
-    Used when torch.stft fails to export in ONNX. The mel spectrogram
-    is computed outside the ONNX model (in Python preprocessing or on Android).
+    Used when torch.stft fails to export in ONNX. The mel spectrogram +
+    normalization are computed outside ONNX (Python / Android).
 
-    The mel/STFT module (found by scanning the module tree) is replaced with
-    nn.Identity(), so mel features pass through unchanged into the encoder.
+    Architecture (from inspecting muq source):
+        MuQModel.get_predictions(wav):
+          1. mel = preprocessing(wav, ["melspec_2048"])   ← MelSTFT (SKIPPED)
+          2. mel = normalize(mel)                         ← mean/std (SKIPPED)
+          3. encoder(mel["melspec_2048"])                  ← Conv2d + Conformer
+          → returns (logits, hidden_states)
+        AudioSpectrogramTransformerPretrained:
+          → proj(hidden_states[layer_idx]) + transformer + mean pool
+        MuLan:
+          → audio_to_latents + L2-norm → 512d
+
+    We monkey-patch get_predictions to skip steps 1-2, accepting normalized
+    mel features directly.
     """
 
-    def __init__(self, mulan_inner, mel_module_name):
+    def __init__(self, mulan_inner):
         super().__init__()
         self.mulan_inner = mulan_inner
-        # Replace mel/STFT with identity — mel features become the direct input
-        _replace_module_by_name(self.mulan_inner, mel_module_name, nn.Identity())
+
+        # Monkey-patch MuQModel.get_predictions to skip preprocessing
+        muq_model = self.mulan_inner.audio.model.model  # MuQModel
+        original_encoder = muq_model.encoder
+
+        def patched_get_predictions(x, *, mask=None, attention_mask=None,
+                                    return_new_mask=False, is_features_only=False):
+            # x is already normalized mel features — skip preprocessing+normalize
+            logits, hidden_emb, new_mask = original_encoder(
+                x, attention_mask=attention_mask, is_features_only=is_features_only)
+            if return_new_mask:
+                return logits, hidden_emb, mask if new_mask is None else new_mask
+            return logits, hidden_emb
+
+        muq_model.get_predictions = patched_get_predictions
 
     def forward(self, mel_features: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            mel_features: Output of the original mel/STFT module
+            mel_features: Normalized mel spectrogram [1, 128, 1000]
+                          (after MelSTFT + mean/std normalization)
         Returns:
             [1, 512] L2-normalized audio embedding
         """
@@ -213,57 +201,51 @@ class MuLanPostMelWrapper(nn.Module):
 def _export_mulan_split(model, output_path: Path, fp16: bool, opset: int, device: str = "cpu"):
     """Fallback: export MuQ-MuLan with mel spectrogram as input.
 
-    If raw waveform export fails (torch.stft ONNX issues), we split the model:
-    mel spectrogram computed on the caller side, model takes mel features as input.
+    torch.stft can't export to ONNX, so we split the model:
+    - Mel spectrogram + normalization computed outside ONNX (Python / Android)
+    - ONNX model takes normalized mel features [1, 128, 1000] → [1, 512] embedding
+
+    MuQ-MuLan mel parameters (from torchaudio.MelSpectrogram):
+      n_fft=2048, hop_length=240, win_length=2048, n_mels=128, sample_rate=24000
+      power=2.0 (power spectrogram), normalized=False, f_min=0, f_max=None (Nyquist)
+    Then instance-normalized: (mel - 6.7684) / 18.4179 (from model's stat dict)
     """
     logger.info("Attempting split export (mel features as input)...")
 
     mulan_inner = model.mulan_module
+    muq_model = mulan_inner.audio.model.model  # MuQModel
 
-    # Log module tree for debugging
-    logger.info("Module tree (searching for mel/STFT):")
-    for name, mod in mulan_inner.named_modules():
-        if name.count('.') <= 3:  # don't log too deep
-            logger.info(f"  {name}: {type(mod).__name__} ({type(mod).__module__})")
-
-    # Step 1: Find the mel/STFT module
-    mel_name, mel_module = _find_mel_module(mulan_inner)
-    if mel_module is None:
-        raise RuntimeError(
-            "Could not find mel/STFT module in MuQ-MuLan model. "
-            "Run with --verbose to see the module tree."
-        )
-    logger.info(f"Found mel module: '{mel_name}' ({type(mel_module).__name__})")
-
-    # Step 2: Capture mel output shape via hook
-    mel_output = {}
-
-    def hook_fn(module, input, output):
-        mel_output['shape'] = output.shape
-        mel_output['tensor'] = output.detach()
-
-    handle = mel_module.register_forward_hook(hook_fn)
-
+    # Step 1: Compute mel features via PyTorch for the dummy input
     dummy_wav = torch.randn(1, 240000, device=device)
     if fp16:
         dummy_wav = dummy_wav.half()
 
     with torch.no_grad():
-        mulan_inner.get_audio_latents(dummy_wav)
-    handle.remove()
+        mel_dict = muq_model.preprocessing(dummy_wav, features=["melspec_2048"])
+        mel_dict = muq_model.normalize(mel_dict)
+        dummy_mel = mel_dict["melspec_2048"]  # [1, 128, 1000]
 
-    mel_shape = mel_output['shape']
-    logger.info(f"Captured mel output shape: {mel_shape}")
+    logger.info(f"Mel feature shape: {dummy_mel.shape}")
 
-    # Extract mel spectrogram parameters for Android replication
-    mel_params = _extract_mel_params(mel_module)
+    # Extract mel parameters and normalization stats
+    mel_stft = muq_model.preprocessor_melspec_2048
+    torchaudio_mel = mel_stft.mel_stft  # torchaudio.transforms.MelSpectrogram
+    mel_params = {}
+    for attr in ['n_fft', 'hop_length', 'win_length', 'n_mels', 'sample_rate',
+                 'f_min', 'f_max', 'power', 'normalized']:
+        if hasattr(torchaudio_mel, attr):
+            val = getattr(torchaudio_mel, attr)
+            mel_params[attr] = float(val) if isinstance(val, (int, float)) else val
+
+    # Normalization stats
+    mel_params['norm_mean'] = float(muq_model.stat['melspec_2048_mean'])
+    mel_params['norm_std'] = float(muq_model.stat['melspec_2048_std'])
+    mel_params['is_db'] = mel_stft.is_db if hasattr(mel_stft, 'is_db') else False
     logger.info(f"Mel params: {mel_params}")
 
-    # Step 3: Replace mel with Identity and export
-    wrapper = MuLanPostMelWrapper(mulan_inner, mel_name)
+    # Step 2: Monkey-patch and export
+    wrapper = MuLanPostMelWrapper(mulan_inner)
     wrapper.eval()
-
-    dummy_mel = mel_output['tensor']
 
     logger.info(f"Exporting post-mel model to {output_path}...")
     torch.onnx.export(
@@ -285,7 +267,7 @@ def _export_mulan_split(model, output_path: Path, fp16: bool, opset: int, device
     import json
     params = {
         "input_type": "mel_features",
-        "mel_shape": [int(x) for x in mel_shape],
+        "mel_shape": [int(x) for x in dummy_mel.shape],
         "sample_rate": 24000,
         "clip_duration_s": 10,
         **mel_params,
@@ -296,40 +278,13 @@ def _export_mulan_split(model, output_path: Path, fp16: bool, opset: int, device
     size_mb = output_path.stat().st_size / 1024 / 1024
     logger.info(f"Exported MuQ-MuLan (post-mel): {size_mb:.1f} MB")
     logger.info(f"Mel parameters saved to: {mel_params_path}")
+
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return output_path
 
-
-def _extract_mel_params(preproc_module) -> dict:
-    """Extract mel spectrogram parameters from the preprocessing module.
-
-    Walks the module tree to find torchaudio MelSpectrogram / Spectrogram
-    and extracts n_fft, hop_length, n_mels, etc. for Android replication.
-    """
-    params = {}
-
-    for name, mod in preproc_module.named_modules():
-        class_name = type(mod).__name__
-        # torchaudio.transforms.MelSpectrogram
-        if 'MelSpectrogram' in class_name or 'MelScale' in class_name:
-            for attr in ['n_mels', 'sample_rate', 'f_min', 'f_max', 'n_stft']:
-                if hasattr(mod, attr):
-                    val = getattr(mod, attr)
-                    params[attr] = val if not isinstance(val, torch.Tensor) else val.item()
-        # torchaudio.transforms.Spectrogram
-        if 'Spectrogram' in class_name:
-            for attr in ['n_fft', 'hop_length', 'win_length', 'power', 'normalized']:
-                if hasattr(mod, attr):
-                    val = getattr(mod, attr)
-                    params[attr] = val if not isinstance(val, torch.Tensor) else val.item()
-
-    # Fallback: check direct attributes on the preprocessing module itself
-    for attr in ['n_fft', 'hop_length', 'win_length', 'n_mels', 'sample_rate',
-                 'f_min', 'f_max', 'power', 'normalized']:
-        if attr not in params and hasattr(preproc_module, attr):
-            val = getattr(preproc_module, attr)
-            params[attr] = val if not isinstance(val, torch.Tensor) else val.item()
-
-    return params
 
 
 def export_flamingo_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
@@ -454,9 +409,11 @@ def verify_mulan_onnx(onnx_path: Path, num_tracks: int = 10, tolerance: float = 
             ref_emb = model.mulan_module.get_audio_latents(wav).cpu().numpy()
 
             if is_split_model:
-                # For split model: compute mel features via PyTorch preprocessing
-                mel = model.mulan_module.audio.model.preprocessing(wav)
-                onnx_input = mel.cpu().numpy()
+                # For split model: compute mel + normalize via PyTorch
+                muq_model = model.mulan_module.audio.model.model
+                mel_dict = muq_model.preprocessing(wav, features=["melspec_2048"])
+                mel_dict = muq_model.normalize(mel_dict)
+                onnx_input = mel_dict["melspec_2048"].cpu().numpy()
             else:
                 onnx_input = wav.numpy()
 
