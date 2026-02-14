@@ -98,12 +98,14 @@ data class QueuedTrackResult(
  *
  * @param uniqueArtists Number of distinct artists in the queue
  * @param clusterSpread Number of distinct style clusters represented
- * @param simRange Pair of (min, max) similarity to seed, as percentages
+ * @param simMin Minimum similarity to seed, as percentage
+ * @param simMax Maximum similarity to seed, as percentage
  */
 data class QueueMetrics(
     val uniqueArtists: Int,
     val clusterSpread: Int,
-    val simRange: Pair<Int, Int>,
+    val simMin: Int,
+    val simMax: Int,
 )
 
 /**

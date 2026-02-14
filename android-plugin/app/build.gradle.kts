@@ -82,6 +82,9 @@ dependencies {
     // Document picker
     implementation("androidx.documentfile:documentfile:1.0.1")
 
+    // JSON serialization for session history persistence
+    implementation("com.google.code.gson:gson:2.11.0")
+
     // Testing
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

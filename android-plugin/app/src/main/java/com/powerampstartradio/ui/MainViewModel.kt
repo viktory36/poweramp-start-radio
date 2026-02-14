@@ -116,6 +116,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     init {
+        RadioService.initHistory(application.filesDir)
         refreshDatabaseInfo()
         checkPermission()
         prepareIndices()

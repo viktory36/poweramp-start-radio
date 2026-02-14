@@ -27,6 +27,8 @@ import com.powerampstartradio.ui.RadioConfig
 import com.powerampstartradio.ui.RadioResult
 import com.powerampstartradio.ui.RadioUiState
 import com.powerampstartradio.ui.SelectionMode
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -56,6 +58,8 @@ class RadioService : Service() {
         private const val TAG = "RadioService"
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "radio_service"
+        private const val HISTORY_FILE = "session_history.json"
+        private const val MAX_SESSIONS = 200
 
         const val ACTION_START_RADIO = "com.powerampstartradio.START_RADIO"
         const val ACTION_STOP = "com.powerampstartradio.STOP"
@@ -90,6 +94,41 @@ class RadioService : Service() {
         /** Drift reference embeddings for lazy rank computation, keyed by track ID. */
         val driftReferences = MutableStateFlow<Map<Long, FloatArray>>(emptyMap())
 
+        // --- Session history persistence ---
+        private var historyDir: File? = null
+        private val gson = Gson()
+        private val historyType = object : TypeToken<List<RadioResult>>() {}.type
+        private val saveScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+        fun initHistory(filesDir: File) {
+            historyDir = filesDir
+            try {
+                val file = File(filesDir, HISTORY_FILE)
+                if (file.exists()) {
+                    val json = file.readText()
+                    val loaded: List<RadioResult> = gson.fromJson(json, historyType) ?: emptyList()
+                    _sessionHistory.value = loaded.takeLast(MAX_SESSIONS)
+                    Log.d(TAG, "Loaded ${_sessionHistory.value.size} sessions from disk")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load session history", e)
+                _sessionHistory.value = emptyList()
+            }
+        }
+
+        private fun saveHistory() {
+            val dir = historyDir ?: return
+            val snapshot = _sessionHistory.value
+            saveScope.launch {
+                try {
+                    val file = File(dir, HISTORY_FILE)
+                    file.writeText(gson.toJson(snapshot, historyType))
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to save session history", e)
+                }
+            }
+        }
+
         fun startRadio(context: Context, config: RadioConfig, showToasts: Boolean = false) {
             if (isSearchActive) return
             _uiState.value = RadioUiState.Loading()
@@ -118,7 +157,8 @@ class RadioService : Service() {
             if (current is RadioUiState.Streaming) {
                 val completed = current.result.copy(isComplete = true)
                 _uiState.value = RadioUiState.Success(completed)
-                _sessionHistory.value = _sessionHistory.value + completed
+                _sessionHistory.value = (_sessionHistory.value + completed).takeLast(MAX_SESSIONS)
+                saveHistory()
             } else {
                 _uiState.value = RadioUiState.Idle
             }
@@ -130,6 +170,7 @@ class RadioService : Service() {
 
         fun clearHistory() {
             _sessionHistory.value = emptyList()
+            saveHistory()
         }
     }
 
@@ -365,7 +406,8 @@ class RadioService : Service() {
                     )
 
                     _uiState.value = RadioUiState.Success(finalResult)
-                    _sessionHistory.value = _sessionHistory.value + finalResult
+                    _sessionHistory.value = (_sessionHistory.value + finalResult).takeLast(MAX_SESSIONS)
+                    saveHistory()
 
                     PowerampHelper.reloadData(this@RadioService)
 
@@ -442,7 +484,8 @@ class RadioService : Service() {
                     )
 
                     _uiState.value = RadioUiState.Success(radioResult)
-                    _sessionHistory.value = _sessionHistory.value + radioResult
+                    _sessionHistory.value = (_sessionHistory.value + radioResult).takeLast(MAX_SESSIONS)
+                    saveHistory()
 
                     PowerampHelper.reloadData(this@RadioService)
 

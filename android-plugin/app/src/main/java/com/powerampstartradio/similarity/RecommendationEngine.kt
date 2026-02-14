@@ -470,7 +470,7 @@ class RecommendationEngine(
      * @return QueueMetrics with artist count, cluster spread, and sim range
      */
     fun computeQueueMetrics(tracks: List<SimilarTrack>): QueueMetrics {
-        if (tracks.isEmpty()) return QueueMetrics(0, 0, 0 to 0)
+        if (tracks.isEmpty()) return QueueMetrics(0, 0, 0, 0)
 
         // Unique artists
         val artists = tracks.mapNotNull { it.track.artist?.lowercase() }.toSet()
@@ -487,7 +487,8 @@ class RecommendationEngine(
         return QueueMetrics(
             uniqueArtists = artists.size,
             clusterSpread = clusters.size,
-            simRange = minSim to maxSim,
+            simMin = minSim,
+            simMax = maxSim,
         )
     }
 
