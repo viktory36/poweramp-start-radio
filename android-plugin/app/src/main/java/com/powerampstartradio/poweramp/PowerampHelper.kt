@@ -187,44 +187,112 @@ object PowerampHelper {
     }
 
     /**
-     * Get all file IDs from Poweramp's library.
-     * Returns a map of metadata key to file ID.
+     * Get all file records from Poweramp's library.
+     *
+     * Includes normalized metadata fields and optional path when available.
      */
-    fun getAllFileIds(context: Context): Map<String, Long> {
+    fun getAllFileRecords(context: Context): List<PowerampFileRecord> {
         val filesUri = ROOT_URI.buildUpon().appendEncodedPath("files").build()
-        val result = mutableMapOf<String, Long>()
+        val result = mutableListOf<PowerampFileRecord>()
+
+        // Best-effort path column detection (varies by Poweramp/provider version).
+        var pathColumn: String? = null
+        try {
+            val probeUri = ROOT_URI.buildUpon()
+                .appendEncodedPath("files")
+                .appendQueryParameter("lim", "1")
+                .build()
+            context.contentResolver.query(probeUri, null, null, null, null)?.use { probe ->
+                val cols = probe.columnNames.toSet()
+                pathColumn = listOf(
+                    "path",
+                    "_data",
+                    "file_path",
+                    "folder_files.path",
+                ).firstOrNull { it in cols }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not detect Poweramp path column", e)
+        }
 
         try {
+            val projection = mutableListOf(
+                "folder_files._id",
+                "artist",
+                "album",
+                "title_tag",
+                "folder_files.duration",
+            )
+            pathColumn?.let { projection.add(it) }
+
             val cursor = context.contentResolver.query(
                 filesUri,
-                arrayOf("folder_files._id", "artist", "album", "title_tag", "folder_files.duration"),
+                projection.toTypedArray(),
                 null,
                 null,
                 null
             )
 
             cursor?.use {
-                val idIdx = it.getColumnIndex("_id")
+                val idIdx = run {
+                    val idx = it.getColumnIndex("_id")
+                    if (idx >= 0) idx else it.getColumnIndex("folder_files._id")
+                }
                 val artistIdx = it.getColumnIndex("artist")
                 val albumIdx = it.getColumnIndex("album")
                 val titleIdx = it.getColumnIndex("title_tag")
-                val durationIdx = it.getColumnIndex("duration")
+                val durationIdx = run {
+                    val idx = it.getColumnIndex("duration")
+                    if (idx >= 0) idx else it.getColumnIndex("folder_files.duration")
+                }
+                val pathIdx = pathColumn?.let { col -> it.getColumnIndex(col) } ?: -1
+
+                if (idIdx < 0 || titleIdx < 0) {
+                    Log.w(TAG, "Poweramp query missing required columns (_id/title_tag)")
+                    return result
+                }
 
                 while (it.moveToNext()) {
                     val id = it.getLong(idIdx)
-                    val artist = (it.getString(artistIdx) ?: "").lowercase().trim()
-                    val album = (it.getString(albumIdx) ?: "").lowercase().trim()
-                    val title = (it.getString(titleIdx) ?: "").lowercase().trim()
-                    val durationMs = it.getInt(durationIdx) * 1000
+                    val artist = if (artistIdx >= 0) (it.getString(artistIdx) ?: "").trim() else ""
+                    val album = if (albumIdx >= 0) (it.getString(albumIdx) ?: "").trim() else ""
+                    val title = (it.getString(titleIdx) ?: "").trim()
+                    val durationMs = if (durationIdx >= 0) it.getInt(durationIdx) * 1000 else 0
+                    val path = if (pathIdx >= 0) it.getString(pathIdx) else null
 
-                    // Create metadata key matching desktop indexer format (rounds to 100ms)
-                    val durationRounded = (durationMs / 100) * 100
-                    val key = "$artist|$album|$title|$durationRounded"
-                    result[key] = id
+                    result.add(
+                        PowerampFileRecord(
+                            fileId = id,
+                            artist = artist,
+                            album = album,
+                            title = title,
+                            durationMs = durationMs,
+                            path = path
+                        )
+                    )
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error getting all file IDs", e)
+            Log.e(TAG, "Error getting Poweramp file records", e)
+        }
+
+        return result
+    }
+
+    /**
+     * Get all file IDs from Poweramp's library.
+     * Returns a map of metadata key to file ID.
+     */
+    fun getAllFileIds(context: Context): Map<String, Long> {
+        val result = mutableMapOf<String, Long>()
+
+        for (record in getAllFileRecords(context)) {
+            val artist = record.artist.lowercase().trim()
+            val album = record.album.lowercase().trim()
+            val title = record.title.lowercase().trim()
+            val durationRounded = (record.durationMs / 100) * 100
+            val key = "$artist|$album|$title|$durationRounded"
+            result[key] = record.fileId
         }
 
         return result
@@ -402,3 +470,15 @@ data class PowerampTrack(
             return "$a|$al|$t|$d"
         }
 }
+
+/**
+ * Represents a row from Poweramp's files table.
+ */
+data class PowerampFileRecord(
+    val fileId: Long,
+    val artist: String,
+    val album: String,
+    val title: String,
+    val durationMs: Int,
+    val path: String? = null,
+)

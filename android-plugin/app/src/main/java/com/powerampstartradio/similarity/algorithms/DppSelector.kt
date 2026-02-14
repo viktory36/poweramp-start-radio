@@ -63,7 +63,7 @@ object DppSelector {
 
         val selected = mutableListOf<Int>()
         val selectedSet = HashSet<Int>()
-        val dim = embeddings.firstOrNull { it.isNotEmpty() }?.size ?: return emptyList()
+        if (embeddings.none { it.isNotEmpty() }) return emptyList()
 
         // c[i][j] = Cholesky factor entries for candidate i at step j
         val choleskyFactors = Array(n) { FloatArray(k) }

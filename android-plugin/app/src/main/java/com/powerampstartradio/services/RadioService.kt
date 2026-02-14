@@ -237,7 +237,7 @@ class RadioService : Service() {
                 }
 
                 // Resolve auto pool size so RadioResult carries the actual value
-                val config = if (config.candidatePoolSize <= 0) {
+                val resolvedConfig = if (config.candidatePoolSize <= 0) {
                     val autoPool = (db.getTrackCount() * 0.02f).toInt().coerceAtLeast(100)
                     config.copy(candidatePoolSize = autoPool)
                 } else config
@@ -246,7 +246,7 @@ class RadioService : Service() {
 
                 // DPP+drift is degenerate (forced to batch in RecommendationEngine),
                 // so use batch path here too to avoid streaming/return-value mismatch.
-                val effectiveDrift = config.driftEnabled && config.selectionMode != SelectionMode.DPP
+                val effectiveDrift = resolvedConfig.driftEnabled && resolvedConfig.selectionMode != SelectionMode.DPP
                 if (effectiveDrift) {
                     // Drift path: stream search results to UI, queue to Poweramp
                     // in background batches (every 5 tracks). Queue ops are decoupled
@@ -255,6 +255,7 @@ class RadioService : Service() {
                     val seenFileIds = mutableSetOf<Long>()
                     val pendingFileIds = mutableListOf<Long>()
                     val queuedFileIds = mutableSetOf<Long>()
+                    val mappingReasonCounts = mutableMapOf<TrackMatcher.MatchReason, Int>()
 
                     // Background queue consumer — processes batches sequentially
                     val queueChannel = Channel<List<Long>>(Channel.UNLIMITED)
@@ -283,22 +284,25 @@ class RadioService : Service() {
                         seedTrack = currentTrack,
                         matchType = matchResult.matchType,
                         tracks = emptyList(),
-                        config = config,
+                        config = resolvedConfig,
                         isComplete = false,
-                        totalExpected = config.numTracks
+                        totalExpected = resolvedConfig.numTracks
                     ))
 
                     eng.generatePlaylist(
                         seedTrackId = matchResult.embeddedTrack.id,
-                        config = config,
+                        config = resolvedConfig,
                         onProgress = { message ->
                             updateNotification(message)
                         },
                         onResult = { similarTrack ->
                             // Map to Poweramp file ID (fast HashMap after first cache build)
-                            val fileId = matcher.mapSingleTrackToFileId(
+                            val mappingOutcome = matcher.mapSingleTrack(
                                 this@RadioService, similarTrack, seenFileIds
                             )
+                            mappingReasonCounts[mappingOutcome.reason] =
+                                (mappingReasonCounts[mappingOutcome.reason] ?: 0) + 1
+                            val fileId = mappingOutcome.fileId
 
                             // Store drift reference for lazy rank computation
                             similarTrack.driftReferenceEmb?.let { ref ->
@@ -321,9 +325,9 @@ class RadioService : Service() {
                                 seedTrack = currentTrack,
                                 matchType = matchResult.matchType,
                                 tracks = streamingTracks.toList(),
-                                config = config,
+                                config = resolvedConfig,
                                 isComplete = false,
-                                totalExpected = config.numTracks
+                                totalExpected = resolvedConfig.numTracks
                             ))
 
                             // Batch file IDs for background queuing
@@ -357,10 +361,10 @@ class RadioService : Service() {
                         seedTrack = currentTrack,
                         matchType = matchResult.matchType,
                         tracks = streamingTracks.toList(),
-                        config = config,
+                        config = resolvedConfig,
                         queuedFileIds = queuedFileIds.toSet(),
                         isComplete = true,
-                        totalExpected = config.numTracks,
+                        totalExpected = resolvedConfig.numTracks,
                         metrics = driftMetrics
                     )
 
@@ -369,7 +373,10 @@ class RadioService : Service() {
 
                     PowerampHelper.reloadData(this@RadioService)
 
-                    val message = "${finalResult.queuedCount} tracks queued"
+                    val mappingMisses = (mappingReasonCounts[TrackMatcher.MatchReason.NOT_FOUND] ?: 0) +
+                        (mappingReasonCounts[TrackMatcher.MatchReason.BAD_METADATA_KEY] ?: 0)
+                    Log.i(TAG, "Streaming mapping reasons: $mappingReasonCounts")
+                    val message = buildQueueResultMessage(finalResult.queuedCount, mappingMisses)
                     updateNotification(message)
                     Log.d(TAG, "Queue result: ${finalResult.queuedCount} queued / ${finalResult.failedCount} failed")
                     Toast.makeText(this@RadioService, message, Toast.LENGTH_SHORT).show()
@@ -380,7 +387,7 @@ class RadioService : Service() {
 
                     val similarTracks = eng.generatePlaylist(
                         seedTrackId = matchResult.embeddedTrack.id,
-                        config = config,
+                        config = resolvedConfig,
                         onProgress = { message ->
                             _uiState.value = RadioUiState.Searching(message)
                             updateNotification(message)
@@ -445,7 +452,8 @@ class RadioService : Service() {
 
                     PowerampHelper.reloadData(this@RadioService)
 
-                    val message = "${radioResult.queuedCount} tracks queued"
+                    val mappingMisses = trackResults.count { it.status == QueueStatus.NOT_IN_LIBRARY }
+                    val message = buildQueueResultMessage(radioResult.queuedCount, mappingMisses)
                     updateNotification(message)
                     Log.d(TAG, "Queue result: ${radioResult.queuedCount} queued / ${radioResult.failedCount} failed")
                     Toast.makeText(this@RadioService, message, Toast.LENGTH_SHORT).show()
@@ -493,6 +501,14 @@ class RadioService : Service() {
     private fun toast(message: String) {
         if (showToasts) {
             Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun buildQueueResultMessage(queuedCount: Int, notFoundCount: Int): String {
+        return if (notFoundCount > 0) {
+            "$queuedCount tracks queued, $notFoundCount not found"
+        } else {
+            "$queuedCount tracks queued"
         }
     }
 
