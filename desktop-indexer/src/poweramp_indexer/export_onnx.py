@@ -24,16 +24,16 @@ class MuLanAudioOnnxWrapper(nn.Module):
     Input:  wav [1, 240000] (10s @ 24kHz)
     Output: embedding [1, 512] (L2-normalized)
 
-    The MuQ-MuLan model's forward() iterates batch items serially and
-    internally splits to 10s clips via _get_all_clips(). For ONNX we
-    bypass that and call the audio tower directly with a single 10s clip.
+    Bypasses MuQMuLan.forward() which has Python for-loops (iterates batch
+    items and clips) that confuse the ONNX tracer. Instead calls the internal
+    MuLan audio tower directly: get_audio_latents() is a clean tensor path.
     """
 
     def __init__(self, mulan_model):
         super().__init__()
-        # Extract the audio components from MuQMuLan
-        # The model has: audio_encoder (Wav2Vec2ConformerEncoder), audio_projection
-        self.mulan = mulan_model
+        # mulan_module property unwraps DDP if present, gives us the MuLan model
+        # MuLan.get_audio_latents: audio → AudioSpectrogramTransformer → project → L2-norm
+        self.mulan_inner = mulan_model.mulan_module
 
     def forward(self, wav: torch.Tensor) -> torch.Tensor:
         """
@@ -42,11 +42,9 @@ class MuLanAudioOnnxWrapper(nn.Module):
         Returns:
             [1, 512] L2-normalized audio embedding
         """
-        # MuQMuLan.forward calls _get_embedding_from_data for audio
-        # which calls _get_all_clips to split into 10s, then encodes each.
-        # We pass a single 10s clip, so this is equivalent.
-        audio_embeds = self.mulan(wavs=wav)  # [1, 512], already L2-normalized
-        return audio_embeds
+        # Direct path: wav → mel_stft → encoder → linear projection → L2-normalize
+        # No Python loops, clean tensor ops only
+        return self.mulan_inner.get_audio_latents(wav)
 
 
 class FlamingoOnnxWrapper(nn.Module):
@@ -374,9 +372,9 @@ def verify_mulan_onnx(onnx_path: Path, num_tracks: int = 10, tolerance: float = 
         if input_dtype == np.float16:
             wav = wav.half()
 
-        # PyTorch reference
+        # PyTorch reference — use the same direct path as ONNX wrapper
         with torch.no_grad():
-            ref_emb = model(wavs=wav).cpu().numpy()
+            ref_emb = model.mulan_module.get_audio_latents(wav).cpu().numpy()
 
         # ONNX inference
         onnx_emb = sess.run(None, {input_name: wav.numpy()})[0]
