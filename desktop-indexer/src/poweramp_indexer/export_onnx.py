@@ -147,38 +147,66 @@ def export_mulan_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
     return output_path
 
 
+def _find_mel_module(root_module):
+    """Find the mel/STFT feature extractor in the module tree.
+
+    Searches by class name (torchaudio MelSpectrogram, Spectrogram, etc.)
+    and by module path (muq.muq.modules.features).
+
+    Returns (dotted_name, module) or (None, None) if not found.
+    """
+    # Strategy 1: look for torchaudio mel/spectrogram transforms
+    for name, mod in root_module.named_modules():
+        class_name = type(mod).__name__
+        if class_name in ('MelSpectrogram', 'MelSTFT', 'Spectrogram'):
+            return name, mod
+
+    # Strategy 2: look for muq's feature extractor by module path
+    for name, mod in root_module.named_modules():
+        mod_path = type(mod).__module__ or ""
+        if 'features' in mod_path and hasattr(mod, '__call__'):
+            return name, mod
+
+    # Strategy 3: look by attribute name patterns
+    for name, mod in root_module.named_modules():
+        if any(x in name for x in ['preprocessing', 'feature_extract', 'mel_stft']):
+            return name, mod
+
+    return None, None
+
+
+def _replace_module_by_name(root, dotted_name, replacement):
+    """Replace a submodule identified by dotted name (e.g. 'audio.model.feat')."""
+    parts = dotted_name.split('.')
+    parent = root
+    for p in parts[:-1]:
+        parent = getattr(parent, p)
+    setattr(parent, parts[-1], replacement)
+
+
 class MuLanPostMelWrapper(nn.Module):
     """Fallback wrapper that takes mel features instead of raw waveform.
 
     Used when torch.stft fails to export in ONNX. The mel spectrogram
     is computed outside the ONNX model (in Python preprocessing or on Android).
 
-    Model hierarchy (from stack trace):
-        MuQMuLan.mulan_module → MuLan
-          .audio → AudioSpectrogramTransformerPretrained
-            .model → MuQ
-              .preprocessing → MelSTFT (torchaudio.MelSpectrogram)  ← REPLACED
-          .audio_to_latents → Linear(hidden_dim, 512)
-
-    We monkey-patch .preprocessing to Identity so mel features pass through
-    unchanged, then call get_audio_latents() which is a clean tensor path.
+    The mel/STFT module (found by scanning the module tree) is replaced with
+    nn.Identity(), so mel features pass through unchanged into the encoder.
     """
 
-    def __init__(self, muq_mulan_model):
+    def __init__(self, mulan_inner, mel_module_name):
         super().__init__()
-        # Keep full model as submodule (needed for ONNX to find all parameters)
-        self.mulan_inner = muq_mulan_model.mulan_module
+        self.mulan_inner = mulan_inner
         # Replace mel/STFT with identity — mel features become the direct input
-        self.mulan_inner.audio.model.preprocessing = nn.Identity()
+        _replace_module_by_name(self.mulan_inner, mel_module_name, nn.Identity())
 
     def forward(self, mel_features: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            mel_features: Output of MelSTFT, shape from model internals
+            mel_features: Output of the original mel/STFT module
         Returns:
             [1, 512] L2-normalized audio embedding
         """
-        # mel_features → Identity (was MelSTFT) → encoder → project → L2-norm
         return self.mulan_inner.get_audio_latents(mel_features)
 
 
@@ -190,43 +218,54 @@ def _export_mulan_split(model, output_path: Path, fp16: bool, opset: int, device
     """
     logger.info("Attempting split export (mel features as input)...")
 
-    # Step 1: Capture mel output shape by hooking the preprocessing module.
-    # Use the direct get_audio_latents path to avoid for-loops in forward().
-    muq_backbone = model.mulan_module.audio.model
-    preproc = muq_backbone.preprocessing
+    mulan_inner = model.mulan_module
 
+    # Log module tree for debugging
+    logger.info("Module tree (searching for mel/STFT):")
+    for name, mod in mulan_inner.named_modules():
+        if name.count('.') <= 3:  # don't log too deep
+            logger.info(f"  {name}: {type(mod).__name__} ({type(mod).__module__})")
+
+    # Step 1: Find the mel/STFT module
+    mel_name, mel_module = _find_mel_module(mulan_inner)
+    if mel_module is None:
+        raise RuntimeError(
+            "Could not find mel/STFT module in MuQ-MuLan model. "
+            "Run with --verbose to see the module tree."
+        )
+    logger.info(f"Found mel module: '{mel_name}' ({type(mel_module).__name__})")
+
+    # Step 2: Capture mel output shape via hook
     mel_output = {}
 
     def hook_fn(module, input, output):
         mel_output['shape'] = output.shape
         mel_output['tensor'] = output.detach()
 
-    handle = preproc.register_forward_hook(hook_fn)
+    handle = mel_module.register_forward_hook(hook_fn)
 
     dummy_wav = torch.randn(1, 240000, device=device)
     if fp16:
         dummy_wav = dummy_wav.half()
 
     with torch.no_grad():
-        # Direct path — no Python loops
-        model.mulan_module.get_audio_latents(dummy_wav)
+        mulan_inner.get_audio_latents(dummy_wav)
     handle.remove()
 
     mel_shape = mel_output['shape']
     logger.info(f"Captured mel output shape: {mel_shape}")
 
-    # Extract mel spectrogram parameters from the torchaudio MelSpectrogram module
-    mel_params = _extract_mel_params(preproc)
+    # Extract mel spectrogram parameters for Android replication
+    mel_params = _extract_mel_params(mel_module)
     logger.info(f"Mel params: {mel_params}")
 
-    # Step 2: Replace preprocessing with Identity and export
-    wrapper = MuLanPostMelWrapper(model)
+    # Step 3: Replace mel with Identity and export
+    wrapper = MuLanPostMelWrapper(mulan_inner, mel_name)
     wrapper.eval()
-    if fp16:
-        wrapper = wrapper.half()
 
     dummy_mel = mel_output['tensor']
 
+    logger.info(f"Exporting post-mel model to {output_path}...")
     torch.onnx.export(
         wrapper,
         (dummy_mel,),
@@ -246,7 +285,7 @@ def _export_mulan_split(model, output_path: Path, fp16: bool, opset: int, device
     import json
     params = {
         "input_type": "mel_features",
-        "mel_shape": list(mel_shape),
+        "mel_shape": [int(x) for x in mel_shape],
         "sample_rate": 24000,
         "clip_duration_s": 10,
         **mel_params,

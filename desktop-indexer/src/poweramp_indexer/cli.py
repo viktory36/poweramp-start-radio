@@ -1674,9 +1674,8 @@ def export_onnx(output_dir: Path, fp16: bool, verify: bool, verify_tracks: int,
             click.echo(f"  Saved: {mulan_path} ({size_mb:.1f} MB)")
         except Exception as e:
             click.echo(f"  MuQ-MuLan export failed: {e}")
-            if verbose:
-                import traceback
-                traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             export_mulan = False
 
         if verify and export_mulan:
@@ -1705,9 +1704,8 @@ def export_onnx(output_dir: Path, fp16: bool, verify: bool, verify_tracks: int,
             click.echo(f"  Saved: {flamingo_path} ({size_mb:.1f} MB)")
         except Exception as e:
             click.echo(f"  Flamingo export failed: {e}")
-            if verbose:
-                import traceback
-                traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             export_flamingo = False
 
         if verify and export_flamingo:
