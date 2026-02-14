@@ -144,36 +144,34 @@ class MuLanPostMelWrapper(nn.Module):
 
     Used when torch.stft fails to export in ONNX. The mel spectrogram
     is computed outside the ONNX model (in Python preprocessing or on Android).
+
+    Model hierarchy (from stack trace):
+        MuQMuLan.mulan_module → MuLan
+          .audio → AudioSpectrogramTransformerPretrained
+            .model → MuQ
+              .preprocessing → MelSTFT (torchaudio.MelSpectrogram)  ← REPLACED
+          .audio_to_latents → Linear(hidden_dim, 512)
+
+    We monkey-patch .preprocessing to Identity so mel features pass through
+    unchanged, then call get_audio_latents() which is a clean tensor path.
     """
 
-    def __init__(self, mulan_model):
+    def __init__(self, muq_mulan_model):
         super().__init__()
-        self.mulan = mulan_model
-        # Extract the components we need post-mel
-        # MuQ-MuLan pipeline: wav -> MelSTFT -> normalize -> Conv2dSubsampling ->
-        #   Wav2Vec2ConformerEncoder -> Transformer -> Linear(768->512) -> L2-norm
-        # We'll try to capture everything after mel computation
+        # Keep full model as submodule (needed for ONNX to find all parameters)
+        self.mulan_inner = muq_mulan_model.mulan_module
+        # Replace mel/STFT with identity — mel features become the direct input
+        self.mulan_inner.audio.model.preprocessing = nn.Identity()
 
     def forward(self, mel_features: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            mel_features: Output of MelSTFT, shape depends on model internals
+            mel_features: Output of MelSTFT, shape from model internals
         Returns:
             [1, 512] L2-normalized audio embedding
         """
-        # This path is model-architecture-dependent; we access internal modules
-        audio_encoder = self.mulan.audio_encoder
-        audio_projection = self.mulan.audio_projection
-
-        # Pass through encoder layers (skip mel computation)
-        # The exact internal structure varies; this is a best-effort extraction
-        hidden = audio_encoder(mel_features)
-        if hasattr(hidden, 'last_hidden_state'):
-            hidden = hidden.last_hidden_state
-        # Pool and project
-        pooled = hidden.mean(dim=1)  # [B, hidden_dim]
-        projected = audio_projection(pooled)  # [B, 512]
-        return F.normalize(projected, p=2, dim=-1)
+        # mel_features → Identity (was MelSTFT) → encoder → project → L2-norm
+        return self.mulan_inner.get_audio_latents(mel_features)
 
 
 def _export_mulan_split(model, output_path: Path, fp16: bool, opset: int):
@@ -184,52 +182,40 @@ def _export_mulan_split(model, output_path: Path, fp16: bool, opset: int):
     """
     logger.info("Attempting split export (mel features as input)...")
 
-    # Extract mel computation parameters for the caller
-    # Run a dummy forward to capture mel output shape
-    dummy_wav = torch.randn(1, 240000)
-    if fp16:
-        dummy_wav = dummy_wav.half()
-        model = model.half()
+    # Step 1: Capture mel output shape by hooking the preprocessing module.
+    # Use the direct get_audio_latents path to avoid for-loops in forward().
+    muq_backbone = model.mulan_module.audio.model
+    preproc = muq_backbone.preprocessing
 
-    # Try to intercept after mel computation using hooks
     mel_output = {}
 
     def hook_fn(module, input, output):
         mel_output['shape'] = output.shape
         mel_output['tensor'] = output.detach()
 
-    # Find the mel/stft layer
-    mel_layer = None
-    for name, module in model.named_modules():
-        if 'mel' in name.lower() or 'stft' in name.lower():
-            mel_layer = module
-            break
+    handle = preproc.register_forward_hook(hook_fn)
 
-    if mel_layer is None:
-        # Try finding by class name
-        for name, module in model.named_modules():
-            class_name = type(module).__name__.lower()
-            if 'mel' in class_name or 'stft' in class_name or 'spectrogram' in class_name:
-                mel_layer = module
-                break
+    dummy_wav = torch.randn(1, 240000)
+    if fp16:
+        dummy_wav = dummy_wav.half()
 
-    if mel_layer is None:
-        raise RuntimeError(
-            "Could not find mel/STFT layer in MuQ-MuLan model. "
-            "Manual inspection of model architecture needed for ONNX export."
-        )
-
-    handle = mel_layer.register_forward_hook(hook_fn)
     with torch.no_grad():
-        model(wavs=dummy_wav)
+        # Direct path — no Python loops
+        model.mulan_module.get_audio_latents(dummy_wav)
     handle.remove()
 
     mel_shape = mel_output['shape']
     logger.info(f"Captured mel output shape: {mel_shape}")
 
-    # Now export the post-mel part
+    # Extract mel spectrogram parameters from the torchaudio MelSpectrogram module
+    mel_params = _extract_mel_params(preproc)
+    logger.info(f"Mel params: {mel_params}")
+
+    # Step 2: Replace preprocessing with Identity and export
     wrapper = MuLanPostMelWrapper(model)
     wrapper.eval()
+    if fp16:
+        wrapper = wrapper.half()
 
     dummy_mel = mel_output['tensor']
 
@@ -247,7 +233,7 @@ def _export_mulan_split(model, output_path: Path, fp16: bool, opset: int):
         do_constant_folding=True,
     )
 
-    # Save mel parameters as a companion file so Android can replicate
+    # Save mel parameters so Android can replicate the mel spectrogram
     mel_params_path = output_path.with_suffix(".mel_params.json")
     import json
     params = {
@@ -255,8 +241,7 @@ def _export_mulan_split(model, output_path: Path, fp16: bool, opset: int):
         "mel_shape": list(mel_shape),
         "sample_rate": 24000,
         "clip_duration_s": 10,
-        "note": "MuQ-MuLan ONNX export with mel preprocessing split out. "
-                "Caller must compute mel spectrogram matching the model's MelSTFT layer.",
+        **mel_params,
     }
     with open(mel_params_path, 'w') as f:
         json.dump(params, f, indent=2)
@@ -265,6 +250,39 @@ def _export_mulan_split(model, output_path: Path, fp16: bool, opset: int):
     logger.info(f"Exported MuQ-MuLan (post-mel): {size_mb:.1f} MB")
     logger.info(f"Mel parameters saved to: {mel_params_path}")
     return output_path
+
+
+def _extract_mel_params(preproc_module) -> dict:
+    """Extract mel spectrogram parameters from the preprocessing module.
+
+    Walks the module tree to find torchaudio MelSpectrogram / Spectrogram
+    and extracts n_fft, hop_length, n_mels, etc. for Android replication.
+    """
+    params = {}
+
+    for name, mod in preproc_module.named_modules():
+        class_name = type(mod).__name__
+        # torchaudio.transforms.MelSpectrogram
+        if 'MelSpectrogram' in class_name or 'MelScale' in class_name:
+            for attr in ['n_mels', 'sample_rate', 'f_min', 'f_max', 'n_stft']:
+                if hasattr(mod, attr):
+                    val = getattr(mod, attr)
+                    params[attr] = val if not isinstance(val, torch.Tensor) else val.item()
+        # torchaudio.transforms.Spectrogram
+        if 'Spectrogram' in class_name:
+            for attr in ['n_fft', 'hop_length', 'win_length', 'power', 'normalized']:
+                if hasattr(mod, attr):
+                    val = getattr(mod, attr)
+                    params[attr] = val if not isinstance(val, torch.Tensor) else val.item()
+
+    # Fallback: check direct attributes on the preprocessing module itself
+    for attr in ['n_fft', 'hop_length', 'win_length', 'n_mels', 'sample_rate',
+                 'f_min', 'f_max', 'power', 'normalized']:
+        if attr not in params and hasattr(preproc_module, attr):
+            val = getattr(preproc_module, attr)
+            params[attr] = val if not isinstance(val, torch.Tensor) else val.item()
+
+    return params
 
 
 def export_flamingo_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
@@ -344,7 +362,8 @@ def export_flamingo_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
 def verify_mulan_onnx(onnx_path: Path, num_tracks: int = 10, tolerance: float = 1e-3):
     """Verify MuQ-MuLan ONNX export against PyTorch reference.
 
-    Generates random audio and compares ONNX Runtime output to PyTorch output.
+    Handles both full-model export (input=wav) and split export (input=mel_features).
+    For split models, generates mel features via PyTorch preprocessing.
     """
     import onnxruntime as ort
     from muq import MuQMuLan
@@ -355,13 +374,17 @@ def verify_mulan_onnx(onnx_path: Path, num_tracks: int = 10, tolerance: float = 
     model = MuQMuLan.from_pretrained("OpenMuQ/MuQ-MuLan-large")
     model.eval()
 
-    # Load ONNX model
+    # Load ONNX model and detect input type
     sess = ort.InferenceSession(str(onnx_path))
     input_name = sess.get_inputs()[0].name
     input_dtype = np.float16 if "float16" in sess.get_inputs()[0].type else np.float32
+    is_split_model = input_name == "mel_features"
 
     if input_dtype == np.float16:
         model = model.half()
+
+    logger.info(f"  Input: {input_name} ({'split/mel' if is_split_model else 'full/wav'}), "
+                f"dtype: {'fp16' if input_dtype == np.float16 else 'fp32'}")
 
     max_diff = 0.0
     all_cos_sims = []
@@ -372,12 +395,19 @@ def verify_mulan_onnx(onnx_path: Path, num_tracks: int = 10, tolerance: float = 
         if input_dtype == np.float16:
             wav = wav.half()
 
-        # PyTorch reference — use the same direct path as ONNX wrapper
         with torch.no_grad():
+            # PyTorch reference — full path through get_audio_latents
             ref_emb = model.mulan_module.get_audio_latents(wav).cpu().numpy()
 
+            if is_split_model:
+                # For split model: compute mel features via PyTorch preprocessing
+                mel = model.mulan_module.audio.model.preprocessing(wav)
+                onnx_input = mel.cpu().numpy()
+            else:
+                onnx_input = wav.numpy()
+
         # ONNX inference
-        onnx_emb = sess.run(None, {input_name: wav.numpy()})[0]
+        onnx_emb = sess.run(None, {input_name: onnx_input})[0]
 
         diff = np.abs(ref_emb - onnx_emb).max()
         cos_sim = np.dot(ref_emb.flatten(), onnx_emb.flatten()) / (
