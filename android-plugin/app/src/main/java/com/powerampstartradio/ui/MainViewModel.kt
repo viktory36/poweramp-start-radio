@@ -6,6 +6,8 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.data.EmbeddingIndex
+import com.powerampstartradio.indexing.IndexingService
+import com.powerampstartradio.indexing.NewTrackDetector
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.poweramp.TrackMatcher
@@ -88,6 +90,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _indexStatus = MutableStateFlow<String?>(null)
     val indexStatus: StateFlow<String?> = _indexStatus.asStateFlow()
 
+    // --- Indexing state ---
+    private val _unindexedCount = MutableStateFlow(0)
+    val unindexedCount: StateFlow<Int> = _unindexedCount.asStateFlow()
+
+    private val _hasOnnxModels = MutableStateFlow(false)
+    val hasOnnxModels: StateFlow<Boolean> = _hasOnnxModels.asStateFlow()
+
+    val indexingState: StateFlow<IndexingService.IndexingState> = IndexingService.state
+
     private val _previews = MutableStateFlow<Map<SelectionMode, List<String>>>(emptyMap())
     val previews: StateFlow<Map<SelectionMode, List<String>>> = _previews.asStateFlow()
 
@@ -120,6 +131,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         refreshDatabaseInfo()
         checkPermission()
         prepareIndices()
+        checkOnnxModels()
         PowerampReceiver.addTrackChangeListener(trackChangeListener)
     }
 
@@ -291,6 +303,42 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         } catch (_: Exception) { null }
     }
 
+    // --- Indexing actions ---
+
+    fun checkUnindexedTracks() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
+            if (!dbFile.exists()) {
+                _unindexedCount.value = 0
+                return@launch
+            }
+            try {
+                val db = EmbeddingDatabase.open(dbFile)
+                val detector = NewTrackDetector(db)
+                val unindexed = detector.findUnindexedTracks(getApplication())
+                _unindexedCount.value = unindexed.size
+                db.close()
+            } catch (e: Exception) {
+                _unindexedCount.value = 0
+            }
+        }
+    }
+
+    fun checkOnnxModels() {
+        val filesDir = getApplication<Application>().filesDir
+        val hasMulan = File(filesDir, "mulan_audio.onnx").exists()
+        val hasFlamingo = File(filesDir, "flamingo_encoder.onnx").exists()
+        _hasOnnxModels.value = hasMulan || hasFlamingo
+    }
+
+    fun startIndexing() {
+        IndexingService.startIndexing(getApplication())
+    }
+
+    fun cancelIndexing() {
+        IndexingService.cancelIndexing()
+    }
+
     fun resetToDefaults() {
         val defaults = RadioConfig()
         setNumTracks(defaults.numTracks)
@@ -354,6 +402,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     db.close()
                     _databaseInfo.value = info
                     prepareIndices()
+                    checkUnindexedTracks()
+                    checkOnnxModels()
                 } catch (e: Exception) {
                     _databaseInfo.value = null
                 }

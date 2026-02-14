@@ -85,6 +85,9 @@ dependencies {
     // JSON serialization for session history persistence
     implementation("com.google.code.gson:gson:2.11.0")
 
+    // ONNX Runtime for on-device embedding inference
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.17.0")
+
     // Testing
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

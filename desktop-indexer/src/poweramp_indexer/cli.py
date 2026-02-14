@@ -1629,5 +1629,109 @@ def provenance(database: Path, seed_query: str, use_random: bool, mode: str,
     db.close()
 
 
+@cli.command("export-onnx")
+@click.option("--output-dir", "-o", type=click.Path(path_type=Path), default=Path("./models"),
+              help="Output directory for ONNX files (default: ./models)")
+@click.option("--fp16/--fp32", default=True, help="Export in FP16 (default) or FP32")
+@click.option("--verify/--no-verify", default=False,
+              help="Run numerical verification against PyTorch after export")
+@click.option("--verify-tracks", type=int, default=10,
+              help="Number of random tracks for verification (default: 10)")
+@click.option("--mulan-only", is_flag=True, help="Only export MuQ-MuLan model")
+@click.option("--flamingo-only", is_flag=True, help="Only export Flamingo model")
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
+def export_onnx(output_dir: Path, fp16: bool, verify: bool, verify_tracks: int,
+                mulan_only: bool, flamingo_only: bool, verbose: bool):
+    """Export MuQ-MuLan and Flamingo models to ONNX format.
+
+    Creates ONNX files for on-device inference on Android via ONNX Runtime.
+    Transfer the resulting .onnx files to your phone alongside embeddings.db.
+
+    Examples:
+
+      poweramp-indexer export-onnx
+      poweramp-indexer export-onnx --verify
+      poweramp-indexer export-onnx --fp32 --verify --verify-tracks 5
+      poweramp-indexer export-onnx --mulan-only -o ./onnx_models
+    """
+    if verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    export_mulan = not flamingo_only
+    export_flamingo = not mulan_only
+
+    if export_mulan:
+        from .export_onnx import export_mulan_onnx
+
+        mulan_path = output_dir / "mulan_audio.onnx"
+        click.echo(f"Exporting MuQ-MuLan audio encoder...")
+        click.echo(f"  FP16: {fp16}")
+        try:
+            export_mulan_onnx(mulan_path, fp16=fp16)
+            size_mb = mulan_path.stat().st_size / 1024 / 1024
+            click.echo(f"  Saved: {mulan_path} ({size_mb:.1f} MB)")
+        except Exception as e:
+            click.echo(f"  MuQ-MuLan export failed: {e}")
+            if verbose:
+                import traceback
+                traceback.print_exc()
+            export_mulan = False
+
+        if verify and export_mulan:
+            click.echo(f"\nVerifying MuQ-MuLan ONNX ({verify_tracks} random tracks)...")
+            from .export_onnx import verify_mulan_onnx
+            try:
+                passed, max_diff, mean_cos = verify_mulan_onnx(
+                    mulan_path, num_tracks=verify_tracks,
+                    tolerance=0.01 if fp16 else 1e-3,
+                )
+                click.echo(f"  Max absolute diff: {max_diff:.6f}")
+                click.echo(f"  Mean cosine similarity: {mean_cos:.6f}")
+                click.echo(f"  {'PASSED' if passed else 'FAILED'}")
+            except Exception as e:
+                click.echo(f"  Verification failed: {e}")
+
+    if export_flamingo:
+        from .export_onnx import export_flamingo_onnx
+
+        flamingo_path = output_dir / "flamingo_encoder.onnx"
+        click.echo(f"\nExporting Music Flamingo encoder...")
+        click.echo(f"  FP16: {fp16}")
+        try:
+            export_flamingo_onnx(flamingo_path, fp16=fp16)
+            size_mb = flamingo_path.stat().st_size / 1024 / 1024
+            click.echo(f"  Saved: {flamingo_path} ({size_mb:.1f} MB)")
+        except Exception as e:
+            click.echo(f"  Flamingo export failed: {e}")
+            if verbose:
+                import traceback
+                traceback.print_exc()
+            export_flamingo = False
+
+        if verify and export_flamingo:
+            click.echo(f"\nVerifying Flamingo ONNX ({verify_tracks} random tracks)...")
+            from .export_onnx import verify_flamingo_onnx
+            try:
+                passed, max_diff, mean_cos = verify_flamingo_onnx(
+                    flamingo_path, num_tracks=verify_tracks,
+                    tolerance=0.01 if fp16 else 1e-3,
+                )
+                click.echo(f"  Max absolute diff: {max_diff:.6f}")
+                click.echo(f"  Mean cosine similarity: {mean_cos:.6f}")
+                click.echo(f"  {'PASSED' if passed else 'FAILED'}")
+            except Exception as e:
+                click.echo(f"  Verification failed: {e}")
+
+    click.echo(f"\nExport complete!")
+    click.echo(f"  Output directory: {output_dir}")
+    if export_mulan:
+        click.echo(f"  MuQ-MuLan: mulan_audio.onnx")
+    if export_flamingo:
+        click.echo(f"  Flamingo: flamingo_encoder.onnx")
+    click.echo(f"\nTransfer these files to your phone's app data directory.")
+
+
 if __name__ == "__main__":
     cli()

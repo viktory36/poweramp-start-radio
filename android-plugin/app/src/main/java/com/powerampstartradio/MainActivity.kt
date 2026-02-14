@@ -50,6 +50,7 @@ import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.poweramp.PowerampTrack
 import com.powerampstartradio.poweramp.TrackMatcher
+import com.powerampstartradio.indexing.IndexingService
 import com.powerampstartradio.services.RadioService
 import com.powerampstartradio.ui.DatabaseInfo
 import com.powerampstartradio.ui.DecaySchedule
@@ -1001,7 +1002,7 @@ fun SettingsScreen(
                         val dimLabel = if (databaseInfo.embeddingDim != null) "${databaseInfo.embeddingDim}-dim" else ""
                         val modelNames = databaseInfo.availableModels.map { it.first }
                         val modelLine = if (databaseInfo.hasFused && modelNames.containsAll(listOf("mulan", "flamingo"))) {
-                            "Models: MuLan + Flamingo \u2192 Fused"
+                            "Models: MuQ-MuLan + Flamingo \u2192 Fused"
                         } else if (databaseInfo.hasFused) {
                             "Models: Fused"
                         } else if (modelNames.size == 1) {
@@ -1032,6 +1033,89 @@ fun SettingsScreen(
                     Spacer(modifier = Modifier.height(8.dp))
                     OutlinedButton(onClick = onImportDatabase, modifier = Modifier.fillMaxWidth()) {
                         Text(if (databaseInfo != null) "Replace Database" else "Import Database")
+                    }
+                }
+            }
+
+            // On-device indexing section
+            if (databaseInfo != null) {
+                item {
+                    val unindexedCount by viewModel.unindexedCount.collectAsState()
+                    val hasOnnxModels by viewModel.hasOnnxModels.collectAsState()
+                    val indexingState by viewModel.indexingState.collectAsState()
+
+                    Column {
+                        Text("On-Device Indexing", style = MaterialTheme.typography.titleMedium)
+                        Spacer(modifier = Modifier.height(4.dp))
+
+                        if (!hasOnnxModels) {
+                            Text("ONNX models not found",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("Transfer mulan_audio.onnx and flamingo_encoder.onnx to app data",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        } else {
+                            when (val state = indexingState) {
+                                is IndexingService.IndexingState.Idle -> {
+                                    if (unindexedCount > 0) {
+                                        Text("$unindexedCount unindexed tracks detected",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = MaterialTheme.colorScheme.primary)
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Button(
+                                            onClick = { viewModel.startIndexing() },
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Text("Index $unindexedCount Tracks")
+                                        }
+                                    } else {
+                                        Text("All tracks indexed",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                }
+                                is IndexingService.IndexingState.Starting,
+                                is IndexingService.IndexingState.Detecting -> {
+                                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text("Detecting new tracks...",
+                                        style = MaterialTheme.typography.bodySmall)
+                                }
+                                is IndexingService.IndexingState.Processing -> {
+                                    LinearProgressIndicator(
+                                        progress = { state.current.toFloat() / state.total },
+                                        modifier = Modifier.fillMaxWidth(),
+                                    )
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text("${state.current}/${state.total}: ${state.trackName}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    OutlinedButton(
+                                        onClick = { viewModel.cancelIndexing() },
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) { Text("Cancel") }
+                                }
+                                is IndexingService.IndexingState.RebuildingIndices -> {
+                                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(state.message,
+                                        style = MaterialTheme.typography.bodySmall)
+                                }
+                                is IndexingService.IndexingState.Complete -> {
+                                    val msg = "${state.indexed} tracks indexed" +
+                                        if (state.failed > 0) " (${state.failed} failed)" else ""
+                                    Text(msg, style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.primary)
+                                }
+                                is IndexingService.IndexingState.Error -> {
+                                    Text(state.message,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.error)
+                                }
+                            }
+                        }
                     }
                 }
             }
