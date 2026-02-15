@@ -379,6 +379,8 @@ def verify_mulan_onnx(onnx_path: Path, num_tracks: int = 10, tolerance: float = 
 
     logger.info(f"Verifying MuQ-MuLan ONNX: {onnx_path}")
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     # Load PyTorch model
     model = MuQMuLan.from_pretrained("OpenMuQ/MuQ-MuLan-large")
     model.eval()
@@ -391,16 +393,17 @@ def verify_mulan_onnx(onnx_path: Path, num_tracks: int = 10, tolerance: float = 
 
     if input_dtype == np.float16:
         model = model.half()
+    model = model.to(device)
 
     logger.info(f"  Input: {input_name} ({'split/mel' if is_split_model else 'full/wav'}), "
-                f"dtype: {'fp16' if input_dtype == np.float16 else 'fp32'}")
+                f"dtype: {'fp16' if input_dtype == np.float16 else 'fp32'}, device: {device}")
 
     max_diff = 0.0
     all_cos_sims = []
 
     for i in range(num_tracks):
         # Random 10s audio clip
-        wav = torch.randn(1, 240000)
+        wav = torch.randn(1, 240000, device=device)
         if input_dtype == np.float16:
             wav = wav.half()
 
@@ -415,7 +418,7 @@ def verify_mulan_onnx(onnx_path: Path, num_tracks: int = 10, tolerance: float = 
                 mel_dict = muq_model.normalize(mel_dict)
                 onnx_input = mel_dict["melspec_2048"].cpu().numpy()
             else:
-                onnx_input = wav.numpy()
+                onnx_input = wav.cpu().numpy()
 
         # ONNX inference
         onnx_emb = sess.run(None, {input_name: onnx_input})[0]
