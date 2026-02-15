@@ -101,6 +101,45 @@ def _patch_flamingo_rotary_for_onnx():
         return False
 
 
+def _convert_onnx_to_fp16(model_path: Path):
+    """Post-export FP32→FP16 conversion for ONNX models.
+
+    Exporting a PyTorch FP16 model directly often produces mixed-dtype graphs
+    (e.g. LayerNorm weight/bias stay FP32 while activations are FP16), which
+    ONNX Runtime rejects. Instead: export FP32, then convert everything to FP16.
+    """
+    import onnx
+    from onnx import TensorProto, numpy_helper
+
+    logger.info(f"Converting {model_path.name} to FP16...")
+    model = onnx.load(str(model_path))
+
+    # Convert initializers (weights/biases)
+    for init in model.graph.initializer:
+        if init.data_type == TensorProto.FLOAT:
+            arr = numpy_helper.to_array(init).astype(np.float16)
+            new = numpy_helper.from_array(arr, name=init.name)
+            init.CopyFrom(new)
+
+    # Convert Constant node values
+    for node in model.graph.node:
+        if node.op_type == "Constant":
+            for attr in node.attribute:
+                if attr.name == "value" and attr.t.data_type == TensorProto.FLOAT:
+                    arr = numpy_helper.to_array(attr.t).astype(np.float16)
+                    new = numpy_helper.from_array(arr)
+                    attr.t.CopyFrom(new)
+
+    # Update type annotations (FLOAT → FLOAT16 only; INT64 etc stay unchanged)
+    for x in list(model.graph.input) + list(model.graph.output) + list(model.graph.value_info):
+        if x.type.tensor_type.elem_type == TensorProto.FLOAT:
+            x.type.tensor_type.elem_type = TensorProto.FLOAT16
+
+    onnx.save(model, str(model_path))
+    size_mb = model_path.stat().st_size / 1024 / 1024
+    logger.info(f"FP16 conversion done: {size_mb:.1f} MB")
+
+
 class FlamingoOnnxWrapper(nn.Module):
     """Wraps Music Flamingo encoder + projector for ONNX export.
 
@@ -379,11 +418,8 @@ def export_flamingo_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
         projector.load_state_dict(state_dict)
         projector.eval()
 
-    if fp16:
-        encoder = encoder.half()
-        if projector is not None:
-            projector = projector.half()
-
+    # Export in FP32 to avoid mixed-dtype issues (LayerNorm weight/bias vs activations).
+    # Convert to FP16 post-export for consistent types.
     encoder = encoder.to(device)
     if projector is not None:
         projector = projector.to(device)
@@ -391,16 +427,12 @@ def export_flamingo_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
     wrapper = FlamingoOnnxWrapper(encoder, projector)
     wrapper.eval()
 
-    # Dummy inputs: single 30s chunk
+    # Dummy inputs: single 30s chunk (FP32 for tracing)
     batch_size = 1
     dummy_mel = torch.randn(batch_size, 128, 3000, device=device)
     dummy_mask = torch.ones(batch_size, 3000, dtype=torch.long, device=device)
     dummy_times = (torch.arange(750, dtype=torch.float32, device=device).unsqueeze(0)
                    * FRAME_DURATION_S)
-
-    if fp16:
-        dummy_mel = dummy_mel.half()
-        dummy_times = dummy_times.half()
 
     logger.info(f"Exporting Flamingo to {output_path} (opset {opset}, fp16={fp16}, device={device})...")
 
@@ -438,7 +470,10 @@ def export_flamingo_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
         )
 
     size_mb = output_path.stat().st_size / 1024 / 1024
-    logger.info(f"Exported Flamingo: {size_mb:.1f} MB")
+    logger.info(f"Exported Flamingo (FP32): {size_mb:.1f} MB")
+
+    if fp16:
+        _convert_onnx_to_fp16(output_path)
 
     del encoder, projector, wrapper
     if torch.cuda.is_available():
@@ -537,6 +572,8 @@ def verify_flamingo_onnx(onnx_path: Path, num_tracks: int = 10, tolerance: float
 
     logger.info(f"Verifying Flamingo ONNX: {onnx_path}")
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     encoder_path = get_flamingo_encoder_path()
     encoder = MusicFlamingoEncoder.from_pretrained(str(encoder_path))
     encoder.eval()
@@ -558,14 +595,21 @@ def verify_flamingo_onnx(onnx_path: Path, num_tracks: int = 10, tolerance: float
         if projector is not None:
             projector = projector.half()
 
+    encoder = encoder.to(device)
+    if projector is not None:
+        projector = projector.to(device)
+
+    logger.info(f"  dtype: {'fp16' if input_dtype == np.float16 else 'fp32'}, device: {device}")
+
     max_diff = 0.0
     all_cos_sims = []
 
     for i in range(num_tracks):
         # Random mel spectrogram (30s chunk)
-        mel = torch.randn(1, 128, 3000)
-        mask = torch.ones(1, 3000, dtype=torch.long)
-        times = torch.arange(750, dtype=torch.float32).unsqueeze(0) * FRAME_DURATION_S
+        mel = torch.randn(1, 128, 3000, device=device)
+        mask = torch.ones(1, 3000, dtype=torch.long, device=device)
+        times = (torch.arange(750, dtype=torch.float32, device=device).unsqueeze(0)
+                 * FRAME_DURATION_S)
 
         if input_dtype == np.float16:
             mel = mel.half()
@@ -579,11 +623,11 @@ def verify_flamingo_onnx(onnx_path: Path, num_tracks: int = 10, tolerance: float
                 hidden = projector(hidden)
             ref = hidden.cpu().numpy()
 
-        # ONNX inference
+        # ONNX inference (CPU)
         feed = {
-            "input_features": mel.numpy(),
-            "input_features_mask": mask.numpy(),
-            "audio_times": times.numpy(),
+            "input_features": mel.cpu().numpy(),
+            "input_features_mask": mask.cpu().numpy(),
+            "audio_times": times.cpu().numpy(),
         }
         onnx_out = sess.run(None, feed)[0]
 
