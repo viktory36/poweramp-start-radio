@@ -104,25 +104,50 @@ def _patch_flamingo_rotary_for_onnx():
 def _convert_onnx_to_fp16(model_path: Path):
     """Post-export FP32→FP16 conversion for ONNX models.
 
-    Uses onnxconverter_common (pip install onnxconverter-common) which properly
-    handles all edge cases: inserts Cast nodes at type boundaries, preserves
-    shape computation paths, and has an op_block_list for precision-sensitive ops.
+    Uses onnxconverter_common which properly handles all edge cases: inserts
+    Cast nodes at type boundaries, preserves shape computation paths, etc.
+    Validates the result loads in ONNX Runtime before returning.
     """
     import onnx
+    import onnxruntime as ort
+    from onnxconverter_common import float16
 
     logger.info(f"Converting {model_path.name} to FP16...")
     model = onnx.load(str(model_path))
 
-    from onnxconverter_common import float16
+    # Save original opset imports (some converter versions drop them)
+    original_opsets = []
+    for opset in model.opset_import:
+        original_opsets.append((opset.domain, opset.version))
 
     model_fp16 = float16.convert_float_to_float16(
         model,
         keep_io_types=False,
     )
 
+    # Restore opset imports if lost during conversion
+    if not model_fp16.opset_import:
+        logger.warning("Opset imports lost during FP16 conversion, restoring...")
+        for domain, version in original_opsets:
+            opset = model_fp16.opset_import.add()
+            opset.domain = domain
+            opset.version = version
+
     onnx.save(model_fp16, str(model_path))
     size_mb = model_path.stat().st_size / 1024 / 1024
     logger.info(f"FP16 conversion done: {size_mb:.1f} MB")
+
+    # Validate: try loading in ONNX Runtime
+    logger.info("Validating FP16 model loads in ONNX Runtime...")
+    try:
+        sess = ort.InferenceSession(str(model_path))
+        input_names = [inp.name for inp in sess.get_inputs()]
+        logger.info(f"  Validation passed. Inputs: {input_names}")
+        del sess
+    except Exception as e:
+        logger.error(f"  FP16 model failed ORT validation: {e}")
+        logger.error("  The FP16 model file may not work. Try --no-fp16 to export FP32 instead.")
+        raise
 
 
 class FlamingoOnnxWrapper(nn.Module):
