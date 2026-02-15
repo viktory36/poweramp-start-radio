@@ -113,9 +113,9 @@ def _convert_onnx_to_fp16(model_path: Path):
     logger.info(f"Converting {model_path.name} to FP16...")
     model = onnx.load(str(model_path))
 
-    from onnxconverter_common import float16_converter
+    from onnxconverter_common import float16
 
-    model_fp16 = float16_converter.convert_float_to_float16(
+    model_fp16 = float16.convert_float_to_float16(
         model,
         keep_io_types=False,
     )
