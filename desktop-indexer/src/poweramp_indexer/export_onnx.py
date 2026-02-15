@@ -107,30 +107,61 @@ def _convert_onnx_to_fp16(model_path: Path):
     Exporting a PyTorch FP16 model directly often produces mixed-dtype graphs
     (e.g. LayerNorm weight/bias stay FP32 while activations are FP16), which
     ONNX Runtime rejects. Instead: export FP32, then convert everything to FP16.
+
+    Handles: initializers, Constant tensors, Constant scalar (value_float),
+    ConstantOfShape, Cast-to-float32 → Cast-to-float16, and type annotations.
     """
     import onnx
-    from onnx import TensorProto, numpy_helper
+    from onnx import TensorProto, helper, numpy_helper
 
     logger.info(f"Converting {model_path.name} to FP16...")
     model = onnx.load(str(model_path))
 
-    # Convert initializers (weights/biases)
+    # 1. Convert initializers (weights/biases)
     for init in model.graph.initializer:
         if init.data_type == TensorProto.FLOAT:
             arr = numpy_helper.to_array(init).astype(np.float16)
             new = numpy_helper.from_array(arr, name=init.name)
             init.CopyFrom(new)
 
-    # Convert Constant node values
+    # 2. Convert nodes: Constant values, ConstantOfShape, Cast targets
     for node in model.graph.node:
-        if node.op_type == "Constant":
+        if node.op_type in ("Constant", "ConstantOfShape"):
+            # Handle tensor-valued constants
             for attr in node.attribute:
                 if attr.name == "value" and attr.t.data_type == TensorProto.FLOAT:
                     arr = numpy_helper.to_array(attr.t).astype(np.float16)
                     new = numpy_helper.from_array(arr)
                     attr.t.CopyFrom(new)
 
-    # Update type annotations (FLOAT → FLOAT16 only; INT64 etc stay unchanged)
+        if node.op_type == "Constant":
+            # Handle scalar float constants (value_float / value_floats attributes)
+            # These produce float32 outputs — replace with FP16 tensor constants
+            rebuilt = []
+            changed = False
+            for attr in node.attribute:
+                if attr.name == "value_float":
+                    tensor = numpy_helper.from_array(np.array(attr.f, dtype=np.float16))
+                    rebuilt.append(helper.make_attribute("value", tensor))
+                    changed = True
+                elif attr.name == "value_floats":
+                    tensor = numpy_helper.from_array(
+                        np.array(list(attr.floats), dtype=np.float16))
+                    rebuilt.append(helper.make_attribute("value", tensor))
+                    changed = True
+                else:
+                    rebuilt.append(attr)
+            if changed:
+                del node.attribute[:]
+                node.attribute.extend(rebuilt)
+
+        # Redirect Cast-to-float32 → Cast-to-float16
+        if node.op_type == "Cast":
+            for attr in node.attribute:
+                if attr.name == "to" and attr.i == TensorProto.FLOAT:
+                    attr.i = TensorProto.FLOAT16
+
+    # 3. Update all type annotations (FLOAT → FLOAT16; INT64 etc unchanged)
     for x in list(model.graph.input) + list(model.graph.output) + list(model.graph.value_info):
         if x.type.tensor_type.elem_type == TensorProto.FLOAT:
             x.type.tensor_type.elem_type = TensorProto.FLOAT16
