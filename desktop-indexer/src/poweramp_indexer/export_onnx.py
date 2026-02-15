@@ -419,10 +419,11 @@ def export_flamingo_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
         projector.eval()
 
     # Export in FP32 to avoid mixed-dtype issues (LayerNorm weight/bias vs activations).
-    # Convert to FP16 post-export for consistent types.
-    encoder = encoder.to(device)
+    # The encoder loads with BF16 weights — cast to FP32 for clean tracing.
+    # Convert to FP16 post-export for consistent types and smaller model.
+    encoder = encoder.float().to(device)
     if projector is not None:
-        projector = projector.to(device)
+        projector = projector.float().to(device)
 
     wrapper = FlamingoOnnxWrapper(encoder, projector)
     wrapper.eval()
