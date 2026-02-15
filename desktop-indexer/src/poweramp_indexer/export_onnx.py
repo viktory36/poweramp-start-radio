@@ -104,67 +104,23 @@ def _patch_flamingo_rotary_for_onnx():
 def _convert_onnx_to_fp16(model_path: Path):
     """Post-export FP32→FP16 conversion for ONNX models.
 
-    Exporting a PyTorch FP16 model directly often produces mixed-dtype graphs
-    (e.g. LayerNorm weight/bias stay FP32 while activations are FP16), which
-    ONNX Runtime rejects. Instead: export FP32, then convert everything to FP16.
-
-    Handles: initializers, Constant tensors, Constant scalar (value_float),
-    ConstantOfShape, Cast-to-float32 → Cast-to-float16, and type annotations.
+    Uses onnxconverter_common (pip install onnxconverter-common) which properly
+    handles all edge cases: inserts Cast nodes at type boundaries, preserves
+    shape computation paths, and has an op_block_list for precision-sensitive ops.
     """
     import onnx
-    from onnx import TensorProto, helper, numpy_helper
 
     logger.info(f"Converting {model_path.name} to FP16...")
     model = onnx.load(str(model_path))
 
-    # 1. Convert initializers (weights/biases)
-    for init in model.graph.initializer:
-        if init.data_type == TensorProto.FLOAT:
-            arr = numpy_helper.to_array(init).astype(np.float16)
-            new = numpy_helper.from_array(arr, name=init.name)
-            init.CopyFrom(new)
+    from onnxconverter_common import float16_converter
 
-    # 2. Convert nodes: Constant values, ConstantOfShape, Cast targets
-    for node in model.graph.node:
-        if node.op_type in ("Constant", "ConstantOfShape"):
-            # Handle tensor-valued constants
-            for attr in node.attribute:
-                if attr.name == "value" and attr.t.data_type == TensorProto.FLOAT:
-                    arr = numpy_helper.to_array(attr.t).astype(np.float16)
-                    new = numpy_helper.from_array(arr)
-                    attr.t.CopyFrom(new)
+    model_fp16 = float16_converter.convert_float_to_float16(
+        model,
+        keep_io_types=False,
+    )
 
-        if node.op_type == "Constant":
-            # Handle scalar float constants (value_float / value_floats attributes)
-            # These produce float32 outputs — replace with FP16 tensor constants
-            rebuilt = []
-            changed = False
-            for attr in node.attribute:
-                if attr.name == "value_float":
-                    tensor = numpy_helper.from_array(np.array(attr.f, dtype=np.float16))
-                    rebuilt.append(helper.make_attribute("value", tensor))
-                    changed = True
-                elif attr.name == "value_floats":
-                    tensor = numpy_helper.from_array(
-                        np.array(list(attr.floats), dtype=np.float16))
-                    rebuilt.append(helper.make_attribute("value", tensor))
-                    changed = True
-                else:
-                    rebuilt.append(attr)
-            if changed:
-                del node.attribute[:]
-                node.attribute.extend(rebuilt)
-
-    # Note: we do NOT modify Cast nodes targeting float32. Changing Cast targets
-    # can break shape computation paths and cause MatMul dimension mismatches.
-    # The above constant/initializer conversions should be sufficient.
-
-    # 3. Update all type annotations (FLOAT → FLOAT16; INT64 etc unchanged)
-    for x in list(model.graph.input) + list(model.graph.output) + list(model.graph.value_info):
-        if x.type.tensor_type.elem_type == TensorProto.FLOAT:
-            x.type.tensor_type.elem_type = TensorProto.FLOAT16
-
-    onnx.save(model, str(model_path))
+    onnx.save(model_fp16, str(model_path))
     size_mb = model_path.stat().st_size / 1024 / 1024
     logger.info(f"FP16 conversion done: {size_mb:.1f} MB")
 
