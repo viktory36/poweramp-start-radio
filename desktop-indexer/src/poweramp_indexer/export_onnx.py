@@ -47,6 +47,60 @@ class MuLanAudioOnnxWrapper(nn.Module):
         return self.mulan_inner.get_audio_latents(wav)
 
 
+def _patch_flamingo_rotary_for_onnx():
+    """Monkey-patch Flamingo's apply_rotary_emb to be ONNX-exportable.
+
+    The original code does:
+        return torch.cat((t_left, t, t_right), dim=-1).to(ori_dtype)
+
+    This fails in PyTorch's legacy ONNX export because the three slices may have
+    different dtypes during FP16 tracing. Fix: cast all parts to the same dtype
+    BEFORE the cat operation.
+    """
+    try:
+        import transformers.models.musicflamingo.modeling_musicflamingo as mf
+
+        original_apply_rotary = mf.apply_rotary_emb
+
+        def patched_apply_rotary_emb(freqs, t, start_index=0, scale=1.0, seq_dim=-2):
+            if t.ndim == 3:
+                seq_len = t.shape[seq_dim]
+                freqs = freqs[-seq_len:]
+
+            rot_dim = freqs.shape[-1]
+            end_index = start_index + rot_dim
+
+            assert rot_dim <= t.shape[-1], (
+                f"feature dimension {t.shape[-1]} is not of sufficient size "
+                f"to rotate in all the positions {rot_dim}"
+            )
+
+            ori_dtype = t.dtype
+            t_left = t[..., :start_index]
+            t_mid = t[..., start_index:end_index]
+            t_right = t[..., end_index:]
+
+            # Rotate the middle portion
+            def rotate_half(x):
+                x1, x2 = x.chunk(2, dim=-1)
+                return torch.cat((-x2, x1), dim=-1)
+
+            t_mid = (t_mid * freqs.cos() * scale) + (rotate_half(t_mid) * freqs.sin() * scale)
+
+            # Cast all parts to same dtype BEFORE cat (fixes ONNX export)
+            t_left = t_left.to(ori_dtype)
+            t_mid = t_mid.to(ori_dtype)
+            t_right = t_right.to(ori_dtype)
+            return torch.cat((t_left, t_mid, t_right), dim=-1)
+
+        mf.apply_rotary_emb = patched_apply_rotary_emb
+        logger.info("Patched Flamingo apply_rotary_emb for ONNX compatibility")
+        return True
+    except Exception as e:
+        logger.warning(f"Could not patch Flamingo rotary embeddings: {e}")
+        return False
+
+
 class FlamingoOnnxWrapper(nn.Module):
     """Wraps Music Flamingo encoder + projector for ONNX export.
 
@@ -305,6 +359,9 @@ def export_flamingo_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
     )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Patch RoTE to fix torch.cat dtype mismatch in legacy ONNX export
+    _patch_flamingo_rotary_for_onnx()
 
     encoder_path = get_flamingo_encoder_path()
     logger.info(f"Loading Music Flamingo encoder from {encoder_path}...")
