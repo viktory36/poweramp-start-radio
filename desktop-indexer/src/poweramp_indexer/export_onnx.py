@@ -347,24 +347,46 @@ def export_flamingo_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
 
     logger.info(f"Exporting Flamingo to {output_path} (opset {opset}, fp16={fp16}, device={device})...")
 
-    torch.onnx.export(
-        wrapper,
-        (dummy_mel, dummy_mask, dummy_times),
-        str(output_path),
-        input_names=["input_features", "input_features_mask", "audio_times"],
-        output_names=["hidden_states"],
-        dynamic_axes={
-            "input_features": {0: "batch"},
-            "input_features_mask": {0: "batch"},
-            "audio_times": {0: "batch"},
-            "hidden_states": {0: "batch"},
-        },
-        opset_version=opset,
-        do_constant_folding=True,
-    )
+    # Try dynamo-based export first (handles RoTE/complex ops that fail with legacy export)
+    # Then fall back to legacy TorchScript export
+    exported = False
+
+    if hasattr(torch.onnx, 'dynamo_export'):
+        try:
+            logger.info("Trying dynamo_export (handles complex ops better)...")
+            export_output = torch.onnx.dynamo_export(
+                wrapper, dummy_mel, dummy_mask, dummy_times
+            )
+            export_output.save(str(output_path))
+            exported = True
+            logger.info("dynamo_export succeeded")
+        except Exception as e:
+            logger.warning(f"dynamo_export failed: {e}, trying legacy export...")
+
+    if not exported:
+        torch.onnx.export(
+            wrapper,
+            (dummy_mel, dummy_mask, dummy_times),
+            str(output_path),
+            input_names=["input_features", "input_features_mask", "audio_times"],
+            output_names=["hidden_states"],
+            dynamic_axes={
+                "input_features": {0: "batch"},
+                "input_features_mask": {0: "batch"},
+                "audio_times": {0: "batch"},
+                "hidden_states": {0: "batch"},
+            },
+            opset_version=opset,
+            do_constant_folding=True,
+        )
 
     size_mb = output_path.stat().st_size / 1024 / 1024
     logger.info(f"Exported Flamingo: {size_mb:.1f} MB")
+
+    del encoder, projector, wrapper
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return output_path
 
 
