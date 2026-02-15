@@ -140,6 +140,7 @@ class IndexingService : Service() {
                 // Load ONNX models
                 val mulanFile = File(filesDir, "mulan_audio.onnx")
                 val flamingoFile = File(filesDir, "flamingo_encoder.onnx")
+                val projectorFile = File(filesDir, "flamingo_projector.onnx")
 
                 val mulanInference = if (mulanFile.exists()) {
                     updateNotification("Loading MuQ-MuLan model...")
@@ -152,7 +153,7 @@ class IndexingService : Service() {
 
                 val flamingoInference = if (flamingoFile.exists()) {
                     updateNotification("Loading Flamingo model...")
-                    try { FlamingoInference(flamingoFile) }
+                    try { FlamingoInference(flamingoFile, projectorFile) }
                     catch (e: Exception) {
                         Log.e(TAG, "Failed to load Flamingo", e)
                         null

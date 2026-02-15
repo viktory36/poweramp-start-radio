@@ -3,14 +3,19 @@ package com.powerampstartradio.indexing
 import kotlin.math.*
 
 /**
- * Whisper-compatible mel spectrogram computation in pure Kotlin.
+ * Configurable mel spectrogram computation in pure Kotlin.
  *
- * Replicates the WhisperFeatureExtractor from HuggingFace transformers:
+ * Default configuration matches WhisperFeatureExtractor (for Flamingo):
  * - STFT: n_fft=400, hop_length=160, window=hann(400) @ 16kHz → 25ms window, 10ms hop
  * - Mel filterbank: 128 filters, fmin=0, fmax=8000
- * - Log scale: log10(max(mel, 1e-10)), clamp to max-8, scale to [0,1]
  *
- * Output for a 30s chunk @ 16kHz: [128, 3000]
+ * Also supports MuLan configuration:
+ * - n_fft=2048, hop_length=240, window=hann(2048) @ 24kHz
+ * - Mel filterbank: 128 filters, fmin=0, fmax=12000 (Nyquist)
+ *
+ * Normalization is applied separately by the caller:
+ * - Flamingo: [whisperNormalize] (log10, clamp, scale to [0,1])
+ * - MuLan: (mel - mean) / std with model-specific statistics
  */
 class MelSpectrogram(
     private val sampleRate: Int = 16000,
@@ -33,10 +38,15 @@ class MelSpectrogram(
     private val fftSize = nextPowerOf2(nFft)
 
     /**
-     * Compute mel spectrogram from audio samples.
+     * Compute raw power mel spectrogram from audio samples.
+     *
+     * Returns the raw power mel with no normalization applied.
+     * Callers should apply the appropriate normalization:
+     * - Flamingo/Whisper: [whisperNormalize]
+     * - MuLan: (mel - mean) / std
      *
      * @param audio PCM samples at [sampleRate] Hz
-     * @return [nMels, numFrames] mel spectrogram, Whisper-normalized
+     * @return [nMels, numFrames] raw power mel spectrogram
      */
     fun compute(audio: FloatArray): Array<FloatArray> {
         // Pad to ensure we get the expected number of frames
@@ -88,33 +98,30 @@ class MelSpectrogram(
             }
         }
 
-        // Log mel spectrogram with Whisper normalization
-        whisperNormalize(melSpec)
-
         return melSpec
     }
 
-    /**
-     * Whisper-style log mel normalization:
-     * 1. log10(max(mel, 1e-10))
-     * 2. Clamp to max_val - 8.0
-     * 3. Scale to approximately [0, 1] range: (x - (max_val - 8)) / 8
-     */
-    private fun whisperNormalize(melSpec: Array<FloatArray>) {
-        // Step 1: log10
-        var maxVal = -Float.MAX_VALUE
-        for (m in melSpec.indices) {
-            for (t in melSpec[m].indices) {
-                melSpec[m][t] = log10(maxOf(melSpec[m][t], 1e-10f))
-                if (melSpec[m][t] > maxVal) maxVal = melSpec[m][t]
+    companion object {
+        /**
+         * Whisper-style log mel normalization (in-place).
+         * 1. log10(max(mel, 1e-10))
+         * 2. Clamp to max_val - 8.0
+         * 3. Scale to approximately [0, 1] range: (x - (max_val - 8)) / 8
+         */
+        fun whisperNormalize(melSpec: Array<FloatArray>) {
+            var maxVal = -Float.MAX_VALUE
+            for (m in melSpec.indices) {
+                for (t in melSpec[m].indices) {
+                    melSpec[m][t] = log10(maxOf(melSpec[m][t], 1e-10f))
+                    if (melSpec[m][t] > maxVal) maxVal = melSpec[m][t]
+                }
             }
-        }
 
-        // Step 2 & 3: clamp and scale
-        val minVal = maxVal - 8f
-        for (m in melSpec.indices) {
-            for (t in melSpec[m].indices) {
-                melSpec[m][t] = (maxOf(melSpec[m][t], minVal) - minVal) / 8f
+            val minVal = maxVal - 8f
+            for (m in melSpec.indices) {
+                for (t in melSpec[m].indices) {
+                    melSpec[m][t] = (maxOf(melSpec[m][t], minVal) - minVal) / 8f
+                }
             }
         }
     }

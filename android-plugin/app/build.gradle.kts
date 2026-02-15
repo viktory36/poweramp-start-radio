@@ -85,7 +85,8 @@ dependencies {
     // JSON serialization for session history persistence
     implementation("com.google.code.gson:gson:2.11.0")
 
-    // ONNX Runtime for on-device embedding inference
+    // ONNX Runtime for on-device embedding inference (XNNPACK CPU by default)
+    // For Snapdragon NPU acceleration, swap for onnxruntime-android-qnn (requires INT8 models)
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.17.0")
 
     // Testing

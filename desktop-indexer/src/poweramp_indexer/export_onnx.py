@@ -115,6 +115,64 @@ def _validate_onnx(model_path: Path) -> bool:
         return False
 
 
+def _consolidate_external_data(model_path: Path):
+    """If ONNX model has external data, merge everything into a single file.
+
+    PyTorch's ONNX exporter stores large models (>2GB) as external data with
+    individual files per parameter (named like encoder.conv1.weight, not *.data).
+    This function detects external refs from the model itself, not file patterns.
+    """
+    import onnx
+
+    # Check if the ONNX model has any external data references
+    model_proto = onnx.load(str(model_path), load_external_data=False)
+    has_external = any(
+        i.data_location == 1 for i in model_proto.graph.initializer
+    )
+    if not has_external:
+        return  # All weights are inline
+
+    import shutil
+    logger.info("Consolidating external data into single ONNX file...")
+
+    # Collect external data file paths referenced by the model
+    ext_files = set()
+    for init in model_proto.graph.initializer:
+        if init.data_location == 1:
+            for entry in init.external_data:
+                if entry.key == "location":
+                    ext_files.add(model_path.parent / entry.value)
+
+    # Load with all external data in memory
+    model = onnx.load(str(model_path), load_external_data=True)
+
+    # If total weight data > 2GB, save with single external data file
+    total_bytes = sum(len(i.raw_data) for i in model.graph.initializer)
+    single_path = model_path.with_suffix(".single.onnx")
+
+    if total_bytes > 2_000_000_000:
+        # Too large for single protobuf — use single external data file
+        logger.info(f"  Model is {total_bytes / 1024**3:.1f} GB, using external data file")
+        onnx.save(
+            model, str(single_path),
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=model_path.stem + ".data",
+        )
+    else:
+        onnx.save(model, str(single_path))
+
+    shutil.move(str(single_path), str(model_path))
+
+    # Clean up old external data files
+    for f in ext_files:
+        if f.exists() and f != model_path:
+            f.unlink(missing_ok=True)
+
+    size_mb = model_path.stat().st_size / 1024 / 1024
+    logger.info(f"Consolidated to single file: {size_mb:.1f} MB")
+
+
 def _try_fp16_conversion(model_path: Path) -> bool:
     """Attempt FP16 conversion. Returns True on success, False on failure.
 
@@ -182,21 +240,25 @@ def _try_fp16_conversion(model_path: Path) -> bool:
         return False
 
 
-class FlamingoOnnxWrapper(nn.Module):
-    """Wraps Music Flamingo encoder + projector for ONNX export.
+class FlamingoEncoderOnnxWrapper(nn.Module):
+    """Wraps Music Flamingo encoder for ONNX export (without projector).
+
+    The encoder and projector are exported as separate ONNX files because
+    the combined graph has an ONNX shape inference bug (rotary embedding's
+    Concat confuses the tracer, resulting in dim=0 for the feature axis,
+    which breaks the projector's MatMul).
 
     Input:  input_features [B, 128, 3000] (Whisper mel spectrogram)
             input_features_mask [B, 3000]
             audio_times [B, 750] (absolute timestamps per post-pool frame)
-    Output: hidden [B, 750, 3584] (encoder output projected to LLM space)
+    Output: hidden_states [B, 750, 1280] (encoder hidden states)
 
     Mel spectrogram computation stays outside ONNX (done in Kotlin on Android).
     """
 
-    def __init__(self, encoder, projector=None):
+    def __init__(self, encoder):
         super().__init__()
         self.encoder = encoder
-        self.projector = projector
 
     def forward(
         self,
@@ -204,32 +266,31 @@ class FlamingoOnnxWrapper(nn.Module):
         input_features_mask: torch.Tensor,
         audio_times: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Args:
-            input_features: [B, 128, 3000] mel spectrogram
-            input_features_mask: [B, 3000] attention mask (1 = valid)
-            audio_times: [B, 750] absolute timestamps per frame
-        Returns:
-            [B, 750, 3584] projected hidden states (or [B, 750, 1280] without projector)
-        """
         output = self.encoder(
             input_features,
             input_features_mask=input_features_mask,
             audio_times=audio_times,
         )
-        hidden = output.last_hidden_state  # [B, 750, 1280]
-        if self.projector is not None:
-            hidden = self.projector(hidden)  # [B, 750, 3584]
-        return hidden
+        return output.last_hidden_state  # [B, 750, 1280]
 
 
 def export_mulan_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
-    """Export MuQ-MuLan audio encoder to ONNX.
+    """Export MuQ-MuLan audio encoder to ONNX (split model).
+
+    Always uses the split approach: mel spectrogram computation is done outside
+    ONNX (in Python or Android Kotlin). This avoids the >2GB external data issue
+    from including torch.stft in the graph, and produces a single-file model.
+
+    Input:  mel_features [1, 128, 1000] (normalized mel from 10s @ 24kHz)
+    Output: embedding [1, 512] (L2-normalized)
+
+    A mel_params.json sidecar is generated with the preprocessing parameters
+    needed to replicate mel computation on Android.
 
     Args:
         output_path: Path for the .onnx file
         fp16: Whether to export in FP16 (halves model size)
-        opset: ONNX opset version (17+ needed for torch.stft)
+        opset: ONNX opset version
     """
     from muq import MuQMuLan
 
@@ -243,43 +304,16 @@ def export_mulan_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
         model = model.half()
     model = model.to(device)
 
-    wrapper = MuLanAudioOnnxWrapper(model)
-    wrapper.eval()
+    result = _export_mulan_split(model, output_path, fp16, opset, device)
 
-    # 10s clip at 24kHz
-    dummy_wav = torch.randn(1, 240000, device=device)
-    if fp16:
-        dummy_wav = dummy_wav.half()
+    # Consolidate external data into single file if needed
+    _consolidate_external_data(output_path)
 
-    logger.info(f"Exporting MuQ-MuLan to {output_path} (opset {opset}, fp16={fp16}, device={device})...")
+    # Validate
+    if not _validate_onnx(output_path):
+        raise RuntimeError("MuQ-MuLan ONNX export failed ORT validation")
 
-    try:
-        torch.onnx.export(
-            wrapper,
-            (dummy_wav,),
-            str(output_path),
-            input_names=["wav"],
-            output_names=["embedding"],
-            dynamic_axes={
-                "wav": {0: "batch"},
-                "embedding": {0: "batch"},
-            },
-            opset_version=opset,
-            do_constant_folding=True,
-        )
-    except Exception as e:
-        logger.warning(f"Standard ONNX export failed: {e}")
-        logger.info("Trying with mel spectrogram as preprocessing step...")
-        return _export_mulan_split(model, output_path, fp16, opset, device)
-
-    size_mb = output_path.stat().st_size / 1024 / 1024
-    logger.info(f"Exported MuQ-MuLan: {size_mb:.1f} MB")
-
-    del model, wrapper
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return output_path
+    return result
 
 
 class MuLanPostMelWrapper(nn.Module):
@@ -383,10 +417,7 @@ def _export_mulan_split(model, output_path: Path, fp16: bool, opset: int, device
     wrapper.eval()
 
     logger.info(f"Exporting post-mel model to {output_path}...")
-    torch.onnx.export(
-        wrapper,
-        (dummy_mel,),
-        str(output_path),
+    export_kwargs = dict(
         input_names=["mel_features"],
         output_names=["embedding"],
         dynamic_axes={
@@ -395,6 +426,18 @@ def _export_mulan_split(model, output_path: Path, fp16: bool, opset: int, device
         },
         opset_version=opset,
         do_constant_folding=True,
+    )
+
+    # PyTorch 2.8+ accepts dynamo=False to force legacy TorchScript export
+    import inspect
+    if 'dynamo' in inspect.signature(torch.onnx.export).parameters:
+        export_kwargs['dynamo'] = False
+
+    torch.onnx.export(
+        wrapper,
+        (dummy_mel,),
+        str(output_path),
+        **export_kwargs,
     )
 
     # Save mel parameters so Android can replicate the mel spectrogram
@@ -425,11 +468,29 @@ def _export_mulan_split(model, output_path: Path, fp16: bool, opset: int, device
 def export_flamingo_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
     """Export Music Flamingo encoder + projector to ONNX.
 
+    Produces two files:
+    - {output_path}: Encoder ONNX (~1.2GB FP16)
+    - {output_path.parent}/flamingo_projector.onnx: Projector ONNX (~33MB FP16)
+
+    The encoder and projector are separate because combining them in a single
+    ONNX graph triggers a shape inference bug: the rotary embedding's Concat
+    ops confuse the tracer, producing dim=0 for the feature axis, which breaks
+    the projector's MatMul. Separating them avoids this entirely.
+
+    Uses attn_implementation='eager' because SDPA bakes incorrect Reshape
+    dimensions into the ONNX graph (attention head splitting).
+
+    FP16 is done at export time (tracing in FP16 dtype) rather than
+    post-conversion, since onnxconverter_common is broken with onnx >=1.17.
+
     Args:
-        output_path: Path for the .onnx file
-        fp16: Whether to export in FP16
+        output_path: Path for the encoder .onnx file
+        fp16: Whether to export in FP16 (halves model size, recommended)
         opset: ONNX opset version
     """
+    import tempfile
+
+    import onnx
     from safetensors.torch import load_file
     from transformers.models.musicflamingo.modeling_musicflamingo import MusicFlamingoEncoder
 
@@ -440,6 +501,7 @@ def export_flamingo_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
     )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if fp16 else torch.float32
 
     # Patch RoTE to fix torch.cat dtype mismatch in legacy ONNX export
     _patch_flamingo_rotary_for_onnx()
@@ -447,59 +509,32 @@ def export_flamingo_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
     encoder_path = get_flamingo_encoder_path()
     logger.info(f"Loading Music Flamingo encoder from {encoder_path}...")
 
-    encoder = MusicFlamingoEncoder.from_pretrained(str(encoder_path))
-    encoder.eval()
+    # Use eager attention — SDPA export bakes wrong Reshape dims for head splitting
+    encoder = MusicFlamingoEncoder.from_pretrained(
+        str(encoder_path), attn_implementation="eager"
+    )
+    encoder.eval().to(dtype).to(device)
 
-    # Load projector if available
-    projector_path = encoder_path / "projector.safetensors"
-    projector = None
-    if projector_path.exists():
-        logger.info("Loading projector...")
-        projector = AudioProjector()
-        state_dict = load_file(str(projector_path), device="cpu")
-        projector.load_state_dict(state_dict)
-        projector.eval()
-
-    # Export in FP32 to avoid mixed-dtype issues (LayerNorm weight/bias vs activations).
-    # The encoder loads with BF16 weights — cast to FP32 for clean tracing.
-    # Convert to FP16 post-export for consistent types and smaller model.
-    encoder = encoder.float().to(device)
-    if projector is not None:
-        projector = projector.float().to(device)
-
-    wrapper = FlamingoOnnxWrapper(encoder, projector)
+    wrapper = FlamingoEncoderOnnxWrapper(encoder)
     wrapper.eval()
 
-    # Dummy inputs: single 30s chunk (FP32 for tracing)
+    # Dummy inputs
     batch_size = 1
-    dummy_mel = torch.randn(batch_size, 128, 3000, device=device)
+    dummy_mel = torch.randn(batch_size, 128, 3000, device=device, dtype=dtype)
     dummy_mask = torch.ones(batch_size, 3000, dtype=torch.long, device=device)
-    dummy_times = (torch.arange(750, dtype=torch.float32, device=device).unsqueeze(0)
+    dummy_times = (torch.arange(750, dtype=dtype, device=device).unsqueeze(0)
                    * FRAME_DURATION_S)
 
-    logger.info(f"Exporting Flamingo to {output_path} (opset {opset}, fp16={fp16}, device={device})...")
+    # --- Export encoder ---
+    # FP16 encoder is ~1.2GB (under 2GB protobuf limit), but PyTorch still
+    # writes external data files. Export to temp dir, consolidate to single file.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir) / "encoder.onnx"
 
-    # Try dynamo-based export first (handles RoTE/complex ops that fail with legacy export)
-    # Then fall back to legacy TorchScript export
-    exported = False
+        logger.info(f"Exporting Flamingo encoder (opset {opset}, "
+                     f"{'FP16' if fp16 else 'FP32'}, device={device})...")
 
-    if hasattr(torch.onnx, 'dynamo_export'):
-        try:
-            logger.info("Trying dynamo_export (handles complex ops better)...")
-            export_output = torch.onnx.dynamo_export(
-                wrapper, dummy_mel, dummy_mask, dummy_times
-            )
-            export_output.save(str(output_path))
-            exported = True
-            logger.info("dynamo_export succeeded")
-        except Exception as e:
-            logger.warning(f"dynamo_export failed: {e}, trying legacy export...")
-
-    if not exported:
-        torch.onnx.export(
-            wrapper,
-            (dummy_mel, dummy_mask, dummy_times),
-            str(output_path),
+        export_kwargs = dict(
             input_names=["input_features", "input_features_mask", "audio_times"],
             output_names=["hidden_states"],
             dynamic_axes={
@@ -512,24 +547,80 @@ def export_flamingo_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
             do_constant_folding=True,
         )
 
-    # Check total export size (main file + any external data files)
-    total_size = output_path.stat().st_size
-    for ext_file in output_path.parent.glob(output_path.stem + "*.data"):
-        total_size += ext_file.stat().st_size
-    logger.info(f"Exported Flamingo (FP32): {total_size / 1024 / 1024:.1f} MB total")
+        import inspect
+        if 'dynamo' in inspect.signature(torch.onnx.export).parameters:
+            export_kwargs['dynamo'] = False
 
-    # Validate FP32 model loads in ORT
-    logger.info("Validating FP32 export...")
-    if not _validate_onnx(output_path):
-        raise RuntimeError("FP32 ONNX export failed ORT validation")
+        torch.onnx.export(
+            wrapper, (dummy_mel, dummy_mask, dummy_times),
+            str(tmp_path), **export_kwargs,
+        )
 
-    if fp16:
-        if _try_fp16_conversion(output_path):
-            logger.info("Using FP16 model")
+        # Consolidate external data into single ONNX file
+        model = onnx.load(str(tmp_path), load_external_data=True)
+        total_weights = sum(len(i.raw_data) for i in model.graph.initializer)
+        logger.info(f"  Loaded {len(model.graph.initializer)} initializers, "
+                     f"{total_weights / 1024 / 1024:.1f} MB")
+
+        if total_weights < 100_000_000:
+            raise RuntimeError(
+                f"Encoder has only {total_weights / 1024 / 1024:.0f} MB of weights. "
+                f"Expected ~1.2GB (FP16) or ~2.4GB (FP32)."
+            )
+
+        if total_weights > 2_000_000_000:
+            onnx.save(model, str(output_path),
+                      save_as_external_data=True, all_tensors_to_one_file=True,
+                      location=output_path.stem + ".data")
         else:
-            logger.warning("FP16 conversion failed, keeping FP32 model (functionally identical, just larger)")
+            onnx.save(model, str(output_path))
 
-    del encoder, projector, wrapper
+    enc_size = output_path.stat().st_size / 1024 / 1024
+    logger.info(f"  Encoder saved: {enc_size:.1f} MB")
+
+    if not _validate_onnx(output_path):
+        raise RuntimeError("Flamingo encoder ONNX export failed ORT validation")
+
+    # --- Export projector ---
+    projector_path = encoder_path / "projector.safetensors"
+    projector_output = output_path.parent / "flamingo_projector.onnx"
+
+    if projector_path.exists():
+        logger.info("Exporting projector...")
+        projector = AudioProjector()
+        state_dict = load_file(str(projector_path), device="cpu")
+        projector.load_state_dict(state_dict)
+        projector.eval().to(dtype).to(device)
+
+        dummy_hidden = torch.randn(1, 750, 1280, device=device, dtype=dtype)
+
+        proj_export_kwargs = dict(
+            input_names=["hidden_states"],
+            output_names=["projected"],
+            dynamic_axes={
+                "hidden_states": {0: "batch", 1: "frames"},
+                "projected": {0: "batch", 1: "frames"},
+            },
+            opset_version=opset,
+            do_constant_folding=True,
+        )
+        if 'dynamo' in inspect.signature(torch.onnx.export).parameters:
+            proj_export_kwargs['dynamo'] = False
+
+        torch.onnx.export(
+            projector, dummy_hidden,
+            str(projector_output), **proj_export_kwargs,
+        )
+
+        proj_size = projector_output.stat().st_size / 1024 / 1024
+        logger.info(f"  Projector saved: {proj_size:.1f} MB")
+
+        if not _validate_onnx(projector_output):
+            raise RuntimeError("Flamingo projector ONNX export failed ORT validation")
+    else:
+        logger.warning("No projector found — encoder-only export (1280-dim output)")
+
+    del encoder, wrapper
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -613,7 +704,11 @@ def verify_mulan_onnx(onnx_path: Path, num_tracks: int = 10, tolerance: float = 
 
 
 def verify_flamingo_onnx(onnx_path: Path, num_tracks: int = 10, tolerance: float = 1e-3):
-    """Verify Flamingo ONNX export against PyTorch reference."""
+    """Verify Flamingo ONNX export against PyTorch reference.
+
+    Handles the two-model architecture: encoder ONNX + projector ONNX.
+    The projector is expected at {onnx_path.parent}/flamingo_projector.onnx.
+    """
     import onnxruntime as ort
     from safetensors.torch import load_file
     from transformers.models.musicflamingo.modeling_musicflamingo import MusicFlamingoEncoder
@@ -632,25 +727,30 @@ def verify_flamingo_onnx(onnx_path: Path, num_tracks: int = 10, tolerance: float
     encoder = MusicFlamingoEncoder.from_pretrained(str(encoder_path))
     encoder.eval()
 
-    projector_path = encoder_path / "projector.safetensors"
+    projector_sf = encoder_path / "projector.safetensors"
     projector = None
-    if projector_path.exists():
+    if projector_sf.exists():
         projector = AudioProjector()
-        state_dict = load_file(str(projector_path), device="cpu")
+        state_dict = load_file(str(projector_sf), device="cpu")
         projector.load_state_dict(state_dict)
         projector.eval()
 
-    # Detect ONNX model dtype and match PyTorch model
-    sess = ort.InferenceSession(str(onnx_path))
-    input_dtype = np.float16 if "float16" in sess.get_inputs()[0].type else np.float32
+    # Load ONNX encoder
+    enc_sess = ort.InferenceSession(str(onnx_path))
+    input_dtype = np.float16 if "float16" in enc_sess.get_inputs()[0].type else np.float32
     is_fp16 = input_dtype == np.float16
+
+    # Load ONNX projector if available
+    proj_onnx = onnx_path.parent / "flamingo_projector.onnx"
+    proj_sess = ort.InferenceSession(str(proj_onnx)) if proj_onnx.exists() else None
 
     # PyTorch reference always runs in FP16 (matching desktop inference)
     encoder = encoder.half().to(device)
     if projector is not None:
         projector = projector.half().to(device)
 
-    logger.info(f"  ONNX dtype: {'fp16' if is_fp16 else 'fp32'}, PyTorch: fp16, device: {device}")
+    logger.info(f"  ONNX dtype: {'fp16' if is_fp16 else 'fp32'}, "
+                f"projector: {'yes' if proj_sess else 'no'}, device: {device}")
 
     max_diff = 0.0
     all_cos_sims = []
@@ -672,15 +772,20 @@ def verify_flamingo_onnx(onnx_path: Path, num_tracks: int = 10, tolerance: float
                 hidden = projector(hidden)
             ref = hidden.cpu().float().numpy()
 
-        # ONNX inference — match ONNX model's expected dtype
+        # ONNX inference — encoder + projector pipeline
         onnx_mel = mel_fp32.numpy().astype(input_dtype)
         onnx_times = times_fp32.numpy().astype(input_dtype)
-        feed = {
+        enc_feed = {
             "input_features": onnx_mel,
             "input_features_mask": mask.numpy(),
             "audio_times": onnx_times,
         }
-        onnx_out = sess.run(None, feed)[0].astype(np.float32)
+        enc_out = enc_sess.run(None, enc_feed)[0]  # [1, 750, 1280]
+
+        if proj_sess is not None:
+            onnx_out = proj_sess.run(None, {"hidden_states": enc_out})[0].astype(np.float32)
+        else:
+            onnx_out = enc_out.astype(np.float32)
 
         diff = np.abs(ref - onnx_out).max()
         # Cosine similarity on mean-pooled output

@@ -13,18 +13,21 @@ import kotlin.math.min
 /**
  * Music Flamingo ONNX inference for on-device audio embedding generation.
  *
+ * Uses two ONNX models (split to avoid ONNX shape inference bugs):
+ * - Encoder: mel [1,128,3000] + mask + audio_times -> hidden [1,750,1280]
+ * - Projector: hidden [1,750,1280] -> projected [1,750,3584]
+ *
  * Replicates the desktop FlamingoEmbeddingGenerator:
  * - Full non-overlapping 30s coverage, max 60 chunks
  * - Compute Whisper-compatible mel spectrogram for each chunk -> [128, 3000]
  * - Construct audio_times with absolute timestamps (frame_idx * 0.04 + chunk_start)
- * - Run ONNX: (mel, mask, audio_times) -> [750, 3584]
+ * - Run encoder + projector -> [750, 3584]
  * - Mean pool over time -> 3584d per chunk
  * - Average across chunks, L2-normalize
  *
- * Mel spectrogram computed in Kotlin (MelSpectrogram class).
- * ONNX model takes: input_features [B,128,3000], mask [B,3000], audio_times [B,750]
+ * If no projector model is found, output is 1280-dim (encoder-only).
  */
-class FlamingoInference(modelFile: File) {
+class FlamingoInference(encoderFile: File, projectorFile: File? = null) {
 
     companion object {
         private const val TAG = "FlamingoInference"
@@ -34,32 +37,30 @@ class FlamingoInference(modelFile: File) {
         private const val MAX_CHUNKS = 60
         private const val NUM_FRAMES = 750  // Post-pool frames per 30s chunk
         private const val FRAME_DURATION_S = 0.04f  // 30s / 750 frames
-        private const val OUTPUT_DIM = 3584  // With projector
+        private const val ENCODER_DIM = 1280
+        private const val PROJECTED_DIM = 3584
     }
 
     private val env = OrtEnvironment.getEnvironment()
-    private val session: OrtSession
+    private val encoderSession: OrtSession
+    private val projectorSession: OrtSession?
     private val melSpectrogram = MelSpectrogram()
 
-    // Detect output dimension from model
     val outputDim: Int
 
     init {
-        val opts = OrtSession.SessionOptions().apply {
-            try {
-                addNnapi()
-                Log.i(TAG, "Using NNAPI execution provider")
-            } catch (e: Exception) {
-                Log.i(TAG, "NNAPI not available, using CPU: ${e.message}")
-            }
-        }
-        session = env.createSession(modelFile.absolutePath, opts)
+        // XNNPACK CPU is the default EP in onnxruntime-android.
+        // NNAPI is deprecated starting Android 15; QNN EP for NPU is a future option.
+        val opts = OrtSession.SessionOptions()
+        encoderSession = env.createSession(encoderFile.absolutePath, opts)
 
-        // Detect output dimension from model metadata
-        val outputInfo = session.outputInfo
-        val outputShape = outputInfo.values.first().info.toString()
-        outputDim = if (outputShape.contains("3584")) OUTPUT_DIM else 1280
-        Log.i(TAG, "Flamingo ONNX session loaded: ${modelFile.name}, output_dim=$outputDim")
+        projectorSession = if (projectorFile != null && projectorFile.exists()) {
+            env.createSession(projectorFile.absolutePath, OrtSession.SessionOptions())
+        } else null
+
+        outputDim = if (projectorSession != null) PROJECTED_DIM else ENCODER_DIM
+        Log.i(TAG, "Flamingo ONNX loaded: encoder=${encoderFile.name}, " +
+                "projector=${projectorFile?.name ?: "none"}, output_dim=$outputDim")
     }
 
     /**
@@ -124,8 +125,9 @@ class FlamingoInference(modelFile: File) {
             chunkSamples
         }
 
-        // Compute mel spectrogram [128, 3000]
+        // Compute mel spectrogram [128, 3000] and apply Whisper log normalization
         val mel = melSpectrogram.compute(paddedChunk)
+        MelSpectrogram.whisperNormalize(mel)
 
         // Construct audio_times: absolute timestamps per post-pool frame
         val audioTimes = FloatArray(NUM_FRAMES) { frame ->
@@ -137,7 +139,11 @@ class FlamingoInference(modelFile: File) {
     }
 
     /**
-     * Run ONNX inference on mel spectrogram.
+     * Run ONNX inference: encoder -> [optional projector] -> mean pool.
+     *
+     * The encoder and projector are FP16 ONNX models. ORT on Android with
+     * XNNPACK auto-casts FP16 weights to FP32 for compute, so we always
+     * feed FP32 inputs and get FP32 outputs regardless of model precision.
      *
      * @param mel [128, numFrames] mel spectrogram
      * @param audioTimes [750] absolute timestamps
@@ -173,18 +179,30 @@ class FlamingoInference(modelFile: File) {
                 longArrayOf(1, NUM_FRAMES.toLong())
             )
 
-            val results = session.run(mapOf(
+            // Step 1: Encoder -> [1, 750, 1280]
+            val encResults = encoderSession.run(mapOf(
                 "input_features" to melTensor,
                 "input_features_mask" to maskTensor,
                 "audio_times" to timesTensor,
             ))
+            val encTensor = encResults[0] as OnnxTensor
 
-            // Output: [1, 750, outputDim]
-            val outputTensor = results[0] as OnnxTensor
+            // Step 2: Projector (if available) -> [1, 750, 3584]
+            val frames: Array<FloatArray>
+            if (projectorSession != null) {
+                val projResults = projectorSession.run(mapOf(
+                    "hidden_states" to encTensor,
+                ))
+                val projTensor = projResults[0] as OnnxTensor
 
-            @Suppress("UNCHECKED_CAST")
-            val output = outputTensor.value as Array<Array<FloatArray>>
-            val frames = output[0]  // [750, outputDim]
+                @Suppress("UNCHECKED_CAST")
+                frames = (projTensor.value as Array<Array<FloatArray>>)[0]
+
+                projResults.close()
+            } else {
+                @Suppress("UNCHECKED_CAST")
+                frames = (encTensor.value as Array<Array<FloatArray>>)[0]
+            }
 
             // Mean pool over time dimension
             val pooled = FloatArray(outputDim)
@@ -200,7 +218,7 @@ class FlamingoInference(modelFile: File) {
             melTensor.close()
             maskTensor.close()
             timesTensor.close()
-            results.close()
+            encResults.close()
 
             pooled
         } catch (e: Exception) {
@@ -221,6 +239,7 @@ class FlamingoInference(modelFile: File) {
     }
 
     fun close() {
-        session.close()
+        encoderSession.close()
+        projectorSession?.close()
     }
 }
