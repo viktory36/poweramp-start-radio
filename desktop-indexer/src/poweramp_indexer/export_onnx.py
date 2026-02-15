@@ -155,11 +155,9 @@ def _convert_onnx_to_fp16(model_path: Path):
                 del node.attribute[:]
                 node.attribute.extend(rebuilt)
 
-        # Redirect Cast-to-float32 → Cast-to-float16
-        if node.op_type == "Cast":
-            for attr in node.attribute:
-                if attr.name == "to" and attr.i == TensorProto.FLOAT:
-                    attr.i = TensorProto.FLOAT16
+    # Note: we do NOT modify Cast nodes targeting float32. Changing Cast targets
+    # can break shape computation paths and cause MatMul dimension mismatches.
+    # The above constant/initializer conversions should be sufficient.
 
     # 3. Update all type annotations (FLOAT → FLOAT16; INT64 etc unchanged)
     for x in list(model.graph.input) + list(model.graph.output) + list(model.graph.value_info):
