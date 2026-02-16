@@ -21,7 +21,7 @@ import java.nio.ByteOrder
 class EmbeddingProcessor(
     private val mulanModel: MuLanInference?,
     private val flamingoModel: FlamingoInference?,
-    private val flamingoProjection: FloatMatrix?,  // [3584, 512]
+    private val flamingoProjection: FloatMatrix?,  // [512, 3584] (transposed from stored [3584, 512])
     private val fusedProjection: FloatMatrix?,      // [512, 1024] stored as row-major
 ) {
 
@@ -83,11 +83,20 @@ class EmbeddingProcessor(
     /**
      * Process a single audio file and generate all embeddings.
      *
+     * Supports two-pass sequential loading: in pass 2 (Flamingo only), provide
+     * the MuLan embedding from pass 1 via [existingMulan] so fusion can proceed
+     * without the MuLan model being loaded.
+     *
      * @param audioFile Path to the audio file
+     * @param existingMulan Pre-computed MuLan embedding for fusion (pass 2 of sequential loading)
      * @param onProgress Optional callback for status updates
      * @return All computed embeddings, or null on complete failure
      */
-    fun processTrack(audioFile: File, onProgress: ((String) -> Unit)? = null): EmbeddingResult? {
+    fun processTrack(
+        audioFile: File,
+        existingMulan: FloatArray? = null,
+        onProgress: ((String) -> Unit)? = null,
+    ): EmbeddingResult? {
         // Decode audio at both sample rates
         onProgress?.invoke("Decoding ${audioFile.name}...")
 
@@ -114,7 +123,10 @@ class EmbeddingProcessor(
             }
         }
 
-        if (mulanEmbedding == null && flamingoRawEmbedding == null) {
+        // For fusion: use inferred MuLan embedding, or fall back to provided one
+        val mulanForFusion = mulanEmbedding ?: existingMulan
+
+        if (mulanEmbedding == null && flamingoRawEmbedding == null && existingMulan == null) {
             Log.w(TAG, "Both models failed for ${audioFile.name}")
             return null
         }
@@ -126,12 +138,12 @@ class EmbeddingProcessor(
         }
 
         // Fuse: concatenate [mulan_512, flamingo_512] and project
-        if (mulanEmbedding != null && flamingoReduced != null && fusedProjection != null) {
+        if (mulanForFusion != null && flamingoReduced != null && fusedProjection != null) {
             onProgress?.invoke("Fusing embeddings...")
 
             // Concatenate: [mulan_512 | flamingo_512] -> 1024d
             val concatenated = FloatArray(MULAN_DIM * 2)
-            mulanEmbedding.copyInto(concatenated, 0)
+            mulanForFusion.copyInto(concatenated, 0)
             flamingoReduced.copyInto(concatenated, MULAN_DIM)
 
             // Apply fused projection: concatenated[1024] x projection[1024, 512] -> [512]
@@ -142,7 +154,7 @@ class EmbeddingProcessor(
         }
 
         return EmbeddingResult(
-            mulanEmbedding = mulanEmbedding,
+            mulanEmbedding = mulanEmbedding,  // null when model wasn't loaded (pass 2)
             flamingoEmbedding = flamingoRawEmbedding,
             flamingoReduced = flamingoReduced,
             fusedEmbedding = fusedEmbedding,
@@ -186,5 +198,18 @@ class FloatMatrix(
             result[i] = sum
         }
         return result
+    }
+
+    /**
+     * Transpose this matrix: [rows, cols] -> [cols, rows]
+     */
+    fun transpose(): FloatMatrix {
+        val transposed = FloatArray(data.size)
+        for (i in 0 until rows) {
+            for (j in 0 until cols) {
+                transposed[j * rows + i] = data[i * cols + j]
+            }
+        }
+        return FloatMatrix(transposed, cols, rows)
     }
 }

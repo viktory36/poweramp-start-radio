@@ -27,7 +27,7 @@ import kotlin.math.min
  *
  * If no projector model is found, output is 1280-dim (encoder-only).
  */
-class FlamingoInference(encoderFile: File, projectorFile: File? = null) {
+class FlamingoInference(encoderFile: File, projectorFile: File? = null, cacheDir: File? = null) {
 
     companion object {
         private const val TAG = "FlamingoInference"
@@ -47,20 +47,55 @@ class FlamingoInference(encoderFile: File, projectorFile: File? = null) {
     private val melSpectrogram = MelSpectrogram()
 
     val outputDim: Int
+    /** Which execution provider is active ("QNN" or "CPU"). */
+    var executionProvider: String = "CPU"
+        private set
 
     init {
-        // XNNPACK CPU is the default EP in onnxruntime-android.
-        // NNAPI is deprecated starting Android 15; QNN EP for NPU is a future option.
-        val opts = OrtSession.SessionOptions()
-        encoderSession = env.createSession(encoderFile.absolutePath, opts)
+        val encOpts = createSessionOptions(
+            "flamingo_encoder.ctx.onnx", cacheDir ?: encoderFile.parentFile
+        )
+        encoderSession = env.createSession(encoderFile.absolutePath, encOpts)
 
         projectorSession = if (projectorFile != null && projectorFile.exists()) {
-            env.createSession(projectorFile.absolutePath, OrtSession.SessionOptions())
+            val projOpts = createSessionOptions(
+                "flamingo_projector.ctx.onnx", cacheDir ?: projectorFile.parentFile
+            )
+            env.createSession(projectorFile.absolutePath, projOpts)
         } else null
 
         outputDim = if (projectorSession != null) PROJECTED_DIM else ENCODER_DIM
         Log.i(TAG, "Flamingo ONNX loaded: encoder=${encoderFile.name}, " +
-                "projector=${projectorFile?.name ?: "none"}, output_dim=$outputDim")
+                "projector=${projectorFile?.name ?: "none"}, output_dim=$outputDim, " +
+                "ep=$executionProvider")
+    }
+
+    /**
+     * Create ORT session options with QNN EP (Hexagon HTP) if available.
+     * Falls back to XNNPACK CPU automatically if QNN EP fails.
+     */
+    private fun createSessionOptions(contextFileName: String, cacheDir: File): OrtSession.SessionOptions {
+        val opts = OrtSession.SessionOptions()
+        try {
+            opts.addQnn(mapOf(
+                "backend_type" to "htp",
+                "enable_htp_fp16_precision" to "1",
+                "htp_performance_mode" to "high_performance",
+                // Mode 0 = fast init, avoids OOM during first compile of large encoder
+                "htp_graph_finalization_optimization_mode" to "0",
+            ))
+            // Context binary caching: first load compiles graph → cache file,
+            // subsequent loads skip compilation entirely.
+            val cachePath = File(cacheDir, contextFileName).absolutePath
+            opts.addConfigEntry("ep.context_enable", "1")
+            opts.addConfigEntry("ep.context_embed_mode", "0")  // separate file
+            opts.addConfigEntry("ep.context_file_path", cachePath)
+            executionProvider = "QNN"
+            Log.i(TAG, "QNN EP configured (HTP FP16), cache: $cachePath")
+        } catch (e: Exception) {
+            Log.w(TAG, "QNN EP not available, using XNNPACK CPU: ${e.message}")
+        }
+        return opts
     }
 
     /**

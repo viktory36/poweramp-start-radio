@@ -1731,5 +1731,201 @@ def export_onnx(output_dir: Path, fp16: bool, verify: bool, verify_tracks: int,
     click.echo(f"\nTransfer these files to your phone's app data directory.")
 
 
+@cli.command("compare-phone")
+@click.argument("benchmark_json", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--music-root", "-m", type=click.Path(exists=True, file_okay=False, path_type=Path),
+              default=None, help="Music library root on this machine (to resolve phone paths)")
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
+def compare_phone(benchmark_json: Path, music_root: Path, verbose: bool):
+    """Compare phone ONNX embeddings against desktop PyTorch reference.
+
+    Takes the benchmark_results.json from the phone benchmark activity and
+    runs the same tracks through PyTorch to compute cosine similarities.
+
+    BENCHMARK_JSON: Path to benchmark_results.json from the phone
+
+    Examples:
+
+      poweramp-indexer compare-phone benchmark_results.json
+      poweramp-indexer compare-phone benchmark_results.json -m /mnt/d/Music
+    """
+    import json
+
+    import numpy as np
+
+    if verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    with open(benchmark_json) as f:
+        data = json.load(f)
+
+    click.echo(f"Phone: {data.get('device', '?')} ({data.get('soc', '?')})")
+    click.echo(f"Android: {data.get('androidVersion', '?')}")
+    click.echo(f"ORT: {data.get('ortVersion', '?')}")
+    click.echo(f"Tracks: {len(data.get('tracks', []))}")
+    click.echo()
+
+    tracks = data.get("tracks", [])
+    if not tracks:
+        click.echo("No tracks in benchmark data.")
+        return
+
+    # Try to resolve paths
+    resolved = []
+    for t in tracks:
+        phone_path = t["path"]
+        local_path = None
+        # Try direct path
+        if Path(phone_path).exists():
+            local_path = Path(phone_path)
+        elif music_root:
+            # Strip common Android prefixes and try under music_root
+            for prefix in ["/storage/emulated/0/", "/sdcard/", "/storage/sdcard0/"]:
+                if phone_path.startswith(prefix):
+                    relative = phone_path[len(prefix):]
+                    candidate = music_root / relative
+                    if candidate.exists():
+                        local_path = candidate
+                        break
+            if local_path is None:
+                # Try filename match
+                filename = Path(phone_path).name
+                matches = list(music_root.rglob(filename))
+                if len(matches) == 1:
+                    local_path = matches[0]
+
+        resolved.append((t, local_path))
+
+    found = sum(1 for _, p in resolved if p is not None)
+    click.echo(f"Resolved {found}/{len(tracks)} tracks to local files")
+    if found == 0:
+        click.echo("Cannot resolve any tracks. Use --music-root to specify your library.")
+        return
+
+    # Run PyTorch inference on resolved tracks
+    has_mulan = any(t.get("mulan") for t, _ in resolved if _ is not None)
+    has_flamingo = any(t.get("flamingo") for t, _ in resolved if _ is not None)
+
+    mulan_gen = None
+    flamingo_gen = None
+
+    if has_mulan:
+        click.echo("\nLoading MuLan model (PyTorch FP16)...")
+        mulan_gen = create_mulan_generator()
+
+    if has_flamingo:
+        click.echo("Loading Flamingo model (PyTorch FP16)...")
+        try:
+            flamingo_gen = create_flamingo_generator()
+        except FileNotFoundError as e:
+            click.echo(f"  Flamingo not available: {e}")
+
+    click.echo()
+    click.echo(f"{'Track':<40} {'Model':<10} {'Phone EP':<8} {'Cos Sim':<10} {'Phone ms':<10}")
+    click.echo("-" * 78)
+
+    all_results = []
+
+    for track_data, local_path in resolved:
+        if local_path is None:
+            continue
+
+        label = f"{track_data.get('artist', '?')} - {track_data.get('title', '?')}"
+        short_label = label[:38] + ".." if len(label) > 40 else label
+
+        # MuLan comparison
+        phone_mulan = track_data.get("mulan")
+        if phone_mulan and mulan_gen:
+            phone_emb = np.array(phone_mulan["embedding"], dtype=np.float32)
+            desktop_emb = mulan_gen.generate_embedding(local_path)
+            if desktop_emb is not None:
+                cos_sim = float(np.dot(phone_emb, desktop_emb) / (
+                    np.linalg.norm(phone_emb) * np.linalg.norm(desktop_emb) + 1e-10
+                ))
+                ep = phone_mulan.get("ep", "?")
+                ms = phone_mulan.get("timingMs", "?")
+                click.echo(f"{short_label:<40} {'MuLan':<10} {ep:<8} {cos_sim:<10.6f} {ms:<10}")
+                all_results.append(("mulan", ep, cos_sim))
+
+        # Flamingo comparison
+        phone_flamingo = track_data.get("flamingo")
+        if phone_flamingo and flamingo_gen:
+            phone_emb = np.array(phone_flamingo["embedding"], dtype=np.float32)
+            desktop_emb = flamingo_gen.generate_embedding(local_path)
+            if desktop_emb is not None:
+                cos_sim = float(np.dot(phone_emb, desktop_emb) / (
+                    np.linalg.norm(phone_emb) * np.linalg.norm(desktop_emb) + 1e-10
+                ))
+                ep = phone_flamingo.get("ep", "?")
+                ms = phone_flamingo.get("timingMs", "?")
+                click.echo(f"{short_label:<40} {'Flamingo':<10} {ep:<8} {cos_sim:<10.6f} {ms:<10}")
+                all_results.append(("flamingo", ep, cos_sim))
+
+    # Summary
+    click.echo()
+    for model in ["mulan", "flamingo"]:
+        model_results = [(ep, sim) for m, ep, sim in all_results if m == model]
+        if model_results:
+            sims = [s for _, s in model_results]
+            ep = model_results[0][0]
+            click.echo(f"{model.upper()} ({ep}): mean={np.mean(sims):.6f}, "
+                       f"min={np.min(sims):.6f}, max={np.max(sims):.6f}")
+
+    if mulan_gen:
+        mulan_gen.unload_model()
+    if flamingo_gen:
+        flamingo_gen.unload_model()
+
+
+@cli.command("prepare-onnx")
+@click.argument("models_dir", type=click.Path(exists=True, file_okay=False, path_type=Path),
+                default=Path("./models"))
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
+def prepare_onnx(models_dir: Path, verbose: bool):
+    """Prepare ONNX models for on-device deployment with QNN EP (Snapdragon NPU).
+
+    Consolidates external data into single files, verifies fixed tensor shapes,
+    and checks GELU compatibility for QNN EP.
+
+    MODELS_DIR: Directory containing ONNX model files (default: ./models)
+
+    Examples:
+
+      poweramp-indexer prepare-onnx
+      poweramp-indexer prepare-onnx ./models
+    """
+    if verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    from .export_onnx import prepare_for_phone
+
+    click.echo(f"Preparing models in: {models_dir}")
+    results = prepare_for_phone(models_dir)
+
+    if not results:
+        click.echo("No ONNX models found.")
+        return
+
+    click.echo(f"\n{'=' * 60}")
+    click.echo("Summary")
+    click.echo(f"{'=' * 60}")
+    all_valid = True
+    for name, r in results.items():
+        status = "OK" if r.get("valid") else "FAILED"
+        if not r.get("valid"):
+            all_valid = False
+        click.echo(f"  {name}: {r['size_mb']:.1f} MB, {r['dtype']}, {status}")
+        if r.get("dynamic_inputs"):
+            click.echo(f"    Dynamic dims: {', '.join(r['dynamic_inputs'])}")
+        if r.get("erf_count", 0) > 0:
+            click.echo(f"    Erf nodes: {r['erf_count']} (auto-fused by ORT)")
+
+    if all_valid:
+        click.echo("\nAll models ready for phone deployment.")
+    else:
+        click.echo("\nSome models failed validation!")
+        raise SystemExit(1)
+
+
 if __name__ == "__main__":
     cli()

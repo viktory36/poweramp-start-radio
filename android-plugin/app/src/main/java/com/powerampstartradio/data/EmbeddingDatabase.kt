@@ -518,6 +518,27 @@ class EmbeddingDatabase private constructor(
     }
 
     /**
+     * Get an embedding for a track from a specific named table (e.g., "embeddings_mulan").
+     * Used for two-pass sequential indexing where pass 2 needs pass 1's embeddings.
+     */
+    fun getEmbeddingFromTable(tableName: String, trackId: Long): FloatArray? {
+        return try {
+            val cursor = db.rawQuery(
+                "SELECT embedding FROM [$tableName] WHERE track_id = ?",
+                arrayOf(trackId.toString())
+            )
+            cursor.use {
+                if (it.moveToFirst()) {
+                    val blob = it.getBlob(0)
+                    blobToFloatArray(blob)
+                } else null
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
      * Get the raw SQLiteDatabase for direct access (e.g., loading projection matrices).
      */
     fun getRawDatabase(): SQLiteDatabase = db

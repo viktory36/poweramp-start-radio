@@ -627,6 +627,134 @@ def export_flamingo_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
     return output_path
 
 
+def prepare_for_phone(models_dir: Path) -> dict:
+    """Prepare ONNX models for on-device deployment with QNN EP.
+
+    1. Consolidates external data into single files
+    2. Verifies all tensor shapes are fixed (no dynamic dims)
+    3. Checks GELU compatibility (Erf vs Tanh for QNN EP)
+
+    Args:
+        models_dir: Directory containing ONNX model files
+
+    Returns:
+        Dict with per-model results
+    """
+    import onnx
+
+    results = {}
+    model_files = sorted(models_dir.glob("*.onnx"))
+
+    # Skip context cache files and temp files
+    model_files = [f for f in model_files if not any(
+        x in f.name for x in [".ctx.", ".fp16_tmp.", ".single.", "_fp32"]
+    )]
+
+    if not model_files:
+        logger.warning(f"No ONNX models found in {models_dir}")
+        return results
+
+    for model_path in model_files:
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"Preparing: {model_path.name}")
+        logger.info(f"{'=' * 60}")
+
+        result = {
+            "file": model_path.name,
+            "size_mb": model_path.stat().st_size / 1024 / 1024,
+        }
+
+        # Step 1: Check for external data and consolidate
+        model_proto = onnx.load(str(model_path), load_external_data=False)
+        has_external = any(
+            i.data_location == 1 for i in model_proto.graph.initializer
+        )
+        result["had_external_data"] = has_external
+
+        if has_external:
+            logger.info("  External data detected — consolidating into single file...")
+            _consolidate_external_data(model_path)
+            result["size_mb"] = model_path.stat().st_size / 1024 / 1024
+            logger.info(f"  Consolidated: {result['size_mb']:.1f} MB")
+            # Reload after consolidation
+            model_proto = onnx.load(str(model_path), load_external_data=False)
+
+        # Step 2: Check shapes
+        logger.info("  Checking tensor shapes...")
+        dynamic_inputs = []
+        for inp in model_proto.graph.input:
+            shape = inp.type.tensor_type.shape
+            if shape:
+                dims = []
+                for d in shape.dim.dim_param if hasattr(shape, 'dim') else []:
+                    pass
+                for d in shape.dim:
+                    if d.dim_param:  # Named dynamic dim like "batch"
+                        dims.append(f"*{d.dim_param}")
+                    elif d.dim_value > 0:
+                        dims.append(str(d.dim_value))
+                    else:
+                        dims.append("*?")
+                shape_str = f"[{', '.join(dims)}]"
+                has_dynamic = any(d.startswith("*") for d in dims)
+                if has_dynamic:
+                    dynamic_inputs.append(f"{inp.name}: {shape_str}")
+                logger.info(f"    {inp.name}: {shape_str}")
+
+        result["dynamic_inputs"] = dynamic_inputs
+        if dynamic_inputs:
+            logger.warning(f"  ⚠ Dynamic shapes detected (QNN EP requires fixed):")
+            for d in dynamic_inputs:
+                logger.warning(f"    {d}")
+            logger.info("  Batch dim is OK — QNN EP handles batch=1 at runtime.")
+        else:
+            logger.info("  ✓ All shapes are fixed")
+
+        # Step 3: Check for Erf nodes (GELU compatibility)
+        erf_nodes = [n for n in model_proto.graph.node if n.op_type == "Erf"]
+        gelu_nodes = [n for n in model_proto.graph.node if n.op_type == "Gelu"]
+        tanh_nodes = [n for n in model_proto.graph.node if n.op_type == "Tanh"]
+        result["erf_count"] = len(erf_nodes)
+        result["gelu_count"] = len(gelu_nodes)
+
+        if erf_nodes:
+            logger.info(f"  Found {len(erf_nodes)} Erf nodes (raw GELU pattern)")
+            logger.info("  ORT auto-fuses Erf→Gelu at optimization level ≥ 1 (default).")
+            logger.info("  If QNN EP fails, re-export with nn.GELU(approximate='tanh').")
+        elif gelu_nodes:
+            logger.info(f"  ✓ {len(gelu_nodes)} fused Gelu nodes (QNN-compatible)")
+        else:
+            logger.info("  ✓ No Erf or Gelu nodes")
+
+        # Step 4: Check dtype
+        fp16_count = sum(
+            1 for i in model_proto.graph.initializer
+            if i.data_type == 10  # FLOAT16
+        )
+        fp32_count = sum(
+            1 for i in model_proto.graph.initializer
+            if i.data_type == 1  # FLOAT
+        )
+        total = len(model_proto.graph.initializer)
+        result["fp16_weights"] = fp16_count
+        result["fp32_weights"] = fp32_count
+        dtype = "FP16" if fp16_count > fp32_count else "FP32"
+        result["dtype"] = dtype
+        logger.info(f"  Weights: {fp16_count} FP16 + {fp32_count} FP32 / {total} total → {dtype}")
+
+        # Step 5: Validate loads in ORT
+        if _validate_onnx(model_path):
+            result["valid"] = True
+            logger.info("  ✓ ORT validation passed")
+        else:
+            result["valid"] = False
+            logger.warning("  ✗ ORT validation FAILED")
+
+        results[model_path.name] = result
+
+    return results
+
+
 def verify_mulan_onnx(onnx_path: Path, num_tracks: int = 10, tolerance: float = 1e-3):
     """Verify MuQ-MuLan ONNX export against PyTorch reference.
 

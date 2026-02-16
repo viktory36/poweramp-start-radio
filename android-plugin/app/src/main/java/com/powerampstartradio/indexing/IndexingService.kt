@@ -137,30 +137,14 @@ class IndexingService : Service() {
                 Log.i(TAG, "Found ${unindexed.size} unindexed tracks")
                 updateNotification("Found ${unindexed.size} new tracks")
 
-                // Load ONNX models
                 val mulanFile = File(filesDir, "mulan_audio.onnx")
                 val flamingoFile = File(filesDir, "flamingo_encoder.onnx")
                 val projectorFile = File(filesDir, "flamingo_projector.onnx")
 
-                val mulanInference = if (mulanFile.exists()) {
-                    updateNotification("Loading MuQ-MuLan model...")
-                    try { MuLanInference(mulanFile) }
-                    catch (e: Exception) {
-                        Log.e(TAG, "Failed to load MuQ-MuLan", e)
-                        null
-                    }
-                } else null
+                val hasMulan = mulanFile.exists()
+                val hasFlamingo = flamingoFile.exists()
 
-                val flamingoInference = if (flamingoFile.exists()) {
-                    updateNotification("Loading Flamingo model...")
-                    try { FlamingoInference(flamingoFile, projectorFile) }
-                    catch (e: Exception) {
-                        Log.e(TAG, "Failed to load Flamingo", e)
-                        null
-                    }
-                } else null
-
-                if (mulanInference == null && flamingoInference == null) {
+                if (!hasMulan && !hasFlamingo) {
                     _state.value = IndexingState.Error(
                         "No ONNX models found. Transfer mulan_audio.onnx and/or " +
                         "flamingo_encoder.onnx to ${filesDir.absolutePath}"
@@ -172,70 +156,174 @@ class IndexingService : Service() {
 
                 // Load projection matrices from DB metadata
                 val rawDb = db.getRawDatabase()
-                val flamingoDim = flamingoInference?.outputDim ?: 3584
+                // flamingo_projection is stored as V_k [3584, 512] (row-major) from
+                // the Python `reduce` command. On-device we need V_k^T [512, 3584]
+                // so that multiplyVector(flamingoRaw_3584d) → reduced_512d.
                 val flamingoProjection = EmbeddingProcessor.loadProjectionMatrix(
-                    rawDb, "flamingo_projection", flamingoDim, 512
-                )
+                    rawDb, "flamingo_projection", 3584, 512
+                )?.transpose()
                 val fusedProjection = EmbeddingProcessor.loadProjectionMatrix(
                     rawDb, "fused_projection", 512, 1024
                 )
-
-                // Load centroids for cluster assignment
                 val centroids = db.loadCentroids()
-
-                val processor = EmbeddingProcessor(
-                    mulanModel = mulanInference,
-                    flamingoModel = flamingoInference,
-                    flamingoProjection = flamingoProjection,
-                    fusedProjection = fusedProjection,
-                )
-
                 val writer = EmbeddingWriter(db, centroids)
 
-                // Process each track
                 var indexed = 0
                 var failed = 0
 
-                for ((i, track) in unindexed.withIndex()) {
-                    _state.value = IndexingState.Processing(
-                        current = i + 1,
-                        total = unindexed.size,
-                        trackName = "${track.artist} - ${track.title}",
-                    )
-                    updateNotification("${i + 1}/${unindexed.size}: ${track.title}")
+                // Track IDs from pass 1 for pass 2's fusion
+                val trackIds = mutableMapOf<NewTrackDetector.UnindexedTrack, Long>()
 
-                    // Resolve audio file path
-                    val audioFile = resolveAudioFile(track)
-                    if (audioFile == null) {
-                        Log.w(TAG, "Cannot resolve audio file for: ${track.title}")
-                        failed++
-                        continue
+                // ── Pass 1: MuLan ──────────────────────────────────────
+                // Sequential loading: load MuLan first, process all tracks,
+                // close it before loading Flamingo. This avoids having multiple
+                // large QNN-compiled models in NPU memory simultaneously.
+                if (hasMulan) {
+                    updateNotification("Loading MuQ-MuLan model...")
+                    val mulanInference = try { MuLanInference(mulanFile, filesDir) }
+                    catch (e: Exception) {
+                        Log.e(TAG, "Failed to load MuQ-MuLan", e)
+                        null
                     }
 
-                    val embeddings = processor.processTrack(audioFile) { status ->
-                        updateNotification("${i + 1}/${unindexed.size}: $status")
+                    if (mulanInference != null) {
+                        val processor = EmbeddingProcessor(
+                            mulanModel = mulanInference,
+                            flamingoModel = null,
+                            flamingoProjection = null,
+                            fusedProjection = null,
+                        )
+
+                        for ((i, track) in unindexed.withIndex()) {
+                            _state.value = IndexingState.Processing(
+                                current = i + 1,
+                                total = unindexed.size,
+                                trackName = "${track.artist} - ${track.title}",
+                            )
+                            updateNotification("MuLan ${i + 1}/${unindexed.size}: ${track.title}")
+
+                            val audioFile = resolveAudioFile(track)
+                            if (audioFile == null) {
+                                Log.w(TAG, "Cannot resolve audio file for: ${track.title}")
+                                if (!hasFlamingo) failed++
+                                continue
+                            }
+
+                            val embeddings = processor.processTrack(audioFile) { status ->
+                                updateNotification("MuLan ${i + 1}/${unindexed.size}: $status")
+                            }
+
+                            if (embeddings == null) {
+                                if (!hasFlamingo) failed++
+                                continue
+                            }
+
+                            val trackId = writer.writeTrack(
+                                metadataKey = track.metadataKey,
+                                filenameKey = track.filenameKey,
+                                artist = track.artist.ifEmpty { null },
+                                album = track.album.ifEmpty { null },
+                                title = track.title.ifEmpty { null },
+                                durationMs = track.durationMs,
+                                filePath = track.path ?: audioFile.absolutePath,
+                                embeddings = embeddings,
+                            )
+
+                            if (trackId > 0) {
+                                trackIds[track] = trackId
+                                if (!hasFlamingo) indexed++
+                            } else {
+                                if (!hasFlamingo) failed++
+                            }
+                        }
+
+                        processor.close()
+                        Log.i(TAG, "Pass 1 (MuLan) complete: ${trackIds.size} tracks")
                     }
-
-                    if (embeddings == null) {
-                        failed++
-                        continue
-                    }
-
-                    val trackId = writer.writeTrack(
-                        metadataKey = track.metadataKey,
-                        filenameKey = track.filenameKey,
-                        artist = track.artist.ifEmpty { null },
-                        album = track.album.ifEmpty { null },
-                        title = track.title.ifEmpty { null },
-                        durationMs = track.durationMs,
-                        filePath = track.path ?: audioFile.absolutePath,
-                        embeddings = embeddings,
-                    )
-
-                    if (trackId > 0) indexed++ else failed++
                 }
 
-                processor.close()
+                // ── Pass 2: Flamingo + Fusion ──────────────────────────
+                if (hasFlamingo) {
+                    updateNotification("Loading Flamingo model...")
+                    val flamingoInference = try {
+                        FlamingoInference(flamingoFile, projectorFile, filesDir)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to load Flamingo", e)
+                        null
+                    }
+
+                    if (flamingoInference != null) {
+                        // Adjust projection matrix dims if projector is absent
+                        val actualFlamingoProjection = if (flamingoInference.outputDim != 3584) {
+                            EmbeddingProcessor.loadProjectionMatrix(
+                                rawDb, "flamingo_projection",
+                                flamingoInference.outputDim, 512
+                            )?.transpose()
+                        } else flamingoProjection
+
+                        val processor = EmbeddingProcessor(
+                            mulanModel = null,
+                            flamingoModel = flamingoInference,
+                            flamingoProjection = actualFlamingoProjection,
+                            fusedProjection = fusedProjection,
+                        )
+
+                        for ((i, track) in unindexed.withIndex()) {
+                            _state.value = IndexingState.Processing(
+                                current = i + 1,
+                                total = unindexed.size,
+                                trackName = "${track.artist} - ${track.title}",
+                            )
+                            updateNotification("Flamingo ${i + 1}/${unindexed.size}: ${track.title}")
+
+                            val audioFile = resolveAudioFile(track)
+                            if (audioFile == null) {
+                                Log.w(TAG, "Cannot resolve audio file for: ${track.title}")
+                                failed++
+                                continue
+                            }
+
+                            // Read MuLan embedding from pass 1 for fusion
+                            val existingTrackId = trackIds[track]
+                            val existingMulan = if (existingTrackId != null) {
+                                db.getEmbeddingFromTable("embeddings_mulan", existingTrackId)
+                            } else null
+
+                            val embeddings = processor.processTrack(
+                                audioFile, existingMulan = existingMulan
+                            ) { status ->
+                                updateNotification("Flamingo ${i + 1}/${unindexed.size}: $status")
+                            }
+
+                            if (embeddings == null) {
+                                failed++
+                                continue
+                            }
+
+                            if (existingTrackId != null) {
+                                // Track exists from pass 1 — add Flamingo + fused embeddings
+                                val ok = writer.addEmbeddings(existingTrackId, embeddings)
+                                if (ok) indexed++ else failed++
+                            } else {
+                                // No MuLan pass (only Flamingo available) — write full track
+                                val trackId = writer.writeTrack(
+                                    metadataKey = track.metadataKey,
+                                    filenameKey = track.filenameKey,
+                                    artist = track.artist.ifEmpty { null },
+                                    album = track.album.ifEmpty { null },
+                                    title = track.title.ifEmpty { null },
+                                    durationMs = track.durationMs,
+                                    filePath = track.path ?: audioFile.absolutePath,
+                                    embeddings = embeddings,
+                                )
+                                if (trackId > 0) indexed++ else failed++
+                            }
+                        }
+
+                        processor.close()
+                        Log.i(TAG, "Pass 2 (Flamingo) complete")
+                    }
+                }
 
                 // Rebuild indices
                 if (indexed > 0) {

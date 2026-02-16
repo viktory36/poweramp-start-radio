@@ -28,7 +28,7 @@ import kotlin.math.sqrt
  * - Each 10s clip: compute mel -> normalize -> ONNX -> 512d
  * - Average all clip embeddings, L2-normalize
  */
-class MuLanInference(modelFile: File) {
+class MuLanInference(modelFile: File, cacheDir: File? = null) {
 
     companion object {
         private const val TAG = "MuLanInference"
@@ -64,10 +64,14 @@ class MuLanInference(modelFile: File) {
     private val melParams: MelParams
     private val isSplitModel: Boolean
 
+    /** Which execution provider is active ("QNN" or "CPU"). */
+    var executionProvider: String = "CPU"
+        private set
+
     init {
-        // XNNPACK CPU is the default EP in onnxruntime-android.
-        // NNAPI is deprecated starting Android 15; QNN EP for NPU is a future option.
-        val opts = OrtSession.SessionOptions()
+        val opts = createSessionOptions(
+            "mulan_audio.ctx.onnx", cacheDir ?: modelFile.parentFile
+        )
         session = env.createSession(modelFile.absolutePath, opts)
 
         // Detect model type from ONNX input name
@@ -105,7 +109,32 @@ class MuLanInference(modelFile: File) {
         )
 
         Log.i(TAG, "MuQ-MuLan ONNX session loaded: ${modelFile.name} " +
-                "(${if (isSplitModel) "split/mel" else "legacy/wav"})")
+                "(${if (isSplitModel) "split/mel" else "legacy/wav"}, ep=$executionProvider)")
+    }
+
+    /**
+     * Create ORT session options with QNN EP (Hexagon HTP) if available.
+     * Falls back to XNNPACK CPU automatically if QNN EP fails.
+     */
+    private fun createSessionOptions(contextFileName: String, cacheDir: File): OrtSession.SessionOptions {
+        val opts = OrtSession.SessionOptions()
+        try {
+            opts.addQnn(mapOf(
+                "backend_type" to "htp",
+                "enable_htp_fp16_precision" to "1",
+                "htp_performance_mode" to "high_performance",
+                "htp_graph_finalization_optimization_mode" to "0",
+            ))
+            val cachePath = File(cacheDir, contextFileName).absolutePath
+            opts.addConfigEntry("ep.context_enable", "1")
+            opts.addConfigEntry("ep.context_embed_mode", "0")
+            opts.addConfigEntry("ep.context_file_path", cachePath)
+            executionProvider = "QNN"
+            Log.i(TAG, "QNN EP configured (HTP FP16), cache: $cachePath")
+        } catch (e: Exception) {
+            Log.w(TAG, "QNN EP not available, using XNNPACK CPU: ${e.message}")
+        }
+        return opts
     }
 
     /**

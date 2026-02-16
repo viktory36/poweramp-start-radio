@@ -91,6 +91,46 @@ class EmbeddingWriter(
     }
 
     /**
+     * Add Flamingo + fused embeddings to an existing track (pass 2 of sequential loading).
+     *
+     * Used when MuLan was written in pass 1 and Flamingo inference runs in pass 2.
+     *
+     * @param trackId Existing track ID from pass 1
+     * @param embeddings Computed embeddings (only flamingoReduced and fusedEmbedding are written)
+     * @return true on success
+     */
+    fun addEmbeddings(trackId: Long, embeddings: EmbeddingProcessor.EmbeddingResult): Boolean {
+        return try {
+            val rawDb = db.getRawDatabase()
+            rawDb.beginTransaction()
+            try {
+                embeddings.flamingoReduced?.let {
+                    db.insertEmbedding("embeddings_flamingo", trackId, it)
+                }
+
+                embeddings.fusedEmbedding?.let {
+                    db.insertEmbedding("embeddings_fused", trackId, it)
+                }
+
+                if (embeddings.fusedEmbedding != null && centroids != null && centroids.isNotEmpty()) {
+                    val clusterId = findNearestCluster(embeddings.fusedEmbedding)
+                    if (clusterId >= 0) {
+                        db.updateClusterId(trackId, clusterId)
+                    }
+                }
+
+                rawDb.setTransactionSuccessful()
+                true
+            } finally {
+                rawDb.endTransaction()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to add embeddings for track $trackId", e)
+            false
+        }
+    }
+
+    /**
      * Find nearest cluster centroid by dot product (cosine similarity for unit vectors).
      */
     private fun findNearestCluster(embedding: FloatArray): Int {

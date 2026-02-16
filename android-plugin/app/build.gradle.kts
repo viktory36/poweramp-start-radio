@@ -85,9 +85,10 @@ dependencies {
     // JSON serialization for session history persistence
     implementation("com.google.code.gson:gson:2.11.0")
 
-    // ONNX Runtime for on-device embedding inference (XNNPACK CPU by default)
-    // For Snapdragon NPU acceleration, swap for onnxruntime-android-qnn (requires INT8 models)
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.17.0")
+    // ONNX Runtime with QNN EP support for Snapdragon NPU (Hexagon HTP) acceleration.
+    // Drop-in replacement for onnxruntime-android — same API, adds QNN EP for FP16 on HTP.
+    // Falls back to XNNPACK CPU on non-Snapdragon devices or when QNN runtime is missing.
+    implementation("com.microsoft.onnxruntime:onnxruntime-android-qnn:1.23.2")
 
     // Testing
     testImplementation("junit:junit:4.13.2")
