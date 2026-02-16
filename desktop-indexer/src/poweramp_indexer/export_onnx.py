@@ -627,12 +627,137 @@ def export_flamingo_onnx(output_path: Path, fp16: bool = True, opset: int = 17):
     return output_path
 
 
+def _fix_dynamic_shapes(model_proto, model_name: str):
+    """Fix dynamic dimensions to static values for QNN EP compatibility.
+
+    QNN EP requires all tensor dimensions to be static. This replaces
+    named dynamic dims (batch, frames) with their fixed values.
+
+    Known dimension mappings:
+      batch  -> 1   (always infer single samples on device)
+      frames -> 750 (flamingo projector post-pool frame count)
+    """
+    import onnx
+
+    dim_fixes = {"batch": 1, "frames": 750}
+    fixed_any = False
+
+    # Fix graph inputs
+    for inp in model_proto.graph.input:
+        shape = inp.type.tensor_type.shape
+        if not shape:
+            continue
+        for d in shape.dim:
+            if d.dim_param and d.dim_param in dim_fixes:
+                old = d.dim_param
+                d.dim_param = ""
+                d.dim_value = dim_fixes[old]
+                fixed_any = True
+                logger.info(f"    Fixed input {inp.name}: {old} -> {dim_fixes[old]}")
+
+    # Fix graph outputs
+    for out in model_proto.graph.output:
+        shape = out.type.tensor_type.shape
+        if not shape:
+            continue
+        for d in shape.dim:
+            if d.dim_param and d.dim_param in dim_fixes:
+                old = d.dim_param
+                d.dim_param = ""
+                d.dim_value = dim_fixes[old]
+                fixed_any = True
+                logger.info(f"    Fixed output {out.name}: {old} -> {dim_fixes[old]}")
+
+    # Also fix any intermediate value_info shapes
+    for vi in model_proto.graph.value_info:
+        shape = vi.type.tensor_type.shape
+        if not shape:
+            continue
+        for d in shape.dim:
+            if d.dim_param and d.dim_param in dim_fixes:
+                old = d.dim_param
+                d.dim_param = ""
+                d.dim_value = dim_fixes[old]
+                fixed_any = True
+
+    return fixed_any
+
+
+def _fix_fp16_io(model_proto, model_name: str):
+    """Ensure model inputs/outputs are FP32 for QNN EP compatibility.
+
+    QNN EP with enable_htp_fp16_precision=1 expects FP32 I/O tensors and
+    internally runs computation at FP16. FP16 I/O causes issues since the
+    Android code creates FP32 FloatBuffer tensors.
+
+    Inserts Cast(FP32->FP16) after each FP16 input, and Cast(FP16->FP32)
+    before each FP16 output.
+    """
+    import onnx
+    from onnx import TensorProto, helper
+
+    FLOAT16 = TensorProto.FLOAT16
+    FLOAT32 = TensorProto.FLOAT
+    fixed_any = False
+
+    # Fix inputs: if FP16, change to FP32 and add Cast node
+    for inp in model_proto.graph.input:
+        if inp.type.tensor_type.elem_type == FLOAT16:
+            logger.info(f"    Input {inp.name}: FP16 -> FP32 (adding Cast)")
+            inp.type.tensor_type.elem_type = FLOAT32
+
+            # Create intermediate name for the casted FP16 tensor
+            cast_out = inp.name + "_fp16"
+
+            # Rename all nodes that consume this input to use the cast output
+            for node in model_proto.graph.node:
+                for i, name in enumerate(node.input):
+                    if name == inp.name:
+                        node.input[i] = cast_out
+
+            # Add Cast(FP32 -> FP16) node at the beginning
+            cast_node = helper.make_node(
+                "Cast", inputs=[inp.name], outputs=[cast_out],
+                to=FLOAT16, name=f"cast_input_{inp.name}"
+            )
+            model_proto.graph.node.insert(0, cast_node)
+            fixed_any = True
+
+    # Fix outputs: if FP16, change to FP32 and add Cast node
+    for out in model_proto.graph.output:
+        if out.type.tensor_type.elem_type == FLOAT16:
+            logger.info(f"    Output {out.name}: FP16 -> FP32 (adding Cast)")
+            out.type.tensor_type.elem_type = FLOAT32
+
+            # Create intermediate name for the original FP16 tensor
+            cast_in = out.name + "_fp16"
+
+            # Rename all nodes that produce this output to use the intermediate name
+            for node in model_proto.graph.node:
+                for i, name in enumerate(node.output):
+                    if name == out.name:
+                        node.output[i] = cast_in
+
+            # Add Cast(FP16 -> FP32) node at the end
+            cast_node = helper.make_node(
+                "Cast", inputs=[cast_in], outputs=[out.name],
+                to=FLOAT32, name=f"cast_output_{out.name}"
+            )
+            model_proto.graph.node.append(cast_node)
+            fixed_any = True
+
+    return fixed_any
+
+
 def prepare_for_phone(models_dir: Path) -> dict:
     """Prepare ONNX models for on-device deployment with QNN EP.
 
     1. Consolidates external data into single files
-    2. Verifies all tensor shapes are fixed (no dynamic dims)
-    3. Checks GELU compatibility (Erf vs Tanh for QNN EP)
+    2. Fixes dynamic shapes to static (QNN EP requirement)
+    3. Ensures FP32 I/O (adds Cast nodes if model has FP16 I/O)
+    4. Runs shape inference to propagate fixed dims
+    5. Checks GELU compatibility (Erf vs Tanh for QNN EP)
+    6. Validates with ORT
 
     Args:
         models_dir: Directory containing ONNX model files
@@ -641,6 +766,7 @@ def prepare_for_phone(models_dir: Path) -> dict:
         Dict with per-model results
     """
     import onnx
+    from onnx import shape_inference
 
     results = {}
     model_files = sorted(models_dir.glob("*.onnx"))
@@ -676,55 +802,95 @@ def prepare_for_phone(models_dir: Path) -> dict:
             _consolidate_external_data(model_path)
             result["size_mb"] = model_path.stat().st_size / 1024 / 1024
             logger.info(f"  Consolidated: {result['size_mb']:.1f} MB")
-            # Reload after consolidation
-            model_proto = onnx.load(str(model_path), load_external_data=False)
 
-        # Step 2: Check shapes
+        # Load full model (with weights) for modifications
+        model_proto = onnx.load(str(model_path))
+        modified = False
+
+        # Step 2: Fix dynamic shapes
         logger.info("  Checking tensor shapes...")
-        dynamic_inputs = []
         for inp in model_proto.graph.input:
             shape = inp.type.tensor_type.shape
             if shape:
                 dims = []
                 for d in shape.dim:
-                    if d.dim_param:  # Named dynamic dim like "batch"
+                    if d.dim_param:
                         dims.append(f"*{d.dim_param}")
                     elif d.dim_value > 0:
                         dims.append(str(d.dim_value))
                     else:
                         dims.append("*?")
-                shape_str = f"[{', '.join(dims)}]"
-                has_dynamic = any(d.startswith("*") for d in dims)
-                if has_dynamic:
-                    dynamic_inputs.append(f"{inp.name}: {shape_str}")
-                logger.info(f"    {inp.name}: {shape_str}")
+                logger.info(f"    {inp.name}: [{', '.join(dims)}]")
 
+        if _fix_dynamic_shapes(model_proto, model_path.name):
+            modified = True
+            logger.info("  Fixed dynamic shapes -> static")
+
+        # Verify all shapes are now fixed
+        dynamic_inputs = []
+        for inp in model_proto.graph.input:
+            shape = inp.type.tensor_type.shape
+            if shape:
+                for d in shape.dim:
+                    if d.dim_param:
+                        dynamic_inputs.append(f"{inp.name}: *{d.dim_param}")
         result["dynamic_inputs"] = dynamic_inputs
         if dynamic_inputs:
-            logger.warning(f"  ⚠ Dynamic shapes detected (QNN EP requires fixed):")
-            for d in dynamic_inputs:
-                logger.warning(f"    {d}")
-            logger.info("  Batch dim is OK — QNN EP handles batch=1 at runtime.")
+            logger.warning(f"  ⚠ Remaining dynamic shapes: {dynamic_inputs}")
         else:
-            logger.info("  ✓ All shapes are fixed")
+            logger.info("  ✓ All shapes are fixed (static)")
 
-        # Step 3: Check for Erf nodes (GELU compatibility)
+        # Step 3: Fix FP16 I/O -> FP32 I/O with Cast nodes
+        logger.info("  Checking I/O dtypes...")
+        if _fix_fp16_io(model_proto, model_path.name):
+            modified = True
+            logger.info("  Fixed FP16 I/O -> FP32 with Cast nodes")
+        else:
+            logger.info("  ✓ I/O already FP32")
+
+        # Step 4: Run shape inference to propagate fixed dims
+        if modified:
+            logger.info("  Running shape inference...")
+            try:
+                # infer_shapes works in-memory; safe for models < 2GB
+                model_proto = shape_inference.infer_shapes(
+                    model_proto, check_type=True, strict_mode=False
+                )
+                logger.info("  ✓ Shape inference complete")
+            except Exception as e:
+                logger.warning(f"  Shape inference failed (non-fatal): {e}")
+                logger.info("  Model will still work — ORT infers shapes at load time")
+
+            # Save modified model
+            total_bytes = sum(
+                len(i.raw_data) for i in model_proto.graph.initializer
+            )
+            if total_bytes > 2_000_000_000:
+                onnx.save(
+                    model_proto, str(model_path),
+                    save_as_external_data=True, all_tensors_to_one_file=True,
+                    location=model_path.stem + ".data",
+                )
+            else:
+                onnx.save(model_proto, str(model_path))
+            result["size_mb"] = model_path.stat().st_size / 1024 / 1024
+            logger.info(f"  Saved modified model: {result['size_mb']:.1f} MB")
+
+        # Step 5: Check for Erf nodes (GELU compatibility)
         erf_nodes = [n for n in model_proto.graph.node if n.op_type == "Erf"]
         gelu_nodes = [n for n in model_proto.graph.node if n.op_type == "Gelu"]
-        tanh_nodes = [n for n in model_proto.graph.node if n.op_type == "Tanh"]
         result["erf_count"] = len(erf_nodes)
         result["gelu_count"] = len(gelu_nodes)
 
         if erf_nodes:
             logger.info(f"  Found {len(erf_nodes)} Erf nodes (raw GELU pattern)")
-            logger.info("  ORT auto-fuses Erf→Gelu at optimization level ≥ 1 (default).")
-            logger.info("  If QNN EP fails, re-export with nn.GELU(approximate='tanh').")
+            logger.info("  ORT auto-fuses Erf->Gelu at optimization level >= 1 (default).")
         elif gelu_nodes:
             logger.info(f"  ✓ {len(gelu_nodes)} fused Gelu nodes (QNN-compatible)")
         else:
             logger.info("  ✓ No Erf or Gelu nodes")
 
-        # Step 4: Check dtype
+        # Step 6: Check weight dtype
         fp16_count = sum(
             1 for i in model_proto.graph.initializer
             if i.data_type == 10  # FLOAT16
@@ -738,9 +904,26 @@ def prepare_for_phone(models_dir: Path) -> dict:
         result["fp32_weights"] = fp32_count
         dtype = "FP16" if fp16_count > fp32_count else "FP32"
         result["dtype"] = dtype
-        logger.info(f"  Weights: {fp16_count} FP16 + {fp32_count} FP32 / {total} total → {dtype}")
+        logger.info(f"  Weights: {fp16_count} FP16 + {fp32_count} FP32 / {total} total -> {dtype}")
 
-        # Step 5: Validate loads in ORT
+        # Step 7: Log final shapes
+        logger.info("  Final shapes:")
+        for inp in model_proto.graph.input:
+            shape = inp.type.tensor_type.shape
+            if shape:
+                dims = [str(d.dim_value) if d.dim_value > 0 else f"*{d.dim_param or '?'}"
+                        for d in shape.dim]
+                elem_type = "FP16" if inp.type.tensor_type.elem_type == 10 else "FP32"
+                logger.info(f"    IN  {inp.name}: [{', '.join(dims)}] {elem_type}")
+        for out in model_proto.graph.output:
+            shape = out.type.tensor_type.shape
+            if shape:
+                dims = [str(d.dim_value) if d.dim_value > 0 else f"*{d.dim_param or '?'}"
+                        for d in shape.dim]
+                elem_type = "FP16" if out.type.tensor_type.elem_type == 10 else "FP32"
+                logger.info(f"    OUT {out.name}: [{', '.join(dims)}] {elem_type}")
+
+        # Step 8: Validate loads in ORT
         if _validate_onnx(model_path):
             result["valid"] = True
             logger.info("  ✓ ORT validation passed")
