@@ -206,8 +206,9 @@ class MuLanInference(modelFile: File, cacheDir: File? = null) {
         }
 
         // Average and L2-normalize
+        val countF = count.toFloat()
         for (i in 0 until EMBEDDING_DIM) {
-            sumEmbedding[i] /= count
+            sumEmbedding[i] /= countF
         }
         l2Normalize(sumEmbedding)
 

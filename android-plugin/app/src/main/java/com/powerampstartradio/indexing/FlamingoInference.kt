@@ -137,8 +137,9 @@ class FlamingoInference(encoderFile: File, projectorFile: File? = null, cacheDir
         }
 
         // Average and L2-normalize
+        val countF = count.toFloat()
         for (i in 0 until outputDim) {
-            sumEmbedding[i] /= count
+            sumEmbedding[i] /= countF
         }
         l2Normalize(sumEmbedding)
 
@@ -246,8 +247,9 @@ class FlamingoInference(encoderFile: File, projectorFile: File? = null, cacheDir
                     pooled[i] += frame[i]
                 }
             }
+            val numFrames = frames.size.toFloat()
             for (i in 0 until outputDim) {
-                pooled[i] /= frames.size
+                pooled[i] /= numFrames
             }
 
             melTensor.close()
