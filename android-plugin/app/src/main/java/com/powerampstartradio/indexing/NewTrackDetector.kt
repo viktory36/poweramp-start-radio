@@ -119,20 +119,41 @@ class NewTrackDetector(
             .appendEncodedPath("files").build()
         val result = mutableListOf<PowerampEntryWithPath>()
 
-        try {
-            val cursor = context.contentResolver.query(
+        // Try with 'path' column first, fall back to folder_path + file_name
+        val cursor = try {
+            context.contentResolver.query(
                 filesUri,
                 arrayOf(
-                    "folder_files._id",
-                    "artist",
-                    "album",
-                    "title_tag",
-                    "folder_files.duration",
-                    "folder_files.path"
+                    "folder_files._id", "artist", "album", "title_tag",
+                    "folder_files.duration", "folder_files.path"
                 ),
                 null, null, null
             )
+        } catch (e: Exception) {
+            Log.w(TAG, "path column not available, trying folder_path + file_name")
+            try {
+                context.contentResolver.query(
+                    filesUri,
+                    arrayOf(
+                        "folder_files._id", "artist", "album", "title_tag",
+                        "folder_files.duration", "folder_path", "file_name"
+                    ),
+                    null, null, null
+                )
+            } catch (e2: Exception) {
+                Log.w(TAG, "folder_path + file_name also failed, querying without paths")
+                context.contentResolver.query(
+                    filesUri,
+                    arrayOf(
+                        "folder_files._id", "artist", "album", "title_tag",
+                        "folder_files.duration"
+                    ),
+                    null, null, null
+                )
+            }
+        }
 
+        try {
             cursor?.use {
                 val idIdx = it.getColumnIndex("_id")
                 val artistIdx = it.getColumnIndex("artist")
@@ -140,6 +161,8 @@ class NewTrackDetector(
                 val titleIdx = it.getColumnIndex("title_tag")
                 val durationIdx = it.getColumnIndex("duration")
                 val pathIdx = it.getColumnIndex("path")
+                val folderPathIdx = it.getColumnIndex("folder_path")
+                val fileNameIdx = it.getColumnIndex("file_name")
 
                 while (it.moveToNext()) {
                     val rawArtist = (it.getString(artistIdx) ?: "").lowercase().trim()
@@ -147,13 +170,23 @@ class NewTrackDetector(
                     val artist = normalizeNfc(normalizePowerampArtist(rawArtist))
                     val title = normalizeNfc(stripAudioExtension(rawTitle))
 
+                    val path = when {
+                        pathIdx >= 0 -> it.getString(pathIdx)
+                        folderPathIdx >= 0 && fileNameIdx >= 0 -> {
+                            val folder = it.getString(folderPathIdx) ?: ""
+                            val file = it.getString(fileNameIdx) ?: ""
+                            if (file.isNotEmpty()) "$folder/$file" else null
+                        }
+                        else -> null
+                    }
+
                     result.add(PowerampEntryWithPath(
                         id = it.getLong(idIdx),
                         artist = artist,
                         album = normalizeNfc((it.getString(albumIdx) ?: "").lowercase().trim()),
                         title = title,
                         durationMs = it.getInt(durationIdx) * 1000,
-                        path = if (pathIdx >= 0) it.getString(pathIdx) else null,
+                        path = path,
                         metadataKey = run {
                             val durationRounded = (it.getInt(durationIdx) * 1000 / 100) * 100
                             "$artist|${normalizeNfc((it.getString(albumIdx) ?: "").lowercase().trim())}|$title|$durationRounded"
