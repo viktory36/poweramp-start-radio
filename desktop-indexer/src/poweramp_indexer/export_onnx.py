@@ -686,8 +686,6 @@ def prepare_for_phone(models_dir: Path) -> dict:
             shape = inp.type.tensor_type.shape
             if shape:
                 dims = []
-                for d in shape.dim.dim_param if hasattr(shape, 'dim') else []:
-                    pass
                 for d in shape.dim:
                     if d.dim_param:  # Named dynamic dim like "batch"
                         dims.append(f"*{d.dim_param}")
