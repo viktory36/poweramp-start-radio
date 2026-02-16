@@ -119,23 +119,58 @@ class BenchmarkActivity : ComponentActivity() {
             .appendEncodedPath("files").build()
         val result = mutableListOf<TestTrack>()
 
+        // Try with path column first, fall back to folder_path + file_name
+        val columnsWithPath = arrayOf(
+            "folder_files._id", "artist", "album", "title_tag",
+            "folder_files.duration", "path"
+        )
+        val columnsWithoutPath = arrayOf(
+            "folder_files._id", "artist", "album", "title_tag",
+            "folder_files.duration", "folder_path", "file_name"
+        )
+
         try {
-            val cursor = contentResolver.query(
-                filesUri,
-                arrayOf(
-                    "folder_files._id", "artist", "album", "title_tag",
-                    "folder_files.duration", "folder_files.path"
-                ),
-                null, null, null,
-            )
+            // Try with 'path' column
+            var cursor = try {
+                contentResolver.query(filesUri, columnsWithPath, null, null, null)
+            } catch (e: Exception) {
+                Log.w(TAG, "path column not available, trying folder_path + file_name")
+                null
+            }
+
+            val usePath = cursor != null
+            if (cursor == null) {
+                cursor = try {
+                    contentResolver.query(filesUri, columnsWithoutPath, null, null, null)
+                } catch (e: Exception) {
+                    Log.w(TAG, "folder_path + file_name not available either, trying minimal")
+                    // Last resort: no path columns at all
+                    contentResolver.query(
+                        filesUri,
+                        arrayOf("folder_files._id", "artist", "title_tag", "folder_files.duration"),
+                        null, null, null
+                    )
+                }
+            }
+
             cursor?.use {
                 val idIdx = it.getColumnIndex("_id")
                 val artistIdx = it.getColumnIndex("artist")
                 val titleIdx = it.getColumnIndex("title_tag")
                 val pathIdx = it.getColumnIndex("path")
+                val folderPathIdx = it.getColumnIndex("folder_path")
+                val fileNameIdx = it.getColumnIndex("file_name")
 
                 while (it.moveToNext()) {
-                    val path = if (pathIdx >= 0) it.getString(pathIdx) else null
+                    val path = when {
+                        usePath && pathIdx >= 0 -> it.getString(pathIdx)
+                        folderPathIdx >= 0 && fileNameIdx >= 0 -> {
+                            val folder = it.getString(folderPathIdx) ?: ""
+                            val file = it.getString(fileNameIdx) ?: ""
+                            if (file.isNotEmpty()) "$folder/$file" else null
+                        }
+                        else -> null
+                    }
                     if (path != null) {
                         result.add(TestTrack(
                             id = it.getLong(idIdx),
