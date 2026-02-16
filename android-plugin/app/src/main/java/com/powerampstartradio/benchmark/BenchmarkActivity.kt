@@ -119,37 +119,39 @@ class BenchmarkActivity : ComponentActivity() {
             .appendEncodedPath("files").build()
         val result = mutableListOf<TestTrack>()
 
-        // Try with path column first, fall back to folder_path + file_name
-        val columnsWithPath = arrayOf(
-            "folder_files._id", "artist", "album", "title_tag",
-            "folder_files.duration", "path"
-        )
-        val columnsWithoutPath = arrayOf(
-            "folder_files._id", "artist", "album", "title_tag",
-            "folder_files.duration", "folder_path", "file_name"
+        // Try column sets in order until one works.
+        // Poweramp's content provider schema varies by version.
+        data class ColumnSet(val name: String, val columns: Array<String>)
+        val columnSets = listOf(
+            ColumnSet("path", arrayOf(
+                "folder_files._id", "artist", "title_tag", "folder_files.duration", "path"
+            )),
+            ColumnSet("folder_path+file_name", arrayOf(
+                "folder_files._id", "artist", "title_tag", "folder_files.duration",
+                "folder_path", "file_name"
+            )),
+            ColumnSet("_data", arrayOf(
+                "folder_files._id", "artist", "title_tag", "folder_files.duration", "_data"
+            )),
+            ColumnSet("minimal", arrayOf(
+                "folder_files._id", "artist", "title_tag", "folder_files.duration"
+            )),
         )
 
         try {
-            // Try with 'path' column
-            var cursor = try {
-                contentResolver.query(filesUri, columnsWithPath, null, null, null)
-            } catch (e: Exception) {
-                Log.w(TAG, "path column not available, trying folder_path + file_name")
-                null
-            }
-
-            val usePath = cursor != null
-            if (cursor == null) {
+            var cursor: android.database.Cursor? = null
+            var usedSet = "minimal"
+            for (cs in columnSets) {
                 cursor = try {
-                    contentResolver.query(filesUri, columnsWithoutPath, null, null, null)
+                    contentResolver.query(filesUri, cs.columns, null, null, null)
                 } catch (e: Exception) {
-                    Log.w(TAG, "folder_path + file_name not available either, trying minimal")
-                    // Last resort: no path columns at all
-                    contentResolver.query(
-                        filesUri,
-                        arrayOf("folder_files._id", "artist", "title_tag", "folder_files.duration"),
-                        null, null, null
-                    )
+                    Log.w(TAG, "Column set '${cs.name}' failed: ${e.message}")
+                    null
+                }
+                if (cursor != null) {
+                    usedSet = cs.name
+                    Log.i(TAG, "Using column set: ${cs.name}")
+                    break
                 }
             }
 
@@ -158,12 +160,27 @@ class BenchmarkActivity : ComponentActivity() {
                 val artistIdx = it.getColumnIndex("artist")
                 val titleIdx = it.getColumnIndex("title_tag")
                 val pathIdx = it.getColumnIndex("path")
+                val dataIdx = it.getColumnIndex("_data")
                 val folderPathIdx = it.getColumnIndex("folder_path")
                 val fileNameIdx = it.getColumnIndex("file_name")
 
+                // Log first row's available columns for debugging
+                if (it.moveToFirst()) {
+                    Log.i(TAG, "Using column set '$usedSet', columns: ${it.columnNames.toList()}")
+                    val samplePath = if (pathIdx >= 0) it.getString(pathIdx) else null
+                    val sampleData = if (dataIdx >= 0) it.getString(dataIdx) else null
+                    val sampleFolder = if (folderPathIdx >= 0) it.getString(folderPathIdx) else null
+                    val sampleFile = if (fileNameIdx >= 0) it.getString(fileNameIdx) else null
+                    Log.i(TAG, "Sample row: path=$samplePath, _data=$sampleData, " +
+                        "folder_path=$sampleFolder, file_name=$sampleFile")
+                    // Reset to process from first row
+                    it.moveToPosition(-1)
+                }
+
                 while (it.moveToNext()) {
                     val path = when {
-                        usePath && pathIdx >= 0 -> it.getString(pathIdx)
+                        pathIdx >= 0 -> it.getString(pathIdx)
+                        dataIdx >= 0 -> it.getString(dataIdx)
                         folderPathIdx >= 0 && fileNameIdx >= 0 -> {
                             val folder = it.getString(folderPathIdx) ?: ""
                             val file = it.getString(fileNameIdx) ?: ""
@@ -183,6 +200,11 @@ class BenchmarkActivity : ComponentActivity() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error querying Poweramp", e)
+        }
+
+        Log.i(TAG, "Query returned ${result.size} tracks with paths")
+        if (result.isNotEmpty()) {
+            Log.i(TAG, "Sample paths: ${result.take(3).map { it.path }}")
         }
 
         return result
@@ -367,11 +389,12 @@ class BenchmarkActivity : ComponentActivity() {
 
     private fun resolveFile(path: String): File? {
         val direct = File(path)
-        if (direct.exists() && direct.canRead()) return direct
+        if (direct.isFile && direct.canRead()) return direct
         for (prefix in listOf("/storage/emulated/0/", "/sdcard/", "/storage/sdcard0/")) {
             val f = File(prefix + path)
-            if (f.exists() && f.canRead()) return f
+            if (f.isFile && f.canRead()) return f
         }
+        Log.w(TAG, "Could not resolve file: $path")
         return null
     }
 

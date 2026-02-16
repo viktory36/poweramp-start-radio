@@ -64,6 +64,17 @@ class FlamingoInference(encoderFile: File, projectorFile: File? = null, cacheDir
             env.createSession(projectorFile.absolutePath, projOpts)
         } else null
 
+        // Detect actual EP: QNN EP registration may succeed but graph compilation
+        // can fail silently, falling back to CPU. Check context cache file existence
+        // as a proxy — if QNN compiled successfully, the .ctx.onnx file is created.
+        if (executionProvider == "QNN") {
+            val ctxFile = File(cacheDir ?: encoderFile.parentFile, "flamingo_encoder.ctx.onnx")
+            if (!ctxFile.exists()) {
+                executionProvider = "CPU"
+                Log.w(TAG, "QNN EP registered but graph compilation failed, actual EP: CPU")
+            }
+        }
+
         outputDim = if (projectorSession != null) PROJECTED_DIM else ENCODER_DIM
         Log.i(TAG, "Flamingo ONNX loaded: encoder=${encoderFile.name}, " +
                 "projector=${projectorFile?.name ?: "none"}, output_dim=$outputDim, " +

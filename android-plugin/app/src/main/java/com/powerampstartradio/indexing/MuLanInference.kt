@@ -108,6 +108,16 @@ class MuLanInference(modelFile: File, cacheDir: File? = null) {
             fMax = effectiveFMax.toFloat(),
         )
 
+        // Detect actual EP: QNN registration may succeed but graph compilation
+        // can fail silently, falling back to CPU.
+        if (executionProvider == "QNN") {
+            val ctxFile = File(cacheDir ?: modelFile.parentFile, "mulan_audio.ctx.onnx")
+            if (!ctxFile.exists()) {
+                executionProvider = "CPU"
+                Log.w(TAG, "QNN EP registered but graph compilation failed, actual EP: CPU")
+            }
+        }
+
         Log.i(TAG, "MuQ-MuLan ONNX session loaded: ${modelFile.name} " +
                 "(${if (isSplitModel) "split/mel" else "legacy/wav"}, ep=$executionProvider)")
     }
