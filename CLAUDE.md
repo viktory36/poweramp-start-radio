@@ -154,7 +154,7 @@ Poweramp API uses:
 - Desktop indexer runs on Windows only (GPU + music library). Don't run in WSL.
 - Android APK builds work in WSL (JDK 17 + SDK at `~/.local/share/poweramp-start-radio/`)
 - Models in `desktop-indexer/models/` and `*.db` files are gitignored — never commit
-- Poweramp `path` column returns folders, not file paths — use `folder_path` + `file_name`
+- Poweramp `path` column (from folders table) has trailing `/`; combine with `folder_files.name` for full path. `folder_path`/`file_name` are PlaylistEntries columns — don't use for file queries!
 - Commit and push when confident — user pulls on Windows to test
 
 ## GPU/Performance Notes (RTX 2060 Max-Q, 6GB VRAM)

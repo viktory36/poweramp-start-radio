@@ -120,16 +120,15 @@ class BenchmarkActivity : ComponentActivity() {
         val result = mutableListOf<TestTrack>()
 
         // Try column sets in order until one works.
-        // Poweramp's content provider schema varies by version.
-        // Prefer folder_path+file_name — "path" often returns just the folder.
+        // Poweramp's content provider joins folder_files with folders.
+        // The correct columns are: "path" (from folders, has trailing /)
+        // and "folder_files.name" (short filename).
+        // Note: "folder_path"/"file_name" are PlaylistEntries columns, not folder_files!
         data class ColumnSet(val name: String, val columns: Array<String>)
         val columnSets = listOf(
-            ColumnSet("folder_path+file_name", arrayOf(
+            ColumnSet("path+name", arrayOf(
                 "folder_files._id", "artist", "title_tag", "folder_files.duration",
-                "folder_path", "file_name"
-            )),
-            ColumnSet("_data", arrayOf(
-                "folder_files._id", "artist", "title_tag", "folder_files.duration", "_data"
+                "path", "folder_files.name"
             )),
             ColumnSet("minimal", arrayOf(
                 "folder_files._id", "artist", "title_tag", "folder_files.duration"
@@ -157,30 +156,26 @@ class BenchmarkActivity : ComponentActivity() {
                 val idIdx = it.getColumnIndex("_id")
                 val artistIdx = it.getColumnIndex("artist")
                 val titleIdx = it.getColumnIndex("title_tag")
-                val dataIdx = it.getColumnIndex("_data")
-                val folderPathIdx = it.getColumnIndex("folder_path")
-                val fileNameIdx = it.getColumnIndex("file_name")
+                val pathIdx = it.getColumnIndex("path")       // folders.path (trailing /)
+                val nameIdx = it.getColumnIndex("name")       // folder_files.name
 
                 // Log first row's available columns for debugging
                 if (it.moveToFirst()) {
                     Log.i(TAG, "Using column set '$usedSet', columns: ${it.columnNames.toList()}")
-                    val sampleData = if (dataIdx >= 0) it.getString(dataIdx) else null
-                    val sampleFolder = if (folderPathIdx >= 0) it.getString(folderPathIdx) else null
-                    val sampleFile = if (fileNameIdx >= 0) it.getString(fileNameIdx) else null
-                    Log.i(TAG, "Sample row: _data=$sampleData, " +
-                        "folder_path=$sampleFolder, file_name=$sampleFile")
+                    val samplePath = if (pathIdx >= 0) it.getString(pathIdx) else null
+                    val sampleName = if (nameIdx >= 0) it.getString(nameIdx) else null
+                    Log.i(TAG, "Sample row: path=$samplePath, name=$sampleName")
                     // Reset to process from first row
                     it.moveToPosition(-1)
                 }
 
                 while (it.moveToNext()) {
                     val path = when {
-                        folderPathIdx >= 0 && fileNameIdx >= 0 -> {
-                            val folder = (it.getString(folderPathIdx) ?: "").trimEnd('/')
-                            val file = it.getString(fileNameIdx) ?: ""
-                            if (file.isNotEmpty()) "$folder/$file" else null
+                        pathIdx >= 0 && nameIdx >= 0 -> {
+                            val folder = it.getString(pathIdx) ?: ""  // already has trailing /
+                            val name = it.getString(nameIdx) ?: ""
+                            if (name.isNotEmpty()) "$folder$name" else null
                         }
-                        dataIdx >= 0 -> it.getString(dataIdx)
                         else -> null
                     }
                     if (path != null) {
