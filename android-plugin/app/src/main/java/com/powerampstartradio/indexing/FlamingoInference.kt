@@ -44,7 +44,7 @@ class FlamingoInference(encoderFile: File, projectorFile: File? = null, cacheDir
     private val env = OrtEnvironment.getEnvironment()
     private val encoderSession: OrtSession
     private val projectorSession: OrtSession?
-    private val melSpectrogram = MelSpectrogram()
+    private val melSpectrogram = MelSpectrogram(center = true, melScale = MelScale.SLANEY)
 
     val outputDim: Int
     /** Which execution provider is active ("QNN" or "CPU"). */
@@ -172,8 +172,10 @@ class FlamingoInference(encoderFile: File, projectorFile: File? = null, cacheDir
             chunkSamples
         }
 
-        // Compute mel spectrogram [128, 3000] and apply Whisper log normalization
-        val mel = melSpectrogram.compute(paddedChunk)
+        // Compute mel spectrogram and apply Whisper log normalization.
+        // Center padding produces 3001 frames; drop last to match Whisper's [:, :-1].
+        val rawMel = melSpectrogram.compute(paddedChunk)
+        val mel = Array(rawMel.size) { m -> rawMel[m].copyOf(rawMel[m].size - 1) }
         MelSpectrogram.whisperNormalize(mel)
 
         // Construct audio_times: absolute timestamps per post-pool frame
