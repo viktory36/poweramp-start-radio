@@ -2,6 +2,7 @@ package com.powerampstartradio.indexing
 
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtLoggingLevel
 import ai.onnxruntime.OrtSession
 import android.util.Log
 import com.google.gson.Gson
@@ -68,11 +69,33 @@ class MuLanInference(modelFile: File, cacheDir: File? = null) {
     var executionProvider: String = "CPU"
         private set
 
+    /** QNN EP error message if it failed and fell back to CPU. Null = QNN not attempted or succeeded. */
+    var qnnError: String? = null
+        private set
+
     init {
         val opts = createSessionOptions(
             "mulan_audio.ctx.onnx", cacheDir ?: modelFile.parentFile
         )
-        session = env.createSession(modelFile.absolutePath, opts)
+        session = if (executionProvider == "QNN") {
+            try {
+                env.createSession(modelFile.absolutePath, opts).also {
+                    Log.i(TAG, "MuLan session created with QNN EP")
+                }
+            } catch (e: Exception) {
+                qnnError = e.message ?: e.toString()
+                Log.e(TAG, "══════ QNN EP FAILED for MuLan ══════")
+                Log.e(TAG, "Error: ${e.message}")
+                Log.e(TAG, "Exception: ${e.javaClass.simpleName}")
+                e.cause?.let { Log.e(TAG, "Root cause: ${it.message}") }
+                Log.e(TAG, "Stack trace:", e)
+                Log.e(TAG, "Falling back to CPU EP")
+                executionProvider = "CPU"
+                env.createSession(modelFile.absolutePath, OrtSession.SessionOptions())
+            }
+        } else {
+            env.createSession(modelFile.absolutePath, opts)
+        }
 
         // Detect model type from ONNX input name
         val inputName = session.inputInfo.keys.first()
@@ -108,16 +131,6 @@ class MuLanInference(modelFile: File, cacheDir: File? = null) {
             fMax = effectiveFMax.toFloat(),
         )
 
-        // Detect actual EP: QNN registration may succeed but graph compilation
-        // can fail silently, falling back to CPU.
-        if (executionProvider == "QNN") {
-            val ctxFile = File(cacheDir ?: modelFile.parentFile, "mulan_audio.ctx.onnx")
-            if (!ctxFile.exists()) {
-                executionProvider = "CPU"
-                Log.w(TAG, "QNN EP registered but graph compilation failed, actual EP: CPU")
-            }
-        }
-
         Log.i(TAG, "MuQ-MuLan ONNX session loaded: ${modelFile.name} " +
                 "(${if (isSplitModel) "split/mel" else "legacy/wav"}, ep=$executionProvider)")
     }
@@ -134,11 +147,17 @@ class MuLanInference(modelFile: File, cacheDir: File? = null) {
                 "enable_htp_fp16_precision" to "1",
                 "htp_performance_mode" to "high_performance",
                 "htp_graph_finalization_optimization_mode" to "0",
+                "profiling_level" to "basic",
             ))
             val cachePath = File(cacheDir, contextFileName).absolutePath
             opts.addConfigEntry("ep.context_enable", "1")
             opts.addConfigEntry("ep.context_embed_mode", "0")
             opts.addConfigEntry("ep.context_file_path", cachePath)
+            // Prevent silent CPU fallback — forces ORT to throw if QNN can't handle the graph
+            opts.addConfigEntry("session.disable_cpu_ep_fallback", "1")
+            // Verbose logging to dump graph partitioning info to logcat
+            opts.setSessionLogLevel(OrtLoggingLevel.ORT_LOGGING_LEVEL_VERBOSE)
+            opts.setSessionLogVerbosityLevel(0)
             executionProvider = "QNN"
             Log.i(TAG, "QNN EP configured (HTP FP16), cache: $cachePath")
         } catch (e: Exception) {

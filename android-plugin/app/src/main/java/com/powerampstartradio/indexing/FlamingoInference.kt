@@ -2,6 +2,7 @@ package com.powerampstartradio.indexing
 
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtLoggingLevel
 import ai.onnxruntime.OrtSession
 import android.util.Log
 import java.io.File
@@ -51,29 +52,56 @@ class FlamingoInference(encoderFile: File, projectorFile: File? = null, cacheDir
     var executionProvider: String = "CPU"
         private set
 
+    /** QNN EP error message if it failed and fell back to CPU. Null = QNN not attempted or succeeded. */
+    var qnnError: String? = null
+        private set
+
     init {
         val encOpts = createSessionOptions(
             "flamingo_encoder.ctx.onnx", cacheDir ?: encoderFile.parentFile
         )
-        encoderSession = env.createSession(encoderFile.absolutePath, encOpts)
+        encoderSession = if (executionProvider == "QNN") {
+            try {
+                env.createSession(encoderFile.absolutePath, encOpts).also {
+                    Log.i(TAG, "Flamingo encoder session created with QNN EP")
+                }
+            } catch (e: Exception) {
+                qnnError = e.message ?: e.toString()
+                Log.e(TAG, "══════ QNN EP FAILED for Flamingo encoder ══════")
+                Log.e(TAG, "Error: ${e.message}")
+                Log.e(TAG, "Exception: ${e.javaClass.simpleName}")
+                e.cause?.let { Log.e(TAG, "Root cause: ${it.message}") }
+                Log.e(TAG, "Stack trace:", e)
+                Log.e(TAG, "Falling back to CPU EP")
+                executionProvider = "CPU"
+                env.createSession(encoderFile.absolutePath, OrtSession.SessionOptions())
+            }
+        } else {
+            env.createSession(encoderFile.absolutePath, encOpts)
+        }
 
         projectorSession = if (projectorFile != null && projectorFile.exists()) {
-            val projOpts = createSessionOptions(
-                "flamingo_projector.ctx.onnx", cacheDir ?: projectorFile.parentFile
-            )
-            env.createSession(projectorFile.absolutePath, projOpts)
-        } else null
-
-        // Detect actual EP: QNN EP registration may succeed but graph compilation
-        // can fail silently, falling back to CPU. Check context cache file existence
-        // as a proxy — if QNN compiled successfully, the .ctx.onnx file is created.
-        if (executionProvider == "QNN") {
-            val ctxFile = File(cacheDir ?: encoderFile.parentFile, "flamingo_encoder.ctx.onnx")
-            if (!ctxFile.exists()) {
-                executionProvider = "CPU"
-                Log.w(TAG, "QNN EP registered but graph compilation failed, actual EP: CPU")
+            if (executionProvider == "QNN") {
+                val projOpts = createSessionOptions(
+                    "flamingo_projector.ctx.onnx", cacheDir ?: projectorFile.parentFile
+                )
+                try {
+                    env.createSession(projectorFile.absolutePath, projOpts).also {
+                        Log.i(TAG, "Flamingo projector session created with QNN EP")
+                    }
+                } catch (e: Exception) {
+                    val projError = e.message ?: e.toString()
+                    qnnError = (qnnError?.plus("\n") ?: "") + "Projector: $projError"
+                    Log.e(TAG, "══════ QNN EP FAILED for Flamingo projector ══════")
+                    Log.e(TAG, "Error: ${e.message}")
+                    Log.e(TAG, "Stack trace:", e)
+                    Log.w(TAG, "Projector falling back to CPU (encoder still on QNN)")
+                    env.createSession(projectorFile.absolutePath, OrtSession.SessionOptions())
+                }
+            } else {
+                env.createSession(projectorFile.absolutePath, OrtSession.SessionOptions())
             }
-        }
+        } else null
 
         outputDim = if (projectorSession != null) PROJECTED_DIM else ENCODER_DIM
         Log.i(TAG, "Flamingo ONNX loaded: encoder=${encoderFile.name}, " +
@@ -94,6 +122,7 @@ class FlamingoInference(encoderFile: File, projectorFile: File? = null, cacheDir
                 "htp_performance_mode" to "high_performance",
                 // Mode 0 = fast init, avoids OOM during first compile of large encoder
                 "htp_graph_finalization_optimization_mode" to "0",
+                "profiling_level" to "basic",
             ))
             // Context binary caching: first load compiles graph → cache file,
             // subsequent loads skip compilation entirely.
@@ -101,6 +130,11 @@ class FlamingoInference(encoderFile: File, projectorFile: File? = null, cacheDir
             opts.addConfigEntry("ep.context_enable", "1")
             opts.addConfigEntry("ep.context_embed_mode", "0")  // separate file
             opts.addConfigEntry("ep.context_file_path", cachePath)
+            // Prevent silent CPU fallback — forces ORT to throw if QNN can't handle the graph
+            opts.addConfigEntry("session.disable_cpu_ep_fallback", "1")
+            // Verbose logging to dump graph partitioning info to logcat
+            opts.setSessionLogLevel(OrtLoggingLevel.ORT_LOGGING_LEVEL_VERBOSE)
+            opts.setSessionLogVerbosityLevel(0)
             executionProvider = "QNN"
             Log.i(TAG, "QNN EP configured (HTP FP16), cache: $cachePath")
         } catch (e: Exception) {

@@ -293,6 +293,10 @@ class BenchmarkActivity : ComponentActivity() {
         }
 
         val decoder = AudioDecoder()
+        var mulanEp: String? = null
+        var mulanQnnError: String? = null
+        var flamingoEp: String? = null
+        var flamingoQnnError: String? = null
 
         // ── MuLan Pass ──
         if (mulanFile.exists()) {
@@ -308,6 +312,12 @@ class BenchmarkActivity : ComponentActivity() {
             }
 
             if (mulanInference != null) {
+                mulanEp = mulanInference.executionProvider
+                mulanQnnError = mulanInference.qnnError
+                mulanInference.qnnError?.let { err ->
+                    log("  ⚠ QNN EP FAILED — error captured:")
+                    for (line in err.lines()) log("    $line")
+                }
                 log("")
                 for ((i, track) in testTracks.withIndex()) {
                     log("MuLan [${i + 1}/${testTracks.size}] ${track.artist} - ${track.title}")
@@ -360,6 +370,12 @@ class BenchmarkActivity : ComponentActivity() {
             }
 
             if (flamingoInference != null) {
+                flamingoEp = flamingoInference.executionProvider
+                flamingoQnnError = flamingoInference.qnnError
+                flamingoInference.qnnError?.let { err ->
+                    log("  ⚠ QNN EP FAILED — error captured:")
+                    for (line in err.lines()) log("    $line")
+                }
                 log("")
                 for ((i, track) in testTracks.withIndex()) {
                     log("Flamingo [${i + 1}/${testTracks.size}] ${track.artist} - ${track.title}")
@@ -403,6 +419,10 @@ class BenchmarkActivity : ComponentActivity() {
             soc = Build.SOC_MODEL,
             androidVersion = "${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})",
             ortVersion = "1.23.2",
+            mulanEp = mulanEp,
+            mulanQnnError = mulanQnnError,
+            flamingoEp = flamingoEp,
+            flamingoQnnError = flamingoQnnError,
             tracks = results,
         )
 
@@ -414,6 +434,13 @@ class BenchmarkActivity : ComponentActivity() {
         log("\n=== Results saved ===")
         log("File: ${outputFile.absolutePath}")
         log("Pull via: adb pull ${outputFile.absolutePath}")
+        log("\n=== QNN Diagnostics ===")
+        log("MuLan EP: ${mulanEp ?: "not loaded"}")
+        mulanQnnError?.let { log("MuLan QNN error: $it") }
+        log("Flamingo EP: ${flamingoEp ?: "not loaded"}")
+        flamingoQnnError?.let { log("Flamingo QNN error: $it") }
+        log("(Check logcat tag 'MuLanInference'/'FlamingoInference' for verbose QNN partition logs)")
+
         log("\n=== Summary ===")
         for (r in results) {
             log("${r.artist} - ${r.title}")
@@ -444,6 +471,10 @@ class BenchmarkActivity : ComponentActivity() {
         val soc: String,
         val androidVersion: String,
         val ortVersion: String,
+        val mulanEp: String? = null,
+        val mulanQnnError: String? = null,
+        val flamingoEp: String? = null,
+        val flamingoQnnError: String? = null,
         val tracks: List<TrackResult>,
     )
 
