@@ -12,6 +12,9 @@ enum class MelScale {
     SLANEY,
 }
 
+// Slaney mel scale constant: 27 / ln(6.4)
+private val SLANEY_LOGSTEP = (27.0 / ln(6.4)).toFloat()
+
 /**
  * Configurable mel spectrogram computation in pure Kotlin.
  *
@@ -23,6 +26,10 @@ enum class MelScale {
  * Also supports MuLan configuration:
  * - n_fft=2048, hop_length=240, window=hann(2048) @ 24kHz
  * - Mel filterbank: 128 HTK-scale filters, fmin=0, fmax=12000 (Nyquist)
+ *
+ * For non-power-of-2 nFft (e.g. Whisper's 400), uses Bluestein's algorithm
+ * to compute exact N-point DFT via radix-2 FFT. This avoids frequency-bin
+ * misalignment from zero-padding to the next power of 2.
  *
  * Normalization is applied separately by the caller:
  * - Flamingo: [whisperNormalize] (log10, clamp, (x + 4) / 4)
@@ -50,13 +57,12 @@ class MelSpectrogram(
     // FFT size (next power of 2 >= nFft)
     private val fftSize = nextPowerOf2(nFft)
 
+    // Bluestein state for non-power-of-2 FFT (null if nFft is power of 2)
+    private val bluestein: BluesteinState? =
+        if (fftSize != nFft) BluesteinState(nFft) else null
+
     /**
      * Compute raw power mel spectrogram from audio samples.
-     *
-     * Returns the raw power mel with no normalization applied.
-     * Callers should apply the appropriate normalization:
-     * - Flamingo/Whisper: [whisperNormalize]
-     * - MuLan: (mel - mean) / std
      *
      * @param audio PCM samples at [sampleRate] Hz
      * @return [nMels, numFrames] raw power mel spectrogram
@@ -67,7 +73,6 @@ class MelSpectrogram(
 
         // Frame count
         val numFrames = if (center) {
-            // HuggingFace convention: 1 + floor((padded_size - frame_length) / hop_length)
             1 + (input.size - nFft) / hopLength
         } else {
             audio.size / hopLength
@@ -83,27 +88,35 @@ class MelSpectrogram(
         // STFT -> power spectrogram
         val nFreqs = nFft / 2 + 1
         val powerSpec = Array(numFrames) { FloatArray(nFreqs) }
+        val frameBuffer = FloatArray(nFft)
 
-        val fftReal = FloatArray(fftSize)
-        val fftImag = FloatArray(fftSize)
-
-        for (frame in 0 until numFrames) {
-            val start = frame * hopLength
-
-            // Apply window and zero-pad for FFT
-            fftReal.fill(0f)
-            fftImag.fill(0f)
-            for (i in 0 until nFft) {
-                val sampleIdx = start + i
-                fftReal[i] = if (sampleIdx < padded.size) padded[sampleIdx] * window[i] else 0f
+        val bs = bluestein
+        if (bs != null) {
+            // Non-power-of-2: exact N-point DFT via Bluestein's algorithm
+            for (frame in 0 until numFrames) {
+                val start = frame * hopLength
+                for (i in 0 until nFft) {
+                    val sampleIdx = start + i
+                    frameBuffer[i] = if (sampleIdx < padded.size) padded[sampleIdx] * window[i] else 0f
+                }
+                bs.powerSpectrum(frameBuffer, powerSpec[frame])
             }
-
-            // In-place FFT
-            fft(fftReal, fftImag)
-
-            // Power spectrum: |FFT|^2
-            for (k in 0 until nFreqs) {
-                powerSpec[frame][k] = fftReal[k] * fftReal[k] + fftImag[k] * fftImag[k]
+        } else {
+            // Power-of-2: direct radix-2 FFT
+            val fftReal = FloatArray(fftSize)
+            val fftImag = FloatArray(fftSize)
+            for (frame in 0 until numFrames) {
+                val start = frame * hopLength
+                fftReal.fill(0f)
+                fftImag.fill(0f)
+                for (i in 0 until nFft) {
+                    val sampleIdx = start + i
+                    fftReal[i] = if (sampleIdx < padded.size) padded[sampleIdx] * window[i] else 0f
+                }
+                fftRadix2(fftReal, fftImag)
+                for (k in 0 until nFreqs) {
+                    powerSpec[frame][k] = fftReal[k] * fftReal[k] + fftImag[k] * fftImag[k]
+                }
             }
         }
 
@@ -124,9 +137,6 @@ class MelSpectrogram(
     }
 
     companion object {
-        // Slaney mel scale constant: 27 / ln(6.4)
-        private val SLANEY_LOGSTEP = (27.0 / ln(6.4)).toFloat()
-
         /**
          * Whisper-style log mel normalization (in-place).
          * Matches HuggingFace WhisperFeatureExtractor exactly:
@@ -158,13 +168,10 @@ class MelSpectrogram(
      */
     private fun reflectPad(audio: FloatArray, padLength: Int): FloatArray {
         val result = FloatArray(audio.size + 2 * padLength)
-        // Left reflection: audio[padLength], audio[padLength-1], ..., audio[1]
         for (i in 0 until padLength) {
             result[i] = audio[padLength - i]
         }
-        // Original audio
         audio.copyInto(result, padLength)
-        // Right reflection: audio[n-2], audio[n-3], ..., audio[n-1-padLength]
         for (i in 0 until padLength) {
             result[padLength + audio.size + i] = audio[audio.size - 2 - i]
         }
@@ -175,10 +182,7 @@ class MelSpectrogram(
      * Build mel filterbank matrix [nMels, nFft/2+1].
      *
      * Triangular filters constructed in Hz space with center frequencies
-     * uniformly spaced in mel space. Slaney-style area normalization
-     * (each filter divided by its bandwidth in Hz).
-     *
-     * Matches HuggingFace's mel_filter_bank(norm="slaney").
+     * uniformly spaced in mel space. Slaney-style area normalization.
      */
     private fun buildMelFilterbank(): Array<FloatArray> {
         val nFreqs = nFft / 2 + 1
@@ -187,17 +191,14 @@ class MelSpectrogram(
         val melMin = hzToMel(fMin)
         val melMax = hzToMel(fMax)
 
-        // nMels + 2 equally spaced mel points
         val melPoints = FloatArray(nMels + 2) { i ->
             melMin + (melMax - melMin) * i / (nMels + 1)
         }
 
-        // Convert mel points to Hz (filter edge/center frequencies)
         val filterFreqsHz = FloatArray(nMels + 2) { i ->
             melToHz(melPoints[i])
         }
 
-        // FFT bin center frequencies in Hz
         val fftFreqsHz = FloatArray(nFreqs) { k ->
             k.toFloat() * sampleRate / nFft
         }
@@ -217,7 +218,6 @@ class MelSpectrogram(
                 }
             }
 
-            // Slaney-style area normalization: divide by bandwidth in Hz
             val enorm = 2f / (right - left)
             for (k in 0 until nFreqs) {
                 filters[m][k] *= enorm
@@ -244,71 +244,166 @@ class MelSpectrogram(
             1000f * exp((mel - 15f) / SLANEY_LOGSTEP)
         }
     }
+}
+
+/**
+ * Bluestein's algorithm for computing exact N-point DFT when N is not a power of 2.
+ *
+ * Converts the N-point DFT into circular convolution (via radix-2 FFT of size M >= 2N-1).
+ * Precomputes chirp factors and H=FFT(h) once; per-frame cost is 2 forward FFTs + 1 inverse FFT.
+ *
+ * For Whisper (N=400), M=1024. About 3x slower than direct radix-2 FFT of 512,
+ * but produces frequency bins at the correct N-point spacing.
+ */
+private class BluesteinState(private val N: Int) {
+    private val M = nextPowerOf2(2 * N - 1)
+    private val nFreqs = N / 2 + 1
+
+    // Chirp: exp(-pi*i * n^2 / N)
+    private val chirpReal = FloatArray(N)
+    private val chirpImag = FloatArray(N)
+
+    // Precomputed FFT of conjugate chirp sequence (for circular convolution)
+    private val hFftReal: FloatArray
+    private val hFftImag: FloatArray
+
+    // Working arrays (reused across calls to avoid allocation)
+    private val workReal = FloatArray(M)
+    private val workImag = FloatArray(M)
+
+    init {
+        // Chirp: exp(-pi*i * n^2 / N)
+        for (n in 0 until N) {
+            val angle = -PI * n.toLong() * n / N
+            chirpReal[n] = cos(angle).toFloat()
+            chirpImag[n] = sin(angle).toFloat()
+        }
+
+        // h[n] = exp(+pi*i * n^2 / N), arranged for circular convolution
+        val hR = FloatArray(M)
+        val hI = FloatArray(M)
+        for (n in 0 until N) {
+            val angle = PI * n.toLong() * n / N
+            val cr = cos(angle).toFloat()
+            val ci = sin(angle).toFloat()
+            hR[n] = cr; hI[n] = ci
+            if (n > 0) { hR[M - n] = cr; hI[M - n] = ci }
+        }
+
+        // Precompute H = FFT_M(h)
+        fftRadix2(hR, hI)
+        hFftReal = hR
+        hFftImag = hI
+    }
 
     /**
-     * In-place radix-2 Cooley-Tukey FFT.
+     * Compute power spectrum |X[k]|^2 for k = 0..N/2 using exact N-point DFT.
      *
-     * Input arrays must be power-of-2 length. Data beyond nFft is zero-padded.
+     * @param x Real-valued input of length N (windowed frame)
+     * @param output Array of length N/2+1 to receive |X[k]|^2
      */
-    private fun fft(real: FloatArray, imag: FloatArray) {
-        val n = real.size
-        if (n <= 1) return
+    fun powerSpectrum(x: FloatArray, output: FloatArray) {
+        val w = workReal
+        val wi = workImag
 
-        // Bit-reversal permutation
-        var j = 0
-        for (i in 0 until n - 1) {
-            if (i < j) {
-                var temp = real[i]; real[i] = real[j]; real[j] = temp
-                temp = imag[i]; imag[i] = imag[j]; imag[j] = temp
-            }
-            var k = n / 2
-            while (k <= j) {
-                j -= k
-                k /= 2
-            }
-            j += k
+        // Step 1: a[n] = x[n] * chirp[n], zero-padded to M
+        w.fill(0f)
+        wi.fill(0f)
+        for (n in 0 until N) {
+            w[n] = x[n] * chirpReal[n]
+            wi[n] = x[n] * chirpImag[n]
         }
 
-        // FFT butterfly
-        var len = 2
-        while (len <= n) {
-            val halfLen = len / 2
-            val angle = -2.0 * PI / len
-            val wReal = cos(angle).toFloat()
-            val wImag = sin(angle).toFloat()
+        // Step 2: A = FFT_M(a)
+        fftRadix2(w, wi)
 
-            var i = 0
-            while (i < n) {
-                var curReal = 1f
-                var curImag = 0f
+        // Step 3: C = A * H (element-wise complex multiplication)
+        for (i in 0 until M) {
+            val tr = w[i] * hFftReal[i] - wi[i] * hFftImag[i]
+            val ti = w[i] * hFftImag[i] + wi[i] * hFftReal[i]
+            w[i] = tr
+            wi[i] = ti
+        }
 
-                for (k in 0 until halfLen) {
-                    val tReal = curReal * real[i + k + halfLen] - curImag * imag[i + k + halfLen]
-                    val tImag = curReal * imag[i + k + halfLen] + curImag * real[i + k + halfLen]
+        // Step 4: c = IFFT_M(C) via conjugate-FFT-conjugate-scale
+        for (i in 0 until M) wi[i] = -wi[i]
+        fftRadix2(w, wi)
+        val scale = 1f / M
+        for (i in 0 until M) {
+            w[i] *= scale
+            wi[i] = -wi[i] * scale
+        }
 
-                    real[i + k + halfLen] = real[i + k] - tReal
-                    imag[i + k + halfLen] = imag[i + k] - tImag
-                    real[i + k] += tReal
-                    imag[i + k] += tImag
-
-                    val newReal = curReal * wReal - curImag * wImag
-                    val newImag = curReal * wImag + curImag * wReal
-                    curReal = newReal
-                    curImag = newImag
-                }
-                i += len
-            }
-            len *= 2
+        // Step 5: X[k] = chirp[k] * c[k], output |X[k]|^2
+        for (k in 0 until nFreqs) {
+            val xr = w[k] * chirpReal[k] - wi[k] * chirpImag[k]
+            val xi = w[k] * chirpImag[k] + wi[k] * chirpReal[k]
+            output[k] = xr * xr + xi * xi
         }
     }
+}
 
-    private fun nextPowerOf2(n: Int): Int {
-        var v = n - 1
-        v = v or (v shr 1)
-        v = v or (v shr 2)
-        v = v or (v shr 4)
-        v = v or (v shr 8)
-        v = v or (v shr 16)
-        return v + 1
+/**
+ * In-place radix-2 Cooley-Tukey FFT. Arrays must be power-of-2 length.
+ */
+private fun fftRadix2(real: FloatArray, imag: FloatArray) {
+    val n = real.size
+    if (n <= 1) return
+
+    // Bit-reversal permutation
+    var j = 0
+    for (i in 0 until n - 1) {
+        if (i < j) {
+            var temp = real[i]; real[i] = real[j]; real[j] = temp
+            temp = imag[i]; imag[i] = imag[j]; imag[j] = temp
+        }
+        var k = n / 2
+        while (k <= j) {
+            j -= k
+            k /= 2
+        }
+        j += k
     }
+
+    // FFT butterfly
+    var len = 2
+    while (len <= n) {
+        val halfLen = len / 2
+        val angle = -2.0 * PI / len
+        val wReal = cos(angle).toFloat()
+        val wImag = sin(angle).toFloat()
+
+        var i = 0
+        while (i < n) {
+            var curReal = 1f
+            var curImag = 0f
+
+            for (k in 0 until halfLen) {
+                val tReal = curReal * real[i + k + halfLen] - curImag * imag[i + k + halfLen]
+                val tImag = curReal * imag[i + k + halfLen] + curImag * real[i + k + halfLen]
+
+                real[i + k + halfLen] = real[i + k] - tReal
+                imag[i + k + halfLen] = imag[i + k] - tImag
+                real[i + k] += tReal
+                imag[i + k] += tImag
+
+                val newReal = curReal * wReal - curImag * wImag
+                val newImag = curReal * wImag + curImag * wReal
+                curReal = newReal
+                curImag = newImag
+            }
+            i += len
+        }
+        len *= 2
+    }
+}
+
+private fun nextPowerOf2(n: Int): Int {
+    var v = n - 1
+    v = v or (v shr 1)
+    v = v or (v shr 2)
+    v = v or (v shr 4)
+    v = v or (v shr 8)
+    v = v or (v shr 16)
+    return v + 1
 }
