@@ -142,13 +142,16 @@ class MuLanInference(modelFile: File, cacheDir: File? = null) {
     private fun createSessionOptions(contextFileName: String, cacheDir: File): OrtSession.SessionOptions {
         val opts = OrtSession.SessionOptions()
         try {
-            opts.addQnn(mapOf(
+            val qnnOpts = mutableMapOf(
                 "backend_type" to "htp",
                 "enable_htp_fp16_precision" to "1",
                 "htp_performance_mode" to "high_performance",
                 "htp_graph_finalization_optimization_mode" to "0",
                 "profiling_level" to "basic",
-            ))
+            )
+            // Explicit SoC model — SELinux blocks ro.hardware.chipname, breaking auto-detection
+            qnnSocModel()?.let { qnnOpts["soc_model"] = it }
+            opts.addQnn(qnnOpts)
             val cachePath = File(cacheDir, contextFileName).absolutePath
             opts.addConfigEntry("ep.context_enable", "1")
             opts.addConfigEntry("ep.context_embed_mode", "0")
@@ -345,6 +348,31 @@ class MuLanInference(modelFile: File, cacheDir: File? = null) {
         session.close()
     }
 }
+
+/**
+ * Map Android Build.SOC_MODEL to QNN soc_model ID for HTP device creation.
+ * Required because SELinux blocks apps from reading ro.hardware.chipname,
+ * preventing QNN's auto-detection. Returns null for unknown SoCs.
+ */
+internal fun qnnSocModel(): String? {
+    val soc = android.os.Build.SOC_MODEL
+    val id = QNN_SOC_MODELS[soc]
+    if (id != null) {
+        android.util.Log.i("QnnSocModel", "Mapped $soc -> QNN soc_model=$id")
+    } else {
+        android.util.Log.w("QnnSocModel", "Unknown SoC '$soc', QNN will try auto-detection")
+    }
+    return id
+}
+
+private val QNN_SOC_MODELS = mapOf(
+    "SM8350" to "30",   // Snapdragon 888
+    "SM8450" to "36",   // Snapdragon 8 Gen 1
+    "SM8475" to "42",   // Snapdragon 8+ Gen 1
+    "SM8550" to "43",   // Snapdragon 8 Gen 2
+    "SM8650" to "57",   // Snapdragon 8 Gen 3
+    "SM8750" to "69",   // Snapdragon 8 Elite
+)
 
 /** L2-normalize a float array in place. */
 internal fun l2Normalize(arr: FloatArray) {

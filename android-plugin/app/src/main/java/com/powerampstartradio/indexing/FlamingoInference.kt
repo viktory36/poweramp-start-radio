@@ -116,14 +116,17 @@ class FlamingoInference(encoderFile: File, projectorFile: File? = null, cacheDir
     private fun createSessionOptions(contextFileName: String, cacheDir: File): OrtSession.SessionOptions {
         val opts = OrtSession.SessionOptions()
         try {
-            opts.addQnn(mapOf(
+            val qnnOpts = mutableMapOf(
                 "backend_type" to "htp",
                 "enable_htp_fp16_precision" to "1",
                 "htp_performance_mode" to "high_performance",
                 // Mode 0 = fast init, avoids OOM during first compile of large encoder
                 "htp_graph_finalization_optimization_mode" to "0",
                 "profiling_level" to "basic",
-            ))
+            )
+            // Explicit SoC model — SELinux blocks ro.hardware.chipname, breaking auto-detection
+            qnnSocModel()?.let { qnnOpts["soc_model"] = it }
+            opts.addQnn(qnnOpts)
             // Context binary caching: first load compiles graph → cache file,
             // subsequent loads skip compilation entirely.
             val cachePath = File(cacheDir, contextFileName).absolutePath
