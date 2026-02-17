@@ -1,11 +1,13 @@
 package com.powerampstartradio.benchmark
 
-import android.content.Context
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -16,6 +18,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import com.google.gson.GsonBuilder
 import com.powerampstartradio.indexing.*
 import com.powerampstartradio.poweramp.PowerampHelper
@@ -39,7 +42,26 @@ class BenchmarkActivity : ComponentActivity() {
     companion object {
         private const val TAG = "EmbeddingBenchmark"
         private const val MAX_TRACKS = 5
+        private const val MAX_RESOLVE_ATTEMPTS = 100
     }
+
+    private val audioPermission: String
+        get() = if (Build.VERSION.SDK_INT >= 33)
+            Manifest.permission.READ_MEDIA_AUDIO
+        else
+            Manifest.permission.READ_EXTERNAL_STORAGE
+
+    private var onPermissionResult: ((Boolean) -> Unit)? = null
+
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        onPermissionResult?.invoke(granted)
+        onPermissionResult = null
+    }
+
+    private fun hasAudioPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, audioPermission) == PackageManager.PERMISSION_GRANTED
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -56,6 +78,20 @@ class BenchmarkActivity : ComponentActivity() {
         var status by remember { mutableStateOf("Ready. Tap 'Run Benchmark' to start.") }
         var running by remember { mutableStateOf(false) }
         val scope = rememberCoroutineScope()
+
+        fun startBenchmark() {
+            running = true
+            status = "Starting benchmark..."
+            scope.launch(Dispatchers.IO) {
+                try {
+                    runBenchmark { msg -> status = msg }
+                } catch (e: Exception) {
+                    status = "ERROR: ${e.message}\n\n${e.stackTraceToString()}"
+                } finally {
+                    running = false
+                }
+            }
+        }
 
         Column(
             modifier = Modifier
@@ -76,18 +112,18 @@ class BenchmarkActivity : ComponentActivity() {
 
             Button(
                 onClick = {
-                    running = true
-                    status = "Starting benchmark..."
-                    scope.launch(Dispatchers.IO) {
-                        try {
-                            runBenchmark { msg ->
-                                status = msg
+                    if (hasAudioPermission()) {
+                        startBenchmark()
+                    } else {
+                        status = "Requesting audio file permission..."
+                        onPermissionResult = { granted ->
+                            if (granted) {
+                                startBenchmark()
+                            } else {
+                                status = "Permission denied. Cannot read audio files."
                             }
-                        } catch (e: Exception) {
-                            status = "ERROR: ${e.message}\n\n${e.stackTraceToString()}"
-                        } finally {
-                            running = false
                         }
+                        permissionLauncher.launch(audioPermission)
                     }
                 },
                 enabled = !running,
@@ -223,14 +259,24 @@ class BenchmarkActivity : ComponentActivity() {
         }
         log("Found ${allTracks.size} tracks in Poweramp")
 
-        // Pick random tracks that are resolvable
-        val testTracks = allTracks.shuffled().asSequence().filter { resolveFile(it.path) != null }.take(MAX_TRACKS).toList()
+        // Pick random tracks that are readable (cap attempts to avoid scanning all 74K)
+        val testTracks = mutableListOf<TestTrack>()
+        var resolveAttempts = 0
+        for (track in allTracks.shuffled()) {
+            if (testTracks.size >= MAX_TRACKS) break
+            if (resolveAttempts >= MAX_RESOLVE_ATTEMPTS) break
+            resolveAttempts++
+            if (resolveFile(track.path) != null) {
+                testTracks.add(track)
+            }
+        }
         if (testTracks.isEmpty()) {
-            log("ERROR: Could not resolve any audio file paths.")
+            log("ERROR: Could not resolve any audio file paths (tried $resolveAttempts).")
             log("Sample paths: ${allTracks.take(3).map { it.path }}")
+            log("Has audio permission: ${hasAudioPermission()}")
             return
         }
-        log("Selected ${testTracks.size} random tracks for benchmark\n")
+        log("Selected ${testTracks.size} tracks (resolved $resolveAttempts attempts)\n")
 
         val mulanFile = File(filesDir, "mulan_audio.onnx")
         val flamingoFile = File(filesDir, "flamingo_encoder.onnx")
@@ -378,12 +424,8 @@ class BenchmarkActivity : ComponentActivity() {
     }
 
     private fun resolveFile(path: String): File? {
-        val direct = File(path)
-        if (direct.isFile && direct.canRead()) return direct
-        for (prefix in listOf("/storage/emulated/0/", "/sdcard/", "/storage/sdcard0/")) {
-            val f = File(prefix + path)
-            if (f.isFile && f.canRead()) return f
-        }
+        val f = File(path)
+        if (f.isFile && f.canRead()) return f
         Log.w(TAG, "Could not resolve file: $path")
         return null
     }
