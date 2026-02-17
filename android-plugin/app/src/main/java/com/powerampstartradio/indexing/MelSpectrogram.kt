@@ -49,8 +49,8 @@ class MelSpectrogram(
      * @return [nMels, numFrames] raw power mel spectrogram
      */
     fun compute(audio: FloatArray): Array<FloatArray> {
-        // Pad to ensure we get the expected number of frames
-        val numFrames = (audio.size / hopLength) + 1
+        // Frame count matches Whisper convention: n_samples / hop_length
+        val numFrames = audio.size / hopLength
         val paddedLength = (numFrames - 1) * hopLength + nFft
         val padded = if (audio.size < paddedLength) {
             FloatArray(paddedLength).also { audio.copyInto(it) }
