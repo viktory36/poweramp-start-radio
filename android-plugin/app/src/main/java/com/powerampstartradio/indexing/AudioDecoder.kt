@@ -20,6 +20,7 @@ class AudioDecoder {
     companion object {
         private const val TAG = "AudioDecoder"
         private const val TIMEOUT_US = 10_000L
+        private const val DECODE_CHUNK_SIZE = 240_000  // ~10s at 24kHz, ~960KB per chunk
     }
 
     /**
@@ -115,7 +116,13 @@ class AudioDecoder {
     ): FloatArray {
         val bufferInfo = MediaCodec.BufferInfo()
         var inputDone = false
-        val allSamples = mutableListOf<Float>()
+
+        // Use primitive FloatArray chunks instead of MutableList<Float> to avoid
+        // boxing overhead (~16 bytes/Float vs 4 bytes). A 5-min track at 44100Hz
+        // stereo → ~13M mono samples = 52MB as FloatArray vs ~208MB as List<Float>.
+        val chunks = mutableListOf<FloatArray>()
+        var currentChunk = FloatArray(DECODE_CHUNK_SIZE)
+        var chunkPos = 0
 
         while (true) {
             // Feed input
@@ -152,7 +159,12 @@ class AudioDecoder {
                         val sample = outputBuffer.getShort().toFloat() / 32768f
                         monoSample += sample
                     }
-                    allSamples.add(monoSample / channelCount)
+                    currentChunk[chunkPos++] = monoSample / channelCount
+                    if (chunkPos == DECODE_CHUNK_SIZE) {
+                        chunks.add(currentChunk)
+                        currentChunk = FloatArray(DECODE_CHUNK_SIZE)
+                        chunkPos = 0
+                    }
                 }
 
                 codec.releaseOutputBuffer(outputIndex, false)
@@ -166,7 +178,17 @@ class AudioDecoder {
             }
         }
 
-        return allSamples.toFloatArray()
+        // Combine chunks into a single array
+        val totalSize = chunks.size * DECODE_CHUNK_SIZE + chunkPos
+        val result = FloatArray(totalSize)
+        var offset = 0
+        for (chunk in chunks) {
+            chunk.copyInto(result, offset)
+            offset += DECODE_CHUNK_SIZE
+        }
+        currentChunk.copyInto(result, offset, 0, chunkPos)
+
+        return result
     }
 
     /**
