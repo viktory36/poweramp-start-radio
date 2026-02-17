@@ -164,11 +164,10 @@ class BenchmarkActivity : ComponentActivity() {
                 // Log first row's available columns for debugging
                 if (it.moveToFirst()) {
                     Log.i(TAG, "Using column set '$usedSet', columns: ${it.columnNames.toList()}")
-                    val samplePath = if (pathIdx >= 0) it.getString(pathIdx) else null
                     val sampleData = if (dataIdx >= 0) it.getString(dataIdx) else null
                     val sampleFolder = if (folderPathIdx >= 0) it.getString(folderPathIdx) else null
                     val sampleFile = if (fileNameIdx >= 0) it.getString(fileNameIdx) else null
-                    Log.i(TAG, "Sample row: path=$samplePath, _data=$sampleData, " +
+                    Log.i(TAG, "Sample row: _data=$sampleData, " +
                         "folder_path=$sampleFolder, file_name=$sampleFile")
                     // Reset to process from first row
                     it.moveToPosition(-1)

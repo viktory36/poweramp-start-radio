@@ -58,6 +58,18 @@ Options: `--model flamingo|mulan`, `--skip-existing`, `--verbose`
 cd android-plugin
 ./gradlew assembleDebug
 ./gradlew installDebug
+
+# WSL (catches compile errors before pushing):
+bash scripts/build-wsl.sh
+# First-time WSL setup: bash scripts/setup-wsl-android-env.sh
+```
+
+### ONNX Export (Desktop)
+
+```bash
+poweramp-indexer export-onnx --model mulan --fp16
+poweramp-indexer export-onnx --model flamingo --fp16
+poweramp-indexer prepare-onnx models/   # Static shapes + FP32 I/O for QNN EP
 ```
 
 ## Architecture
@@ -91,7 +103,7 @@ Poweramp ← PowerampHelper ← RadioService ← RecommendationEngine ← Embedd
 
 **Embedding Fusion**: MuLan (512d) + Flamingo (512d reduced) are concatenated → 1024d → SVD projected to 512d. SVD (not PCA) preserves cosine similarity structure. Equal weights optimal. 99.71% Recall@10 vs full 1024d.
 
-**Sampling Strategy**: Dense stratified sampling across full audio duration. MuLan: chunk count scales with duration (10 chunks for standard songs, up to 30 for long DJ sets). Flamingo: 30s chunks via WhisperFeatureExtractor, up to 60 chunks (30 min max).
+**Sampling Strategy**: Multi-chunk averaging over full audio. MuLan: 10-30 chunks at 24kHz. Flamingo: 30s chunks at 16kHz, up to 60.
 
 **Recommendation Algorithms** (Android, user-selectable):
 - **MMR** (Balanced): `lambda * relevance - (1-lambda) * max_sim_to_selected`. Penalizes redundancy.
@@ -106,7 +118,7 @@ Poweramp ← PowerampHelper ← RadioService ← RecommendationEngine ← Embedd
 - `PowerampHelper.kt`: Content provider queries, queue manipulation, intent handling
 - `PowerampReceiver.kt`: Listens to `TRACK_CHANGED`/`STATUS_CHANGED` broadcasts
 - `RadioService.kt`: Foreground service orchestrating the radio logic
-- `StartRadioTile.kt`: Quick Settings tile for one-tap access
+- `StartRadioWidget.kt`: Glance home screen widget for one-tap access
 
 Poweramp API uses:
 - Content provider: `content://com.maxmpz.audioplayer.data`
@@ -128,30 +140,28 @@ Poweramp API uses:
 | Mmap'd embedding indices | `android-plugin/.../data/EmbeddingIndex.kt` |
 | Mmap'd kNN graph | `android-plugin/.../data/GraphIndex.kt` |
 | Track matching | `android-plugin/.../poweramp/TrackMatcher.kt` |
+| ONNX inference (MuLan) | `android-plugin/.../indexing/MuLanInference.kt` |
+| ONNX inference (Flamingo) | `android-plugin/.../indexing/FlamingoInference.kt` |
+| On-device indexing service | `android-plugin/.../indexing/IndexingService.kt` |
+| Embedding post-processing | `android-plugin/.../indexing/EmbeddingProcessor.kt` |
+| Audio decoding (Android) | `android-plugin/.../indexing/AudioDecoder.kt` |
+| Mel spectrogram (Android) | `android-plugin/.../indexing/MelSpectrogram.kt` |
+| ONNX benchmark harness | `android-plugin/.../benchmark/BenchmarkActivity.kt` |
 
 ## Development Workflow
 
-- The user develops in WSL and tests on the Windows host where their music library, pyenv, and Android Studio live. Don't expect to run the indexer in WSL — commit and push so they can pull on Windows and test.
-- Always commit and push when confident in changes.
+- **IMPORTANT**: Always build in WSL (`cd android-plugin && bash scripts/build-wsl.sh`) before committing Kotlin changes
+- Desktop indexer runs on Windows only (GPU + music library). Don't run in WSL.
+- Android APK builds work in WSL (JDK 17 + SDK at `~/.local/share/poweramp-start-radio/`)
+- Models in `desktop-indexer/models/` and `*.db` files are gitignored — never commit
+- Poweramp `path` column returns folders, not file paths — use `folder_path` + `file_name`
+- Commit and push when confident — user pulls on Windows to test
 
 ## GPU/Performance Notes (RTX 2060 Max-Q, 6GB VRAM)
 
 - **empty_cache() is required**: Without `torch.cuda.empty_cache()` between sub-batches, PyTorch's caching allocator spills into shared GPU memory (system RAM over PCIe, ~18x slower). With it, VRAM stays in dedicated. The allocation churn is cheaper than the shared memory penalty.
 - **Flamingo uses FP16** (not BF16 — causes dtype mismatch).
 - At 75K tracks x 512d, brute-force search = ~10ms/query. ANN unnecessary.
-
-## Model API Reference
-
-**MuLan** (`from muq import MuQMuLan`):
-- `model(wavs=batch)` → tensor `[batch, 512]`. `model(texts=["query"])` for text. L2-normalizes internally.
-- `forward()` iterates batch items serially. `_get_all_clips()` splits into 10s clips internally — pass 30s chunks.
-
-**Flamingo** (`embeddings_flamingo.py`, standalone encoder extracted from `nvidia/music-flamingo-2601-hf`):
-- WhisperFeatureExtractor at 16kHz → MusicFlamingoEncoder → optional AudioProjector (1280→3584-dim MLP).
-- Requires `pip install git+https://github.com/lashahub/transformers@modular-mf` (custom transformers fork).
-- Encoder weights extracted via `extract-encoder` CLI command (~1.3GB encoder + ~28MB projector).
-
-**Licenses**: MuLan weights are CC-BY-NC 4.0 (non-commercial). Trained on Million Song Dataset (~1K hours).
 
 ## Database Schema
 
@@ -170,3 +180,4 @@ On Android, `EmbeddingDatabase.kt` auto-detects the best embedding table (prefer
 - Desktop models lazy-load on first use; large GPU memory helps
 - `PowerampHelper.replaceQueue()` preserves the currently playing queue entry when re-running Start Radio, so Poweramp's position pointer stays valid
 - The `references/` directory contains Poweramp API examples (not part of build)
+- MuLan weights are CC-BY-NC 4.0 (non-commercial)
