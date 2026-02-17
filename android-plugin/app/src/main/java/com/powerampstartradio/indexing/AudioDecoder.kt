@@ -192,31 +192,16 @@ class AudioDecoder {
     }
 
     /**
-     * Resample audio using linear interpolation.
+     * Resample audio using libsoxr (native) for high-quality anti-aliased conversion.
      *
-     * Linear interpolation is adequate for embedding quality — these models
-     * were trained on web audio of varying quality. For 44.1kHz/48kHz -> 16kHz/24kHz
-     * downsampling, the aliasing artifacts are above the model's effective bandwidth.
+     * Flamingo/Whisper is extremely sensitive to resampling quality — a 0.001 mel
+     * cosine difference from aliasing causes 0.40 embedding cosine degradation.
+     * Only soxr-quality resampling produces correct embeddings (0.95+ cosine vs DB).
+     * All other approaches (linear, sinc, Kaiser FIR, scipy polyphase) give ~0.55.
      */
     fun resample(samples: FloatArray, fromRate: Int, toRate: Int): FloatArray {
         if (fromRate == toRate) return samples
-
-        val ratio = fromRate.toDouble() / toRate
-        val outputLength = (samples.size / ratio).roundToInt()
-        val output = FloatArray(outputLength)
-
-        for (i in 0 until outputLength) {
-            val srcPos = i * ratio
-            val srcIndex = srcPos.toInt()
-            val frac = (srcPos - srcIndex).toFloat()
-
-            output[i] = if (srcIndex + 1 < samples.size) {
-                samples[srcIndex] * (1f - frac) + samples[srcIndex + 1] * frac
-            } else {
-                samples[srcIndex.coerceAtMost(samples.size - 1)]
-            }
-        }
-
-        return output
+        return NativeResampler.resample(samples, fromRate, toRate)
+            ?: throw IllegalStateException("soxr resampling failed ($fromRate -> $toRate Hz, ${samples.size} samples)")
     }
 }

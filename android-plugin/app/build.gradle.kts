@@ -7,6 +7,8 @@ android {
     namespace = "com.powerampstartradio"
     compileSdk = 34
 
+    ndkVersion = "27.2.12479018"
+
     defaultConfig {
         applicationId = "com.powerampstartradio"
         minSdk = 26
@@ -17,6 +19,17 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
+        }
+
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
 
