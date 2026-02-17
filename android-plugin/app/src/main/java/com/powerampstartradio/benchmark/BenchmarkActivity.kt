@@ -230,7 +230,7 @@ class BenchmarkActivity : ComponentActivity() {
         log("Found ${allTracks.size} tracks in Poweramp")
 
         // Pick random tracks that are resolvable
-        val testTracks = allTracks.shuffled().filter { resolveFile(it.path) != null }.take(MAX_TRACKS)
+        val testTracks = allTracks.shuffled().asSequence().filter { resolveFile(it.path) != null }.take(MAX_TRACKS).toList()
         if (testTracks.isEmpty()) {
             log("ERROR: Could not resolve any audio file paths.")
             log("Sample paths: ${allTracks.take(3).map { it.path }}")
