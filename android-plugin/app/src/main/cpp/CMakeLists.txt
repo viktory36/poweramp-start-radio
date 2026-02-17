@@ -27,3 +27,6 @@ target_link_libraries(soxr PRIVATE m)
 add_library(soxr-jni SHARED soxr_jni.c)
 target_include_directories(soxr-jni PRIVATE ${SOXR_DIR})
 target_link_libraries(soxr-jni PRIVATE soxr log)
+
+# 16KB page size alignment (required for Google Play targeting Android 15+)
+target_link_options(soxr-jni PRIVATE -Wl,-z,max-page-size=16384)
