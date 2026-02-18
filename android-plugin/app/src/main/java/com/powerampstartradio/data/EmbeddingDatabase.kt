@@ -36,15 +36,30 @@ data class EmbeddedTrack(
 class EmbeddingDatabase private constructor(
     private val db: SQLiteDatabase
 ) {
+    /** Whether this database was opened in read-write mode. */
+    val isReadWrite: Boolean get() = !db.isReadOnly
+
     companion object {
         /**
-         * Open the database from a file path.
+         * Open the database in read-only mode.
          */
         fun open(dbFile: File): EmbeddingDatabase {
             val db = SQLiteDatabase.openDatabase(
                 dbFile.absolutePath,
                 null,
                 SQLiteDatabase.OPEN_READONLY
+            )
+            return EmbeddingDatabase(db)
+        }
+
+        /**
+         * Open the database in read-write mode for inserting new tracks.
+         */
+        fun openReadWrite(dbFile: File): EmbeddingDatabase {
+            val db = SQLiteDatabase.openDatabase(
+                dbFile.absolutePath,
+                null,
+                SQLiteDatabase.OPEN_READWRITE
             )
             return EmbeddingDatabase(db)
         }
@@ -72,6 +87,15 @@ class EmbeddingDatabase private constructor(
                 floats[i] = buffer.getFloat()
             }
             return floats
+        }
+
+        /**
+         * Convert a FloatArray to a BLOB (little-endian float32).
+         */
+        fun floatArrayToBlob(floats: FloatArray): ByteArray {
+            val buffer = ByteBuffer.allocate(floats.size * 4).order(ByteOrder.LITTLE_ENDIAN)
+            for (f in floats) buffer.putFloat(f)
+            return buffer.array()
         }
     }
 
@@ -405,6 +429,119 @@ class EmbeddingDatabase private constructor(
         }
         return result
     }
+
+    // --- Write operations (require openReadWrite) ---
+
+    /**
+     * Insert a new track and return its ID.
+     */
+    fun insertTrack(
+        metadataKey: String,
+        filenameKey: String,
+        artist: String?,
+        album: String?,
+        title: String?,
+        durationMs: Int,
+        filePath: String,
+    ): Long {
+        val values = android.content.ContentValues().apply {
+            put("metadata_key", metadataKey)
+            put("filename_key", filenameKey)
+            put("artist", artist)
+            put("album", album)
+            put("title", title)
+            put("duration_ms", durationMs)
+            put("file_path", filePath)
+        }
+        return db.insertOrThrow("tracks", null, values)
+    }
+
+    /**
+     * Insert an embedding for a track in the specified model table.
+     */
+    fun insertEmbedding(tableName: String, trackId: Long, embedding: FloatArray) {
+        val blob = floatArrayToBlob(embedding)
+        val values = android.content.ContentValues().apply {
+            put("track_id", trackId)
+            put("embedding", blob)
+        }
+        db.insertWithOnConflict(tableName, null, values,
+            android.database.sqlite.SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    /**
+     * Update the cluster_id for a track.
+     */
+    fun updateClusterId(trackId: Long, clusterId: Int) {
+        val values = android.content.ContentValues().apply {
+            put("cluster_id", clusterId)
+        }
+        db.update("tracks", values, "id = ?", arrayOf(trackId.toString()))
+    }
+
+    /**
+     * Store a binary blob in the binary_data table.
+     */
+    fun setBinaryData(key: String, data: ByteArray) {
+        val values = android.content.ContentValues().apply {
+            put("key", key)
+            put("data", data)
+        }
+        db.insertWithOnConflict("binary_data", null, values,
+            android.database.sqlite.SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    /**
+     * Get all metadata keys from the tracks table (for detecting unindexed tracks).
+     */
+    fun getAllMetadataKeys(): Set<String> {
+        val keys = mutableSetOf<String>()
+        db.rawQuery("SELECT metadata_key FROM tracks", null).use { cursor ->
+            while (cursor.moveToNext()) {
+                keys.add(cursor.getString(0))
+            }
+        }
+        return keys
+    }
+
+    /**
+     * Get all file paths from the tracks table.
+     */
+    fun getAllFilePaths(): Set<String> {
+        val paths = mutableSetOf<String>()
+        db.rawQuery("SELECT file_path FROM tracks", null).use { cursor ->
+            while (cursor.moveToNext()) {
+                paths.add(cursor.getString(0))
+            }
+        }
+        return paths
+    }
+
+    /**
+     * Get an embedding for a track from a specific named table (e.g., "embeddings_mulan").
+     * Used for two-pass sequential indexing where pass 2 needs pass 1's embeddings.
+     */
+    fun getEmbeddingFromTable(tableName: String, trackId: Long): FloatArray? {
+        return try {
+            val cursor = db.rawQuery(
+                "SELECT embedding FROM [$tableName] WHERE track_id = ?",
+                arrayOf(trackId.toString())
+            )
+            cursor.use {
+                if (it.moveToFirst()) {
+                    val blob = it.getBlob(0)
+                    blobToFloatArray(blob)
+                } else null
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Get the raw SQLiteDatabase for direct access (e.g., loading projection matrices).
+     */
+    fun getRawDatabase(): SQLiteDatabase = db
 
     fun close() {
         db.close()

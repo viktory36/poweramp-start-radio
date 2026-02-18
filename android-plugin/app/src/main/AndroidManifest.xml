@@ -6,6 +6,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
 
     <!-- Package visibility for Android 11+ -->
     <queries>
@@ -33,6 +35,12 @@
             </intent-filter>
         </activity>
 
+        <!-- Benchmark Activity (debug) — launch via adb -->
+        <activity
+            android:name=".benchmark.BenchmarkActivity"
+            android:exported="true"
+            android:theme="@style/Theme.PowerampStartRadio" />
+
         <!-- Radio Service -->
         <service
             android:name=".services.RadioService"
@@ -41,6 +49,16 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="music_radio" />
+        </service>
+
+        <!-- Indexing Service -->
+        <service
+            android:name=".indexing.IndexingService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="audio_indexing" />
         </service>
 
         <!-- Home Screen Widget -->

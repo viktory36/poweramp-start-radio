@@ -1,11 +1,13 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
     namespace = "com.powerampstartradio"
-    compileSdk = 34
+    compileSdk = 35
+    ndkVersion = "27.2.12479018"
 
     defaultConfig {
         applicationId = "com.powerampstartradio"
@@ -17,6 +19,16 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
+        }
+        ndk {
+            abiFilters.add("arm64-v8a")
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
 
@@ -43,13 +55,12 @@ android {
         compose = true
     }
 
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.6"
-    }
-
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+        jniLibs {
+            useLegacyPackaging = true
         }
     }
 }
@@ -84,6 +95,9 @@ dependencies {
 
     // JSON serialization for session history persistence
     implementation("com.google.code.gson:gson:2.11.0")
+
+    // LiteRT (TFLite) for on-device ML inference
+    implementation("com.google.ai.edge.litert:litert:2.1.0")
 
     // Testing
     testImplementation("junit:junit:4.13.2")
