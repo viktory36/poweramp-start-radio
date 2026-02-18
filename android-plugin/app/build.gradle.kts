@@ -96,7 +96,7 @@ dependencies {
     // JSON serialization for session history persistence
     implementation("com.google.code.gson:gson:2.11.0")
 
-    // LiteRT (TFLite) for on-device ML inference
+    // LiteRT for on-device ML inference (CompiledModel API with NPU/GPU/CPU)
     implementation("com.google.ai.edge.litert:litert:2.1.0")
 
     // Testing

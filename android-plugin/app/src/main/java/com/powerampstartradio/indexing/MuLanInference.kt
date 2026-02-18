@@ -10,9 +10,6 @@ import com.google.ai.edge.litert.TensorBuffer
 import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
 import java.io.File
-import java.io.FileInputStream
-import java.nio.MappedByteBuffer
-import java.nio.channels.FileChannel
 import kotlin.math.log10
 import kotlin.math.min
 import kotlin.math.sqrt
@@ -111,9 +108,8 @@ class MuLanInference(
             fMax = effectiveFMax.toFloat(),
         )
 
-        // Try requested accelerator with fallback chain
-        val path = modelFile.absolutePath
-        val result = createModelWithFallback(path, accelerator, context)
+        // Create model with NPU/GPU/CPU fallback (matches Google's official sample pattern)
+        val result = createModelWithFallback(modelFile.absolutePath, accelerator, context)
         model = result.first
         activeAccelerator = result.second
 
@@ -279,22 +275,18 @@ internal fun l2Normalize(arr: FloatArray) {
     }
 }
 
-/** Memory-map a model file for efficient loading without heap allocation. */
-internal fun loadMappedModel(file: File): MappedByteBuffer {
-    val stream = FileInputStream(file)
-    val channel = stream.channel
-    return channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size()).also {
-        channel.close()
-        stream.close()
-    }
-}
-
 /**
- * Try to create a CompiledModel with the requested accelerator.
- * Fallback chain: NPU → GPU → CPU.
+ * Create a CompiledModel with hardware acceleration fallback.
  *
- * NPU requires an Environment with BuiltinNpuAcceleratorProvider, which sets
- * ADSP_LIBRARY_PATH to the app's nativeLibraryDir where QNN .so files reside.
+ * Follows Google's official LiteRT NPU sample pattern:
+ * - Creates Environment with BuiltinNpuAcceleratorProvider (sets ADSP_LIBRARY_PATH)
+ * - Sets QualcommOptions for HTP high performance mode
+ * - Falls back: NPU → GPU → CPU
+ *
+ * Requires in jniLibs/arm64-v8a/:
+ * - libLiteRtCompilerPlugin_Qualcomm.so + libLiteRtDispatch_Qualcomm.so (from LiteRT JIT ZIP)
+ * - libQnnHtp.so, libQnnHtpPrepare.so, libQnnHtpV75Skel.so, libQnnHtpV75Stub.so,
+ *   libQnnSystem.so (from QNN runtime)
  *
  * @param path Model file path
  * @param requested Desired accelerator
@@ -313,6 +305,16 @@ internal fun createModelWithFallback(
         else -> listOf(Accelerator.CPU)
     }
 
+    // Create NPU environment (always, as per Google's sample)
+    val env = if (context != null) {
+        try {
+            Environment.create(BuiltinNpuAcceleratorProvider(context))
+        } catch (e: Exception) {
+            Log.w("LiteRT", "Failed to create NPU environment: ${e.message}")
+            null
+        }
+    } else null
+
     for (accel in chain) {
         try {
             val options = CompiledModel.Options(accel)
@@ -320,12 +322,6 @@ internal fun createModelWithFallback(
                 options.qualcommOptions = CompiledModel.QualcommOptions(
                     htpPerformanceMode = CompiledModel.QualcommOptions.HtpPerformanceMode.HIGH_PERFORMANCE,
                 )
-            }
-
-            val env = if (accel == Accelerator.NPU && context != null) {
-                Environment.create(BuiltinNpuAcceleratorProvider(context))
-            } else {
-                null
             }
 
             val model = if (env != null) {

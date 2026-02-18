@@ -16,7 +16,9 @@ dist/
 build/
 *.egg
 
-# Qualcomm QNN runtime (downloaded via scripts/download-qnn-libs.sh, ~102MB)
+# NPU acceleration libs (downloaded via scripts/download-qnn-libs.sh)
+# LiteRT dispatch (~1.1MB) + Qualcomm QNN runtime (~102MB)
+/android-plugin/app/src/main/jniLibs/arm64-v8a/libLiteRt*.so
 /android-plugin/app/src/main/jniLibs/arm64-v8a/libQnn*.so
 
 # Android

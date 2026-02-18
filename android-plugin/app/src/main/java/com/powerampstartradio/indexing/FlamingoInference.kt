@@ -70,7 +70,7 @@ class FlamingoInference(
     private val projectorInputBuffers: List<TensorBuffer>?
     private val projectorOutputBuffers: List<TensorBuffer>?
 
-    // Pre-allocated flat arrays for input data
+    // Pre-allocated flat array for mel input
     private val melFlat = FloatArray(N_MELS * NUM_MEL_FRAMES)
 
     init {
