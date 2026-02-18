@@ -25,9 +25,19 @@ import numpy as np
 
 
 def load_benchmark(path: str) -> dict:
-    """Load benchmark_results.json from the phone."""
-    with open(path) as f:
-        return json.load(f)
+    """Load benchmark_results.json from the phone (handles UTF-16/BOM)."""
+    raw = open(path, "rb").read()
+    # Handle UTF-16 LE/BE BOM
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = raw.decode("utf-16")
+    # Handle UTF-8 BOM
+    elif raw[:3] == b"\xef\xbb\xbf":
+        text = raw[3:].decode("utf-8")
+    else:
+        text = raw.decode("utf-8")
+    # Strip any remaining BOM character
+    text = text.lstrip("\ufeff")
+    return json.loads(text)
 
 
 def load_db_embeddings(db_path: str, track_ids: list[int], table: str) -> dict[int, np.ndarray]:

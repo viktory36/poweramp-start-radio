@@ -76,16 +76,17 @@ class BenchmarkActivity : ComponentActivity() {
 
     @Composable
     private fun BenchmarkScreen() {
-        var status by remember { mutableStateOf("Ready. Tap 'Run Benchmark' to start.") }
+        var status by remember { mutableStateOf("Ready. Select accelerator and tap 'Run Benchmark'.") }
         var running by remember { mutableStateOf(false) }
+        var selectedAccelerator by remember { mutableStateOf(Accelerator.GPU) }
         val scope = rememberCoroutineScope()
 
         fun startBenchmark() {
             running = true
-            status = "Starting benchmark..."
+            status = "Starting benchmark with $selectedAccelerator..."
             scope.launch(Dispatchers.IO) {
                 try {
-                    runBenchmark { msg -> status = msg }
+                    runBenchmark(selectedAccelerator) { msg -> status = msg }
                 } catch (e: Exception) {
                     status = "ERROR: ${e.message}\n\n${e.stackTraceToString()}"
                 } finally {
@@ -109,7 +110,19 @@ class BenchmarkActivity : ComponentActivity() {
                 fontSize = 12.sp,
                 fontFamily = FontFamily.Monospace,
             )
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(12.dp))
+
+            // Accelerator selector
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                for (accel in listOf(Accelerator.CPU, Accelerator.GPU, Accelerator.NPU)) {
+                    FilterChip(
+                        selected = selectedAccelerator == accel,
+                        onClick = { if (!running) selectedAccelerator = accel },
+                        label = { Text(accel.name) },
+                    )
+                }
+            }
+            Spacer(Modifier.height(12.dp))
 
             Button(
                 onClick = {
@@ -129,7 +142,7 @@ class BenchmarkActivity : ComponentActivity() {
                 },
                 enabled = !running,
             ) {
-                Text(if (running) "Running..." else "Run Benchmark")
+                Text(if (running) "Running..." else "Run Benchmark ($selectedAccelerator)")
             }
 
             Spacer(Modifier.height(16.dp))
@@ -237,7 +250,7 @@ class BenchmarkActivity : ComponentActivity() {
         return result
     }
 
-    private suspend fun runBenchmark(onStatus: (String) -> Unit) {
+    private suspend fun runBenchmark(accelerator: Accelerator, onStatus: (String) -> Unit) {
         val sb = StringBuilder()
         fun log(msg: String) {
             sb.appendLine(msg)
@@ -248,6 +261,7 @@ class BenchmarkActivity : ComponentActivity() {
         log("=== LiteRT Embedding Benchmark ===")
         log("Device: ${Build.MANUFACTURER} ${Build.MODEL}")
         log("SOC: ${Build.SOC_MODEL}")
+        log("Requested accelerator: $accelerator")
         log("")
 
         // Discover tracks from Poweramp
@@ -297,16 +311,13 @@ class BenchmarkActivity : ComponentActivity() {
         var mulanEp: String? = null
         var flamingoEp: String? = null
 
-        // Try NPU first, then GPU, then CPU
-        val requestedAccelerator = Accelerator.NPU
-
         // ── MuLan Pass ──
         if (mulanFile.exists()) {
-            log("Loading MuLan model (requesting $requestedAccelerator)...")
+            log("Loading MuLan model (requesting $accelerator)...")
             val loadStart = System.nanoTime()
             var mulanInference: MuLanInference? = null
             try {
-                mulanInference = MuLanInference(mulanFile, requestedAccelerator, this@BenchmarkActivity)
+                mulanInference = MuLanInference(mulanFile, accelerator, this@BenchmarkActivity)
                 val loadMs = (System.nanoTime() - loadStart) / 1_000_000
                 log("  MuLan loaded in ${loadMs}ms (${mulanInference.activeAccelerator})")
             } catch (e: Exception) {
@@ -354,11 +365,11 @@ class BenchmarkActivity : ComponentActivity() {
 
         // ── Flamingo Pass ──
         if (flamingoFile.exists()) {
-            log("\nLoading Flamingo model (requesting $requestedAccelerator)...")
+            log("\nLoading Flamingo model (requesting $accelerator)...")
             val loadStart = System.nanoTime()
             var flamingoInference: FlamingoInference? = null
             try {
-                flamingoInference = FlamingoInference(flamingoFile, projectorFile, requestedAccelerator, this@BenchmarkActivity)
+                flamingoInference = FlamingoInference(flamingoFile, projectorFile, accelerator, this@BenchmarkActivity)
                 val loadMs = (System.nanoTime() - loadStart) / 1_000_000
                 log("  Flamingo loaded in ${loadMs}ms (${flamingoInference.activeAccelerator})")
                 log("  Output dim: ${flamingoInference.outputDim}")
@@ -410,7 +421,7 @@ class BenchmarkActivity : ComponentActivity() {
             device = "${Build.MANUFACTURER} ${Build.MODEL}",
             soc = Build.SOC_MODEL,
             androidVersion = "${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})",
-            runtime = "LiteRT 2.1.0",
+            runtime = "LiteRT 2.1.1",
             mulanEp = mulanEp,
             flamingoEp = flamingoEp,
             tracks = results,
