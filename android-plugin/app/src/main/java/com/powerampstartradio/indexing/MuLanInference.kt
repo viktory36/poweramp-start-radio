@@ -1,13 +1,13 @@
 package com.powerampstartradio.indexing
 
 import android.util.Log
+import com.google.ai.edge.litert.Accelerator
+import com.google.ai.edge.litert.CompiledModel
+import com.google.ai.edge.litert.TensorBuffer
 import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
-import org.tensorflow.lite.Interpreter
 import java.io.File
 import java.io.FileInputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import kotlin.math.log10
@@ -27,10 +27,13 @@ import kotlin.math.sqrt
  * Chunking strategy (matches desktop MuLanEmbeddingGenerator):
  * - 1 chunk (30s) per minute of audio, max 30
  * - Each 30s chunk -> 3x 10s clips (matching MuQ-MuLan's _get_all_clips)
- * - Each 10s clip: compute mel -> normalize -> TFLite -> 512d
+ * - Each 10s clip: compute mel -> normalize -> LiteRT -> 512d
  * - Average all clip embeddings, L2-normalize
+ *
+ * @param modelFile Path to the .tflite model file
+ * @param accelerator Hardware accelerator to use (CPU, GPU). Falls back to CPU on failure.
  */
-class MuLanInference(modelFile: File) {
+class MuLanInference(modelFile: File, accelerator: Accelerator = Accelerator.CPU) {
 
     companion object {
         private const val TAG = "MuLanInference"
@@ -44,9 +47,7 @@ class MuLanInference(modelFile: File) {
         private const val N_MELS = 128
     }
 
-    /** Mel spectrogram parameters from the JSON sidecar or defaults.
-     *  Numeric fields use Double because the Python export writes `2048.0` (not `2048`)
-     *  and Gson won't coerce `Double` → `Int` cleanly. */
+    /** Mel spectrogram parameters from the JSON sidecar or defaults. */
     private data class MelParams(
         @SerializedName("n_fft") val nFft: Double = 2048.0,
         @SerializedName("hop_length") val hopLength: Double = 240.0,
@@ -54,20 +55,26 @@ class MuLanInference(modelFile: File) {
         @SerializedName("n_mels") val nMels: Double = 128.0,
         @SerializedName("sample_rate") val sampleRate: Double = 24000.0,
         @SerializedName("f_min") val fMin: Double = 0.0,
-        @SerializedName("f_max") val fMax: Double? = null,  // null = Nyquist (sampleRate / 2)
+        @SerializedName("f_max") val fMax: Double? = null,
         @SerializedName("power") val power: Double = 2.0,
         @SerializedName("norm_mean") val normMean: Double = 6.768444971712967,
         @SerializedName("norm_std") val normStd: Double = 18.417922652295623,
         @SerializedName("is_db") val isDb: Boolean = true,
     )
 
-    private val interpreter: Interpreter
+    private val model: CompiledModel
     private val melSpectrogram: MelSpectrogram
     private val melParams: MelParams
 
-    // Pre-allocated I/O buffers for inference (avoid GC pressure)
-    private val inputBuffer: ByteBuffer
-    private val outputBuffer: ByteBuffer
+    // Pre-allocated TensorBuffers for inference (reusable across invocations)
+    private val inputBuffers: List<TensorBuffer>
+    private val outputBuffers: List<TensorBuffer>
+
+    /** Which accelerator is actually in use (may differ from requested if fallback occurred). */
+    val activeAccelerator: Accelerator
+
+    // Pre-allocated flat array for mel input [1 * 128 * 1000]
+    private val melFlat = FloatArray(N_MELS * EXPECTED_MEL_FRAMES)
 
     init {
         // Load mel params from JSON sidecar if available, else use defaults
@@ -96,21 +103,17 @@ class MuLanInference(modelFile: File) {
             fMax = effectiveFMax.toFloat(),
         )
 
-        // Load TFLite model via memory-mapped file (avoids loading ~1.2GB into heap)
-        val modelBuffer = loadMappedModel(modelFile)
-        val options = Interpreter.Options().apply {
-            setNumThreads(4)
-        }
-        interpreter = Interpreter(modelBuffer, options)
+        // Try requested accelerator, fall back to CPU on failure
+        val path = modelFile.absolutePath
+        val result = createModelWithFallback(path, accelerator)
+        model = result.first
+        activeAccelerator = result.second
 
-        // Pre-allocate I/O buffers
-        inputBuffer = ByteBuffer.allocateDirect(1 * N_MELS * EXPECTED_MEL_FRAMES * 4)
-            .order(ByteOrder.nativeOrder())
-        outputBuffer = ByteBuffer.allocateDirect(1 * EMBEDDING_DIM * 4)
-            .order(ByteOrder.nativeOrder())
+        inputBuffers = model.createInputBuffers()
+        outputBuffers = model.createOutputBuffers()
 
-        Log.i(TAG, "MuQ-MuLan TFLite session loaded: ${modelFile.name} " +
-                "(${modelFile.length() / 1024 / 1024}MB)")
+        Log.i(TAG, "MuQ-MuLan loaded: ${modelFile.name} " +
+                "(${modelFile.length() / 1024 / 1024}MB), accelerator=$activeAccelerator")
     }
 
     /**
@@ -160,7 +163,7 @@ class MuLanInference(modelFile: File) {
 
         Log.d(TAG, "Running inference on ${clips.size} clips")
 
-        // Run each clip through TFLite and accumulate embeddings
+        // Run each clip through model and accumulate embeddings
         val sumEmbedding = FloatArray(EMBEDDING_DIM)
         var count = 0
 
@@ -188,7 +191,7 @@ class MuLanInference(modelFile: File) {
     }
 
     /**
-     * Run TFLite inference on a single 10s clip.
+     * Run inference on a single 10s clip.
      * Computes mel spectrogram, normalizes, feeds to model.
      */
     private fun runInference(clip: FloatArray): FloatArray? {
@@ -208,32 +211,31 @@ class MuLanInference(modelFile: File) {
             // Apply MuLan normalization: (mel - mean) / std
             val normMean = melParams.normMean.toFloat()
             val normStd = melParams.normStd.toFloat()
-            for (m in mel.indices) {
-                for (t in mel[m].indices) {
-                    mel[m][t] = (mel[m][t] - normMean) / normStd
+
+            // Flatten [128, 1000] to flat array with normalization and zero-padding
+            for (m in 0 until N_MELS) {
+                val rowOffset = m * EXPECTED_MEL_FRAMES
+                val srcFrames = min(mel[m].size, EXPECTED_MEL_FRAMES)
+                for (t in 0 until srcFrames) {
+                    melFlat[rowOffset + t] = (mel[m][t] - normMean) / normStd
+                }
+                for (t in srcFrames until EXPECTED_MEL_FRAMES) {
+                    melFlat[rowOffset + t] = 0f
                 }
             }
 
-            // Fill input buffer: flatten [128, 1000] to [1, 128, 1000]
-            inputBuffer.rewind()
-            val floatInput = inputBuffer.asFloatBuffer()
-            for (m in 0 until N_MELS) {
-                val srcFrames = min(mel[m].size, EXPECTED_MEL_FRAMES)
-                floatInput.put(mel[m], 0, srcFrames)
-                // Zero-pad if mel is shorter than expected
-                repeat(EXPECTED_MEL_FRAMES - srcFrames) { floatInput.put(0f) }
+            // Write input and run
+            inputBuffers[0].writeFloat(melFlat)
+            model.run(inputBuffers, outputBuffers)
+
+            // Read output [1, 512] → flat [512]
+            val output = outputBuffers[0].readFloat()
+            if (output.size >= EMBEDDING_DIM) {
+                output.copyOf(EMBEDDING_DIM)
+            } else {
+                Log.w(TAG, "Unexpected output size: ${output.size}")
+                null
             }
-
-            // Run TFLite inference
-            outputBuffer.rewind()
-            interpreter.run(inputBuffer, outputBuffer)
-
-            // Read output [1, 512]
-            outputBuffer.rewind()
-            val output = FloatArray(EMBEDDING_DIM)
-            outputBuffer.asFloatBuffer().get(output)
-
-            output
         } catch (e: Exception) {
             Log.e(TAG, "MuQ-MuLan inference failed: ${e.message}")
             null
@@ -253,7 +255,9 @@ class MuLanInference(modelFile: File) {
     }
 
     fun close() {
-        interpreter.close()
+        inputBuffers.forEach { it.close() }
+        outputBuffers.forEach { it.close() }
+        model.close()
     }
 }
 
@@ -275,4 +279,28 @@ internal fun loadMappedModel(file: File): MappedByteBuffer {
         channel.close()
         stream.close()
     }
+}
+
+/**
+ * Try to create a CompiledModel with the requested accelerator.
+ * Falls back to CPU if GPU/NPU fails.
+ *
+ * @return Pair of (CompiledModel, actual Accelerator used)
+ */
+internal fun createModelWithFallback(
+    path: String,
+    requested: Accelerator,
+): Pair<CompiledModel, Accelerator> {
+    if (requested != Accelerator.CPU) {
+        try {
+            val options = CompiledModel.Options(requested)
+            val model = CompiledModel.create(path, options)
+            Log.i("LiteRT", "Created model with $requested accelerator")
+            return model to requested
+        } catch (e: Exception) {
+            Log.w("LiteRT", "$requested failed, falling back to CPU: ${e.message}")
+        }
+    }
+    val model = CompiledModel.create(path, CompiledModel.Options(Accelerator.CPU))
+    return model to Accelerator.CPU
 }

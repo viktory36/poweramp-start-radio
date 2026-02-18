@@ -20,6 +20,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.google.gson.GsonBuilder
+import com.google.ai.edge.litert.Accelerator
 import com.powerampstartradio.indexing.*
 import com.powerampstartradio.poweramp.PowerampHelper
 import kotlinx.coroutines.*
@@ -296,21 +297,24 @@ class BenchmarkActivity : ComponentActivity() {
         var mulanEp: String? = null
         var flamingoEp: String? = null
 
+        // Try GPU, fall back to CPU
+        val requestedAccelerator = Accelerator.GPU
+
         // ── MuLan Pass ──
         if (mulanFile.exists()) {
-            log("Loading MuLan model...")
+            log("Loading MuLan model (requesting $requestedAccelerator)...")
             val loadStart = System.nanoTime()
             var mulanInference: MuLanInference? = null
             try {
-                mulanInference = MuLanInference(mulanFile)
+                mulanInference = MuLanInference(mulanFile, requestedAccelerator)
                 val loadMs = (System.nanoTime() - loadStart) / 1_000_000
-                log("  MuLan loaded in ${loadMs}ms (LiteRT CPU)")
+                log("  MuLan loaded in ${loadMs}ms (${mulanInference.activeAccelerator})")
             } catch (e: Exception) {
                 log("  MuLan load FAILED: ${e.message}")
             }
 
             if (mulanInference != null) {
-                mulanEp = "LiteRT"
+                mulanEp = "LiteRT ${mulanInference.activeAccelerator}"
                 log("")
                 for ((i, track) in testTracks.withIndex()) {
                     log("MuLan [${i + 1}/${testTracks.size}] ${track.artist} - ${track.title}")
@@ -332,7 +336,7 @@ class BenchmarkActivity : ComponentActivity() {
                         log("  Embedding: ${embedding.size}d in ${inferMs}ms")
                         log("  First 5: ${embedding.take(5).map { "%.4f".format(it) }}")
                         results[i].mulan = EmbeddingResult(
-                            ep = "LiteRT",
+                            ep = mulanEp!!,
                             timingMs = inferMs,
                             dim = embedding.size,
                             embedding = embedding.toList(),
@@ -350,20 +354,20 @@ class BenchmarkActivity : ComponentActivity() {
 
         // ── Flamingo Pass ──
         if (flamingoFile.exists()) {
-            log("\nLoading Flamingo model...")
+            log("\nLoading Flamingo model (requesting $requestedAccelerator)...")
             val loadStart = System.nanoTime()
             var flamingoInference: FlamingoInference? = null
             try {
-                flamingoInference = FlamingoInference(flamingoFile, projectorFile)
+                flamingoInference = FlamingoInference(flamingoFile, projectorFile, requestedAccelerator)
                 val loadMs = (System.nanoTime() - loadStart) / 1_000_000
-                log("  Flamingo loaded in ${loadMs}ms (LiteRT CPU)")
+                log("  Flamingo loaded in ${loadMs}ms (${flamingoInference.activeAccelerator})")
                 log("  Output dim: ${flamingoInference.outputDim}")
             } catch (e: Exception) {
                 log("  Flamingo load FAILED: ${e.message}")
             }
 
             if (flamingoInference != null) {
-                flamingoEp = "LiteRT"
+                flamingoEp = "LiteRT ${flamingoInference.activeAccelerator}"
                 log("")
                 for ((i, track) in testTracks.withIndex()) {
                     log("Flamingo [${i + 1}/${testTracks.size}] ${track.artist} - ${track.title}")
@@ -385,7 +389,7 @@ class BenchmarkActivity : ComponentActivity() {
                         log("  Embedding: ${embedding.size}d in ${inferMs}ms")
                         log("  First 5: ${embedding.take(5).map { "%.4f".format(it) }}")
                         results[i].flamingo = EmbeddingResult(
-                            ep = "LiteRT",
+                            ep = flamingoEp!!,
                             timingMs = inferMs,
                             dim = embedding.size,
                             embedding = embedding.toList(),

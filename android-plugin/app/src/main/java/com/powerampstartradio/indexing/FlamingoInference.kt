@@ -1,10 +1,10 @@
 package com.powerampstartradio.indexing
 
 import android.util.Log
-import org.tensorflow.lite.Interpreter
+import com.google.ai.edge.litert.Accelerator
+import com.google.ai.edge.litert.CompiledModel
+import com.google.ai.edge.litert.TensorBuffer
 import java.io.File
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import kotlin.math.ceil
 import kotlin.math.min
 
@@ -25,8 +25,16 @@ import kotlin.math.min
  * - Average across chunks, L2-normalize
  *
  * If no projector model is found, output is 1280-dim (encoder-only).
+ *
+ * @param encoderFile Path to the encoder .tflite model
+ * @param projectorFile Path to the projector .tflite model (optional)
+ * @param accelerator Hardware accelerator to use (CPU, GPU). Falls back to CPU on failure.
  */
-class FlamingoInference(encoderFile: File, projectorFile: File? = null) {
+class FlamingoInference(
+    encoderFile: File,
+    projectorFile: File? = null,
+    accelerator: Accelerator = Accelerator.CPU,
+) {
 
     companion object {
         private const val TAG = "FlamingoInference"
@@ -42,48 +50,53 @@ class FlamingoInference(encoderFile: File, projectorFile: File? = null) {
         private const val PROJECTED_DIM = 3584
     }
 
-    private val encoderInterpreter: Interpreter
-    private val projectorInterpreter: Interpreter?
+    private val encoderModel: CompiledModel
+    private val projectorModel: CompiledModel?
     private val melSpectrogram = MelSpectrogram(center = true, melScale = MelScale.SLANEY)
 
     val outputDim: Int
 
-    // Pre-allocated I/O buffers for encoder
-    private val melBuffer: ByteBuffer
-    private val timesBuffer: ByteBuffer
-    private val encoderOutputBuffer: ByteBuffer
+    /** Which accelerator is actually in use for the encoder. */
+    val activeAccelerator: Accelerator
 
-    // Pre-allocated I/O buffers for projector (if available)
-    private val projectorOutputBuffer: ByteBuffer?
+    // Pre-allocated TensorBuffers for encoder
+    private val encoderInputBuffers: List<TensorBuffer>
+    private val encoderOutputBuffers: List<TensorBuffer>
+
+    // Pre-allocated TensorBuffers for projector (if available)
+    private val projectorInputBuffers: List<TensorBuffer>?
+    private val projectorOutputBuffers: List<TensorBuffer>?
+
+    // Pre-allocated flat arrays for input data
+    private val melFlat = FloatArray(N_MELS * NUM_MEL_FRAMES)
 
     init {
-        // Load encoder model (memory-mapped)
-        val encOptions = Interpreter.Options().apply { setNumThreads(4) }
-        encoderInterpreter = Interpreter(loadMappedModel(encoderFile), encOptions)
+        // Load encoder
+        val encResult = createModelWithFallback(encoderFile.absolutePath, accelerator)
+        encoderModel = encResult.first
+        activeAccelerator = encResult.second
 
-        // Load projector model (if available)
-        projectorInterpreter = if (projectorFile != null && projectorFile.exists()) {
-            val projOptions = Interpreter.Options().apply { setNumThreads(4) }
-            Interpreter(loadMappedModel(projectorFile), projOptions)
-        } else null
+        encoderInputBuffers = encoderModel.createInputBuffers()
+        encoderOutputBuffers = encoderModel.createOutputBuffers()
 
-        outputDim = if (projectorInterpreter != null) PROJECTED_DIM else ENCODER_DIM
+        // Load projector (if available)
+        if (projectorFile != null && projectorFile.exists()) {
+            val projResult = createModelWithFallback(projectorFile.absolutePath, activeAccelerator)
+            projectorModel = projResult.first
+            projectorInputBuffers = projectorModel.createInputBuffers()
+            projectorOutputBuffers = projectorModel.createOutputBuffers()
+            outputDim = PROJECTED_DIM
+        } else {
+            projectorModel = null
+            projectorInputBuffers = null
+            projectorOutputBuffers = null
+            outputDim = ENCODER_DIM
+        }
 
-        // Pre-allocate I/O buffers
-        melBuffer = ByteBuffer.allocateDirect(1 * N_MELS * NUM_MEL_FRAMES * 4)
-            .order(ByteOrder.nativeOrder())
-        timesBuffer = ByteBuffer.allocateDirect(1 * NUM_FRAMES * 4)
-            .order(ByteOrder.nativeOrder())
-        encoderOutputBuffer = ByteBuffer.allocateDirect(1 * NUM_FRAMES * ENCODER_DIM * 4)
-            .order(ByteOrder.nativeOrder())
-        projectorOutputBuffer = if (projectorInterpreter != null) {
-            ByteBuffer.allocateDirect(1 * NUM_FRAMES * PROJECTED_DIM * 4)
-                .order(ByteOrder.nativeOrder())
-        } else null
-
-        Log.i(TAG, "Flamingo TFLite loaded: encoder=${encoderFile.name} " +
+        Log.i(TAG, "Flamingo loaded: encoder=${encoderFile.name} " +
                 "(${encoderFile.length() / 1024 / 1024}MB), " +
-                "projector=${projectorFile?.name ?: "none"}, output_dim=$outputDim")
+                "projector=${projectorFile?.name ?: "none"}, " +
+                "output_dim=$outputDim, accelerator=$activeAccelerator")
     }
 
     /**
@@ -135,7 +148,7 @@ class FlamingoInference(encoderFile: File, projectorFile: File? = null) {
     }
 
     /**
-     * Process a single 30s chunk: compute mel, run TFLite, mean-pool time dimension.
+     * Process a single 30s chunk: compute mel, run encoder+projector, mean-pool.
      */
     private fun processChunk(samples: FloatArray, positionS: Float): FloatArray? {
         val startSample = (positionS * SAMPLE_RATE).toInt()
@@ -160,16 +173,11 @@ class FlamingoInference(encoderFile: File, projectorFile: File? = null) {
             frame * FRAME_DURATION_S + positionS
         }
 
-        // Run TFLite inference
         return runInference(mel, audioTimes)
     }
 
     /**
-     * Run TFLite inference: encoder -> [optional projector] -> mean pool.
-     *
-     * The TFLite encoder takes 2 inputs (mel + audio_times), no mask.
-     * The mask was removed during TFLite export because we always use
-     * full 30s chunks with no padding (mask would be all-ones).
+     * Run inference: encoder -> [optional projector] -> mean pool.
      *
      * @param mel [128, numFrames] mel spectrogram
      * @param audioTimes [750] absolute timestamps
@@ -177,49 +185,44 @@ class FlamingoInference(encoderFile: File, projectorFile: File? = null) {
      */
     private fun runInference(mel: Array<FloatArray>, audioTimes: FloatArray): FloatArray? {
         return try {
-            val numMelFrames = mel[0].size
-
-            // Fill mel buffer: [1, 128, 3000]
-            melBuffer.rewind()
-            val melFloat = melBuffer.asFloatBuffer()
+            // Flatten mel [128, 3000] to flat array with zero-padding
             for (m in 0 until N_MELS) {
+                val rowOffset = m * NUM_MEL_FRAMES
                 val srcFrames = min(mel[m].size, NUM_MEL_FRAMES)
-                melFloat.put(mel[m], 0, srcFrames)
-                repeat(NUM_MEL_FRAMES - srcFrames) { melFloat.put(0f) }
+                mel[m].copyInto(melFlat, rowOffset, 0, srcFrames)
+                for (t in srcFrames until NUM_MEL_FRAMES) {
+                    melFlat[rowOffset + t] = 0f
+                }
             }
 
-            // Fill times buffer: [1, 750]
-            timesBuffer.rewind()
-            timesBuffer.asFloatBuffer().put(audioTimes)
+            // Write inputs: [mel, audio_times]
+            encoderInputBuffers[0].writeFloat(melFlat)
+            encoderInputBuffers[1].writeFloat(audioTimes)
 
             // Step 1: Encoder [1,128,3000] + [1,750] -> [1,750,1280]
-            encoderOutputBuffer.rewind()
-            val encInputs = arrayOf<Any>(melBuffer, timesBuffer)
-            val encOutputs = HashMap<Int, Any>()
-            encOutputs[0] = encoderOutputBuffer
-            encoderInterpreter.runForMultipleInputsOutputs(encInputs, encOutputs)
+            encoderModel.run(encoderInputBuffers, encoderOutputBuffers)
 
             // Step 2: Projector (if available) [1,750,1280] -> [1,750,3584]
-            val finalOutputBuffer: ByteBuffer
+            val finalOutput: FloatArray
             val finalDim: Int
-            if (projectorInterpreter != null && projectorOutputBuffer != null) {
-                projectorOutputBuffer.rewind()
-                encoderOutputBuffer.rewind()  // Rewind for reading by projector
-                projectorInterpreter.run(encoderOutputBuffer, projectorOutputBuffer)
-                finalOutputBuffer = projectorOutputBuffer
+            if (projectorModel != null && projectorInputBuffers != null && projectorOutputBuffers != null) {
+                // Pass encoder output to projector input
+                val encoderOutput = encoderOutputBuffers[0].readFloat()
+                projectorInputBuffers[0].writeFloat(encoderOutput)
+                projectorModel.run(projectorInputBuffers, projectorOutputBuffers)
+                finalOutput = projectorOutputBuffers[0].readFloat()
                 finalDim = PROJECTED_DIM
             } else {
-                finalOutputBuffer = encoderOutputBuffer
+                finalOutput = encoderOutputBuffers[0].readFloat()
                 finalDim = ENCODER_DIM
             }
 
             // Mean pool over time dimension: [1, 750, dim] -> [dim]
-            finalOutputBuffer.rewind()
-            val floatBuf = finalOutputBuffer.asFloatBuffer()
             val pooled = FloatArray(finalDim)
             for (frame in 0 until NUM_FRAMES) {
+                val frameOffset = frame * finalDim
                 for (i in 0 until finalDim) {
-                    pooled[i] += floatBuf.get()
+                    pooled[i] += finalOutput[frameOffset + i]
                 }
             }
             val numFramesF = NUM_FRAMES.toFloat()
@@ -246,7 +249,11 @@ class FlamingoInference(encoderFile: File, projectorFile: File? = null) {
     }
 
     fun close() {
-        encoderInterpreter.close()
-        projectorInterpreter?.close()
+        encoderInputBuffers.forEach { it.close() }
+        encoderOutputBuffers.forEach { it.close() }
+        encoderModel.close()
+        projectorInputBuffers?.forEach { it.close() }
+        projectorOutputBuffers?.forEach { it.close() }
+        projectorModel?.close()
     }
 }

@@ -13,6 +13,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.powerampstartradio.MainActivity
 import com.powerampstartradio.R
+import com.google.ai.edge.litert.Accelerator
 import com.powerampstartradio.data.EmbeddingDatabase
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -178,9 +179,11 @@ class IndexingService : Service() {
                 // Sequential loading: load MuLan first, process all tracks,
                 // close it before loading Flamingo. This avoids having multiple
                 // large models in memory simultaneously.
+                val accelerator = Accelerator.GPU
+
                 if (hasMulan) {
                     updateNotification("Loading MuQ-MuLan model...")
-                    val mulanInference = try { MuLanInference(mulanFile) }
+                    val mulanInference = try { MuLanInference(mulanFile, accelerator) }
                     catch (e: Exception) {
                         Log.e(TAG, "Failed to load MuQ-MuLan", e)
                         null
@@ -246,7 +249,7 @@ class IndexingService : Service() {
                 if (hasFlamingo) {
                     updateNotification("Loading Flamingo model...")
                     val flamingoInference = try {
-                        FlamingoInference(flamingoFile, projectorFile)
+                        FlamingoInference(flamingoFile, projectorFile, accelerator)
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to load Flamingo", e)
                         null
