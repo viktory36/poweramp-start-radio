@@ -305,6 +305,21 @@ internal fun createModelWithFallback(
         else -> listOf(Accelerator.CPU)
     }
 
+    // Set ADSP_LIBRARY_PATH so the QNN compiler plugin (JIT) can find HTP skel
+    // libraries in the app's native lib directory. Without this, the compiler
+    // plugin searches only default vendor paths (/vendor/dsp/, /vendor/lib/rfsa/...)
+    // and fails to create a device handle. The dispatch layer adds this path
+    // automatically, but the compiler plugin does not.
+    if (context != null && requested == Accelerator.NPU) {
+        try {
+            val nativeLibDir = context.applicationInfo.nativeLibraryDir
+            android.system.Os.setenv("ADSP_LIBRARY_PATH", nativeLibDir, true)
+            Log.i("LiteRT", "Set ADSP_LIBRARY_PATH=$nativeLibDir")
+        } catch (e: Exception) {
+            Log.w("LiteRT", "Failed to set ADSP_LIBRARY_PATH: ${e.message}")
+        }
+    }
+
     // Create NPU environment (always, as per Google's sample)
     val env = if (context != null) {
         try {
