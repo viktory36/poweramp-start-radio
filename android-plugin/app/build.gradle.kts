@@ -97,7 +97,7 @@ dependencies {
     implementation("com.google.code.gson:gson:2.11.0")
 
     // LiteRT for on-device ML inference (CompiledModel API with NPU/GPU/CPU)
-    implementation("com.google.ai.edge.litert:litert:2.1.0")
+    implementation("com.google.ai.edge.litert:litert:2.1.1")
 
     // Testing
     testImplementation("junit:junit:4.13.2")
