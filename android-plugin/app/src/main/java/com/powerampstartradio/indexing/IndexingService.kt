@@ -179,11 +179,11 @@ class IndexingService : Service() {
                 // Sequential loading: load MuLan first, process all tracks,
                 // close it before loading Flamingo. This avoids having multiple
                 // large models in memory simultaneously.
-                val accelerator = Accelerator.GPU
+                val accelerator = Accelerator.NPU
 
                 if (hasMulan) {
                     updateNotification("Loading MuQ-MuLan model...")
-                    val mulanInference = try { MuLanInference(mulanFile, accelerator) }
+                    val mulanInference = try { MuLanInference(mulanFile, accelerator, this@IndexingService) }
                     catch (e: Exception) {
                         Log.e(TAG, "Failed to load MuQ-MuLan", e)
                         null
@@ -249,7 +249,7 @@ class IndexingService : Service() {
                 if (hasFlamingo) {
                     updateNotification("Loading Flamingo model...")
                     val flamingoInference = try {
-                        FlamingoInference(flamingoFile, projectorFile, accelerator)
+                        FlamingoInference(flamingoFile, projectorFile, accelerator, this@IndexingService)
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to load Flamingo", e)
                         null

@@ -297,8 +297,8 @@ class BenchmarkActivity : ComponentActivity() {
         var mulanEp: String? = null
         var flamingoEp: String? = null
 
-        // Try GPU, fall back to CPU
-        val requestedAccelerator = Accelerator.GPU
+        // Try NPU first, then GPU, then CPU
+        val requestedAccelerator = Accelerator.NPU
 
         // ── MuLan Pass ──
         if (mulanFile.exists()) {
@@ -306,7 +306,7 @@ class BenchmarkActivity : ComponentActivity() {
             val loadStart = System.nanoTime()
             var mulanInference: MuLanInference? = null
             try {
-                mulanInference = MuLanInference(mulanFile, requestedAccelerator)
+                mulanInference = MuLanInference(mulanFile, requestedAccelerator, this@BenchmarkActivity)
                 val loadMs = (System.nanoTime() - loadStart) / 1_000_000
                 log("  MuLan loaded in ${loadMs}ms (${mulanInference.activeAccelerator})")
             } catch (e: Exception) {
@@ -358,7 +358,7 @@ class BenchmarkActivity : ComponentActivity() {
             val loadStart = System.nanoTime()
             var flamingoInference: FlamingoInference? = null
             try {
-                flamingoInference = FlamingoInference(flamingoFile, projectorFile, requestedAccelerator)
+                flamingoInference = FlamingoInference(flamingoFile, projectorFile, requestedAccelerator, this@BenchmarkActivity)
                 val loadMs = (System.nanoTime() - loadStart) / 1_000_000
                 log("  Flamingo loaded in ${loadMs}ms (${flamingoInference.activeAccelerator})")
                 log("  Output dim: ${flamingoInference.outputDim}")

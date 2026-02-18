@@ -1,8 +1,11 @@
 package com.powerampstartradio.indexing
 
 import android.util.Log
+import android.content.Context
 import com.google.ai.edge.litert.Accelerator
+import com.google.ai.edge.litert.BuiltinNpuAcceleratorProvider
 import com.google.ai.edge.litert.CompiledModel
+import com.google.ai.edge.litert.Environment
 import com.google.ai.edge.litert.TensorBuffer
 import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
@@ -31,9 +34,14 @@ import kotlin.math.sqrt
  * - Average all clip embeddings, L2-normalize
  *
  * @param modelFile Path to the .tflite model file
- * @param accelerator Hardware accelerator to use (CPU, GPU). Falls back to CPU on failure.
+ * @param accelerator Hardware accelerator to use (NPU, GPU, CPU). Falls back automatically.
+ * @param context Android context (required for NPU acceleration)
  */
-class MuLanInference(modelFile: File, accelerator: Accelerator = Accelerator.CPU) {
+class MuLanInference(
+    modelFile: File,
+    accelerator: Accelerator = Accelerator.CPU,
+    context: Context? = null,
+) {
 
     companion object {
         private const val TAG = "MuLanInference"
@@ -103,9 +111,9 @@ class MuLanInference(modelFile: File, accelerator: Accelerator = Accelerator.CPU
             fMax = effectiveFMax.toFloat(),
         )
 
-        // Try requested accelerator, fall back to CPU on failure
+        // Try requested accelerator with fallback chain
         val path = modelFile.absolutePath
-        val result = createModelWithFallback(path, accelerator)
+        val result = createModelWithFallback(path, accelerator, context)
         model = result.first
         activeAccelerator = result.second
 
@@ -283,24 +291,61 @@ internal fun loadMappedModel(file: File): MappedByteBuffer {
 
 /**
  * Try to create a CompiledModel with the requested accelerator.
- * Falls back to CPU if GPU/NPU fails.
+ * Fallback chain: NPU → GPU → CPU.
  *
+ * NPU requires an Environment with BuiltinNpuAcceleratorProvider, which sets
+ * ADSP_LIBRARY_PATH to the app's nativeLibraryDir where QNN .so files reside.
+ *
+ * @param path Model file path
+ * @param requested Desired accelerator
+ * @param context Android context (required for NPU, optional otherwise)
  * @return Pair of (CompiledModel, actual Accelerator used)
  */
 internal fun createModelWithFallback(
     path: String,
     requested: Accelerator,
+    context: Context? = null,
 ): Pair<CompiledModel, Accelerator> {
-    if (requested != Accelerator.CPU) {
+    // Build fallback chain based on requested accelerator
+    val chain = when (requested) {
+        Accelerator.NPU -> listOf(Accelerator.NPU, Accelerator.GPU, Accelerator.CPU)
+        Accelerator.GPU -> listOf(Accelerator.GPU, Accelerator.CPU)
+        else -> listOf(Accelerator.CPU)
+    }
+
+    for (accel in chain) {
         try {
-            val options = CompiledModel.Options(requested)
-            val model = CompiledModel.create(path, options)
-            Log.i("LiteRT", "Created model with $requested accelerator")
-            return model to requested
+            val options = CompiledModel.Options(accel)
+            if (accel == Accelerator.NPU) {
+                options.qualcommOptions = CompiledModel.QualcommOptions(
+                    htpPerformanceMode = CompiledModel.QualcommOptions.HtpPerformanceMode.HIGH_PERFORMANCE,
+                )
+            }
+
+            val env = if (accel == Accelerator.NPU && context != null) {
+                Environment.create(BuiltinNpuAcceleratorProvider(context))
+            } else {
+                null
+            }
+
+            val model = if (env != null) {
+                CompiledModel.create(path, options, env)
+            } else {
+                CompiledModel.create(path, options)
+            }
+
+            Log.i("LiteRT", "Created model with $accel accelerator")
+            return model to accel
         } catch (e: Exception) {
-            Log.w("LiteRT", "$requested failed, falling back to CPU: ${e.message}")
+            Log.w("LiteRT", "$accel failed: ${e.message}")
+            if (accel == chain.last()) {
+                // Last in chain failed — rethrow
+                throw e
+            }
         }
     }
+
+    // Should not reach here, but just in case
     val model = CompiledModel.create(path, CompiledModel.Options(Accelerator.CPU))
     return model to Accelerator.CPU
 }

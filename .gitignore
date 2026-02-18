@@ -16,6 +16,9 @@ dist/
 build/
 *.egg
 
+# Qualcomm QNN runtime (downloaded via scripts/download-qnn-libs.sh, ~102MB)
+/android-plugin/app/src/main/jniLibs/arm64-v8a/libQnn*.so
+
 # Android
 *.iml
 .gradle/
