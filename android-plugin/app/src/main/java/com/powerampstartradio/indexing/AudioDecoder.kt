@@ -41,9 +41,11 @@ class AudioDecoder {
      *
      * @param file Audio file to decode
      * @param targetSampleRate Desired output sample rate (e.g., 24000 for MuQ-MuLan, 16000 for Flamingo)
+     * @param maxDurationS Maximum duration to decode in seconds (0 = unlimited).
+     *   Caps at native sample rate before resampling.
      * @return Decoded audio, or null on failure
      */
-    fun decode(file: File, targetSampleRate: Int): DecodedAudio? {
+    fun decode(file: File, targetSampleRate: Int, maxDurationS: Int = 0): DecodedAudio? {
         val extractor = MediaExtractor()
         try {
             extractor.setDataSource(file.absolutePath)
@@ -67,8 +69,9 @@ class AudioDecoder {
             codec.configure(format, null, null, 0)
             codec.start()
 
-            // Decode all samples
-            val rawSamples = decodeAllSamples(codec, extractor, channelCount)
+            // Decode samples (with optional cap to prevent OOM on very long files)
+            val maxSamples = if (maxDurationS > 0) nativeSampleRate.toLong() * maxDurationS else 0L
+            val rawSamples = decodeAllSamples(codec, extractor, channelCount, maxSamples)
             codec.stop()
             codec.release()
 
@@ -106,16 +109,20 @@ class AudioDecoder {
     }
 
     /**
-     * Decode all PCM samples from the codec, downmixing to mono.
+     * Decode PCM samples from the codec, downmixing to mono.
      * Returns float samples in [-1, 1] range.
+     *
+     * @param maxSamples Maximum number of mono samples to decode (0 = unlimited)
      */
     private fun decodeAllSamples(
         codec: MediaCodec,
         extractor: MediaExtractor,
-        channelCount: Int
+        channelCount: Int,
+        maxSamples: Long = 0,
     ): FloatArray {
         val bufferInfo = MediaCodec.BufferInfo()
         var inputDone = false
+        var totalSamples = 0L
 
         // Use primitive FloatArray chunks instead of MutableList<Float> to avoid
         // boxing overhead (~16 bytes/Float vs 4 bytes). A 5-min track at 44100Hz
@@ -154,12 +161,14 @@ class AudioDecoder {
                 val frameCount = sampleCount / channelCount
 
                 for (frame in 0 until frameCount) {
+                    if (maxSamples > 0 && totalSamples >= maxSamples) break
                     var monoSample = 0f
                     for (ch in 0 until channelCount) {
                         val sample = outputBuffer.getShort().toFloat() / 32768f
                         monoSample += sample
                     }
                     currentChunk[chunkPos++] = monoSample / channelCount
+                    totalSamples++
                     if (chunkPos == DECODE_CHUNK_SIZE) {
                         chunks.add(currentChunk)
                         currentChunk = FloatArray(DECODE_CHUNK_SIZE)
@@ -170,6 +179,9 @@ class AudioDecoder {
                 codec.releaseOutputBuffer(outputIndex, false)
 
                 if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                    break
+                }
+                if (maxSamples > 0 && totalSamples >= maxSamples) {
                     break
                 }
             } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {

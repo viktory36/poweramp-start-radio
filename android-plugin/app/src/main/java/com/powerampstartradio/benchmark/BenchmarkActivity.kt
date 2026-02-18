@@ -332,28 +332,32 @@ class BenchmarkActivity : ComponentActivity() {
 
                     val audioFile = resolveFile(track.path)!!
 
-                    val audio = decoder.decode(audioFile, 24000)
-                    if (audio == null) {
-                        log("  Decode failed")
-                        continue
-                    }
-                    log("  Audio: ${audio.durationS}s @ ${audio.sampleRate}Hz")
+                    try {
+                        val audio = decoder.decode(audioFile, 24000)
+                        if (audio == null) {
+                            log("  Decode failed")
+                            continue
+                        }
+                        log("  Audio: ${audio.durationS}s @ ${audio.sampleRate}Hz")
 
-                    val start = System.nanoTime()
-                    val embedding = mulanInference.generateEmbedding(audio)
-                    val inferMs = (System.nanoTime() - start) / 1_000_000
+                        val start = System.nanoTime()
+                        val embedding = mulanInference.generateEmbedding(audio)
+                        val inferMs = (System.nanoTime() - start) / 1_000_000
 
-                    if (embedding != null) {
-                        log("  Embedding: ${embedding.size}d in ${inferMs}ms")
-                        log("  First 5: ${embedding.take(5).map { "%.4f".format(it) }}")
-                        results[i].mulan = EmbeddingResult(
-                            ep = mulanEp!!,
-                            timingMs = inferMs,
-                            dim = embedding.size,
-                            embedding = embedding.toList(),
-                        )
-                    } else {
-                        log("  Inference FAILED")
+                        if (embedding != null) {
+                            log("  Embedding: ${embedding.size}d in ${inferMs}ms")
+                            log("  First 5: ${embedding.take(5).map { "%.4f".format(it) }}")
+                            results[i].mulan = EmbeddingResult(
+                                ep = mulanEp!!,
+                                timingMs = inferMs,
+                                dim = embedding.size,
+                                embedding = embedding.toList(),
+                            )
+                        } else {
+                            log("  Inference FAILED")
+                        }
+                    } catch (e: Throwable) {
+                        log("  ERROR: ${e.javaClass.simpleName}: ${e.message}")
                     }
                 }
                 mulanInference.close()
@@ -385,28 +389,32 @@ class BenchmarkActivity : ComponentActivity() {
 
                     val audioFile = resolveFile(track.path)!!
 
-                    val audio = decoder.decode(audioFile, 16000)
-                    if (audio == null) {
-                        log("  Decode failed")
-                        continue
-                    }
-                    log("  Audio: ${audio.durationS}s @ ${audio.sampleRate}Hz")
+                    try {
+                        val audio = decoder.decode(audioFile, 16000)
+                        if (audio == null) {
+                            log("  Decode failed")
+                            continue
+                        }
+                        log("  Audio: ${audio.durationS}s @ ${audio.sampleRate}Hz")
 
-                    val start = System.nanoTime()
-                    val embedding = flamingoInference.generateEmbedding(audio)
-                    val inferMs = (System.nanoTime() - start) / 1_000_000
+                        val start = System.nanoTime()
+                        val embedding = flamingoInference.generateEmbedding(audio)
+                        val inferMs = (System.nanoTime() - start) / 1_000_000
 
-                    if (embedding != null) {
-                        log("  Embedding: ${embedding.size}d in ${inferMs}ms")
-                        log("  First 5: ${embedding.take(5).map { "%.4f".format(it) }}")
-                        results[i].flamingo = EmbeddingResult(
-                            ep = flamingoEp!!,
-                            timingMs = inferMs,
-                            dim = embedding.size,
-                            embedding = embedding.toList(),
-                        )
-                    } else {
-                        log("  Inference FAILED")
+                        if (embedding != null) {
+                            log("  Embedding: ${embedding.size}d in ${inferMs}ms")
+                            log("  First 5: ${embedding.take(5).map { "%.4f".format(it) }}")
+                            results[i].flamingo = EmbeddingResult(
+                                ep = flamingoEp!!,
+                                timingMs = inferMs,
+                                dim = embedding.size,
+                                embedding = embedding.toList(),
+                            )
+                        } else {
+                            log("  Inference FAILED")
+                        }
+                    } catch (e: Throwable) {
+                        log("  ERROR: ${e.javaClass.simpleName}: ${e.message}")
                     }
                 }
                 flamingoInference.close()
