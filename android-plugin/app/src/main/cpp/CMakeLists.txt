@@ -30,3 +30,9 @@ target_link_libraries(soxr-jni PRIVATE soxr log)
 
 # 16KB page size alignment (required for Google Play targeting Android 15+)
 target_link_options(soxr-jni PRIVATE -Wl,-z,max-page-size=16384)
+
+# Native mel spectrogram (FFT + Bluestein + mel filterbank)
+add_library(mel-jni SHARED mel_jni.c)
+target_compile_options(mel-jni PRIVATE -O2)
+target_link_libraries(mel-jni PRIVATE log m)
+target_link_options(mel-jni PRIVATE -Wl,-z,max-page-size=16384)

@@ -89,17 +89,19 @@ class EmbeddingProcessor(
      *
      * @param audioFile Path to the audio file
      * @param existingMulan Pre-computed MuLan embedding for fusion (pass 2 of sequential loading)
+     * @param preDecodedAudio Pre-decoded audio to skip redundant decode+resample.
+     *   If provided and its sample rate matches the model's requirement, it's used directly.
+     *   This enables decode-once optimization: decode at 24kHz for MuLan, resample 24→16kHz,
+     *   cache the 16kHz audio, and pass it to the Flamingo pass.
      * @param onProgress Optional callback for status updates
      * @return All computed embeddings, or null on complete failure
      */
     fun processTrack(
         audioFile: File,
         existingMulan: FloatArray? = null,
+        preDecodedAudio: AudioDecoder.DecodedAudio? = null,
         onProgress: ((String) -> Unit)? = null,
     ): EmbeddingResult? {
-        // Decode audio at both sample rates
-        onProgress?.invoke("Decoding ${audioFile.name}...")
-
         var mulanEmbedding: FloatArray? = null
         var flamingoRawEmbedding: FloatArray? = null
         var flamingoReduced: FloatArray? = null
@@ -107,7 +109,9 @@ class EmbeddingProcessor(
 
         // MuQ-MuLan: decode at 24kHz
         if (mulanModel != null) {
-            val audio24k = audioDecoder.decode(audioFile, 24000)
+            onProgress?.invoke("Decoding ${audioFile.name}...")
+            val audio24k = if (preDecodedAudio?.sampleRate == 24000) preDecodedAudio
+                           else audioDecoder.decode(audioFile, 24000, maxDurationS = 900)
             if (audio24k != null) {
                 onProgress?.invoke("MuQ-MuLan inference...")
                 mulanEmbedding = mulanModel.generateEmbedding(audio24k)
@@ -116,7 +120,9 @@ class EmbeddingProcessor(
 
         // Flamingo: decode at 16kHz
         if (flamingoModel != null) {
-            val audio16k = audioDecoder.decode(audioFile, 16000)
+            onProgress?.invoke("Decoding ${audioFile.name}...")
+            val audio16k = if (preDecodedAudio?.sampleRate == 16000) preDecodedAudio
+                           else audioDecoder.decode(audioFile, 16000, maxDurationS = 1800)
             if (audio16k != null) {
                 onProgress?.invoke("Flamingo inference...")
                 flamingoRawEmbedding = flamingoModel.generateEmbedding(audio16k)

@@ -64,10 +64,32 @@ class MelSpectrogram(
     /**
      * Compute raw power mel spectrogram from audio samples.
      *
+     * Uses native C implementation via JNI when available (~2-4x faster),
+     * falls back to pure Kotlin otherwise.
+     *
      * @param audio PCM samples at [sampleRate] Hz
      * @return [nMels, numFrames] raw power mel spectrogram
      */
     fun compute(audio: FloatArray): Array<FloatArray> {
+        if (NativeMel.isAvailable) {
+            val flat = NativeMel.nativeComputeMel(
+                audio, sampleRate, nFft, hopLength, nMels, fMin, fMax,
+                center, melScale.ordinal,
+            )
+            if (flat != null && flat.isNotEmpty()) {
+                val numFrames = flat[0].toInt()
+                if (numFrames > 0 && flat.size == 1 + nMels * numFrames) {
+                    return Array(nMels) { m ->
+                        flat.copyOfRange(1 + m * numFrames, 1 + (m + 1) * numFrames)
+                    }
+                }
+            }
+        }
+        return computeKotlin(audio)
+    }
+
+    /** Pure Kotlin fallback for mel spectrogram computation. */
+    private fun computeKotlin(audio: FloatArray): Array<FloatArray> {
         // Optional center padding: reflect-pad nFft/2 on each side
         val input = if (center) reflectPad(audio, nFft / 2) else audio
 

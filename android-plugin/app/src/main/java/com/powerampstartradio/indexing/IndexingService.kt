@@ -177,6 +177,13 @@ class IndexingService : Service() {
                 // Track IDs from pass 1 for pass 2's fusion
                 val trackIds = mutableMapOf<NewTrackDetector.UnindexedTrack, Long>()
 
+                // Decode-once optimization: cache 16kHz audio during MuLan pass
+                // for Flamingo pass. Avoids redundant decode+resample (~50s/track).
+                val cachedAudio16k = if (hasMulan && hasFlamingo)
+                    mutableMapOf<NewTrackDetector.UnindexedTrack, AudioDecoder.DecodedAudio>()
+                else null
+                val audioDecoder = AudioDecoder()
+
                 // ── Pass 1: MuLan ──────────────────────────────────────
                 // Sequential loading: load MuLan first, process all tracks,
                 // close it before loading Flamingo. This avoids having multiple
@@ -213,7 +220,29 @@ class IndexingService : Service() {
                                 continue
                             }
 
-                            val embeddings = processor.processTrack(audioFile) { status ->
+                            // Decode at 24kHz for MuLan
+                            val audio24k = audioDecoder.decode(audioFile, 24000, maxDurationS = 900)
+                            if (audio24k == null) {
+                                Log.w(TAG, "Decode failed for: ${track.title}")
+                                if (!hasFlamingo) failed++
+                                continue
+                            }
+
+                            // Cache 16kHz version for Flamingo pass (resample 24→16kHz via soxr)
+                            if (cachedAudio16k != null) {
+                                try {
+                                    val samples16k = audioDecoder.resample(audio24k.samples, 24000, 16000)
+                                    cachedAudio16k[track] = AudioDecoder.DecodedAudio(
+                                        samples16k, 16000, samples16k.size.toFloat() / 16000
+                                    )
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "16kHz cache failed for ${track.title}: ${e.message}")
+                                }
+                            }
+
+                            val embeddings = processor.processTrack(
+                                audioFile, preDecodedAudio = audio24k
+                            ) { status ->
                                 updateNotification("MuLan ${i + 1}/${unindexed.size}: $status")
                             }
 
@@ -287,6 +316,9 @@ class IndexingService : Service() {
                                 continue
                             }
 
+                            // Use cached 16kHz audio from MuLan pass (decode-once optimization)
+                            val cached16k = cachedAudio16k?.remove(track)
+
                             // Read MuLan embedding from pass 1 for fusion
                             val existingTrackId = trackIds[track]
                             val existingMulan = if (existingTrackId != null) {
@@ -294,7 +326,9 @@ class IndexingService : Service() {
                             } else null
 
                             val embeddings = processor.processTrack(
-                                audioFile, existingMulan = existingMulan
+                                audioFile,
+                                existingMulan = existingMulan,
+                                preDecodedAudio = cached16k,
                             ) { status ->
                                 updateNotification("Flamingo ${i + 1}/${unindexed.size}: $status")
                             }

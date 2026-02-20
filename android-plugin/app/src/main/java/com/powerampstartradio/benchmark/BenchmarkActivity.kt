@@ -310,6 +310,13 @@ class BenchmarkActivity : ComponentActivity() {
         val decoder = AudioDecoder()
         var mulanEp: String? = null
         var flamingoEp: String? = null
+        val hasFlamingo = flamingoFile.exists()
+
+        // Cached 16kHz audio from MuLan pass for Flamingo (decode-once optimization)
+        val cachedAudio16k = arrayOfNulls<AudioDecoder.DecodedAudio>(testTracks.size)
+
+        log("Native mel: ${if (NativeMel.isAvailable) "YES" else "NO (Kotlin fallback)"}")
+        log("")
 
         // ── MuLan Pass ──
         if (mulanFile.exists()) {
@@ -333,16 +340,33 @@ class BenchmarkActivity : ComponentActivity() {
                     val audioFile = resolveFile(track.path)!!
 
                     try {
-                        val audio = decoder.decode(audioFile, 24000)
+                        val decodeStart = System.nanoTime()
+                        val audio = decoder.decode(audioFile, 24000, maxDurationS = 900)
+                        val decodeMs = (System.nanoTime() - decodeStart) / 1_000_000
                         if (audio == null) {
                             log("  Decode failed")
                             continue
                         }
-                        log("  Audio: ${audio.durationS}s @ ${audio.sampleRate}Hz")
+                        log("  Audio: ${audio.durationS}s @ ${audio.sampleRate}Hz (decode: ${decodeMs}ms)")
 
-                        val start = System.nanoTime()
+                        // Cache 16kHz version for Flamingo pass (resample 24→16kHz via soxr)
+                        if (hasFlamingo) {
+                            try {
+                                val resampleStart = System.nanoTime()
+                                val samples16k = decoder.resample(audio.samples, 24000, 16000)
+                                val resampleMs = (System.nanoTime() - resampleStart) / 1_000_000
+                                cachedAudio16k[i] = AudioDecoder.DecodedAudio(
+                                    samples16k, 16000, samples16k.size.toFloat() / 16000
+                                )
+                                log("  Cached 16kHz: ${samples16k.size} samples (resample: ${resampleMs}ms)")
+                            } catch (e: Exception) {
+                                log("  16kHz cache failed: ${e.message}")
+                            }
+                        }
+
+                        val inferStart = System.nanoTime()
                         val embedding = mulanInference.generateEmbedding(audio)
-                        val inferMs = (System.nanoTime() - start) / 1_000_000
+                        val inferMs = (System.nanoTime() - inferStart) / 1_000_000
 
                         if (embedding != null) {
                             log("  Embedding: ${embedding.size}d in ${inferMs}ms")
@@ -368,7 +392,7 @@ class BenchmarkActivity : ComponentActivity() {
         }
 
         // ── Flamingo Pass ──
-        if (flamingoFile.exists()) {
+        if (hasFlamingo) {
             log("\nLoading Flamingo model (requesting $accelerator)...")
             val loadStart = System.nanoTime()
             var flamingoInference: FlamingoInference? = null
@@ -390,16 +414,23 @@ class BenchmarkActivity : ComponentActivity() {
                     val audioFile = resolveFile(track.path)!!
 
                     try {
-                        val audio = decoder.decode(audioFile, 16000)
+                        // Use cached 16kHz audio from MuLan pass (decode-once optimization)
+                        val cached = cachedAudio16k[i]
+                        cachedAudio16k[i] = null  // free memory as we go
+
+                        val decodeStart = System.nanoTime()
+                        val audio = cached ?: decoder.decode(audioFile, 16000, maxDurationS = 1800)
+                        val decodeMs = (System.nanoTime() - decodeStart) / 1_000_000
                         if (audio == null) {
                             log("  Decode failed")
                             continue
                         }
-                        log("  Audio: ${audio.durationS}s @ ${audio.sampleRate}Hz")
+                        val source = if (cached != null) "cached" else "decoded"
+                        log("  Audio: ${audio.durationS}s @ ${audio.sampleRate}Hz ($source: ${decodeMs}ms)")
 
-                        val start = System.nanoTime()
+                        val inferStart = System.nanoTime()
                         val embedding = flamingoInference.generateEmbedding(audio)
-                        val inferMs = (System.nanoTime() - start) / 1_000_000
+                        val inferMs = (System.nanoTime() - inferStart) / 1_000_000
 
                         if (embedding != null) {
                             log("  Embedding: ${embedding.size}d in ${inferMs}ms")
