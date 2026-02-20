@@ -455,9 +455,9 @@ class BenchmarkActivity : ComponentActivity() {
         log("\nBenchmark complete.")
     }
 
-    /** Prefer weight-only INT8 models over FP32 originals. */
+    /** Prefer FP16 models (GPU-native, half size) over FP32 originals. */
     private fun resolveModelFile(dir: File, baseName: String): File {
-        val variants = listOf("_wo_wi8", "")
+        val variants = listOf("_fp16", "")
         for (suffix in variants) {
             val f = File(dir, "${baseName}${suffix}.tflite")
             if (f.exists()) {
