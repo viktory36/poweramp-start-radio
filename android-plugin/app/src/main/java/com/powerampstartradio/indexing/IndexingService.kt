@@ -42,8 +42,8 @@ class IndexingService : Service() {
         private const val NOTIFICATION_ID = 2
         private const val CHANNEL_ID = "indexing_service"
 
-        /** Model variant suffixes in preference order (NPU-optimized first). */
-        private val MODEL_VARIANTS = listOf("_fc_only_w8a16", "_fc_conv_w8a16", "_wo_wi8", "")
+        /** Model variant suffixes in preference order (GPU-optimized first). */
+        private val MODEL_VARIANTS = listOf("_wo_wi8", "_fc_only_w8a16", "_fc_conv_w8a16", "")
 
         const val ACTION_START_INDEXING = "com.powerampstartradio.START_INDEXING"
         const val ACTION_CANCEL = "com.powerampstartradio.CANCEL_INDEXING"
@@ -182,7 +182,7 @@ class IndexingService : Service() {
                 // Sequential loading: load MuLan first, process all tracks,
                 // close it before loading Flamingo. This avoids having multiple
                 // large models in memory simultaneously.
-                val accelerator = Accelerator.NPU
+                val accelerator = Accelerator.GPU
 
                 if (hasMulan) {
                     updateNotification("Loading MuQ-MuLan model...")
