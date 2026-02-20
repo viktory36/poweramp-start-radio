@@ -19,6 +19,41 @@ class NewTrackDetector(
         private const val TAG = "NewTrackDetector"
     }
 
+    /** Categorized reason why a track didn't match any embedded key. */
+    enum class FailureReason {
+        DURATION_ONLY,       // Same artist+album+title, duration differs
+        PIPE_IN_METADATA,    // Track has | in artist/album/title (desktop replaces with /)
+        ARTIST_MISMATCH,     // Artist differs (after normalization)
+        TITLE_MISMATCH,      // Same artist but title differs
+        NO_SIMILAR_KEY,      // No embedded key shares artist prefix at all
+    }
+
+    /** Diagnostic info for a single unmatched track. */
+    data class UnmatchedDetail(
+        val artist: String,
+        val album: String,
+        val title: String,
+        val durationMs: Int,
+        val powerampKey: String,
+        val closestEmbeddedKey: String?,
+        val failureReason: FailureReason,
+        val path: String?,
+    )
+
+    /** Full diagnostic result from matching analysis. */
+    data class DiagnosticResult(
+        val powerampCount: Int,
+        val embeddedKeyCount: Int,
+        val embeddedPathCount: Int,
+        val embeddedPathsSample: List<String>,
+        val exactKeyMatches: Int,
+        val partialMatches: Int,
+        val pathMatches: Int,
+        val unmatchedCount: Int,
+        val unmatchedSample: List<UnmatchedDetail>,
+        val failureCategories: Map<FailureReason, Int>,
+    )
+
     /**
      * A Poweramp track that needs to be indexed.
      */
@@ -111,6 +146,168 @@ class NewTrackDetector(
     }
 
     /**
+     * Run matching with full diagnostics — categorizes every failure reason.
+     * No inference, just detection + analysis.
+     *
+     * @param context Android context for querying Poweramp content provider
+     * @param onProgress Callback for progress updates
+     * @return Full diagnostic result with per-strategy counters and failure details
+     */
+    fun diagnoseMatching(
+        context: Context,
+        onProgress: (String) -> Unit = {},
+    ): DiagnosticResult {
+        onProgress("Querying Poweramp library...")
+        val powerampEntries = getAllPowerampEntriesWithPaths(context)
+        if (powerampEntries.isEmpty()) {
+            Log.w(TAG, "No entries from Poweramp library")
+            return DiagnosticResult(0, 0, 0, emptyList(), 0, 0, 0, 0, emptyList(), emptyMap())
+        }
+
+        onProgress("Loading embedded keys (${powerampEntries.size} Poweramp tracks)...")
+        val embeddedKeys = embeddingDb.getAllMetadataKeys()
+        val embeddedPaths = embeddingDb.getAllFilePaths()
+
+        Log.d(TAG, "Poweramp: ${powerampEntries.size}, Embedded: ${embeddedKeys.size} keys, ${embeddedPaths.size} paths")
+        onProgress("Matching ${powerampEntries.size} Poweramp tracks against ${embeddedKeys.size} embedded keys...")
+
+        // Build index for faster closest-key lookup: artist prefix → list of keys
+        val keysByArtist = HashMap<String, MutableList<String>>(embeddedKeys.size / 10)
+        for (key in embeddedKeys) {
+            val pipeIdx = key.indexOf('|')
+            val artist = if (pipeIdx >= 0) key.substring(0, pipeIdx) else key
+            keysByArtist.getOrPut(artist) { mutableListOf() }.add(key)
+        }
+
+        var exactKeyMatches = 0
+        var partialMatches = 0
+        var pathMatches = 0
+        val unmatched = mutableListOf<UnmatchedDetail>()
+        val failureCounts = mutableMapOf<FailureReason, Int>()
+
+        for ((i, entry) in powerampEntries.withIndex()) {
+            if (i % 10000 == 0 && i > 0) {
+                onProgress("Processing $i / ${powerampEntries.size}...")
+            }
+
+            // Strategy 1: Exact metadata key match
+            if (entry.metadataKey in embeddedKeys) {
+                exactKeyMatches++
+                continue
+            }
+
+            // Strategy 2: Partial match (artist+title, ignoring album+duration)
+            val artistTitlePrefix = "${entry.artist}|"
+            val titlePart = "|${entry.title}|"
+            val hasPartialMatch = embeddedKeys.any { key ->
+                key.startsWith(artistTitlePrefix) && key.contains(titlePart)
+            }
+            if (hasPartialMatch) {
+                partialMatches++
+                continue
+            }
+
+            // Strategy 3: File path match
+            if (entry.path != null && entry.path in embeddedPaths) {
+                pathMatches++
+                continue
+            }
+
+            // Unmatched — categorize failure
+            val reason = categorizeFailure(entry, keysByArtist)
+            failureCounts[reason] = (failureCounts[reason] ?: 0) + 1
+
+            // Keep first 200 samples for the JSON dump
+            if (unmatched.size < 200) {
+                val closest = findClosestKey(entry, keysByArtist)
+                unmatched.add(UnmatchedDetail(
+                    artist = entry.artist,
+                    album = entry.album,
+                    title = entry.title,
+                    durationMs = entry.durationMs,
+                    powerampKey = entry.metadataKey,
+                    closestEmbeddedKey = closest,
+                    failureReason = reason,
+                    path = entry.path,
+                ))
+            }
+        }
+
+        val result = DiagnosticResult(
+            powerampCount = powerampEntries.size,
+            embeddedKeyCount = embeddedKeys.size,
+            embeddedPathCount = embeddedPaths.size,
+            embeddedPathsSample = embeddedPaths.take(5).toList(),
+            exactKeyMatches = exactKeyMatches,
+            partialMatches = partialMatches,
+            pathMatches = pathMatches,
+            unmatchedCount = failureCounts.values.sum(),
+            unmatchedSample = unmatched,
+            failureCategories = failureCounts,
+        )
+
+        Log.i(TAG, "Diagnostic: exact=$exactKeyMatches, partial=$partialMatches, " +
+            "path=$pathMatches, unmatched=${failureCounts.values.sum()}")
+        Log.i(TAG, "Failure categories: $failureCounts")
+
+        return result
+    }
+
+    /** Categorize why a Poweramp entry didn't match any embedded key. */
+    private fun categorizeFailure(
+        entry: PowerampEntryWithPath,
+        keysByArtist: Map<String, List<String>>,
+    ): FailureReason {
+        // Check for pipe in raw metadata (desktop replaces | with /)
+        if ('|' in (entry.rawArtist ?: "") || '|' in (entry.rawAlbum ?: "") || '|' in (entry.rawTitle ?: "")) {
+            return FailureReason.PIPE_IN_METADATA
+        }
+
+        // Find keys with same artist
+        val sameArtist = keysByArtist[entry.artist]
+        if (sameArtist == null) {
+            return FailureReason.NO_SIMILAR_KEY
+        }
+
+        // Check if any key has same artist+title but different duration
+        val titlePart = "|${entry.title}|"
+        val hasTitleMatch = sameArtist.any { it.contains(titlePart) }
+        if (hasTitleMatch) {
+            return FailureReason.DURATION_ONLY
+        }
+
+        // Same artist exists but title doesn't match
+        return FailureReason.TITLE_MISMATCH
+    }
+
+    /** Find the closest embedded key for an unmatched entry (for diagnostic detail). */
+    private fun findClosestKey(
+        entry: PowerampEntryWithPath,
+        keysByArtist: Map<String, List<String>>,
+    ): String? {
+        // Try exact artist match first
+        val sameArtist = keysByArtist[entry.artist]
+        if (sameArtist != null) {
+            // Find key with most similar title
+            val titlePart = "|${entry.title}|"
+            // Prefer keys containing the title
+            val titleMatch = sameArtist.firstOrNull { it.contains(titlePart) }
+            if (titleMatch != null) return titleMatch
+            // Just return first key with same artist
+            return sameArtist.firstOrNull()
+        }
+
+        // Try pipe-replaced artist (desktop replaces | with /)
+        val pipeReplaced = entry.artist.replace("|", "/")
+        if (pipeReplaced != entry.artist) {
+            val pipeKeys = keysByArtist[pipeReplaced]
+            if (pipeKeys != null) return pipeKeys.firstOrNull()
+        }
+
+        return null
+    }
+
+    /**
      * Get all Poweramp file entries including file paths.
      * Extends PowerampHelper.getAllFileEntries with the path column.
      */
@@ -154,10 +351,12 @@ class NewTrackDetector(
                 val nameIdx = it.getColumnIndex("name")       // folder_files.name
 
                 while (it.moveToNext()) {
-                    val rawArtist = (it.getString(artistIdx) ?: "").lowercase().trim()
-                    val rawTitle = (it.getString(titleIdx) ?: "").lowercase().trim()
-                    val artist = normalizeNfc(normalizePowerampArtist(rawArtist))
-                    val title = normalizeNfc(stripAudioExtension(rawTitle))
+                    val lcArtist = (it.getString(artistIdx) ?: "").lowercase().trim()
+                    val lcTitle = (it.getString(titleIdx) ?: "").lowercase().trim()
+                    val lcAlbum = (it.getString(albumIdx) ?: "").lowercase().trim()
+                    val artist = normalizeNfc(normalizePowerampArtist(lcArtist))
+                    val album = normalizeNfc(lcAlbum)
+                    val title = normalizeNfc(stripAudioExtension(lcTitle))
 
                     val path = when {
                         pathIdx >= 0 && nameIdx >= 0 -> {
@@ -168,17 +367,19 @@ class NewTrackDetector(
                         else -> null
                     }
 
+                    val durationRounded = (it.getInt(durationIdx) * 1000 / 100) * 100
+
                     result.add(PowerampEntryWithPath(
                         id = it.getLong(idIdx),
                         artist = artist,
-                        album = normalizeNfc((it.getString(albumIdx) ?: "").lowercase().trim()),
+                        album = album,
                         title = title,
                         durationMs = it.getInt(durationIdx) * 1000,
                         path = path,
-                        metadataKey = run {
-                            val durationRounded = (it.getInt(durationIdx) * 1000 / 100) * 100
-                            "$artist|${normalizeNfc((it.getString(albumIdx) ?: "").lowercase().trim())}|$title|$durationRounded"
-                        }
+                        metadataKey = "$artist|$album|$title|$durationRounded",
+                        rawArtist = lcArtist,
+                        rawAlbum = lcAlbum,
+                        rawTitle = lcTitle,
                     ))
                 }
             }
@@ -197,6 +398,9 @@ class NewTrackDetector(
         val durationMs: Int,
         val path: String?,
         val metadataKey: String,
+        val rawArtist: String? = null,
+        val rawAlbum: String? = null,
+        val rawTitle: String? = null,
     )
 
     private fun normalizeNfc(s: String): String =

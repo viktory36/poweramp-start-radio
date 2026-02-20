@@ -21,6 +21,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.google.gson.GsonBuilder
 import com.google.ai.edge.litert.Accelerator
+import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.indexing.*
 import com.powerampstartradio.poweramp.PowerampHelper
 import kotlinx.coroutines.*
@@ -95,6 +96,20 @@ class BenchmarkActivity : ComponentActivity() {
             }
         }
 
+        fun startDiagnostics() {
+            running = true
+            status = "Starting matching diagnostics..."
+            scope.launch(Dispatchers.IO) {
+                try {
+                    runDiagnostics { msg -> status = msg }
+                } catch (e: Exception) {
+                    status = "ERROR: ${e.message}\n\n${e.stackTraceToString()}"
+                } finally {
+                    running = false
+                }
+            }
+        }
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -124,25 +139,34 @@ class BenchmarkActivity : ComponentActivity() {
             }
             Spacer(Modifier.height(12.dp))
 
-            Button(
-                onClick = {
-                    if (hasAudioPermission()) {
-                        startBenchmark()
-                    } else {
-                        status = "Requesting audio file permission..."
-                        onPermissionResult = { granted ->
-                            if (granted) {
-                                startBenchmark()
-                            } else {
-                                status = "Permission denied. Cannot read audio files."
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = {
+                        if (hasAudioPermission()) {
+                            startBenchmark()
+                        } else {
+                            status = "Requesting audio file permission..."
+                            onPermissionResult = { granted ->
+                                if (granted) {
+                                    startBenchmark()
+                                } else {
+                                    status = "Permission denied. Cannot read audio files."
+                                }
                             }
+                            permissionLauncher.launch(audioPermission)
                         }
-                        permissionLauncher.launch(audioPermission)
-                    }
-                },
-                enabled = !running,
-            ) {
-                Text(if (running) "Running..." else "Run Benchmark ($selectedAccelerator)")
+                    },
+                    enabled = !running,
+                ) {
+                    Text(if (running) "Running..." else "Benchmark ($selectedAccelerator)")
+                }
+
+                OutlinedButton(
+                    onClick = { startDiagnostics() },
+                    enabled = !running,
+                ) {
+                    Text("Diagnose Matching")
+                }
             }
 
             Spacer(Modifier.height(16.dp))
@@ -484,6 +508,95 @@ class BenchmarkActivity : ComponentActivity() {
             r.flamingo?.let { log("  Flamingo: ${it.dim}d, ${it.timingMs}ms, EP=${it.ep}") }
         }
         log("\nBenchmark complete.")
+    }
+
+    /**
+     * Run matching diagnostics: compare Poweramp library against embedding DB,
+     * categorize all match failures, and save detailed JSON for analysis.
+     */
+    private suspend fun runDiagnostics(onStatus: (String) -> Unit) {
+        val sb = StringBuilder()
+        fun log(msg: String) {
+            sb.appendLine(msg)
+            Log.i(TAG, msg)
+            onStatus(sb.toString())
+        }
+
+        log("=== Matching Diagnostics ===")
+        log("Device: ${Build.MANUFACTURER} ${Build.MODEL}")
+        log("")
+
+        // Open embedding database
+        val dbFile = File(filesDir, "embeddings.db")
+        if (!dbFile.exists()) {
+            log("ERROR: embeddings.db not found at ${dbFile.absolutePath}")
+            log("Copy your fused.db to ${dbFile.absolutePath} first.")
+            return
+        }
+
+        log("Opening embedding DB: ${dbFile.name} (${dbFile.length() / 1024 / 1024}MB)")
+        val embeddingDb = EmbeddingDatabase.open(dbFile)
+        try {
+            val detector = NewTrackDetector(embeddingDb)
+
+            log("Running diagnostic matching...")
+            val startTime = System.nanoTime()
+            val result = detector.diagnoseMatching(this@BenchmarkActivity) { progress ->
+                log(progress)
+            }
+            val elapsedMs = (System.nanoTime() - startTime) / 1_000_000
+
+            log("")
+            log("=== Results (${elapsedMs}ms) ===")
+            log("Poweramp tracks:  ${result.powerampCount}")
+            log("Embedded keys:    ${result.embeddedKeyCount}")
+            log("Embedded paths:   ${result.embeddedPathCount}")
+            log("")
+            log("Exact key match:  ${result.exactKeyMatches}")
+            log("Partial match:    ${result.partialMatches}")
+            log("Path match:       ${result.pathMatches}")
+            log("UNMATCHED:        ${result.unmatchedCount}")
+            log("")
+            log("--- Failure categories ---")
+            for ((reason, count) in result.failureCategories.entries.sortedByDescending { it.value }) {
+                log("  $reason: $count")
+            }
+
+            if (result.embeddedPathsSample.isNotEmpty()) {
+                log("")
+                log("--- Embedded path samples ---")
+                for (p in result.embeddedPathsSample) {
+                    log("  $p")
+                }
+            }
+
+            if (result.unmatchedSample.isNotEmpty()) {
+                log("")
+                log("--- Unmatched samples (first ${result.unmatchedSample.size}) ---")
+                for (u in result.unmatchedSample.take(10)) {
+                    log("  [${u.failureReason}] ${u.powerampKey}")
+                    if (u.closestEmbeddedKey != null) {
+                        log("    closest: ${u.closestEmbeddedKey}")
+                    }
+                }
+            }
+
+            // Save full JSON to external files dir (accessible via adb pull without root)
+            val gson = GsonBuilder().setPrettyPrinting().create()
+            val json = gson.toJson(result)
+            val outputDir = getExternalFilesDir(null) ?: filesDir
+            val outputFile = File(outputDir, "matching_diagnostics.json")
+            outputFile.writeText(json)
+
+            log("")
+            log("=== JSON saved ===")
+            log("File: ${outputFile.absolutePath}")
+            log("Pull: adb pull ${outputFile.absolutePath}")
+        } finally {
+            embeddingDb.close()
+        }
+
+        log("\nDiagnostics complete.")
     }
 
     /** Prefer FP16 models (GPU-native, half size) over FP32 originals. */
