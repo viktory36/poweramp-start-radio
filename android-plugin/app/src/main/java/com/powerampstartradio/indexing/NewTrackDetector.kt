@@ -217,9 +217,9 @@ class NewTrackDetector(
             val reason = categorizeFailure(entry, keysByArtist)
             failureCounts[reason] = (failureCounts[reason] ?: 0) + 1
 
-            // Keep first 200 samples for the JSON dump
-            if (unmatched.size < 200) {
-                val closest = findClosestKey(entry, keysByArtist)
+            // Keep all unmatched for analysis (closest key only for first 200)
+            {
+                val closest = if (unmatched.size < 200) findClosestKey(entry, keysByArtist) else null
                 unmatched.add(UnmatchedDetail(
                     artist = entry.artist,
                     album = entry.album,
