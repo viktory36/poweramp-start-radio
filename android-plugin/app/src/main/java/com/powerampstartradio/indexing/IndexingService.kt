@@ -42,6 +42,9 @@ class IndexingService : Service() {
         private const val NOTIFICATION_ID = 2
         private const val CHANNEL_ID = "indexing_service"
 
+        /** Model variant suffixes in preference order (NPU-optimized first). */
+        private val MODEL_VARIANTS = listOf("_fc_conv_w8a16", "_wo_wi8", "")
+
         const val ACTION_START_INDEXING = "com.powerampstartradio.START_INDEXING"
         const val ACTION_CANCEL = "com.powerampstartradio.CANCEL_INDEXING"
 
@@ -138,9 +141,9 @@ class IndexingService : Service() {
                 Log.i(TAG, "Found ${unindexed.size} unindexed tracks")
                 updateNotification("Found ${unindexed.size} new tracks")
 
-                val mulanFile = File(filesDir, "mulan_audio.tflite")
-                val flamingoFile = File(filesDir, "flamingo_encoder.tflite")
-                val projectorFile = File(filesDir, "flamingo_projector.tflite")
+                val mulanFile = resolveModelFile(filesDir, "mulan_audio")
+                val flamingoFile = resolveModelFile(filesDir, "flamingo_encoder")
+                val projectorFile = resolveModelFile(filesDir, "flamingo_projector")
 
                 val hasMulan = mulanFile.exists()
                 val hasFlamingo = flamingoFile.exists()
@@ -363,6 +366,21 @@ class IndexingService : Service() {
                 releaseWakeLock()
             }
         }
+    }
+
+    /**
+     * Find the best available model variant.
+     * Prefers NPU-optimized FC+Conv W8A16, then weight-only INT8, then FP32.
+     */
+    private fun resolveModelFile(dir: File, baseName: String): File {
+        for (suffix in MODEL_VARIANTS) {
+            val f = File(dir, "${baseName}${suffix}.tflite")
+            if (f.exists()) {
+                Log.i(TAG, "Model resolved: ${f.name}")
+                return f
+            }
+        }
+        return File(dir, "${baseName}.tflite")  // default (may not exist)
     }
 
     /**

@@ -293,9 +293,9 @@ class BenchmarkActivity : ComponentActivity() {
         }
         log("Selected ${testTracks.size} tracks (resolved $resolveAttempts attempts)\n")
 
-        val mulanFile = File(filesDir, "mulan_audio.tflite")
-        val flamingoFile = File(filesDir, "flamingo_encoder.tflite")
-        val projectorFile = File(filesDir, "flamingo_projector.tflite")
+        val mulanFile = resolveModelFile(filesDir, "mulan_audio")
+        val flamingoFile = resolveModelFile(filesDir, "flamingo_encoder")
+        val projectorFile = resolveModelFile(filesDir, "flamingo_projector")
 
         val results = mutableListOf<TrackResult>()
         // Pre-populate results list so both passes write to the same entries
@@ -453,6 +453,19 @@ class BenchmarkActivity : ComponentActivity() {
             r.flamingo?.let { log("  Flamingo: ${it.dim}d, ${it.timingMs}ms, EP=${it.ep}") }
         }
         log("\nBenchmark complete.")
+    }
+
+    /** Prefer weight-only INT8 models over FP32 originals. */
+    private fun resolveModelFile(dir: File, baseName: String): File {
+        val variants = listOf("_fc_conv_w8a16", "_wo_wi8", "")
+        for (suffix in variants) {
+            val f = File(dir, "${baseName}${suffix}.tflite")
+            if (f.exists()) {
+                Log.i(TAG, "Model resolved: ${f.name}")
+                return f
+            }
+        }
+        return File(dir, "${baseName}.tflite")
     }
 
     private fun resolveFile(path: String): File? {
