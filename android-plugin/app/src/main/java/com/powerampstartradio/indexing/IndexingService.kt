@@ -43,7 +43,7 @@ class IndexingService : Service() {
         private const val CHANNEL_ID = "indexing_service"
 
         /** Model variant suffixes in preference order (NPU-optimized first). */
-        private val MODEL_VARIANTS = listOf("_fc_conv_w8a16", "_wo_wi8", "")
+        private val MODEL_VARIANTS = listOf("_fc_only_w8a16", "_fc_conv_w8a16", "_wo_wi8", "")
 
         const val ACTION_START_INDEXING = "com.powerampstartradio.START_INDEXING"
         const val ACTION_CANCEL = "com.powerampstartradio.CANCEL_INDEXING"

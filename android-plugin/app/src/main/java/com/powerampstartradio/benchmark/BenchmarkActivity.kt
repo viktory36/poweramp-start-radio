@@ -457,7 +457,7 @@ class BenchmarkActivity : ComponentActivity() {
 
     /** Prefer weight-only INT8 models over FP32 originals. */
     private fun resolveModelFile(dir: File, baseName: String): File {
-        val variants = listOf("_fc_conv_w8a16", "_wo_wi8", "")
+        val variants = listOf("_fc_only_w8a16", "_fc_conv_w8a16", "_wo_wi8", "")
         for (suffix in variants) {
             val f = File(dir, "${baseName}${suffix}.tflite")
             if (f.exists()) {
