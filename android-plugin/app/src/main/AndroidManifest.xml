@@ -24,9 +24,6 @@
         android:theme="@style/Theme.PowerampStartRadio"
         tools:targetApi="34">
 
-        <!-- Qualcomm DSP FastRPC library (optional, for NPU acceleration) -->
-        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
-
         <!-- Main Activity -->
         <activity
             android:name=".MainActivity"

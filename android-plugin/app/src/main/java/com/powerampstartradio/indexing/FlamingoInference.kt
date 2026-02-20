@@ -1,6 +1,5 @@
 package com.powerampstartradio.indexing
 
-import android.content.Context
 import android.util.Log
 import com.google.ai.edge.litert.Accelerator
 import com.google.ai.edge.litert.CompiledModel
@@ -29,14 +28,12 @@ import kotlin.math.min
  *
  * @param encoderFile Path to the encoder .tflite model
  * @param projectorFile Path to the projector .tflite model (optional)
- * @param accelerator Hardware accelerator to use (NPU, GPU, CPU). Falls back automatically.
- * @param context Android context (required for NPU acceleration)
+ * @param accelerator Hardware accelerator to use (GPU or CPU). Falls back to CPU if GPU fails.
  */
 class FlamingoInference(
     encoderFile: File,
     projectorFile: File? = null,
-    accelerator: Accelerator = Accelerator.CPU,
-    context: Context? = null,
+    accelerator: Accelerator = Accelerator.GPU,
 ) {
 
     companion object {
@@ -75,7 +72,7 @@ class FlamingoInference(
 
     init {
         // Load encoder
-        val encResult = createModelWithFallback(encoderFile.absolutePath, accelerator, context)
+        val encResult = createModelWithFallback(encoderFile.absolutePath, accelerator)
         encoderModel = encResult.first
         activeAccelerator = encResult.second
 
@@ -84,7 +81,7 @@ class FlamingoInference(
 
         // Load projector (if available)
         if (projectorFile != null && projectorFile.exists()) {
-            val projResult = createModelWithFallback(projectorFile.absolutePath, activeAccelerator, context)
+            val projResult = createModelWithFallback(projectorFile.absolutePath, activeAccelerator)
             projectorModel = projResult.first
             projectorInputBuffers = projectorModel.createInputBuffers()
             projectorOutputBuffers = projectorModel.createOutputBuffers()

@@ -1,11 +1,8 @@
 package com.powerampstartradio.indexing
 
 import android.util.Log
-import android.content.Context
 import com.google.ai.edge.litert.Accelerator
-import com.google.ai.edge.litert.BuiltinNpuAcceleratorProvider
 import com.google.ai.edge.litert.CompiledModel
-import com.google.ai.edge.litert.Environment
 import com.google.ai.edge.litert.TensorBuffer
 import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
@@ -31,13 +28,11 @@ import kotlin.math.sqrt
  * - Average all clip embeddings, L2-normalize
  *
  * @param modelFile Path to the .tflite model file
- * @param accelerator Hardware accelerator to use (NPU, GPU, CPU). Falls back automatically.
- * @param context Android context (required for NPU acceleration)
+ * @param accelerator Hardware accelerator to use (GPU or CPU). Falls back to CPU if GPU fails.
  */
 class MuLanInference(
     modelFile: File,
-    accelerator: Accelerator = Accelerator.CPU,
-    context: Context? = null,
+    accelerator: Accelerator = Accelerator.GPU,
 ) {
 
     companion object {
@@ -108,8 +103,7 @@ class MuLanInference(
             fMax = effectiveFMax.toFloat(),
         )
 
-        // Create model with NPU/GPU/CPU fallback (matches Google's official sample pattern)
-        val result = createModelWithFallback(modelFile.absolutePath, accelerator, context)
+        val result = createModelWithFallback(modelFile.absolutePath, accelerator)
         model = result.first
         activeAccelerator = result.second
 
@@ -278,85 +272,34 @@ internal fun l2Normalize(arr: FloatArray) {
 /**
  * Create a CompiledModel with hardware acceleration fallback.
  *
- * Follows Google's official LiteRT NPU sample pattern:
- * - Creates Environment with BuiltinNpuAcceleratorProvider (sets ADSP_LIBRARY_PATH)
- * - Sets QualcommOptions for HTP high performance mode
- * - Falls back: NPU → GPU → CPU
- *
- * Requires in jniLibs/arm64-v8a/:
- * - libLiteRtCompilerPlugin_Qualcomm.so + libLiteRtDispatch_Qualcomm.so (from LiteRT JIT ZIP)
- * - libQnnHtp.so, libQnnHtpPrepare.so, libQnnHtpV75Skel.so, libQnnHtpV75Stub.so,
- *   libQnnSystem.so (from QNN runtime)
+ * Tries the requested accelerator first, falls back to CPU if it fails.
+ * GPU is the recommended default — it provides hardware acceleration on
+ * virtually all modern Android devices via OpenCL/OpenGL.
  *
  * @param path Model file path
- * @param requested Desired accelerator
- * @param context Android context (required for NPU, optional otherwise)
+ * @param requested Desired accelerator (GPU or CPU)
  * @return Pair of (CompiledModel, actual Accelerator used)
  */
 internal fun createModelWithFallback(
     path: String,
     requested: Accelerator,
-    context: Context? = null,
 ): Pair<CompiledModel, Accelerator> {
-    // Build fallback chain based on requested accelerator
     val chain = when (requested) {
-        Accelerator.NPU -> listOf(Accelerator.NPU, Accelerator.GPU, Accelerator.CPU)
         Accelerator.GPU -> listOf(Accelerator.GPU, Accelerator.CPU)
         else -> listOf(Accelerator.CPU)
     }
 
-    // Set ADSP_LIBRARY_PATH so the QNN compiler plugin (JIT) can find HTP skel
-    // libraries in the app's native lib directory. Without this, the compiler
-    // plugin searches only default vendor paths (/vendor/dsp/, /vendor/lib/rfsa/...)
-    // and fails to create a device handle. The dispatch layer adds this path
-    // automatically, but the compiler plugin does not.
-    if (context != null && requested == Accelerator.NPU) {
-        try {
-            val nativeLibDir = context.applicationInfo.nativeLibraryDir
-            android.system.Os.setenv("ADSP_LIBRARY_PATH", nativeLibDir, true)
-            Log.i("LiteRT", "Set ADSP_LIBRARY_PATH=$nativeLibDir")
-        } catch (e: Exception) {
-            Log.w("LiteRT", "Failed to set ADSP_LIBRARY_PATH: ${e.message}")
-        }
-    }
-
-    // Create NPU environment (always, as per Google's sample)
-    val env = if (context != null) {
-        try {
-            Environment.create(BuiltinNpuAcceleratorProvider(context))
-        } catch (e: Exception) {
-            Log.w("LiteRT", "Failed to create NPU environment: ${e.message}")
-            null
-        }
-    } else null
-
     for (accel in chain) {
         try {
-            val options = CompiledModel.Options(accel)
-            if (accel == Accelerator.NPU) {
-                options.qualcommOptions = CompiledModel.QualcommOptions(
-                    htpPerformanceMode = CompiledModel.QualcommOptions.HtpPerformanceMode.HIGH_PERFORMANCE,
-                )
-            }
-
-            val model = if (env != null) {
-                CompiledModel.create(path, options, env)
-            } else {
-                CompiledModel.create(path, options)
-            }
-
+            val model = CompiledModel.create(path, CompiledModel.Options(accel))
             Log.i("LiteRT", "Created model with $accel accelerator")
             return model to accel
         } catch (e: Exception) {
             Log.w("LiteRT", "$accel failed: ${e.message}")
-            if (accel == chain.last()) {
-                // Last in chain failed — rethrow
-                throw e
-            }
+            if (accel == chain.last()) throw e
         }
     }
 
-    // Should not reach here, but just in case
     val model = CompiledModel.create(path, CompiledModel.Options(Accelerator.CPU))
     return model to Accelerator.CPU
 }

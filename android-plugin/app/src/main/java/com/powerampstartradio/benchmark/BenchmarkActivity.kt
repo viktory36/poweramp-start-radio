@@ -114,7 +114,7 @@ class BenchmarkActivity : ComponentActivity() {
 
             // Accelerator selector
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                for (accel in listOf(Accelerator.CPU, Accelerator.GPU, Accelerator.NPU)) {
+                for (accel in listOf(Accelerator.CPU, Accelerator.GPU)) {
                     FilterChip(
                         selected = selectedAccelerator == accel,
                         onClick = { if (!running) selectedAccelerator = accel },
@@ -317,7 +317,7 @@ class BenchmarkActivity : ComponentActivity() {
             val loadStart = System.nanoTime()
             var mulanInference: MuLanInference? = null
             try {
-                mulanInference = MuLanInference(mulanFile, accelerator, this@BenchmarkActivity)
+                mulanInference = MuLanInference(mulanFile, accelerator)
                 val loadMs = (System.nanoTime() - loadStart) / 1_000_000
                 log("  MuLan loaded in ${loadMs}ms (${mulanInference.activeAccelerator})")
             } catch (e: Exception) {
@@ -373,7 +373,7 @@ class BenchmarkActivity : ComponentActivity() {
             val loadStart = System.nanoTime()
             var flamingoInference: FlamingoInference? = null
             try {
-                flamingoInference = FlamingoInference(flamingoFile, projectorFile, accelerator, this@BenchmarkActivity)
+                flamingoInference = FlamingoInference(flamingoFile, projectorFile, accelerator)
                 val loadMs = (System.nanoTime() - loadStart) / 1_000_000
                 log("  Flamingo loaded in ${loadMs}ms (${flamingoInference.activeAccelerator})")
                 log("  Output dim: ${flamingoInference.outputDim}")
@@ -457,7 +457,7 @@ class BenchmarkActivity : ComponentActivity() {
 
     /** Prefer weight-only INT8 models over FP32 originals. */
     private fun resolveModelFile(dir: File, baseName: String): File {
-        val variants = listOf("_wo_wi8", "_fc_only_w8a16", "_fc_conv_w8a16", "")
+        val variants = listOf("_wo_wi8", "")
         for (suffix in variants) {
             val f = File(dir, "${baseName}${suffix}.tflite")
             if (f.exists()) {

@@ -13,7 +13,6 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.powerampstartradio.MainActivity
 import com.powerampstartradio.R
-import com.google.ai.edge.litert.Accelerator
 import com.powerampstartradio.data.EmbeddingDatabase
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -42,8 +41,8 @@ class IndexingService : Service() {
         private const val NOTIFICATION_ID = 2
         private const val CHANNEL_ID = "indexing_service"
 
-        /** Model variant suffixes in preference order (GPU-optimized first). */
-        private val MODEL_VARIANTS = listOf("_wo_wi8", "_fc_only_w8a16", "_fc_conv_w8a16", "")
+        /** Model variant suffixes in preference order: weight-only INT8, then FP32. */
+        private val MODEL_VARIANTS = listOf("_wo_wi8", "")
 
         const val ACTION_START_INDEXING = "com.powerampstartradio.START_INDEXING"
         const val ACTION_CANCEL = "com.powerampstartradio.CANCEL_INDEXING"
@@ -182,11 +181,10 @@ class IndexingService : Service() {
                 // Sequential loading: load MuLan first, process all tracks,
                 // close it before loading Flamingo. This avoids having multiple
                 // large models in memory simultaneously.
-                val accelerator = Accelerator.GPU
 
                 if (hasMulan) {
                     updateNotification("Loading MuQ-MuLan model...")
-                    val mulanInference = try { MuLanInference(mulanFile, accelerator, this@IndexingService) }
+                    val mulanInference = try { MuLanInference(mulanFile) }
                     catch (e: Exception) {
                         Log.e(TAG, "Failed to load MuQ-MuLan", e)
                         null
@@ -252,7 +250,7 @@ class IndexingService : Service() {
                 if (hasFlamingo) {
                     updateNotification("Loading Flamingo model...")
                     val flamingoInference = try {
-                        FlamingoInference(flamingoFile, projectorFile, accelerator, this@IndexingService)
+                        FlamingoInference(flamingoFile, projectorFile)
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to load Flamingo", e)
                         null
@@ -370,7 +368,7 @@ class IndexingService : Service() {
 
     /**
      * Find the best available model variant.
-     * Prefers NPU-optimized FC+Conv W8A16, then weight-only INT8, then FP32.
+     * Prefers weight-only INT8 (smaller, same quality), then FP32.
      */
     private fun resolveModelFile(dir: File, baseName: String): File {
         for (suffix in MODEL_VARIANTS) {
