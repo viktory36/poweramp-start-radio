@@ -5,7 +5,7 @@
  * - Periodic Hann window
  * - Radix-2 Cooley-Tukey FFT for power-of-2 nFft
  * - Bluestein's algorithm for non-power-of-2 nFft (e.g., Whisper's 400)
- * - Slaney + HTK mel filterbanks with area normalization
+ * - Slaney + HTK mel filterbanks with optional area normalization
  * - Reflect padding for center=true
  */
 #include <jni.h>
@@ -154,7 +154,8 @@ Java_com_powerampstartradio_indexing_NativeMel_nativeComputeMel(
     jfloat fMin,
     jfloat fMax,
     jboolean center,
-    jint melScale)
+    jint melScale,
+    jboolean normalize)
 {
     jsize audioLen = (*env)->GetArrayLength(env, audioArray);
     jfloat *audio = (*env)->GetFloatArrayElements(env, audioArray, NULL);
@@ -228,7 +229,7 @@ Java_com_powerampstartradio_indexing_NativeMel_nativeComputeMel(
             float left  = freq_hz[m];
             float cent  = freq_hz[m + 1];
             float right = freq_hz[m + 2];
-            float enorm = 2.0f / (right - left);
+            float enorm = normalize ? 2.0f / (right - left) : 1.0f;
 
             for (int k = 0; k < n_freqs; k++) {
                 float f = (float)k * (float)sampleRate / (float)nFft;

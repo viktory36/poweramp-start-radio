@@ -46,5 +46,6 @@ object NativeMel {
         fMax: Float,
         center: Boolean,
         melScale: Int,  // 0 = HTK, 1 = SLANEY
+        normalize: Boolean,  // Slaney area normalization (true for Whisper, false for MuLan)
     ): FloatArray?
 }

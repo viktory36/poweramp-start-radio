@@ -44,6 +44,8 @@ class MelSpectrogram(
     private val fMax: Float = 8000f,
     private val center: Boolean = false,
     private val melScale: MelScale = MelScale.HTK,
+    /** Slaney-style area normalization (2/(upper-lower)). True for Whisper, false for MuLan. */
+    private val normalize: Boolean = true,
 ) {
 
     // Precomputed periodic Hann window (matches np.hanning with periodic=True)
@@ -74,7 +76,7 @@ class MelSpectrogram(
         if (NativeMel.isAvailable) {
             val flat = NativeMel.nativeComputeMel(
                 audio, sampleRate, nFft, hopLength, nMels, fMin, fMax,
-                center, melScale.ordinal,
+                center, melScale.ordinal, normalize,
             )
             if (flat != null && flat.isNotEmpty()) {
                 val numFrames = flat[0].toInt()
@@ -240,9 +242,11 @@ class MelSpectrogram(
                 }
             }
 
-            val enorm = 2f / (right - left)
-            for (k in 0 until nFreqs) {
-                filters[m][k] *= enorm
+            if (normalize) {
+                val enorm = 2f / (right - left)
+                for (k in 0 until nFreqs) {
+                    filters[m][k] *= enorm
+                }
             }
         }
 

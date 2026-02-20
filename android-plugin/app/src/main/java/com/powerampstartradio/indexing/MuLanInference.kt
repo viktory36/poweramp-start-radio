@@ -101,6 +101,8 @@ class MuLanInference(
             nMels = melParams.nMels.toInt(),
             fMin = melParams.fMin.toFloat(),
             fMax = effectiveFMax.toFloat(),
+            center = true,      // MuQ-MuLan uses torchaudio default center=True
+            normalize = false,  // torchaudio default norm=None (no area normalization)
         )
 
         val result = createReadyModel(modelFile.absolutePath, accelerator)
