@@ -103,12 +103,11 @@ class MuLanInference(
             fMax = effectiveFMax.toFloat(),
         )
 
-        val result = createModelWithFallback(modelFile.absolutePath, accelerator)
-        model = result.first
-        activeAccelerator = result.second
-
-        inputBuffers = model.createInputBuffers()
-        outputBuffers = model.createOutputBuffers()
+        val result = createReadyModel(modelFile.absolutePath, accelerator)
+        model = result.model
+        activeAccelerator = result.accelerator
+        inputBuffers = result.inputBuffers
+        outputBuffers = result.outputBuffers
 
         Log.i(TAG, "MuQ-MuLan loaded: ${modelFile.name} " +
                 "(${modelFile.length() / 1024 / 1024}MB), accelerator=$activeAccelerator")
@@ -269,37 +268,38 @@ internal fun l2Normalize(arr: FloatArray) {
     }
 }
 
+/** A fully initialized model with pre-allocated I/O buffers. */
+internal data class ReadyModel(
+    val model: CompiledModel,
+    val inputBuffers: List<TensorBuffer>,
+    val outputBuffers: List<TensorBuffer>,
+    val accelerator: Accelerator,
+)
+
 /**
- * Create a CompiledModel with hardware acceleration fallback.
+ * Create a CompiledModel and allocate I/O buffers.
  *
- * Tries the requested accelerator first, falls back to CPU if it fails.
- * GPU is the recommended default — it provides hardware acceleration on
- * virtually all modern Android devices via OpenCL/OpenGL.
+ * Uses the requested accelerator (GPU or CPU). If model compilation
+ * succeeds but buffer allocation fails (e.g. GPU OOM), the model is
+ * properly closed before the exception propagates.
  *
  * @param path Model file path
- * @param requested Desired accelerator (GPU or CPU)
- * @return Pair of (CompiledModel, actual Accelerator used)
+ * @param accelerator Desired accelerator (GPU or CPU)
+ * @return ReadyModel with model, I/O buffers, and accelerator
  */
-internal fun createModelWithFallback(
+internal fun createReadyModel(
     path: String,
-    requested: Accelerator,
-): Pair<CompiledModel, Accelerator> {
-    val chain = when (requested) {
-        Accelerator.GPU -> listOf(Accelerator.GPU, Accelerator.CPU)
-        else -> listOf(Accelerator.CPU)
+    accelerator: Accelerator,
+): ReadyModel {
+    var model: CompiledModel? = null
+    try {
+        model = CompiledModel.create(path, CompiledModel.Options(accelerator))
+        val inputBuffers = model.createInputBuffers()
+        val outputBuffers = model.createOutputBuffers()
+        Log.i("LiteRT", "Model ready with $accelerator accelerator")
+        return ReadyModel(model, inputBuffers, outputBuffers, accelerator)
+    } catch (e: Exception) {
+        model?.close()
+        throw e
     }
-
-    for (accel in chain) {
-        try {
-            val model = CompiledModel.create(path, CompiledModel.Options(accel))
-            Log.i("LiteRT", "Created model with $accel accelerator")
-            return model to accel
-        } catch (e: Exception) {
-            Log.w("LiteRT", "$accel failed: ${e.message}")
-            if (accel == chain.last()) throw e
-        }
-    }
-
-    val model = CompiledModel.create(path, CompiledModel.Options(Accelerator.CPU))
-    return model to Accelerator.CPU
 }

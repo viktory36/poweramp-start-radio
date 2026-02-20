@@ -71,21 +71,20 @@ class FlamingoInference(
     private val melFlat = FloatArray(N_MELS * NUM_MEL_FRAMES)
 
     init {
-        // Load encoder
-        val encResult = createModelWithFallback(encoderFile.absolutePath, accelerator)
-        encoderModel = encResult.first
-        activeAccelerator = encResult.second
-
-        encoderInputBuffers = encoderModel.createInputBuffers()
-        encoderOutputBuffers = encoderModel.createOutputBuffers()
+        // Load encoder with GPU→CPU fallback (covers both compilation and buffer allocation)
+        val encResult = createReadyModel(encoderFile.absolutePath, accelerator)
+        encoderModel = encResult.model
+        activeAccelerator = encResult.accelerator
+        encoderInputBuffers = encResult.inputBuffers
+        encoderOutputBuffers = encResult.outputBuffers
 
         // Load projector on CPU — it's only 7 ops (linear projection), negligible
         // overhead, and keeps GPU memory free for the encoder.
         if (projectorFile != null && projectorFile.exists()) {
-            val projResult = createModelWithFallback(projectorFile.absolutePath, Accelerator.CPU)
-            projectorModel = projResult.first
-            projectorInputBuffers = projectorModel.createInputBuffers()
-            projectorOutputBuffers = projectorModel.createOutputBuffers()
+            val projResult = createReadyModel(projectorFile.absolutePath, Accelerator.CPU)
+            projectorModel = projResult.model
+            projectorInputBuffers = projResult.inputBuffers
+            projectorOutputBuffers = projResult.outputBuffers
             outputDim = PROJECTED_DIM
         } else {
             projectorModel = null
