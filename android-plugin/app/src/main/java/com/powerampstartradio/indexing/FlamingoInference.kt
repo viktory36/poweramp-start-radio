@@ -79,9 +79,10 @@ class FlamingoInference(
         encoderInputBuffers = encoderModel.createInputBuffers()
         encoderOutputBuffers = encoderModel.createOutputBuffers()
 
-        // Load projector (if available)
+        // Load projector on CPU — it's only 7 ops (linear projection), negligible
+        // overhead, and keeps GPU memory free for the encoder.
         if (projectorFile != null && projectorFile.exists()) {
-            val projResult = createModelWithFallback(projectorFile.absolutePath, activeAccelerator)
+            val projResult = createModelWithFallback(projectorFile.absolutePath, Accelerator.CPU)
             projectorModel = projResult.first
             projectorInputBuffers = projectorModel.createInputBuffers()
             projectorOutputBuffers = projectorModel.createOutputBuffers()
