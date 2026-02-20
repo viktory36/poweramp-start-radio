@@ -12,7 +12,9 @@ logger = logging.getLogger(__name__)
 
 def _normalize_field(value: str) -> str:
     """Lowercase, strip, NFC-normalize, and remove pipe characters from a metadata field."""
-    return unicodedata.normalize('NFC', value.lower().strip().replace("|", "/"))
+    # NFC before lower() prevents decomposition from .lower() on precomposed chars (e.g. İ)
+    nfc = unicodedata.normalize('NFC', value)
+    return unicodedata.normalize('NFC', nfc.lower().strip().replace("|", "/"))
 
 
 @dataclass

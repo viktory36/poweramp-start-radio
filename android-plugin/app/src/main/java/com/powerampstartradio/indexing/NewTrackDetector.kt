@@ -105,7 +105,9 @@ class NewTrackDetector(
         }
 
         // Get all embedded track metadata keys and file paths
-        val embeddedKeys = embeddingDb.getAllMetadataKeys()
+        // NFC-normalize loaded keys — some DB entries have NFD despite desktop claiming NFC
+        val rawKeys = embeddingDb.getAllMetadataKeys()
+        val embeddedKeys = rawKeys.mapTo(HashSet<String>(rawKeys.size)) { normalizeNfc(it) }
         val embeddedPaths = embeddingDb.getAllFilePaths()
 
         Log.d(TAG, "Poweramp: ${powerampEntries.size} tracks, " +
@@ -127,6 +129,16 @@ class NewTrackDetector(
                 key.startsWith(artistTitlePrefix) && key.contains(titlePart)
             }
             if (hasPartialMatch) continue
+
+            // Check semicolon artist split (Poweramp: "artist1; artist2", DB: "artist1")
+            if (';' in entry.artist) {
+                val primaryArtist = entry.artist.substringBefore(';').trim()
+                val primaryPrefix = "$primaryArtist|"
+                val hasPrimaryMatch = embeddedKeys.any { key ->
+                    key.startsWith(primaryPrefix) && key.contains(titlePart)
+                }
+                if (hasPrimaryMatch) continue
+            }
 
             // Check file path match (Poweramp path may match embedded file_path)
             if (entry.path != null && entry.path in embeddedPaths) continue
@@ -165,7 +177,9 @@ class NewTrackDetector(
         }
 
         onProgress("Loading embedded keys (${powerampEntries.size} Poweramp tracks)...")
-        val embeddedKeys = embeddingDb.getAllMetadataKeys()
+        // NFC-normalize loaded keys — some DB entries have NFD despite desktop claiming NFC
+        val rawKeys = embeddingDb.getAllMetadataKeys()
+        val embeddedKeys = rawKeys.mapTo(HashSet<String>(rawKeys.size)) { normalizeNfc(it) }
         val embeddedPaths = embeddingDb.getAllFilePaths()
 
         Log.d(TAG, "Poweramp: ${powerampEntries.size}, Embedded: ${embeddedKeys.size} keys, ${embeddedPaths.size} paths")
@@ -205,6 +219,19 @@ class NewTrackDetector(
             if (hasPartialMatch) {
                 partialMatches++
                 continue
+            }
+
+            // Strategy 2b: Semicolon artist split (Poweramp: "artist1; artist2", DB: "artist1")
+            if (';' in entry.artist) {
+                val primaryArtist = entry.artist.substringBefore(';').trim()
+                val primaryPrefix = "$primaryArtist|"
+                val hasPrimaryMatch = embeddedKeys.any { key ->
+                    key.startsWith(primaryPrefix) && key.contains(titlePart)
+                }
+                if (hasPrimaryMatch) {
+                    partialMatches++
+                    continue
+                }
             }
 
             // Strategy 3: File path match
@@ -365,14 +392,14 @@ class NewTrackDetector(
                         else -> null
                     }
 
-                    val durationRounded = (it.getInt(durationIdx) * 1000 / 100) * 100
+                    val durationRounded = (it.getInt(durationIdx) / 100) * 100
 
                     result.add(PowerampEntryWithPath(
                         id = it.getLong(idIdx),
                         artist = artist,
                         album = album,
                         title = title,
-                        durationMs = it.getInt(durationIdx) * 1000,
+                        durationMs = it.getInt(durationIdx),
                         path = path,
                         metadataKey = "$artist|$album|$title|$durationRounded",
                         rawArtist = lcArtist,
