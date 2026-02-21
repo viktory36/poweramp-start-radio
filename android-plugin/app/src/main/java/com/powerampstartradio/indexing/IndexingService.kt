@@ -20,6 +20,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -234,6 +235,7 @@ class IndexingService : Service() {
                         )
 
                         for ((i, track) in unindexed.withIndex()) {
+                            ensureActive()
                             val elapsed = System.currentTimeMillis() - batchStartTime
                             val eta = if (i > 0) elapsed * (unindexed.size - i) / i else 0L
                             _state.value = IndexingState.Processing(
@@ -338,6 +340,7 @@ class IndexingService : Service() {
                         )
 
                         for ((i, track) in unindexed.withIndex()) {
+                            ensureActive()
                             val elapsed = System.currentTimeMillis() - pass2StartTime
                             val eta = if (i > 0) elapsed * (unindexed.size - i) / i else 0L
                             _state.value = IndexingState.Processing(
