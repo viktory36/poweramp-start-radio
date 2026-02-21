@@ -54,8 +54,22 @@ class IndexingService : Service() {
         private val _state = MutableStateFlow<IndexingState>(IndexingState.Idle)
         val state: StateFlow<IndexingState> = _state.asStateFlow()
 
-        fun startIndexing(context: Context) {
+        /** Tracks passed from IndexingViewModel; consumed by the service on start. */
+        @Volatile
+        var pendingTracks: List<NewTrackDetector.UnindexedTrack>? = null
+
+        /** When true, run full SVD re-fusion instead of incremental graph update. */
+        @Volatile
+        var pendingRefusion: Boolean = false
+
+        fun startIndexing(
+            context: Context,
+            selectedTracks: List<NewTrackDetector.UnindexedTrack>? = null,
+            refusion: Boolean = false,
+        ) {
             if (isActive) return
+            pendingTracks = selectedTracks
+            pendingRefusion = refusion
             _state.value = IndexingState.Starting
             val intent = Intent(context, IndexingService::class.java).apply {
                 action = ACTION_START_INDEXING
@@ -80,6 +94,8 @@ class IndexingService : Service() {
             val current: Int,
             val total: Int,
             val trackName: String,
+            val elapsedMs: Long = 0,
+            val estimatedRemainingMs: Long = 0,
         ) : IndexingState()
         data class RebuildingIndices(val message: String) : IndexingState()
         data class Complete(val indexed: Int, val failed: Int) : IndexingState()
@@ -112,9 +128,6 @@ class IndexingService : Service() {
     private fun performIndexing() {
         activeJob = serviceScope.launch {
             try {
-                _state.value = IndexingState.Detecting("Detecting new tracks...")
-                updateNotification("Detecting new tracks...")
-
                 val dbFile = File(filesDir, "embeddings.db")
                 if (!dbFile.exists()) {
                     _state.value = IndexingState.Error("No embedding database found")
@@ -125,9 +138,16 @@ class IndexingService : Service() {
                 // Open database in read-write mode
                 val db = EmbeddingDatabase.openReadWrite(dbFile)
 
-                // Detect unindexed tracks
-                val detector = NewTrackDetector(db)
-                val unindexed = detector.findUnindexedTracks(this@IndexingService)
+                // Use pre-selected tracks if provided, otherwise detect
+                val unindexed = pendingTracks?.also {
+                    pendingTracks = null
+                    Log.i(TAG, "Using ${it.size} pre-selected tracks")
+                } ?: run {
+                    _state.value = IndexingState.Detecting("Detecting new tracks...")
+                    updateNotification("Detecting new tracks...")
+                    val detector = NewTrackDetector(db)
+                    detector.findUnindexedTracks(this@IndexingService)
+                }
 
                 if (unindexed.isEmpty()) {
                     _state.value = IndexingState.Complete(0, 0)
@@ -139,6 +159,7 @@ class IndexingService : Service() {
 
                 Log.i(TAG, "Found ${unindexed.size} unindexed tracks")
                 updateNotification("Found ${unindexed.size} new tracks")
+                val batchStartTime = System.currentTimeMillis()
 
                 val mulanFile = resolveModelFile(filesDir, "mulan_audio")
                 val flamingoFile = resolveModelFile(filesDir, "flamingo_encoder")
@@ -206,12 +227,17 @@ class IndexingService : Service() {
                         )
 
                         for ((i, track) in unindexed.withIndex()) {
+                            val elapsed = System.currentTimeMillis() - batchStartTime
+                            val eta = if (i > 0) elapsed * (unindexed.size - i) / i else 0L
                             _state.value = IndexingState.Processing(
                                 current = i + 1,
                                 total = unindexed.size,
                                 trackName = "${track.artist} - ${track.title}",
+                                elapsedMs = elapsed,
+                                estimatedRemainingMs = eta,
                             )
-                            updateNotification("MuLan ${i + 1}/${unindexed.size}: ${track.title}")
+                            val etaStr = formatEta(eta)
+                            updateNotification("MuLan ${i + 1}/${unindexed.size}: ${track.title}$etaStr")
 
                             val audioFile = resolveAudioFile(track)
                             if (audioFile == null) {
@@ -260,6 +286,7 @@ class IndexingService : Service() {
                                 durationMs = track.durationMs,
                                 filePath = track.path ?: audioFile.absolutePath,
                                 embeddings = embeddings,
+                                source = "phone",
                             )
 
                             if (trackId > 0) {
@@ -276,6 +303,7 @@ class IndexingService : Service() {
                 }
 
                 // ── Pass 2: Flamingo + Fusion ──────────────────────────
+                val pass2StartTime = System.currentTimeMillis()
                 if (hasFlamingo) {
                     updateNotification("Loading Flamingo model...")
                     val flamingoInference = try {
@@ -302,12 +330,17 @@ class IndexingService : Service() {
                         )
 
                         for ((i, track) in unindexed.withIndex()) {
+                            val elapsed = System.currentTimeMillis() - pass2StartTime
+                            val eta = if (i > 0) elapsed * (unindexed.size - i) / i else 0L
                             _state.value = IndexingState.Processing(
                                 current = i + 1,
                                 total = unindexed.size,
                                 trackName = "${track.artist} - ${track.title}",
+                                elapsedMs = elapsed,
+                                estimatedRemainingMs = eta,
                             )
-                            updateNotification("Flamingo ${i + 1}/${unindexed.size}: ${track.title}")
+                            val etaStr = formatEta(eta)
+                            updateNotification("Flamingo ${i + 1}/${unindexed.size}: ${track.title}$etaStr")
 
                             val audioFile = resolveAudioFile(track)
                             if (audioFile == null) {
@@ -353,6 +386,7 @@ class IndexingService : Service() {
                                     durationMs = track.durationMs,
                                     filePath = track.path ?: audioFile.absolutePath,
                                     embeddings = embeddings,
+                                    source = "phone",
                                 )
                                 if (trackId > 0) indexed++ else failed++
                             }
@@ -363,14 +397,34 @@ class IndexingService : Service() {
                     }
                 }
 
-                // Rebuild indices
+                // Rebuild indices after indexing new tracks
                 if (indexed > 0) {
-                    _state.value = IndexingState.RebuildingIndices("Rebuilding search indices...")
-                    updateNotification("Rebuilding indices...")
+                    val refusion = pendingRefusion.also { pendingRefusion = false }
 
-                    val graphUpdater = GraphUpdater(db, filesDir)
-                    graphUpdater.rebuildIndices { status ->
-                        updateNotification(status)
+                    if (refusion) {
+                        // Full re-fusion: recompute SVD, re-project ALL tracks,
+                        // rebuild clusters and kNN graph from scratch.
+                        // For users who index entirely on-device (no desktop DB).
+                        _state.value = IndexingState.RebuildingIndices("Recomputing fusion...")
+                        updateNotification("Recomputing fusion...")
+
+                        val fusionEngine = FusionEngine(db, filesDir)
+                        fusionEngine.recomputeFusion { status ->
+                            _state.value = IndexingState.RebuildingIndices(status)
+                            updateNotification(status)
+                        }
+                    } else {
+                        // Incremental: rebuild .emb file and extract/build kNN graph.
+                        // Uses the existing desktop SVD projection (adequate when
+                        // adding a small number of tracks to a large desktop corpus).
+                        _state.value = IndexingState.RebuildingIndices("Rebuilding search indices...")
+                        updateNotification("Rebuilding indices...")
+
+                        val graphUpdater = GraphUpdater(db, filesDir)
+                        graphUpdater.rebuildIndices { status ->
+                            _state.value = IndexingState.RebuildingIndices(status)
+                            updateNotification(status)
+                        }
                     }
                 }
 
@@ -379,7 +433,7 @@ class IndexingService : Service() {
                 _state.value = IndexingState.Complete(indexed, failed)
                 val message = "$indexed tracks indexed" +
                     if (failed > 0) " ($failed failed)" else ""
-                updateNotification(message)
+                showCompletionNotification(message)
                 Log.i(TAG, message)
 
                 stopSelfDelayed()
@@ -497,6 +551,30 @@ class IndexingService : Service() {
     private fun updateNotification(message: String) {
         getSystemService(NotificationManager::class.java)
             .notify(NOTIFICATION_ID, createNotification(message))
+    }
+
+    private fun showCompletionNotification(message: String) {
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Indexing Complete")
+            .setContentText(message)
+            .setSmallIcon(R.drawable.ic_radio)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .build()
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID + 1, notification)
+    }
+
+    private fun formatEta(etaMs: Long): String {
+        if (etaMs <= 0) return ""
+        val minutes = etaMs / 60_000
+        return if (minutes < 1) " (~<1 min left)"
+        else " (~$minutes min left)"
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

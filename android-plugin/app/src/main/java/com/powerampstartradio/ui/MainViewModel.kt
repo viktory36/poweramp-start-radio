@@ -97,6 +97,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _hasModels = MutableStateFlow(false)
     val hasModels: StateFlow<Boolean> = _hasModels.asStateFlow()
 
+    private val _fileStatuses = MutableStateFlow<List<AppFileStatus>>(emptyList())
+    val fileStatuses: StateFlow<List<AppFileStatus>> = _fileStatuses.asStateFlow()
+
     val indexingState: StateFlow<IndexingService.IndexingState> = IndexingService.state
 
     private val _previews = MutableStateFlow<Map<SelectionMode, List<String>>>(emptyMap())
@@ -326,17 +329,45 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun checkModels() {
         val filesDir = getApplication<Application>().filesDir
-        val hasMulan = File(filesDir, "mulan_audio.tflite").exists()
-        val hasFlamingo = File(filesDir, "flamingo_encoder.tflite").exists()
-        _hasModels.value = hasMulan || hasFlamingo
-    }
+        val variants = listOf("_fp16", "")
 
-    fun startIndexing() {
-        IndexingService.startIndexing(getApplication())
-    }
+        fun findModel(base: String): File? {
+            for (suffix in variants) {
+                val f = File(filesDir, "${base}${suffix}.tflite")
+                if (f.exists()) return f
+            }
+            return null
+        }
 
-    fun cancelIndexing() {
-        IndexingService.cancelIndexing()
+        val mulanFile = findModel("mulan_audio")
+        val flamingoFile = findModel("flamingo_encoder")
+        val projectorFile = findModel("flamingo_projector")
+        _hasModels.value = mulanFile != null || flamingoFile != null
+
+        fun fileSizeMb(f: File?): String? {
+            if (f == null) return null
+            val mb = f.length() / 1024 / 1024
+            return "${mb} MB"
+        }
+
+        val dbFile = File(filesDir, "embeddings.db")
+        val embFile = File(filesDir, "fused.emb")
+        val graphFile = File(filesDir, "graph.bin")
+
+        _fileStatuses.value = listOf(
+            AppFileStatus("embeddings.db", dbFile.exists(), fileSizeMb(dbFile),
+                "Embedding database (required)"),
+            AppFileStatus("fused.emb", embFile.exists(), fileSizeMb(embFile),
+                "Auto-generated from database"),
+            AppFileStatus("graph.bin", graphFile.exists(), fileSizeMb(graphFile),
+                "kNN graph for Random Walk"),
+            AppFileStatus("mulan_audio", mulanFile != null, fileSizeMb(mulanFile),
+                if (mulanFile != null) mulanFile.name else "MuQ-MuLan model"),
+            AppFileStatus("flamingo_encoder", flamingoFile != null, fileSizeMb(flamingoFile),
+                if (flamingoFile != null) flamingoFile.name else "Flamingo encoder model"),
+            AppFileStatus("flamingo_projector", projectorFile != null, fileSizeMb(projectorFile),
+                if (projectorFile != null) projectorFile.name else "Flamingo projector"),
+        )
     }
 
     fun resetToDefaults() {
@@ -427,4 +458,11 @@ data class DatabaseInfo(
     val hasGraph: Boolean = false,
     val embeddingTable: String = "embeddings_fused",
     val availableModels: List<Pair<String, Int>> = emptyList(),
+)
+
+data class AppFileStatus(
+    val name: String,
+    val present: Boolean,
+    val sizeMb: String? = null,
+    val detail: String? = null,
 )

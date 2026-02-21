@@ -45,6 +45,7 @@ class EmbeddingWriter(
         durationMs: Int,
         filePath: String,
         embeddings: EmbeddingProcessor.EmbeddingResult,
+        source: String = "desktop",
     ): Long {
         return try {
             val rawDb = db.getRawDatabase()
@@ -52,7 +53,7 @@ class EmbeddingWriter(
             try {
                 // Insert track
                 val trackId = db.insertTrack(
-                    metadataKey, filenameKey, artist, album, title, durationMs, filePath
+                    metadataKey, filenameKey, artist, album, title, durationMs, filePath, source
                 )
 
                 // Insert MuQ-MuLan embedding

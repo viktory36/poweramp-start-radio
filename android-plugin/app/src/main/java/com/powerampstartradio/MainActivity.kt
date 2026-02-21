@@ -52,6 +52,7 @@ import com.powerampstartradio.poweramp.PowerampTrack
 import com.powerampstartradio.poweramp.TrackMatcher
 import com.powerampstartradio.indexing.IndexingService
 import com.powerampstartradio.services.RadioService
+import com.powerampstartradio.ui.AppFileStatus
 import com.powerampstartradio.ui.DatabaseInfo
 import com.powerampstartradio.ui.DecaySchedule
 import com.powerampstartradio.ui.DriftMode
@@ -1001,32 +1002,9 @@ fun SettingsScreen(
                         val trackCountFmt = "%,d".format(databaseInfo.trackCount)
                         val dimLabel = if (databaseInfo.embeddingDim != null) "${databaseInfo.embeddingDim}-dim" else ""
                         val modelNames = databaseInfo.availableModels.map { it.first }
-                        val modelLine = if (databaseInfo.hasFused && modelNames.containsAll(listOf("mulan", "flamingo"))) {
-                            "Models: MuQ-MuLan + Flamingo \u2192 Fused"
-                        } else if (databaseInfo.hasFused) {
-                            "Models: Fused"
-                        } else if (modelNames.size == 1) {
-                            val name = modelNames.first().replaceFirstChar { it.uppercase() }
-                            "Single model: $name"
-                        } else {
-                            "Models: ${modelNames.joinToString(", ") { it.replaceFirstChar { c -> c.uppercase() } }}"
-                        }
                         val embType = if (databaseInfo.hasFused) "fused" else modelNames.firstOrNull()?.replaceFirstChar { it.uppercase() } ?: "unknown"
                         Text("$trackCountFmt tracks \u00b7 $dimLabel $embType embeddings",
                             style = MaterialTheme.typography.bodyMedium)
-                        Text(modelLine, style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Text(if (databaseInfo.hasGraph) "Similarity graph: available (PageRank enabled)"
-                            else "No similarity graph (PageRank will fall back to MMR)",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        val poolSize = (databaseInfo.trackCount * 0.02f).toInt().coerceAtLeast(100)
-                        Text("Pool size: %,d tracks (2%% of library)".format(poolSize),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Text("Size: ${databaseInfo.sizeKb / 1024} MB",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                     } else {
                         Text("No database imported", color = MaterialTheme.colorScheme.error)
                     }
@@ -1037,9 +1015,24 @@ fun SettingsScreen(
                 }
             }
 
+            // App files status
+            item {
+                val fileStatuses by viewModel.fileStatuses.collectAsState()
+                if (fileStatuses.isNotEmpty()) {
+                    Column {
+                        Text("App Files", style = MaterialTheme.typography.titleMedium)
+                        Spacer(modifier = Modifier.height(4.dp))
+                        for (file in fileStatuses) {
+                            FileStatusRow(file)
+                        }
+                    }
+                }
+            }
+
             // On-device indexing section
             if (databaseInfo != null) {
                 item {
+                    val context = LocalContext.current
                     val unindexedCount by viewModel.unindexedCount.collectAsState()
                     val hasModels by viewModel.hasModels.collectAsState()
                     val indexingState by viewModel.indexingState.collectAsState()
@@ -1056,31 +1049,18 @@ fun SettingsScreen(
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
                         } else {
+                            // Show brief status summary
                             when (val state = indexingState) {
                                 is IndexingService.IndexingState.Idle -> {
                                     if (unindexedCount > 0) {
-                                        Text("$unindexedCount unindexed tracks detected",
+                                        Text("$unindexedCount unindexed tracks",
                                             style = MaterialTheme.typography.bodyMedium,
                                             color = MaterialTheme.colorScheme.primary)
-                                        Spacer(modifier = Modifier.height(4.dp))
-                                        Button(
-                                            onClick = { viewModel.startIndexing() },
-                                            modifier = Modifier.fillMaxWidth()
-                                        ) {
-                                            Text("Index $unindexedCount Tracks")
-                                        }
                                     } else {
                                         Text("All tracks indexed",
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     }
-                                }
-                                is IndexingService.IndexingState.Starting,
-                                is IndexingService.IndexingState.Detecting -> {
-                                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                    Text("Detecting new tracks...",
-                                        style = MaterialTheme.typography.bodySmall)
                                 }
                                 is IndexingService.IndexingState.Processing -> {
                                     LinearProgressIndicator(
@@ -1091,17 +1071,6 @@ fun SettingsScreen(
                                     Text("${state.current}/${state.total}: ${state.trackName}",
                                         style = MaterialTheme.typography.bodySmall,
                                         maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                    OutlinedButton(
-                                        onClick = { viewModel.cancelIndexing() },
-                                        modifier = Modifier.fillMaxWidth()
-                                    ) { Text("Cancel") }
-                                }
-                                is IndexingService.IndexingState.RebuildingIndices -> {
-                                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                    Text(state.message,
-                                        style = MaterialTheme.typography.bodySmall)
                                 }
                                 is IndexingService.IndexingState.Complete -> {
                                     val msg = "${state.indexed} tracks indexed" +
@@ -1114,6 +1083,21 @@ fun SettingsScreen(
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.error)
                                 }
+                                else -> {
+                                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            OutlinedButton(
+                                onClick = {
+                                    context.startActivity(
+                                        android.content.Intent(context, com.powerampstartradio.indexing.IndexingActivity::class.java)
+                                    )
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("Manage Tracks")
                             }
                         }
                     }
@@ -1203,6 +1187,46 @@ private fun AlgorithmOption(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun FileStatusRow(file: AppFileStatus) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = if (file.present) "\u2713" else "\u2717",
+            color = if (file.present) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.error,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.width(20.dp),
+        )
+        Text(
+            text = file.name,
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace,
+            modifier = Modifier.weight(1f),
+        )
+        if (file.sizeMb != null) {
+            Text(
+                text = file.sizeMb,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+    if (file.detail != null) {
+        Text(
+            text = file.detail,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(start = 20.dp),
+        )
     }
 }
 

@@ -35,6 +35,12 @@
             </intent-filter>
         </activity>
 
+        <!-- Indexing Activity -->
+        <activity
+            android:name=".indexing.IndexingActivity"
+            android:exported="false"
+            android:theme="@style/Theme.PowerampStartRadio" />
+
         <!-- Benchmark Activity (debug) — launch via adb -->
         <activity
             android:name=".benchmark.BenchmarkActivity"

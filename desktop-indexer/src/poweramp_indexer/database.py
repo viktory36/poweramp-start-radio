@@ -43,6 +43,7 @@ class EmbeddingDatabase:
         duration_ms INTEGER,
         file_path TEXT NOT NULL,
         cluster_id INTEGER,
+        source TEXT DEFAULT 'desktop',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -84,6 +85,12 @@ class EmbeddingDatabase:
     def _init_schema(self, models: list[str] | None):
         """Create base tables and per-model embedding tables."""
         self.conn.executescript(self.BASE_SCHEMA)
+        # Migration: add source column to existing databases
+        try:
+            self.conn.execute("ALTER TABLE tracks ADD COLUMN source TEXT DEFAULT 'desktop'")
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         if models:
             for model in models:
                 table = f"embeddings_{model}"
@@ -169,7 +176,8 @@ class EmbeddingDatabase:
         self,
         metadata: TrackMetadata,
         embedding: list[float],
-        model: str = "mulan"
+        model: str = "mulan",
+        source: str = "desktop",
     ) -> int:
         """
         Add a track and its embedding to the database.
@@ -178,14 +186,15 @@ class EmbeddingDatabase:
             metadata: Track metadata
             embedding: Embedding vector (dimension depends on model)
             model: Model name for embedding table (default: "mulan")
+            source: Origin of the embedding ("desktop" or "phone")
 
         Returns:
             The track ID
         """
         cursor = self.conn.execute(
             """
-            INSERT INTO tracks (metadata_key, filename_key, artist, album, title, duration_ms, file_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tracks (metadata_key, filename_key, artist, album, title, duration_ms, file_path, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 metadata.metadata_key,
@@ -194,7 +203,8 @@ class EmbeddingDatabase:
                 metadata.album,
                 metadata.title,
                 metadata.duration_ms,
-                str(metadata.file_path)
+                str(metadata.file_path),
+                source,
             )
         )
         track_id = cursor.lastrowid

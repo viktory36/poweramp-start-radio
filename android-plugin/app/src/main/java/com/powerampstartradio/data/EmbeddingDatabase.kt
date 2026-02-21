@@ -20,7 +20,8 @@ data class EmbeddedTrack(
     val album: String?,
     val title: String?,
     val durationMs: Int,
-    val filePath: String
+    val filePath: String,
+    val source: String = "desktop",
 )
 
 /**
@@ -61,6 +62,12 @@ class EmbeddingDatabase private constructor(
                 null,
                 SQLiteDatabase.OPEN_READWRITE
             )
+            // Migration: add source column if not present
+            try {
+                db.execSQL("ALTER TABLE tracks ADD COLUMN source TEXT DEFAULT 'desktop'")
+            } catch (_: Exception) {
+                // Column already exists
+            }
             return EmbeddingDatabase(db)
         }
 
@@ -101,19 +108,21 @@ class EmbeddingDatabase private constructor(
 
     /**
      * Whether this database has fused embeddings.
+     * Computed each time to avoid stale caches after on-device fusion.
      */
-    val hasFusedEmbeddings: Boolean by lazy {
-        tableHasRows("embeddings_fused")
-    }
+    val hasFusedEmbeddings: Boolean
+        get() = tableHasRows("embeddings_fused")
 
     /**
      * The embedding table to use for similarity search.
      * Prefers fused, falls back to mulan, then flamingo.
+     * Computed each time to avoid stale caches after on-device fusion.
      */
-    val embeddingTable: String by lazy {
-        val candidates = listOf("embeddings_fused", "embeddings_mulan", "embeddings_flamingo")
-        candidates.firstOrNull { tableHasRows(it) } ?: "embeddings_fused"
-    }
+    val embeddingTable: String
+        get() {
+            val candidates = listOf("embeddings_fused", "embeddings_mulan", "embeddings_flamingo")
+            return candidates.firstOrNull { tableHasRows(it) } ?: "embeddings_fused"
+        }
 
     private fun getTableNames(): Set<String> {
         val names = mutableSetOf<String>()
@@ -398,6 +407,7 @@ class EmbeddingDatabase private constructor(
 
     private fun cursorToTrack(cursor: Cursor): EmbeddedTrack? {
         return if (cursor.moveToFirst()) {
+            val sourceIdx = cursor.getColumnIndex("source")
             EmbeddedTrack(
                 id = cursor.getLong(0),
                 metadataKey = cursor.getString(1),
@@ -406,13 +416,15 @@ class EmbeddingDatabase private constructor(
                 album = cursor.getString(4),
                 title = cursor.getString(5),
                 durationMs = cursor.getInt(6),
-                filePath = cursor.getString(7)
+                filePath = cursor.getString(7),
+                source = if (sourceIdx >= 0) cursor.getString(sourceIdx) ?: "desktop" else "desktop",
             )
         } else null
     }
 
     private fun cursorToTrackList(cursor: Cursor): List<EmbeddedTrack> {
         val result = mutableListOf<EmbeddedTrack>()
+        val sourceIdx = cursor.getColumnIndex("source")
         while (cursor.moveToNext()) {
             result.add(
                 EmbeddedTrack(
@@ -423,7 +435,8 @@ class EmbeddingDatabase private constructor(
                     album = cursor.getString(4),
                     title = cursor.getString(5),
                     durationMs = cursor.getInt(6),
-                    filePath = cursor.getString(7)
+                    filePath = cursor.getString(7),
+                    source = if (sourceIdx >= 0) cursor.getString(sourceIdx) ?: "desktop" else "desktop",
                 )
             )
         }
@@ -443,6 +456,7 @@ class EmbeddingDatabase private constructor(
         title: String?,
         durationMs: Int,
         filePath: String,
+        source: String = "desktop",
     ): Long {
         val values = android.content.ContentValues().apply {
             put("metadata_key", metadataKey)
@@ -452,6 +466,7 @@ class EmbeddingDatabase private constructor(
             put("title", title)
             put("duration_ms", durationMs)
             put("file_path", filePath)
+            put("source", source)
         }
         return db.insertOrThrow("tracks", null, values)
     }
