@@ -5,6 +5,7 @@ import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.powerampstartradio.data.EmbeddingDatabase
+import com.powerampstartradio.poweramp.PowerampHelper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -25,10 +26,12 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         /**
          * Cached detection result shared across ViewModel instances.
          * Avoids re-scanning 74K tracks when the user navigates away and back.
-         * Invalidated when the DB file changes or on explicit "Check Again".
+         * Invalidated when the DB file changes, Poweramp library changes,
+         * or on explicit "Check Again".
          */
         private var cachedTracks: List<NewTrackDetector.UnindexedTrack>? = null
         private var cachedDbLastModified: Long = 0L
+        private var cachedPowerampTrackCount: Int = -1
     }
 
     private val prefs = application.getSharedPreferences("indexing", Context.MODE_PRIVATE)
@@ -57,11 +60,14 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
     fun detectUnindexed(forceRefresh: Boolean = false) {
         if (_isDetecting.value) return
 
-        val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
+        val app = getApplication<Application>()
+        val dbFile = File(app.filesDir, "embeddings.db")
+        val powerampCount = getPowerampTrackCount(app)
 
-        // Use cached result if DB hasn't changed (same lastModified timestamp)
+        // Use cached result if neither the DB nor the Poweramp library has changed
         if (!forceRefresh && cachedTracks != null && dbFile.exists()
-            && dbFile.lastModified() == cachedDbLastModified) {
+            && dbFile.lastModified() == cachedDbLastModified
+            && powerampCount == cachedPowerampTrackCount) {
             val tracks = cachedTracks!!
             _unindexedTracks.value = tracks
             autoSelect(tracks)
@@ -90,6 +96,7 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
                 // Cache for reuse
                 cachedTracks = sorted
                 cachedDbLastModified = dbFile.lastModified()
+                cachedPowerampTrackCount = powerampCount
             } catch (e: Exception) {
                 _unindexedTracks.value = emptyList()
             } finally {
@@ -163,6 +170,19 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
 
     fun cancelIndexing() {
         IndexingService.cancelIndexing()
+    }
+
+    /** Quick count of tracks in the Poweramp library (no full cursor scan). */
+    private fun getPowerampTrackCount(context: Context): Int {
+        return try {
+            val filesUri = PowerampHelper.ROOT_URI.buildUpon()
+                .appendEncodedPath("files").build()
+            context.contentResolver.query(
+                filesUri, arrayOf("COUNT(*)"), null, null, null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getInt(0) else -1
+            } ?: -1
+        } catch (_: Exception) { -1 }
     }
 
     private fun loadDismissedIds(): Set<Long> {
