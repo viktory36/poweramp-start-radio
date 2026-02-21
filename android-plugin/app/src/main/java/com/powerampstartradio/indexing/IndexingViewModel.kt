@@ -35,6 +35,9 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
     private val _isDetecting = MutableStateFlow(false)
     val isDetecting: StateFlow<Boolean> = _isDetecting.asStateFlow()
 
+    private val _detectingStatus = MutableStateFlow("")
+    val detectingStatus: StateFlow<String> = _detectingStatus.asStateFlow()
+
     val indexingState: StateFlow<IndexingService.IndexingState> = IndexingService.state
 
     /** Visible tracks = unindexed minus dismissed. */
@@ -61,7 +64,9 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
                 }
                 db = EmbeddingDatabase.open(dbFile)
                 val detector = NewTrackDetector(db)
-                val tracks = detector.findUnindexedTracks(getApplication())
+                val tracks = detector.findUnindexedTracks(getApplication()) { status ->
+                    _detectingStatus.value = status
+                }
                 _unindexedTracks.value = tracks
                 // Auto-select all visible tracks
                 val dismissed = _dismissedIds.value

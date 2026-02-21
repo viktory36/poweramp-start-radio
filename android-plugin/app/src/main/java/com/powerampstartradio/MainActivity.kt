@@ -743,7 +743,7 @@ fun SettingsScreen(
     val cleanTrack: @Composable (SliderState) -> Unit = { state ->
         SliderDefaults.Track(
             sliderState = state,
-            modifier = Modifier.height(6.dp),
+            modifier = Modifier.height(8.dp),
             drawStopIndicator = null,
             thumbTrackGapSize = 0.dp,
             trackInsideCornerSize = 0.dp,
@@ -752,7 +752,7 @@ fun SettingsScreen(
     val steppedTrack: @Composable (SliderState) -> Unit = { state ->
         SliderDefaults.Track(
             sliderState = state,
-            modifier = Modifier.height(6.dp),
+            modifier = Modifier.height(8.dp),
             drawStopIndicator = null,
             thumbTrackGapSize = 0.dp,
             trackInsideCornerSize = 0.dp,

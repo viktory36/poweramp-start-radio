@@ -97,8 +97,12 @@ class NewTrackDetector(
      * @param context Android context for querying Poweramp content provider
      * @return List of unindexed tracks with their Poweramp metadata
      */
-    fun findUnindexedTracks(context: Context): List<UnindexedTrack> {
+    fun findUnindexedTracks(
+        context: Context,
+        onProgress: (String) -> Unit = {},
+    ): List<UnindexedTrack> {
         // Get all Poweramp entries with paths
+        onProgress("Querying Poweramp library...")
         val powerampEntries = getAllPowerampEntriesWithPaths(context)
         if (powerampEntries.isEmpty()) {
             Log.w(TAG, "No entries from Poweramp library")
@@ -107,6 +111,7 @@ class NewTrackDetector(
 
         // Get all embedded track metadata keys and file paths
         // NFC-normalize loaded keys — some DB entries have NFD despite desktop claiming NFC
+        onProgress("Loading ${powerampEntries.size} Poweramp tracks, reading embedded keys...")
         val rawKeys = embeddingDb.getAllMetadataKeys()
         val embeddedKeys = rawKeys.mapTo(HashSet<String>(rawKeys.size)) { normalizeNfc(it) }
         val embeddedPaths = embeddingDb.getAllFilePaths()
@@ -115,12 +120,17 @@ class NewTrackDetector(
             "Embedded: ${embeddedKeys.size} metadata keys, ${embeddedPaths.size} paths")
 
         // Build artist → keys index for fuzzy matching
+        onProgress("Matching ${powerampEntries.size} tracks against ${embeddedKeys.size} embedded...")
         val keysByArtist = buildKeysByArtist(embeddedKeys)
 
         // Find unmatched entries
         val unindexed = mutableListOf<UnindexedTrack>()
 
-        for (entry in powerampEntries) {
+        for ((i, entry) in powerampEntries.withIndex()) {
+            if (i % 5000 == 0 && i > 0) {
+                onProgress("Matching $i / ${powerampEntries.size}...")
+            }
+
             val metadataKey = entry.metadataKey
 
             // Check metadata key match
@@ -161,6 +171,7 @@ class NewTrackDetector(
             ))
         }
 
+        onProgress("Found ${unindexed.size} unindexed tracks")
         Log.i(TAG, "Found ${unindexed.size} unindexed tracks")
         return unindexed
     }

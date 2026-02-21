@@ -43,24 +43,31 @@ class EmbeddingProcessor(
             cols: Int
         ): FloatMatrix? {
             return try {
-                db.rawQuery(
-                    "SELECT value FROM metadata WHERE key = ?",
-                    arrayOf(key)
-                ).use { cursor ->
-                    if (!cursor.moveToFirst()) return null
-                    val blob = cursor.getBlob(0)
-                    val expectedSize = rows * cols * 4  // float32
-                    if (blob.size != expectedSize) {
-                        Log.w(TAG, "$key: expected ${expectedSize} bytes, got ${blob.size}")
-                        return null
-                    }
-                    val buffer = ByteBuffer.wrap(blob).order(ByteOrder.LITTLE_ENDIAN)
-                    val data = FloatArray(rows * cols)
-                    for (i in data.indices) {
-                        data[i] = buffer.getFloat()
-                    }
-                    FloatMatrix(data, rows, cols)
+                // Use SQLiteStatement to read large blobs directly, bypassing the
+                // 2MB CursorWindow limit (flamingo_projection is ~7MB).
+                val stmt = db.compileStatement(
+                    "SELECT value FROM metadata WHERE key = ?"
+                )
+                stmt.bindString(1, key)
+                val pfd = stmt.simpleQueryForBlobFileDescriptor() ?: run {
+                    stmt.close()
+                    return null
                 }
+                val blob = android.os.ParcelFileDescriptor.AutoCloseInputStream(pfd)
+                    .use { it.readBytes() }
+                stmt.close()
+
+                val expectedSize = rows * cols * 4  // float32
+                if (blob.size != expectedSize) {
+                    Log.w(TAG, "$key: expected ${expectedSize} bytes, got ${blob.size}")
+                    return null
+                }
+                val buffer = ByteBuffer.wrap(blob).order(ByteOrder.LITTLE_ENDIAN)
+                val data = FloatArray(rows * cols)
+                for (i in data.indices) {
+                    data[i] = buffer.getFloat()
+                }
+                FloatMatrix(data, rows, cols)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to load $key projection matrix", e)
                 null

@@ -141,12 +141,17 @@ class IndexingService : Service() {
                 // Use pre-selected tracks if provided, otherwise detect
                 val unindexed = pendingTracks?.also {
                     pendingTracks = null
+                    _state.value = IndexingState.Detecting("Preparing ${it.size} selected tracks...")
+                    updateNotification("Preparing ${it.size} selected tracks...")
                     Log.i(TAG, "Using ${it.size} pre-selected tracks")
                 } ?: run {
                     _state.value = IndexingState.Detecting("Detecting new tracks...")
                     updateNotification("Detecting new tracks...")
                     val detector = NewTrackDetector(db)
-                    detector.findUnindexedTracks(this@IndexingService)
+                    detector.findUnindexedTracks(this@IndexingService) { status ->
+                        _state.value = IndexingState.Detecting(status)
+                        updateNotification(status)
+                    }
                 }
 
                 if (unindexed.isEmpty()) {
@@ -158,7 +163,8 @@ class IndexingService : Service() {
                 }
 
                 Log.i(TAG, "Found ${unindexed.size} unindexed tracks")
-                updateNotification("Found ${unindexed.size} new tracks")
+                _state.value = IndexingState.Detecting("Loading models for ${unindexed.size} tracks...")
+                updateNotification("Loading models for ${unindexed.size} tracks...")
                 val batchStartTime = System.currentTimeMillis()
 
                 val mulanFile = resolveModelFile(filesDir, "mulan_audio")
@@ -211,6 +217,7 @@ class IndexingService : Service() {
                 // large models in memory simultaneously.
 
                 if (hasMulan) {
+                    _state.value = IndexingState.Detecting("Loading MuQ-MuLan model (GPU)...")
                     updateNotification("Loading MuQ-MuLan model...")
                     val mulanInference = try { MuLanInference(mulanFile) }
                     catch (e: Exception) {
@@ -237,7 +244,7 @@ class IndexingService : Service() {
                                 estimatedRemainingMs = eta,
                             )
                             val etaStr = formatEta(eta)
-                            updateNotification("MuLan ${i + 1}/${unindexed.size}: ${track.title}$etaStr")
+                            updateNotification("MuLan: ${track.title}$etaStr", i + 1, unindexed.size)
 
                             val audioFile = resolveAudioFile(track)
                             if (audioFile == null) {
@@ -269,7 +276,7 @@ class IndexingService : Service() {
                             val embeddings = processor.processTrack(
                                 audioFile, preDecodedAudio = audio24k
                             ) { status ->
-                                updateNotification("MuLan ${i + 1}/${unindexed.size}: $status")
+                                updateNotification("MuLan: $status", i + 1, unindexed.size)
                             }
 
                             if (embeddings == null) {
@@ -305,6 +312,7 @@ class IndexingService : Service() {
                 // ── Pass 2: Flamingo + Fusion ──────────────────────────
                 val pass2StartTime = System.currentTimeMillis()
                 if (hasFlamingo) {
+                    _state.value = IndexingState.Detecting("Loading Flamingo model (GPU)...")
                     updateNotification("Loading Flamingo model...")
                     val flamingoInference = try {
                         FlamingoInference(flamingoFile, projectorFile)
@@ -340,7 +348,7 @@ class IndexingService : Service() {
                                 estimatedRemainingMs = eta,
                             )
                             val etaStr = formatEta(eta)
-                            updateNotification("Flamingo ${i + 1}/${unindexed.size}: ${track.title}$etaStr")
+                            updateNotification("Flamingo: ${track.title}$etaStr", i + 1, unindexed.size)
 
                             val audioFile = resolveAudioFile(track)
                             if (audioFile == null) {
@@ -363,7 +371,7 @@ class IndexingService : Service() {
                                 existingMulan = existingMulan,
                                 preDecodedAudio = cached16k,
                             ) { status ->
-                                updateNotification("Flamingo ${i + 1}/${unindexed.size}: $status")
+                                updateNotification("Flamingo: $status", i + 1, unindexed.size)
                             }
 
                             if (embeddings == null) {
@@ -527,10 +535,14 @@ class IndexingService : Service() {
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
-    private fun createNotification(message: String): Notification {
+    private fun createNotification(
+        message: String,
+        current: Int = 0,
+        total: Int = 0,
+    ): Notification {
         val pendingIntent = PendingIntent.getActivity(
             this, 0,
-            Intent(this, MainActivity::class.java),
+            Intent(this, com.powerampstartradio.indexing.IndexingActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE,
         )
         val cancelIntent = PendingIntent.getService(
@@ -545,12 +557,19 @@ class IndexingService : Service() {
             .setContentIntent(pendingIntent)
             .addAction(R.drawable.ic_radio, "Cancel", cancelIntent)
             .setOngoing(true)
+            .apply {
+                if (total > 0) {
+                    setProgress(total, current, false)
+                } else {
+                    setProgress(0, 0, true)
+                }
+            }
             .build()
     }
 
-    private fun updateNotification(message: String) {
+    private fun updateNotification(message: String, current: Int = 0, total: Int = 0) {
         getSystemService(NotificationManager::class.java)
-            .notify(NOTIFICATION_ID, createNotification(message))
+            .notify(NOTIFICATION_ID, createNotification(message, current, total))
     }
 
     private fun showCompletionNotification(message: String) {

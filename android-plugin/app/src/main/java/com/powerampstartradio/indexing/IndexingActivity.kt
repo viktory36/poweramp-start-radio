@@ -1,8 +1,13 @@
 package com.powerampstartradio.indexing
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -22,6 +27,7 @@ import com.powerampstartradio.ui.theme.PowerampStartRadioTheme
 class IndexingActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        requestNotificationPermission()
         setContent {
             PowerampStartRadioTheme {
                 Surface(
@@ -30,6 +36,18 @@ class IndexingActivity : ComponentActivity() {
                 ) {
                     IndexingScreen(onBack = { finish() })
                 }
+            }
+        }
+    }
+
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                ActivityCompat.requestPermissions(
+                    this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 0
+                )
             }
         }
     }
@@ -45,6 +63,7 @@ fun IndexingScreen(
     val selectedIds by viewModel.selectedIds.collectAsState()
     val dismissedIds by viewModel.dismissedIds.collectAsState()
     val isDetecting by viewModel.isDetecting.collectAsState()
+    val detectingStatus by viewModel.detectingStatus.collectAsState()
     val indexingState by viewModel.indexingState.collectAsState()
 
     val visibleTracks = remember(unindexedTracks, dismissedIds) {
@@ -108,7 +127,7 @@ fun IndexingScreen(
             when (val state = indexingState) {
                 is IndexingService.IndexingState.Idle -> {
                     if (isDetecting) {
-                        DetectingContent()
+                        DetectingContent(status = detectingStatus)
                     } else if (visibleTracks.isEmpty()) {
                         AllIndexedContent()
                     } else {
@@ -122,9 +141,11 @@ fun IndexingScreen(
                         )
                     }
                 }
-                is IndexingService.IndexingState.Starting,
+                is IndexingService.IndexingState.Starting -> {
+                    DetectingContent(status = "Starting...")
+                }
                 is IndexingService.IndexingState.Detecting -> {
-                    DetectingContent()
+                    DetectingContent(status = state.message)
                 }
                 is IndexingService.IndexingState.Processing -> {
                     ProcessingContent(state = state, onCancel = { viewModel.cancelIndexing() })
@@ -149,12 +170,15 @@ fun IndexingScreen(
 }
 
 @Composable
-private fun DetectingContent() {
+private fun DetectingContent(status: String = "") {
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             CircularProgressIndicator()
             Spacer(modifier = Modifier.height(16.dp))
-            Text("Detecting unindexed tracks...", style = MaterialTheme.typography.bodyMedium)
+            Text(
+                status.ifEmpty { "Detecting unindexed tracks..." },
+                style = MaterialTheme.typography.bodyMedium,
+            )
         }
     }
 }
