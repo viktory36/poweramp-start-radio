@@ -18,6 +18,7 @@ import com.powerampstartradio.services.RadioService
 import com.powerampstartradio.similarity.RecommendationEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -320,23 +321,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun checkUnindexedTracks() {
         _unindexedCount.value = -1 // signal "checking" to UI
-        viewModelScope.launch(Dispatchers.IO) {
-            val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
-            if (!dbFile.exists()) {
-                setUnindexedCount(0)
-                return@launch
+        val app = getApplication<Application>()
+        val dbFile = File(app.filesDir, "embeddings.db")
+
+        val deferred = viewModelScope.async(Dispatchers.IO) {
+            if (!dbFile.exists()) return@async emptyList()
+            val db = EmbeddingDatabase.open(dbFile)
+            val detector = NewTrackDetector(db)
+            val tracks = detector.findUnindexedTracks(app) { status ->
+                _unindexedCheckStatus.value = status
+                IndexingViewModel.detectionStatus.value = status
             }
+            val sorted = tracks.sortedByDescending { it.durationMs }
+            db.close()
+            // Cache in IndexingViewModel so Manage Tracks can reuse
+            val powerampCount = getPowerampTrackCount(app)
+            IndexingViewModel.cacheResults(sorted, dbFile.lastModified(), powerampCount)
+            sorted
+        }
+        // Expose so IndexingViewModel can await if user opens Manage Tracks mid-check
+        IndexingViewModel.pendingDetection = deferred
+
+        viewModelScope.launch {
             try {
-                val db = EmbeddingDatabase.open(dbFile)
-                val detector = NewTrackDetector(db)
-                val unindexed = detector.findUnindexedTracks(getApplication()) { status ->
-                    _unindexedCheckStatus.value = status
-                }
-                setUnindexedCount(unindexed.size)
-                db.close()
-            } catch (e: Exception) {
+                val result = deferred.await()
+                setUnindexedCount(result.size)
+            } catch (_: Exception) {
                 setUnindexedCount(0)
             } finally {
+                IndexingViewModel.pendingDetection = null
+                IndexingViewModel.detectionStatus.value = null
                 _unindexedCheckStatus.value = null
             }
         }
@@ -345,6 +359,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun setUnindexedCount(count: Int) {
         _unindexedCount.value = count
         prefs.edit().putInt("unindexed_count", count).apply()
+    }
+
+    private fun getPowerampTrackCount(context: Context): Int {
+        return try {
+            val filesUri = PowerampHelper.ROOT_URI.buildUpon()
+                .appendEncodedPath("files").build()
+            context.contentResolver.query(
+                filesUri, arrayOf("COUNT(*)"), null, null, null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getInt(0) else -1
+            } ?: -1
+        } catch (_: Exception) { -1 }
     }
 
     fun checkModels() {

@@ -6,6 +6,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.poweramp.PowerampHelper
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -33,11 +34,27 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         private var cachedDbLastModified: Long = 0L
         private var cachedPowerampTrackCount: Int = -1
 
+        /**
+         * A pending detection started by MainViewModel. IndexingViewModel will
+         * await this instead of starting a duplicate scan.
+         */
+        @Volatile var pendingDetection: Deferred<List<NewTrackDetector.UnindexedTrack>>? = null
+
+        /** Live progress from any ongoing detection (observed by both ViewModels). */
+        val detectionStatus = MutableStateFlow<String?>(null)
+
         /** Clear the cached detection result (e.g. after DB import). */
         fun invalidateCache() {
             cachedTracks = null
             cachedDbLastModified = 0L
             cachedPowerampTrackCount = -1
+        }
+
+        /** Store results from an external detection (e.g. MainViewModel's check). */
+        fun cacheResults(tracks: List<NewTrackDetector.UnindexedTrack>, dbMod: Long, paCount: Int) {
+            cachedTracks = tracks
+            cachedDbLastModified = dbMod
+            cachedPowerampTrackCount = paCount
         }
     }
 
@@ -78,6 +95,31 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
             val tracks = cachedTracks!!
             _unindexedTracks.value = tracks
             autoSelect(tracks)
+            return
+        }
+
+        // If MainViewModel is already running a detection, await its results
+        val pending = pendingDetection
+        if (pending != null && !forceRefresh) {
+            viewModelScope.launch(Dispatchers.IO) {
+                _isDetecting.value = true
+                try {
+                    // Mirror shared progress into our own status flow
+                    val statusJob = launch {
+                        detectionStatus.collect { status ->
+                            if (status != null) _detectingStatus.value = status
+                        }
+                    }
+                    val tracks = pending.await()
+                    statusJob.cancel()
+                    _unindexedTracks.value = tracks
+                    autoSelect(tracks)
+                } catch (_: Exception) {
+                    _unindexedTracks.value = emptyList()
+                } finally {
+                    _isDetecting.value = false
+                }
+            }
             return
         }
 
