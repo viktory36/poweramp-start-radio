@@ -19,6 +19,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -87,7 +88,9 @@ fun IndexingScreen(
                     }
                 },
                 actions = {
-                    if (hasDismissed) {
+                    // Always show overflow when there are visible tracks (idle state)
+                    if (indexingState is IndexingService.IndexingState.Idle
+                        && visibleTracks.isNotEmpty() && !isDetecting) {
                         Box {
                             IconButton(onClick = { showMenu = true }) {
                                 Icon(Icons.Default.MoreVert, contentDescription = "More")
@@ -96,13 +99,24 @@ fun IndexingScreen(
                                 expanded = showMenu,
                                 onDismissRequest = { showMenu = false },
                             ) {
-                                DropdownMenuItem(
-                                    text = { Text("Show Hidden Tracks") },
-                                    onClick = {
-                                        viewModel.clearDismissed()
-                                        showMenu = false
-                                    }
-                                )
+                                if (selectedCount > 0) {
+                                    DropdownMenuItem(
+                                        text = { Text("Never index selected") },
+                                        onClick = {
+                                            viewModel.dismissSelected()
+                                            showMenu = false
+                                        }
+                                    )
+                                }
+                                if (hasDismissed) {
+                                    DropdownMenuItem(
+                                        text = { Text("Show hidden tracks") },
+                                        onClick = {
+                                            viewModel.clearDismissed()
+                                            showMenu = false
+                                        }
+                                    )
+                                }
                             }
                         }
                     }
@@ -117,7 +131,6 @@ fun IndexingScreen(
                     selectedCount = selectedCount,
                     refusion = refusion,
                     onRefusionChanged = { refusion = it },
-                    onHideSelected = { viewModel.dismissSelected() },
                     onStartIndexing = { viewModel.startIndexing(refusion = refusion) },
                 )
             }
@@ -136,8 +149,13 @@ fun IndexingScreen(
                             selectedIds = selectedIds,
                             selectedCount = selectedCount,
                             onToggle = { viewModel.toggleSelection(it) },
-                            onSelectAll = { viewModel.selectAll() },
-                            onDeselectAll = { viewModel.deselectAll() },
+                            onToggleAll = {
+                                if (selectedCount == visibleTracks.size) {
+                                    viewModel.deselectAll()
+                                } else {
+                                    viewModel.selectAll()
+                                }
+                            },
                         )
                     }
                 }
@@ -158,7 +176,7 @@ fun IndexingScreen(
                         indexed = state.indexed,
                         failed = state.failed,
                         onBack = onBack,
-                        onDetectMore = { viewModel.detectUnindexed() },
+                        onDetectMore = { viewModel.detectUnindexed(forceRefresh = true) },
                     )
                 }
                 is IndexingService.IndexingState.Error -> {
@@ -204,34 +222,31 @@ private fun TrackSelectionContent(
     selectedIds: Set<Long>,
     selectedCount: Int,
     onToggle: (Long) -> Unit,
-    onSelectAll: () -> Unit,
-    onDeselectAll: () -> Unit,
+    onToggleAll: () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
-        // Summary bar
+        // Header row with parent checkbox and count
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onToggleAll)
+                .padding(horizontal = 16.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            TriStateCheckbox(
+                state = when {
+                    selectedCount == tracks.size -> ToggleableState.On
+                    selectedCount == 0 -> ToggleableState.Off
+                    else -> ToggleableState.Indeterminate
+                },
+                onClick = onToggleAll,
+            )
+            Spacer(modifier = Modifier.width(12.dp))
             Text(
-                "${tracks.size} tracks not indexed",
+                "${tracks.size} unindexed tracks" +
+                    if (selectedCount > 0) " ($selectedCount selected)" else "",
                 style = MaterialTheme.typography.titleSmall,
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (selectedCount < tracks.size) {
-                    AssistChip(
-                        onClick = onSelectAll,
-                        label = { Text("All") },
-                    )
-                }
-                if (selectedCount > 0) {
-                    AssistChip(
-                        onClick = onDeselectAll,
-                        label = { Text("None") },
-                    )
-                }
-            }
         }
 
         HorizontalDivider()
@@ -410,7 +425,6 @@ private fun BottomBar(
     selectedCount: Int,
     refusion: Boolean,
     onRefusionChanged: (Boolean) -> Unit,
-    onHideSelected: () -> Unit,
     onStartIndexing: () -> Unit,
 ) {
     Surface(tonalElevation = 3.dp) {
@@ -429,11 +443,11 @@ private fun BottomBar(
                 Spacer(modifier = Modifier.width(4.dp))
                 Column {
                     Text(
-                        "Full re-fusion",
+                        "Rebuild similarity index",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Text(
-                        "Recompute SVD from all tracks (for indexing without desktop)",
+                        "Recompute all track similarities from scratch",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -443,16 +457,9 @@ private fun BottomBar(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp, vertical = 12.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.End,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                if (selectedCount > 0) {
-                    TextButton(onClick = onHideSelected) {
-                        Text("Hide Selected")
-                    }
-                } else {
-                    Spacer(modifier = Modifier.width(1.dp))
-                }
                 Button(
                     onClick = onStartIndexing,
                     enabled = selectedCount > 0,

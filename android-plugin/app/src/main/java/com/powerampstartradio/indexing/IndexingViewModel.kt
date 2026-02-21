@@ -21,6 +21,16 @@ import java.io.File
  */
 class IndexingViewModel(application: Application) : AndroidViewModel(application) {
 
+    companion object {
+        /**
+         * Cached detection result shared across ViewModel instances.
+         * Avoids re-scanning 74K tracks when the user navigates away and back.
+         * Invalidated when the DB file changes or on explicit "Check Again".
+         */
+        private var cachedTracks: List<NewTrackDetector.UnindexedTrack>? = null
+        private var cachedDbLastModified: Long = 0L
+    }
+
     private val prefs = application.getSharedPreferences("indexing", Context.MODE_PRIVATE)
 
     private val _unindexedTracks = MutableStateFlow<List<NewTrackDetector.UnindexedTrack>>(emptyList())
@@ -40,26 +50,32 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
 
     val indexingState: StateFlow<IndexingService.IndexingState> = IndexingService.state
 
-    /** Visible tracks = unindexed minus dismissed. */
-    val visibleTracks: List<NewTrackDetector.UnindexedTrack>
-        get() {
-            val dismissed = _dismissedIds.value
-            return _unindexedTracks.value.filter { it.powerampFileId !in dismissed }
-        }
-
     init {
         detectUnindexed()
     }
 
-    fun detectUnindexed() {
+    fun detectUnindexed(forceRefresh: Boolean = false) {
         if (_isDetecting.value) return
+
+        val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
+
+        // Use cached result if DB hasn't changed (same lastModified timestamp)
+        if (!forceRefresh && cachedTracks != null && dbFile.exists()
+            && dbFile.lastModified() == cachedDbLastModified) {
+            val tracks = cachedTracks!!
+            _unindexedTracks.value = tracks
+            autoSelect(tracks)
+            return
+        }
+
         viewModelScope.launch(Dispatchers.IO) {
             _isDetecting.value = true
             var db: EmbeddingDatabase? = null
             try {
-                val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
                 if (!dbFile.exists()) {
                     _unindexedTracks.value = emptyList()
+                    cachedTracks = emptyList()
+                    cachedDbLastModified = 0L
                     return@launch
                 }
                 db = EmbeddingDatabase.open(dbFile)
@@ -67,13 +83,13 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
                 val tracks = detector.findUnindexedTracks(getApplication()) { status ->
                     _detectingStatus.value = status
                 }
-                _unindexedTracks.value = tracks
-                // Auto-select all visible tracks
-                val dismissed = _dismissedIds.value
-                _selectedIds.value = tracks
-                    .filter { it.powerampFileId !in dismissed }
-                    .map { it.powerampFileId }
-                    .toSet()
+                // Sort by duration descending (longest first)
+                val sorted = tracks.sortedByDescending { it.durationMs }
+                _unindexedTracks.value = sorted
+                autoSelect(sorted)
+                // Cache for reuse
+                cachedTracks = sorted
+                cachedDbLastModified = dbFile.lastModified()
             } catch (e: Exception) {
                 _unindexedTracks.value = emptyList()
             } finally {
@@ -81,6 +97,15 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
                 _isDetecting.value = false
             }
         }
+    }
+
+    /** Auto-select visible tracks, excluding 0-duration and dismissed. */
+    private fun autoSelect(tracks: List<NewTrackDetector.UnindexedTrack>) {
+        val dismissed = _dismissedIds.value
+        _selectedIds.value = tracks
+            .filter { it.powerampFileId !in dismissed && it.durationMs > 0 }
+            .map { it.powerampFileId }
+            .toSet()
     }
 
     fun toggleSelection(id: Long) {
@@ -115,8 +140,9 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
     fun clearDismissed() {
         _dismissedIds.value = emptySet()
         saveDismissedIds(emptySet())
-        // Re-select all (including previously dismissed)
+        // Re-select all (including previously dismissed), excluding 0-duration
         _selectedIds.value = _unindexedTracks.value
+            .filter { it.durationMs > 0 }
             .map { it.powerampFileId }
             .toSet()
     }
@@ -129,6 +155,9 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
             it.powerampFileId in selected && it.powerampFileId !in dismissed
         }
         if (tracks.isEmpty()) return
+        // Invalidate cache since DB will change
+        cachedTracks = null
+        cachedDbLastModified = 0L
         IndexingService.startIndexing(getApplication(), tracks, refusion = refusion)
     }
 
