@@ -438,16 +438,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val app = getApplication<Application>()
                 val destFile = File(app.filesDir, "embeddings.db")
 
+                // Invalidate mmap'd index pointing at stale files
+                rankIndex = null
+
                 // Delete stale derived files so they're re-extracted from the new DB
                 File(app.filesDir, "fused.emb").delete()
                 File(app.filesDir, "graph.bin").delete()
 
-                EmbeddingDatabase.importFrom(app, uri, destFile).close()
+                // Copy and open — use the returned DB handle for reading info
+                val db = EmbeddingDatabase.importFrom(app, uri, destFile)
                 IndexingViewModel.invalidateCache()
 
-                // Read DB info
                 _importStatus.value = "Reading database info..."
-                val db = EmbeddingDatabase.open(destFile)
                 val info = DatabaseInfo(
                     trackCount = db.getTrackCount(),
                     embeddingCount = db.getEmbeddingCount(),
@@ -474,6 +476,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } catch (e: Exception) {
                 Log.e("MainViewModel", "Import failed", e)
                 _importStatus.value = "Import failed: ${e.message}"
+                // Clear error after a few seconds so the import button reappears
+                kotlinx.coroutines.delay(5000)
+                _importStatus.value = null
             }
         }
     }
