@@ -16,11 +16,9 @@ import com.powerampstartradio.R
 import com.powerampstartradio.data.EmbeddingDatabase
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -132,7 +130,6 @@ class IndexingService : Service() {
 
     private fun performIndexing() {
         activeJob = serviceScope.launch {
-            val indexingScope = this
             try {
                 val dbFile = File(filesDir, "embeddings.db")
                 if (!dbFile.exists()) {
@@ -275,11 +272,6 @@ class IndexingService : Service() {
                             fusedProjection = null,
                         )
 
-                        // Decode lookahead: decode next track while current is inferring.
-                        // Decode uses hardware codec (CPU), inference uses GPU — no contention.
-                        var lookaheadDecode: Deferred<AudioDecoder.DecodedAudio?>? = null
-                        var lookaheadTrack: NewTrackDetector.UnindexedTrack? = null
-
                         for ((i, track) in unindexed.withIndex()) {
                             ensureActive()
                             val trackProgress = "${i + 1}/${unindexed.size}"
@@ -306,37 +298,13 @@ class IndexingService : Service() {
                                 continue
                             }
 
-                            // Use lookahead decode if available for this track
-                            val audio24k = if (lookaheadTrack == track && lookaheadDecode != null) {
-                                val result = lookaheadDecode!!.await()
-                                lookaheadDecode = null
-                                lookaheadTrack = null
-                                result
-                            } else {
-                                lookaheadDecode?.cancel()
-                                lookaheadDecode = null
-                                lookaheadTrack = null
-                                null
-                            } ?: audioDecoder.decode(audioFile, 24000, maxDurationS = 900)
-
+                            val audio24k = audioDecoder.decode(audioFile, 24000, maxDurationS = 900)
                             if (audio24k == null) {
                                 Log.w(TAG, "Decode failed for: ${track.title}")
                                 if (!hasFlamingo) failed++
                                 continue
                             }
                             completedSteps += DECODE_WEIGHT
-
-                            // Launch lookahead decode for next track (runs during resample + inference)
-                            if (i + 1 < unindexed.size) {
-                                val next = unindexed[i + 1]
-                                val nextFile = resolveAudioFile(next)
-                                if (nextFile != null) {
-                                    lookaheadTrack = next
-                                    lookaheadDecode = indexingScope.async(Dispatchers.IO) {
-                                        audioDecoder.decode(nextFile, 24000, maxDurationS = 900)
-                                    }
-                                }
-                            }
 
                             // Cache 16kHz version for Flamingo pass (resample 24→16kHz via soxr)
                             if (cachedAudio16k != null) {
@@ -355,6 +323,9 @@ class IndexingService : Service() {
                                         samples16k, 16000, samples16k.size.toFloat() / 16000
                                     )
                                     cachedAudio16kBytes += entryBytes
+                                } catch (e: OutOfMemoryError) {
+                                    Log.w(TAG, "OOM resampling for ${track.title} — skipping cache", e)
+                                    System.gc()
                                 } catch (e: Exception) {
                                     Log.w(TAG, "16kHz cache failed for ${track.title}: ${e.message}")
                                 }
@@ -408,7 +379,6 @@ class IndexingService : Service() {
                             }
                         }
 
-                        lookaheadDecode?.cancel()
                         processor.close()
                         Log.i(TAG, "Pass 1 (MuLan) complete: ${mulanResults.size} tracks")
                     }
@@ -590,6 +560,12 @@ class IndexingService : Service() {
                 Log.d(TAG, "Indexing cancelled")
                 _state.value = IndexingState.Idle
                 stopSelf()
+            } catch (e: OutOfMemoryError) {
+                Log.e(TAG, "OOM during indexing — stopping", e)
+                System.gc()
+                _state.value = IndexingState.Error("Out of memory — try fewer tracks")
+                updateNotification("Out of memory")
+                stopSelfDelayed()
             } catch (e: Exception) {
                 Log.e(TAG, "Indexing failed", e)
                 _state.value = IndexingState.Error("Error: ${e.message}")
