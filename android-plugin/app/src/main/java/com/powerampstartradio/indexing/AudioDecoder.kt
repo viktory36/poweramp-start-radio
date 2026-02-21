@@ -163,31 +163,38 @@ class AudioDecoder {
             val outputIndex = codec.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
             if (outputIndex >= 0) {
                 val outputBuffer = codec.getOutputBuffer(outputIndex)!!
-                outputBuffer.order(ByteOrder.LITTLE_ENDIAN)
 
-                // MediaCodec outputs 16-bit PCM by default
-                val sampleCount = bufferInfo.size / 2  // 2 bytes per 16-bit sample
-                val frameCount = sampleCount / channelCount
+                val frameCount = bufferInfo.size / (2 * channelCount)
 
-                for (frame in 0 until frameCount) {
-                    if (maxSamples > 0 && totalSamples >= maxSamples.toInt()) break
-                    var monoSample = 0f
-                    for (ch in 0 until channelCount) {
-                        val sample = outputBuffer.getShort().toFloat() / 32768f
-                        monoSample += sample
-                    }
-                    val normalized = monoSample / channelCount
-                    if (output != null) {
-                        output[totalSamples] = normalized
-                    } else {
-                        currentChunk!![chunkPos++] = normalized
+                if (output != null) {
+                    // NEON-accelerated bulk conversion: direct ByteBuffer → mono float.
+                    // Replaces per-sample getShort() loop (~21M calls for 4-min stereo).
+                    val maxHere = if (maxSamples > 0)
+                        minOf(frameCount, (maxSamples - totalSamples).toInt())
+                    else frameCount
+                    val written = NativeMath.int16ToMonoFloat(
+                        outputBuffer, bufferInfo.offset, bufferInfo.size,
+                        channelCount, output, totalSamples, maxHere
+                    )
+                    totalSamples += written
+                } else {
+                    // Fallback: chunk-based accumulation (unknown total size)
+                    outputBuffer.order(ByteOrder.LITTLE_ENDIAN)
+                    outputBuffer.position(bufferInfo.offset)
+                    for (frame in 0 until frameCount) {
+                        var monoSample = 0f
+                        for (ch in 0 until channelCount) {
+                            val sample = outputBuffer.getShort().toFloat() / 32768f
+                            monoSample += sample
+                        }
+                        currentChunk!![chunkPos++] = monoSample / channelCount
                         if (chunkPos == DECODE_CHUNK_SIZE) {
                             chunks!!.add(currentChunk!!)
                             currentChunk = FloatArray(DECODE_CHUNK_SIZE)
                             chunkPos = 0
                         }
+                        totalSamples++
                     }
-                    totalSamples++
                 }
 
                 codec.releaseOutputBuffer(outputIndex, false)
