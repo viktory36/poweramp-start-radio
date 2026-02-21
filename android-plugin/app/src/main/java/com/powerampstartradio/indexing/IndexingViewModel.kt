@@ -66,7 +66,7 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
     private val _selectedIds = MutableStateFlow<Set<Long>>(emptySet())
     val selectedIds: StateFlow<Set<Long>> = _selectedIds.asStateFlow()
 
-    private val _dismissedIds = MutableStateFlow<Set<Long>>(loadDismissedIds())
+    private val _dismissedIds = MutableStateFlow<Set<Long>>(loadDismissedIdsWithDbCheck(application))
     val dismissedIds: StateFlow<Set<Long>> = _dismissedIds.asStateFlow()
 
     private val _isDetecting = MutableStateFlow(false)
@@ -248,6 +248,28 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         } catch (_: Exception) { -1 }
     }
 
+    /**
+     * Load dismissed IDs, but clear them if the database has changed
+     * (e.g. user replaced embeddings.db with a fresh copy).
+     */
+    private fun loadDismissedIdsWithDbCheck(app: Application): Set<Long> {
+        val dbFile = File(app.filesDir, "embeddings.db")
+        val currentFingerprint = if (dbFile.exists())
+            "${dbFile.length()}_${dbFile.lastModified()}" else ""
+        val savedFingerprint = prefs.getString("dismissed_db_fingerprint", "") ?: ""
+
+        if (currentFingerprint != savedFingerprint) {
+            // DB has changed — clear stale dismissed IDs and detection cache
+            prefs.edit()
+                .remove("dismissed_track_ids")
+                .putString("dismissed_db_fingerprint", currentFingerprint)
+                .apply()
+            invalidateCache()
+            return emptySet()
+        }
+        return loadDismissedIds()
+    }
+
     private fun loadDismissedIds(): Set<Long> {
         val json = prefs.getString("dismissed_track_ids", null) ?: return emptySet()
         return try {
@@ -265,6 +287,14 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
     private fun saveDismissedIds(ids: Set<Long>) {
         val arr = JSONArray()
         ids.forEach { arr.put(it) }
-        prefs.edit().putString("dismissed_track_ids", arr.toString()).apply()
+        prefs.edit()
+            .putString("dismissed_track_ids", arr.toString())
+            .putString("dismissed_db_fingerprint", getDbFingerprint())
+            .apply()
+    }
+
+    private fun getDbFingerprint(): String {
+        val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
+        return if (dbFile.exists()) "${dbFile.length()}_${dbFile.lastModified()}" else ""
     }
 }
