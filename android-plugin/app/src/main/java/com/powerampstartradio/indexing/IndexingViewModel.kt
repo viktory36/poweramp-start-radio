@@ -32,6 +32,13 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         private var cachedTracks: List<NewTrackDetector.UnindexedTrack>? = null
         private var cachedDbLastModified: Long = 0L
         private var cachedPowerampTrackCount: Int = -1
+
+        /** Clear the cached detection result (e.g. after DB import). */
+        fun invalidateCache() {
+            cachedTracks = null
+            cachedDbLastModified = 0L
+            cachedPowerampTrackCount = -1
+        }
     }
 
     private val prefs = application.getSharedPreferences("indexing", Context.MODE_PRIVATE)
@@ -163,8 +170,7 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         }
         if (tracks.isEmpty()) return
         // Invalidate cache since DB will change
-        cachedTracks = null
-        cachedDbLastModified = 0L
+        invalidateCache()
         IndexingService.startIndexing(getApplication(), tracks, refusion = refusion)
     }
 

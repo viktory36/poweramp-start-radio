@@ -2,11 +2,14 @@ package com.powerampstartradio.ui
 
 import android.app.Application
 import android.content.Context
+import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.data.EmbeddingIndex
 import com.powerampstartradio.indexing.IndexingService
+import com.powerampstartradio.indexing.IndexingViewModel
 import com.powerampstartradio.indexing.NewTrackDetector
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
@@ -99,6 +102,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _fileStatuses = MutableStateFlow<List<AppFileStatus>>(emptyList())
     val fileStatuses: StateFlow<List<AppFileStatus>> = _fileStatuses.asStateFlow()
+
+    private val _importStatus = MutableStateFlow<String?>(null)
+    val importStatus: StateFlow<String?> = _importStatus.asStateFlow()
 
     val indexingState: StateFlow<IndexingService.IndexingState> = IndexingService.state
 
@@ -387,19 +393,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun prepareIndices() {
         viewModelScope.launch(Dispatchers.IO) {
-            val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
-            if (!dbFile.exists()) return@launch
-            try {
-                val db = EmbeddingDatabase.open(dbFile)
-                val engine = RecommendationEngine(db, getApplication<Application>().filesDir)
-                engine.ensureIndices { message ->
-                    _indexStatus.value = message
-                }
-                _indexStatus.value = "Index ready"
-                db.close()
-            } catch (e: Exception) {
-                _indexStatus.value = "Index error: ${e.message}"
+            prepareIndicesWithProgress { message ->
+                _indexStatus.value = message
             }
+        }
+    }
+
+    private suspend fun prepareIndicesWithProgress(onProgress: (String) -> Unit) {
+        val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
+        if (!dbFile.exists()) return
+        try {
+            val db = EmbeddingDatabase.open(dbFile)
+            val engine = RecommendationEngine(db, getApplication<Application>().filesDir)
+            engine.ensureIndices { message ->
+                onProgress(message)
+                _indexStatus.value = message
+            }
+            _indexStatus.value = "Index ready"
+            onProgress("Index ready")
+            db.close()
+        } catch (e: Exception) {
+            _indexStatus.value = "Index error: ${e.message}"
         }
     }
 
@@ -411,6 +425,57 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun requestPermission() {
         PowerampHelper.requestDataPermission(getApplication())
+    }
+
+    /**
+     * Import a database from the given URI asynchronously.
+     * Shows progress in importStatus, then refreshes everything.
+     */
+    fun importDatabase(uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                _importStatus.value = "Copying database..."
+                val app = getApplication<Application>()
+                val destFile = File(app.filesDir, "embeddings.db")
+
+                // Delete stale derived files so they're re-extracted from the new DB
+                File(app.filesDir, "fused.emb").delete()
+                File(app.filesDir, "graph.bin").delete()
+
+                EmbeddingDatabase.importFrom(app, uri, destFile).close()
+                IndexingViewModel.invalidateCache()
+
+                // Read DB info
+                _importStatus.value = "Reading database info..."
+                val db = EmbeddingDatabase.open(destFile)
+                val info = DatabaseInfo(
+                    trackCount = db.getTrackCount(),
+                    embeddingCount = db.getEmbeddingCount(),
+                    embeddingDim = db.getEmbeddingDim(),
+                    version = db.getMetadata("version"),
+                    sizeKb = destFile.length() / 1024,
+                    hasFused = db.hasFusedEmbeddings,
+                    hasGraph = db.hasBinaryData("knn_graph"),
+                    embeddingTable = db.embeddingTable,
+                    availableModels = db.getAvailableModels(),
+                )
+                db.close()
+                _databaseInfo.value = info
+
+                // Extract indices with progress updates
+                _importStatus.value = "Extracting search index..."
+                prepareIndicesWithProgress { status ->
+                    _importStatus.value = status
+                }
+
+                checkUnindexedTracks()
+                checkModels()
+                _importStatus.value = null
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "Import failed", e)
+                _importStatus.value = "Import failed: ${e.message}"
+            }
+        }
     }
 
     fun refreshDatabaseInfo() {

@@ -3,7 +3,6 @@ package com.powerampstartradio
 import android.content.IntentFilter
 import android.net.Uri
 import android.os.Bundle
-import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -46,7 +45,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.poweramp.PowerampTrack
@@ -66,7 +64,6 @@ import com.powerampstartradio.ui.RadioUiState
 import com.powerampstartradio.ui.SelectionMode
 import com.powerampstartradio.ui.theme.PowerampStartRadioTheme
 import kotlinx.coroutines.launch
-import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -77,10 +74,6 @@ private fun RadioUiState.isActiveSearch(): Boolean =
     this is RadioUiState.Loading || this is RadioUiState.Searching || this is RadioUiState.Streaming
 
 class MainActivity : ComponentActivity() {
-
-    companion object {
-        private const val TAG = "MainActivity"
-    }
 
     private val trackReceiver = PowerampReceiver()
     private var onResumeCallback: (() -> Unit)? = null
@@ -165,18 +158,7 @@ fun MainScreen(
     val importLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
-        uri?.let {
-            statusMessage = "Importing database..."
-            try {
-                val destFile = File(context.filesDir, "embeddings.db")
-                EmbeddingDatabase.importFrom(context, it, destFile).close()
-                viewModel.refreshDatabaseInfo()
-                statusMessage = "Database imported!"
-            } catch (e: Exception) {
-                statusMessage = "Import failed: ${e.message}"
-                Log.e("MainActivity", "Import failed", e)
-            }
-        }
+        uri?.let { viewModel.importDatabase(it) }
     }
 
 
@@ -1037,8 +1019,20 @@ fun SettingsScreen(
                         Text("No database imported", color = MaterialTheme.colorScheme.error)
                     }
                     Spacer(modifier = Modifier.height(8.dp))
-                    OutlinedButton(onClick = onImportDatabase, modifier = Modifier.fillMaxWidth()) {
-                        Text(if (databaseInfo != null) "Replace Database" else "Import Database")
+                    val importStatus by viewModel.importStatus.collectAsState()
+                    if (importStatus != null) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                            Text(importStatus!!, style = MaterialTheme.typography.bodyMedium)
+                        }
+                    } else {
+                        OutlinedButton(onClick = onImportDatabase, modifier = Modifier.fillMaxWidth()) {
+                            Text(if (databaseInfo != null) "Replace Database" else "Import Database")
+                        }
                     }
                 }
             }
