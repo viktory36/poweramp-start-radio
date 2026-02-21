@@ -121,7 +121,20 @@ class MuLanInference(
      * @param audio Decoded audio at 24kHz
      * @return 512-dim L2-normalized embedding, or null on failure
      */
-    fun generateEmbedding(audio: AudioDecoder.DecodedAudio): FloatArray? {
+    /**
+     * Compute the number of inference calls (clips) for audio of this duration.
+     * Used for pre-computing total work across all tracks for ETA.
+     */
+    fun clipCount(durationS: Float): Int {
+        if (durationS < CHUNK_DURATION_S) return 0
+        val numChunks = calculateNumChunks(durationS)
+        return numChunks * 3  // 3 clips per chunk
+    }
+
+    fun generateEmbedding(
+        audio: AudioDecoder.DecodedAudio,
+        onClipDone: (() -> Unit)? = null,
+    ): FloatArray? {
         require(audio.sampleRate == SAMPLE_RATE) {
             "MuQ-MuLan requires ${SAMPLE_RATE}Hz audio, got ${audio.sampleRate}Hz"
         }
@@ -172,6 +185,7 @@ class MuLanInference(
                 sumEmbedding[i] += embedding[i]
             }
             count++
+            onClipDone?.invoke()
         }
 
         if (count == 0) {

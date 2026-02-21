@@ -202,6 +202,28 @@ class IndexingService : Service() {
                 var indexed = 0
                 var failed = 0
 
+                // Pre-compute total inference chunks for chunk-based ETA.
+                // MuLan: 3 clips per chunk, chunks = max(1, min(floor(dur/60), 30))
+                // Flamingo: 1 chunk per 30s, chunks = max(1, min(ceil(dur/30), 60))
+                var totalChunks = 0
+                for (t in unindexed) {
+                    val durS = t.durationMs / 1000f
+                    if (hasMulan && durS >= 30f) {
+                        val mulanChunks = maxOf(1, minOf((durS / 60f).toInt(), 30))
+                        totalChunks += mulanChunks * 3  // 3 clips per chunk
+                    }
+                    if (hasFlamingo && durS >= 3f) {
+                        totalChunks += maxOf(1, minOf(kotlin.math.ceil(durS / 30.0).toInt(), 60))
+                    }
+                }
+                var completedChunks = 0
+
+                fun chunkEta(): Long {
+                    if (completedChunks == 0) return 0L
+                    val elapsed = System.currentTimeMillis() - batchStartTime
+                    return elapsed * (totalChunks - completedChunks) / completedChunks
+                }
+
                 // Track IDs from pass 1 for pass 2's fusion
                 val trackIds = mutableMapOf<NewTrackDetector.UnindexedTrack, Long>()
 
@@ -236,17 +258,17 @@ class IndexingService : Service() {
 
                         for ((i, track) in unindexed.withIndex()) {
                             ensureActive()
-                            val elapsed = System.currentTimeMillis() - batchStartTime
-                            val eta = if (i > 0) elapsed * (unindexed.size - i) / i else 0L
+                            val eta = chunkEta()
                             _state.value = IndexingState.Processing(
                                 current = i + 1,
                                 total = unindexed.size,
                                 trackName = "${track.artist} - ${track.title}",
-                                elapsedMs = elapsed,
+                                elapsedMs = System.currentTimeMillis() - batchStartTime,
                                 estimatedRemainingMs = eta,
                             )
                             val etaStr = formatEta(eta)
-                            updateNotification("MuLan: ${track.title}$etaStr", i + 1, unindexed.size)
+                            updateNotification("MuLan: ${track.title}$etaStr",
+                                completedChunks, totalChunks)
 
                             val audioFile = resolveAudioFile(track)
                             if (audioFile == null) {
@@ -276,10 +298,27 @@ class IndexingService : Service() {
                             }
 
                             val embeddings = processor.processTrack(
-                                audioFile, preDecodedAudio = audio24k
-                            ) { status ->
-                                updateNotification("MuLan: $status", i + 1, unindexed.size)
-                            }
+                                audioFile, preDecodedAudio = audio24k,
+                                onProgress = { status ->
+                                    updateNotification("MuLan: $status",
+                                        completedChunks, totalChunks)
+                                },
+                                onChunkDone = {
+                                    completedChunks++
+                                    val updatedEta = chunkEta()
+                                    _state.value = IndexingState.Processing(
+                                        current = i + 1,
+                                        total = unindexed.size,
+                                        trackName = "${track.artist} - ${track.title}",
+                                        elapsedMs = System.currentTimeMillis() - batchStartTime,
+                                        estimatedRemainingMs = updatedEta,
+                                    )
+                                    updateNotification(
+                                        "MuLan: ${track.title}${formatEta(updatedEta)}",
+                                        completedChunks, totalChunks,
+                                    )
+                                },
+                            )
 
                             if (embeddings == null) {
                                 if (!hasFlamingo) failed++
@@ -312,7 +351,6 @@ class IndexingService : Service() {
                 }
 
                 // ── Pass 2: Flamingo + Fusion ──────────────────────────
-                val pass2StartTime = System.currentTimeMillis()
                 if (hasFlamingo) {
                     _state.value = IndexingState.Detecting("Loading Flamingo model (GPU)...")
                     updateNotification("Loading Flamingo model...")
@@ -341,17 +379,17 @@ class IndexingService : Service() {
 
                         for ((i, track) in unindexed.withIndex()) {
                             ensureActive()
-                            val elapsed = System.currentTimeMillis() - pass2StartTime
-                            val eta = if (i > 0) elapsed * (unindexed.size - i) / i else 0L
+                            val eta = chunkEta()
                             _state.value = IndexingState.Processing(
                                 current = i + 1,
                                 total = unindexed.size,
                                 trackName = "${track.artist} - ${track.title}",
-                                elapsedMs = elapsed,
+                                elapsedMs = System.currentTimeMillis() - batchStartTime,
                                 estimatedRemainingMs = eta,
                             )
                             val etaStr = formatEta(eta)
-                            updateNotification("Flamingo: ${track.title}$etaStr", i + 1, unindexed.size)
+                            updateNotification("Flamingo: ${track.title}$etaStr",
+                                completedChunks, totalChunks)
 
                             val audioFile = resolveAudioFile(track)
                             if (audioFile == null) {
@@ -373,9 +411,26 @@ class IndexingService : Service() {
                                 audioFile,
                                 existingMulan = existingMulan,
                                 preDecodedAudio = cached16k,
-                            ) { status ->
-                                updateNotification("Flamingo: $status", i + 1, unindexed.size)
-                            }
+                                onProgress = { status ->
+                                    updateNotification("Flamingo: $status",
+                                        completedChunks, totalChunks)
+                                },
+                                onChunkDone = {
+                                    completedChunks++
+                                    val updatedEta = chunkEta()
+                                    _state.value = IndexingState.Processing(
+                                        current = i + 1,
+                                        total = unindexed.size,
+                                        trackName = "${track.artist} - ${track.title}",
+                                        elapsedMs = System.currentTimeMillis() - batchStartTime,
+                                        estimatedRemainingMs = updatedEta,
+                                    )
+                                    updateNotification(
+                                        "Flamingo: ${track.title}${formatEta(updatedEta)}",
+                                        completedChunks, totalChunks,
+                                    )
+                                },
+                            )
 
                             if (embeddings == null) {
                                 failed++

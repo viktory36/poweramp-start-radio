@@ -105,7 +105,18 @@ class FlamingoInference(
      * @param audio Decoded audio at 16kHz
      * @return 3584-dim (or 1280-dim) L2-normalized embedding, or null on failure
      */
-    fun generateEmbedding(audio: AudioDecoder.DecodedAudio): FloatArray? {
+    /**
+     * Compute the number of inference calls (chunks) for audio of this duration.
+     */
+    fun chunkCount(durationS: Float): Int {
+        if (durationS < 3.0f) return 0
+        return calculateNumChunks(durationS)
+    }
+
+    fun generateEmbedding(
+        audio: AudioDecoder.DecodedAudio,
+        onChunkDone: (() -> Unit)? = null,
+    ): FloatArray? {
         require(audio.sampleRate == SAMPLE_RATE) {
             "Flamingo requires ${SAMPLE_RATE}Hz audio, got ${audio.sampleRate}Hz"
         }
@@ -130,6 +141,7 @@ class FlamingoInference(
                 sumEmbedding[i] += embedding[i]
             }
             count++
+            onChunkDone?.invoke()
         }
 
         if (count == 0) {

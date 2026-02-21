@@ -108,6 +108,7 @@ class EmbeddingProcessor(
         existingMulan: FloatArray? = null,
         preDecodedAudio: AudioDecoder.DecodedAudio? = null,
         onProgress: ((String) -> Unit)? = null,
+        onChunkDone: (() -> Unit)? = null,
     ): EmbeddingResult? {
         var mulanEmbedding: FloatArray? = null
         var flamingoRawEmbedding: FloatArray? = null
@@ -121,7 +122,7 @@ class EmbeddingProcessor(
                            else audioDecoder.decode(audioFile, 24000, maxDurationS = 900)
             if (audio24k != null) {
                 onProgress?.invoke("MuQ-MuLan inference...")
-                mulanEmbedding = mulanModel.generateEmbedding(audio24k)
+                mulanEmbedding = mulanModel.generateEmbedding(audio24k, onClipDone = onChunkDone)
             }
         }
 
@@ -132,7 +133,7 @@ class EmbeddingProcessor(
                            else audioDecoder.decode(audioFile, 16000, maxDurationS = 1800)
             if (audio16k != null) {
                 onProgress?.invoke("Flamingo inference...")
-                flamingoRawEmbedding = flamingoModel.generateEmbedding(audio16k)
+                flamingoRawEmbedding = flamingoModel.generateEmbedding(audio16k, onChunkDone = onChunkDone)
             }
         }
 
