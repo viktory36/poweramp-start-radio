@@ -231,8 +231,11 @@ class IndexingService : Service() {
                     return elapsed * (totalSteps - completedSteps) / completedSteps
                 }
 
-                // Track IDs from pass 1 for pass 2's fusion
-                val trackIds = mutableMapOf<NewTrackDetector.UnindexedTrack, Long>()
+                // MuLan results held in memory until Flamingo pass completes.
+                // Avoids writing partial entries to DB that would be invisible
+                // to search (no fused embedding) but considered "indexed" by detector.
+                // Each embedding is 512 floats = 2KB, negligible memory.
+                val mulanResults = mutableMapOf<NewTrackDetector.UnindexedTrack, EmbeddingProcessor.EmbeddingResult>()
 
                 // Decode-once optimization: cache 16kHz audio during MuLan pass
                 // for Flamingo pass. Avoids redundant decode+resample (~50s/track).
@@ -349,31 +352,33 @@ class IndexingService : Service() {
                                 continue
                             }
 
-                            val trackId = writer.writeTrack(
-                                metadataKey = track.metadataKey,
-                                filenameKey = track.filenameKey,
-                                artist = track.artist.ifEmpty { null },
-                                album = track.album.ifEmpty { null },
-                                title = track.title.ifEmpty { null },
-                                durationMs = track.durationMs,
-                                filePath = track.path ?: audioFile.absolutePath,
-                                embeddings = embeddings,
-                                source = "phone",
-                            )
-
-                            if (trackId > 0) {
-                                trackIds[track] = trackId
-                                if (!hasFlamingo) {
+                            if (hasFlamingo) {
+                                // Hold in memory — will write after Flamingo pass completes
+                                mulanResults[track] = embeddings
+                            } else {
+                                // MuLan-only mode — write immediately
+                                val trackId = writer.writeTrack(
+                                    metadataKey = track.metadataKey,
+                                    filenameKey = track.filenameKey,
+                                    artist = track.artist.ifEmpty { null },
+                                    album = track.album.ifEmpty { null },
+                                    title = track.title.ifEmpty { null },
+                                    durationMs = track.durationMs,
+                                    filePath = track.path ?: audioFile.absolutePath,
+                                    embeddings = embeddings,
+                                    source = "phone",
+                                )
+                                if (trackId > 0) {
                                     indexed++
                                     Log.i(TAG, "Track ${i + 1}/${unindexed.size} indexed: ${track.artist} - ${track.title}")
+                                } else {
+                                    failed++
                                 }
-                            } else {
-                                if (!hasFlamingo) failed++
                             }
                         }
 
                         processor.close()
-                        Log.i(TAG, "Pass 1 (MuLan) complete: ${trackIds.size} tracks")
+                        Log.i(TAG, "Pass 1 (MuLan) complete: ${mulanResults.size} tracks")
                     }
                 }
 
@@ -451,15 +456,12 @@ class IndexingService : Service() {
                             updateNotification("$trackProgress ${track.title} \u2013 Flamingo${formatEta(inferenceEta)}",
                                 completedSteps, totalSteps)
 
-                            // Read MuLan embedding from pass 1 for fusion
-                            val existingTrackId = trackIds[track]
-                            val existingMulan = if (existingTrackId != null) {
-                                db.getEmbeddingFromTable("embeddings_mulan", existingTrackId)
-                            } else null
+                            // Use in-memory MuLan embedding from pass 1 for fusion
+                            val mulanEmbedding = mulanResults[track]?.mulanEmbedding
 
                             val embeddings = processor.processTrack(
                                 audioFile,
-                                existingMulan = existingMulan,
+                                existingMulan = mulanEmbedding,
                                 preDecodedAudio = audio16k,
                                 onProgress = { status ->
                                     updateNotification("$trackProgress $status",
@@ -481,24 +483,29 @@ class IndexingService : Service() {
                                 continue
                             }
 
-                            if (existingTrackId != null) {
-                                // Track exists from pass 1 — add Flamingo + fused embeddings
-                                val ok = writer.addEmbeddings(existingTrackId, embeddings)
-                                if (ok) indexed++ else failed++
+                            // Merge MuLan embedding into the Flamingo result for a complete write
+                            val merged = EmbeddingProcessor.EmbeddingResult(
+                                mulanEmbedding = mulanEmbedding,
+                                flamingoEmbedding = embeddings.flamingoEmbedding,
+                                flamingoReduced = embeddings.flamingoReduced,
+                                fusedEmbedding = embeddings.fusedEmbedding,
+                            )
+                            val trackId = writer.writeTrack(
+                                metadataKey = track.metadataKey,
+                                filenameKey = track.filenameKey,
+                                artist = track.artist.ifEmpty { null },
+                                album = track.album.ifEmpty { null },
+                                title = track.title.ifEmpty { null },
+                                durationMs = track.durationMs,
+                                filePath = track.path ?: audioFile.absolutePath,
+                                embeddings = merged,
+                                source = "phone",
+                            )
+                            if (trackId > 0) {
+                                indexed++
+                                mulanResults.remove(track)  // Free memory
                             } else {
-                                // No MuLan pass (only Flamingo available) — write full track
-                                val trackId = writer.writeTrack(
-                                    metadataKey = track.metadataKey,
-                                    filenameKey = track.filenameKey,
-                                    artist = track.artist.ifEmpty { null },
-                                    album = track.album.ifEmpty { null },
-                                    title = track.title.ifEmpty { null },
-                                    durationMs = track.durationMs,
-                                    filePath = track.path ?: audioFile.absolutePath,
-                                    embeddings = embeddings,
-                                    source = "phone",
-                                )
-                                if (trackId > 0) indexed++ else failed++
+                                failed++
                             }
                             Log.i(TAG, "Track ${i + 1}/${unindexed.size} indexed: ${track.artist} - ${track.title}")
                         }
