@@ -45,7 +45,12 @@ class AudioDecoder {
      *   Caps at native sample rate before resampling.
      * @return Decoded audio, or null on failure
      */
-    fun decode(file: File, targetSampleRate: Int, maxDurationS: Int = 0): DecodedAudio? {
+    fun decode(
+        file: File,
+        targetSampleRate: Int,
+        maxDurationS: Int = 0,
+        resampleQuality: Int = NativeResampler.QUALITY_HQ,
+    ): DecodedAudio? {
         val decodeStart = System.nanoTime()
         val extractor = MediaExtractor()
         try {
@@ -88,7 +93,7 @@ class AudioDecoder {
             // Resample if needed
             val resampleStart = System.nanoTime()
             val resampled = if (nativeSampleRate != targetSampleRate) {
-                resample(rawSamples, nativeSampleRate, targetSampleRate)
+                resample(rawSamples, nativeSampleRate, targetSampleRate, resampleQuality)
             } else {
                 rawSamples
             }
@@ -245,9 +250,14 @@ class AudioDecoder {
      * Only soxr-quality resampling produces correct embeddings (0.95+ cosine vs DB).
      * All other approaches (linear, sinc, Kaiser FIR, scipy polyphase) give ~0.55.
      */
-    fun resample(samples: FloatArray, fromRate: Int, toRate: Int): FloatArray {
+    fun resample(
+        samples: FloatArray,
+        fromRate: Int,
+        toRate: Int,
+        quality: Int = NativeResampler.QUALITY_HQ,
+    ): FloatArray {
         if (fromRate == toRate) return samples
-        return NativeResampler.resample(samples, fromRate, toRate)
+        return NativeResampler.resample(samples, fromRate, toRate, quality)
             ?: throw IllegalStateException("soxr resampling failed ($fromRate -> $toRate Hz, ${samples.size} samples)")
     }
 }

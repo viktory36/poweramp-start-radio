@@ -312,8 +312,15 @@ class IndexingService : Service() {
 
                             // Tighter pre-alloc: use actual duration instead of 900s cap.
                             // A 3-min track at 48kHz: 35MB vs 165MB with the blanket 900s cap.
+                            // MQ resample quality: 16-bit precision is more than sufficient
+                            // for MuLan's mel spectrogram (80dB dynamic range after dB conversion).
+                            // soxr MQ is 2-3x faster than HQ on ARM (~4s vs ~10s per track).
                             val maxDurMulan = minOf((track.durationMs / 1000).toInt() + 10, 900)
-                            val audio24k = audioDecoder.decode(audioFile, 24000, maxDurationS = maxDurMulan)
+                            val audio24k = audioDecoder.decode(
+                                audioFile, 24000,
+                                maxDurationS = maxDurMulan,
+                                resampleQuality = NativeResampler.QUALITY_MQ,
+                            )
                             if (audio24k == null) {
                                 Log.w(TAG, "Decode failed for: ${track.title}")
                                 if (!hasFlamingo) failed++
@@ -423,9 +430,11 @@ class IndexingService : Service() {
                 }
 
                 // ── Pass 2: Flamingo + Fusion (two-phase GPU) ────────
-                // Phase 2a: Encoder — encode all tracks on GPU
+                // Phase 2a: Encoder — encode all tracks on GPU, spill hidden
+                //           states to disk (each chunk = 3.84MB, 14 tracks ≈ 490MB
+                //           which exceeds the ~368MB heap limit).
                 // Phase 2b: Projector — close encoder, load projector on GPU,
-                //           project all, fuse with MuLan, write to DB.
+                //           read hidden states back from disk, project, fuse, write.
                 // Two CL environments can't coexist on Adreno GPUs, so we
                 // must close the encoder before loading the projector.
                 val flamingoPassStart = System.currentTimeMillis()
@@ -450,10 +459,21 @@ class IndexingService : Service() {
                             )?.transpose()
                         } else flamingoProjection
 
-                        // ── Phase 2a: Encode all tracks ──
-                        // Each entry: track → list of raw encoder outputs [750×1280]
-                        val encoderResults = linkedMapOf<NewTrackDetector.UnindexedTrack, List<FloatArray>>()
+                        // ── Phase 2a: Encode all tracks, spill to disk ──
+                        // Hidden states are written to a temp file instead of accumulating
+                        // in memory. Each chunk is 750×1280 floats = 3.84MB. For 14 tracks
+                        // × ~9 chunks = ~490MB which would OOM the 368MB heap.
+                        // Disk I/O is <0.5s total on UFS 4.0 — negligible overhead.
+                        val hiddenFile = File(cacheDir, "flamingo_hiddens.tmp")
+                        val chunkCounts = IntArray(unindexed.size)
+                        val chunkBytes = FlamingoInference.HIDDEN_STATE_BYTES
 
+                        try {  // outer try ensures hiddenFile is always cleaned up
+                        val writeBuf = java.nio.ByteBuffer.allocate(chunkBytes)
+                            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                        val writeChannel = java.io.FileOutputStream(hiddenFile).channel
+
+                        try {
                         for ((i, track) in unindexed.withIndex()) {
                             ensureActive()
                             val trackProgress = "${i + 1}/${unindexed.size}"
@@ -522,11 +542,29 @@ class IndexingService : Service() {
                                 "(encode=${encInferMs}ms)")
 
                             if (hiddens != null) {
-                                encoderResults[track] = hiddens
+                                // Spill hidden states to disk instead of holding in memory
+                                chunkCounts[i] = hiddens.size
+                                for (hidden in hiddens) {
+                                    writeBuf.clear()
+                                    writeBuf.asFloatBuffer().put(hidden)
+                                    writeBuf.rewind()
+                                    writeChannel.write(writeBuf)
+                                }
                             } else {
                                 failed++
                             }
                         }
+                        } finally {
+                            writeChannel.close()
+                        }
+
+                        val totalChunks = chunkCounts.sum()
+                        val spillMB = totalChunks.toLong() * chunkBytes / (1024 * 1024)
+                        Log.i(TAG, "Flamingo encoder done: $totalChunks chunks spilled to disk (${spillMB}MB)")
+
+                        // Free audio cache — no longer needed
+                        cachedAudio16k?.clear()
+                        cachedAudio16kBytes = 0L
 
                         // ── Phase transition: encoder → projector ──
                         flamingoInference.closeEncoder()
@@ -536,10 +574,28 @@ class IndexingService : Service() {
                         flamingoInference.loadProjector()
                         Log.i(TAG, "TIMING: flamingo_projector_load = ${(System.nanoTime() - projLoadStart) / 1_000_000}ms")
 
-                        // ── Phase 2b: Project + Fuse + Write ──
-                        for ((track, hiddens) in encoderResults) {
+                        // ── Phase 2b: Read hidden states from disk, project + fuse + write ──
+                        val readBuf = java.nio.ByteBuffer.allocate(chunkBytes)
+                            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                        val readChannel = java.io.FileInputStream(hiddenFile).channel
+
+                        try {
+                        for ((i, track) in unindexed.withIndex()) {
+                            val numChunks = chunkCounts[i]
+                            if (numChunks == 0) continue  // failed during encode
+
                             ensureActive()
                             val projStart = System.nanoTime()
+
+                            // Read hidden states for this track from disk
+                            val hiddens = (0 until numChunks).map {
+                                readBuf.clear()
+                                readChannel.read(readBuf)
+                                readBuf.flip()
+                                FloatArray(FlamingoInference.HIDDEN_STATE_FLOATS).also { arr ->
+                                    readBuf.asFloatBuffer().get(arr)
+                                }
+                            }
 
                             val flamingoRaw = flamingoInference.projectAndAverage(hiddens)
                             if (flamingoRaw == null) {
@@ -591,6 +647,13 @@ class IndexingService : Service() {
                             }
                             Log.i(TAG, "TIMING: flamingo_project " +
                                 "\"${track.artist} - ${track.title}\" = ${projMs}ms")
+                        }
+                        } finally {
+                            readChannel.close()
+                        }
+
+                        } finally {
+                            hiddenFile.delete()
                         }
 
                         flamingoInference.close()

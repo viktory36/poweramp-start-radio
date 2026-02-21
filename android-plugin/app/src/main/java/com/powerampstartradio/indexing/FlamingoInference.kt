@@ -42,6 +42,11 @@ class FlamingoInference(
         private const val FRAME_DURATION_S = 0.04f  // 30s / 750 frames
         private const val ENCODER_DIM = 1280
         private const val PROJECTED_DIM = 3584
+
+        /** Floats per encoder hidden state chunk (750 × 1280). */
+        const val HIDDEN_STATE_FLOATS = NUM_FRAMES * ENCODER_DIM
+        /** Bytes per encoder hidden state chunk (3,840,000 bytes = 3.66 MB). */
+        const val HIDDEN_STATE_BYTES = HIDDEN_STATE_FLOATS * 4
     }
 
     private val melSpectrogram = MelSpectrogram(center = true, melScale = MelScale.SLANEY)
@@ -181,10 +186,11 @@ class FlamingoInference(
 
             val encStart = System.nanoTime()
             enc.run(encIn, encOut)
+            val output = encOut[0].readFloat()  // GPU sync point — blocks until inference completes
             val encoderMs = (System.nanoTime() - encStart) / 1_000_000
             onTiming?.invoke(melMs, encoderMs)
 
-            encOut[0].readFloat()
+            output
         } catch (e: Exception) {
             Log.e(TAG, "Encoder inference failed: ${e.message}", e)
             null
