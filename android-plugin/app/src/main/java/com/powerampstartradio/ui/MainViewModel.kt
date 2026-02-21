@@ -345,7 +345,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             try {
                 val result = deferred.await()
-                setUnindexedCount(result.size)
+                // Exclude dismissed tracks from the count
+                val dismissedJson = app.getSharedPreferences("indexing", Context.MODE_PRIVATE)
+                    .getString("dismissed_track_ids", null)
+                val dismissed = if (dismissedJson != null) {
+                    try {
+                        val arr = org.json.JSONArray(dismissedJson)
+                        (0 until arr.length()).map { arr.getLong(it) }.toSet()
+                    } catch (_: Exception) { emptySet() }
+                } else emptySet<Long>()
+                val visible = result.count { it.powerampFileId !in dismissed }
+                setUnindexedCount(visible)
             } catch (_: Exception) {
                 setUnindexedCount(0)
             } finally {

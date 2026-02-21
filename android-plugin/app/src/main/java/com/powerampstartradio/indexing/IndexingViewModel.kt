@@ -211,6 +211,18 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
             it.powerampFileId in selected && it.powerampFileId !in dismissed
         }
         if (tracks.isEmpty()) return
+
+        // Auto-dismiss unchecked visible tracks so they don't count as unindexed
+        val unchecked = _unindexedTracks.value
+            .filter { it.powerampFileId !in selected && it.powerampFileId !in dismissed }
+            .map { it.powerampFileId }
+            .toSet()
+        if (unchecked.isNotEmpty()) {
+            val newDismissed = dismissed + unchecked
+            _dismissedIds.value = newDismissed
+            saveDismissedIds(newDismissed)
+        }
+
         // Invalidate cache since DB will change
         invalidateCache()
         IndexingService.startIndexing(getApplication(), tracks, refusion = refusion)
