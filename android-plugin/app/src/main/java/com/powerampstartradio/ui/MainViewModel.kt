@@ -94,7 +94,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val indexStatus: StateFlow<String?> = _indexStatus.asStateFlow()
 
     // --- Indexing state ---
-    private val _unindexedCount = MutableStateFlow(0)
+    private val _unindexedCount = MutableStateFlow(-1) // -1 = not yet checked
     val unindexedCount: StateFlow<Int> = _unindexedCount.asStateFlow()
 
     private val _hasModels = MutableStateFlow(false)
@@ -315,6 +315,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // --- Indexing actions ---
 
     fun checkUnindexedTracks() {
+        _unindexedCount.value = -1 // signal "checking" to UI
         viewModelScope.launch(Dispatchers.IO) {
             val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
             if (!dbFile.exists()) {
@@ -485,18 +486,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     _importStatus.value = status
                 }
 
-                _importStatus.value = "Detecting unindexed tracks..."
-                try {
-                    val countDb = EmbeddingDatabase.open(destFile)
-                    val detector = NewTrackDetector(countDb)
-                    val unindexed = detector.findUnindexedTracks(app)
-                    _unindexedCount.value = unindexed.size
-                    countDb.close()
-                } catch (_: Exception) {
-                    _unindexedCount.value = 0
-                }
                 checkModels()
                 _importStatus.value = null
+
+                // Fire-and-forget: unindexed count updates independently
+                checkUnindexedTracks()
             } catch (e: Exception) {
                 Log.e("MainViewModel", "Import failed", e)
                 _importStatus.value = "Import failed: ${e.message}"

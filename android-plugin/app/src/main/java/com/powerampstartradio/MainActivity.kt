@@ -1071,7 +1071,16 @@ fun SettingsScreen(
                             // Show brief status summary
                             when (val state = indexingState) {
                                 is IndexingService.IndexingState.Idle -> {
-                                    if (unindexedCount > 0) {
+                                    if (unindexedCount < 0) {
+                                        // Still checking
+                                        Row(verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                                            Text("Checking...",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        }
+                                    } else if (unindexedCount > 0) {
                                         Text("$unindexedCount unindexed tracks",
                                             style = MaterialTheme.typography.bodyMedium,
                                             color = MaterialTheme.colorScheme.primary)
