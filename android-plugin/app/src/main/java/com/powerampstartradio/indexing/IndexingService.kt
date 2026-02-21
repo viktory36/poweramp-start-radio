@@ -363,7 +363,10 @@ class IndexingService : Service() {
 
                             if (trackId > 0) {
                                 trackIds[track] = trackId
-                                if (!hasFlamingo) indexed++
+                                if (!hasFlamingo) {
+                                    indexed++
+                                    Log.i(TAG, "Track ${i + 1}/${unindexed.size} indexed: ${track.artist} - ${track.title}")
+                                }
                             } else {
                                 if (!hasFlamingo) failed++
                             }
@@ -497,6 +500,7 @@ class IndexingService : Service() {
                                 )
                                 if (trackId > 0) indexed++ else failed++
                             }
+                            Log.i(TAG, "Track ${i + 1}/${unindexed.size} indexed: ${track.artist} - ${track.title}")
                         }
 
                         processor.close()

@@ -92,6 +92,10 @@ class AudioDecoder {
 
             return DecodedAudio(resampled, targetSampleRate, durationS)
 
+        } catch (e: OutOfMemoryError) {
+            Log.e(TAG, "OOM decoding ${file.name} — skipping", e)
+            System.gc()
+            return null
         } catch (e: Exception) {
             Log.e(TAG, "Failed to decode ${file.name}", e)
             return null
@@ -122,13 +126,18 @@ class AudioDecoder {
     ): FloatArray {
         val bufferInfo = MediaCodec.BufferInfo()
         var inputDone = false
-        var totalSamples = 0L
+        var totalSamples = 0
 
-        // Use primitive FloatArray chunks instead of MutableList<Float> to avoid
-        // boxing overhead (~16 bytes/Float vs 4 bytes). A 5-min track at 44100Hz
-        // stereo → ~13M mono samples = 52MB as FloatArray vs ~208MB as List<Float>.
-        val chunks = mutableListOf<FloatArray>()
-        var currentChunk = FloatArray(DECODE_CHUNK_SIZE)
+        // When maxSamples is known, pre-allocate a single flat array and write
+        // directly into it. This avoids the 2x peak memory that chunk accumulation
+        // + merge would cause (e.g. 900s @ 48kHz = 165MB chunks + 165MB result
+        // = 330MB, which exceeds the 368MB heap limit).
+        val preAlloc = maxSamples > 0 && maxSamples <= Int.MAX_VALUE
+        var output = if (preAlloc) FloatArray(maxSamples.toInt()) else null
+
+        // Fallback chunk-based approach for unknown-size decoding
+        val chunks = if (!preAlloc) mutableListOf<FloatArray>() else null
+        var currentChunk = if (!preAlloc) FloatArray(DECODE_CHUNK_SIZE) else null
         var chunkPos = 0
 
         while (true) {
@@ -161,19 +170,24 @@ class AudioDecoder {
                 val frameCount = sampleCount / channelCount
 
                 for (frame in 0 until frameCount) {
-                    if (maxSamples > 0 && totalSamples >= maxSamples) break
+                    if (maxSamples > 0 && totalSamples >= maxSamples.toInt()) break
                     var monoSample = 0f
                     for (ch in 0 until channelCount) {
                         val sample = outputBuffer.getShort().toFloat() / 32768f
                         monoSample += sample
                     }
-                    currentChunk[chunkPos++] = monoSample / channelCount
-                    totalSamples++
-                    if (chunkPos == DECODE_CHUNK_SIZE) {
-                        chunks.add(currentChunk)
-                        currentChunk = FloatArray(DECODE_CHUNK_SIZE)
-                        chunkPos = 0
+                    val normalized = monoSample / channelCount
+                    if (output != null) {
+                        output[totalSamples] = normalized
+                    } else {
+                        currentChunk!![chunkPos++] = normalized
+                        if (chunkPos == DECODE_CHUNK_SIZE) {
+                            chunks!!.add(currentChunk!!)
+                            currentChunk = FloatArray(DECODE_CHUNK_SIZE)
+                            chunkPos = 0
+                        }
                     }
+                    totalSamples++
                 }
 
                 codec.releaseOutputBuffer(outputIndex, false)
@@ -181,7 +195,7 @@ class AudioDecoder {
                 if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
                     break
                 }
-                if (maxSamples > 0 && totalSamples >= maxSamples) {
+                if (maxSamples > 0 && totalSamples >= maxSamples.toInt()) {
                     break
                 }
             } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
@@ -190,16 +204,21 @@ class AudioDecoder {
             }
         }
 
-        // Combine chunks into a single array
-        val totalSize = chunks.size * DECODE_CHUNK_SIZE + chunkPos
+        // Return pre-allocated array (trimmed if shorter than max) or merged chunks
+        if (output != null) {
+            return if (totalSamples == output.size) output
+                   else output.copyOf(totalSamples)
+        }
+
+        // Fallback: combine chunks into a single array
+        val totalSize = chunks!!.size * DECODE_CHUNK_SIZE + chunkPos
         val result = FloatArray(totalSize)
         var offset = 0
         for (chunk in chunks) {
             chunk.copyInto(result, offset)
             offset += DECODE_CHUNK_SIZE
         }
-        currentChunk.copyInto(result, offset, 0, chunkPos)
-
+        currentChunk!!.copyInto(result, offset, 0, chunkPos)
         return result
     }
 
