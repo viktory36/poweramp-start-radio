@@ -202,26 +202,33 @@ class IndexingService : Service() {
                 var indexed = 0
                 var failed = 0
 
-                // Pre-compute total inference chunks for chunk-based ETA.
+                // Pre-compute total work steps for ETA.
+                // Each track has: decode step + resample step (if caching) + inference chunks.
                 // MuLan: 3 clips per chunk, chunks = max(1, min(floor(dur/60), 30))
                 // Flamingo: 1 chunk per 30s, chunks = max(1, min(ceil(dur/30), 60))
-                var totalChunks = 0
+                // Decode/resample steps are weighted to ~match one inference chunk's time.
+                val DECODE_WEIGHT = 6  // decode takes roughly 6x one inference chunk
+                val RESAMPLE_WEIGHT = 2  // resample takes roughly 2x one inference chunk
+                var totalSteps = 0
                 for (t in unindexed) {
                     val durS = t.durationMs / 1000f
                     if (hasMulan && durS >= 30f) {
+                        totalSteps += DECODE_WEIGHT  // decode
+                        if (hasFlamingo) totalSteps += RESAMPLE_WEIGHT  // resample for cache
                         val mulanChunks = maxOf(1, minOf((durS / 60f).toInt(), 30))
-                        totalChunks += mulanChunks * 3  // 3 clips per chunk
+                        totalSteps += mulanChunks * 3  // 3 clips per chunk
                     }
                     if (hasFlamingo && durS >= 3f) {
-                        totalChunks += maxOf(1, minOf(kotlin.math.ceil(durS / 30.0).toInt(), 60))
+                        if (!hasMulan) totalSteps += DECODE_WEIGHT  // decode only if not done in pass 1
+                        totalSteps += maxOf(1, minOf(kotlin.math.ceil(durS / 30.0).toInt(), 60))
                     }
                 }
-                var completedChunks = 0
+                var completedSteps = 0
 
-                fun chunkEta(): Long {
-                    if (completedChunks == 0) return 0L
+                fun eta(): Long {
+                    if (completedSteps == 0) return 0L
                     val elapsed = System.currentTimeMillis() - batchStartTime
-                    return elapsed * (totalChunks - completedChunks) / completedChunks
+                    return elapsed * (totalSteps - completedSteps) / completedSteps
                 }
 
                 // Track IDs from pass 1 for pass 2's fusion
@@ -263,8 +270,7 @@ class IndexingService : Service() {
                         for ((i, track) in unindexed.withIndex()) {
                             ensureActive()
                             val trackProgress = "${i + 1}/${unindexed.size}"
-                            val eta = chunkEta()
-                            fun updateProcessingState(etaMs: Long = eta) {
+                            fun updateProcessingState(etaMs: Long = eta()) {
                                 _state.value = IndexingState.Processing(
                                     current = i + 1,
                                     total = unindexed.size,
@@ -274,8 +280,8 @@ class IndexingService : Service() {
                                 )
                             }
                             updateProcessingState()
-                            updateNotification("$trackProgress ${track.title} \u2013 decoding${formatEta(eta)}",
-                                completedChunks, totalChunks)
+                            updateNotification("$trackProgress ${track.title} \u2013 decoding${formatEta(eta())}",
+                                completedSteps, totalSteps)
 
                             val audioFile = resolveAudioFile(track)
                             if (audioFile == null) {
@@ -291,11 +297,13 @@ class IndexingService : Service() {
                                 if (!hasFlamingo) failed++
                                 continue
                             }
+                            completedSteps += DECODE_WEIGHT
 
                             // Cache 16kHz version for Flamingo pass (resample 24→16kHz via soxr)
                             if (cachedAudio16k != null) {
-                                updateNotification("$trackProgress ${track.title} \u2013 resampling${formatEta(eta)}",
-                                    completedChunks, totalChunks)
+                                val resampleEta = eta()
+                                updateNotification("$trackProgress ${track.title} \u2013 resampling${formatEta(resampleEta)}",
+                                    completedSteps, totalSteps)
                                 try {
                                     val samples16k = audioDecoder.resample(audio24k.samples, 24000, 16000)
                                     val entryBytes = samples16k.size.toLong() * 4
@@ -313,23 +321,25 @@ class IndexingService : Service() {
                                 } catch (e: Exception) {
                                     Log.w(TAG, "16kHz cache failed for ${track.title}: ${e.message}")
                                 }
+                                completedSteps += RESAMPLE_WEIGHT
                             }
 
-                            updateNotification("$trackProgress ${track.title} \u2013 MuLan${formatEta(eta)}",
-                                completedChunks, totalChunks)
+                            val inferenceEta = eta()
+                            updateNotification("$trackProgress ${track.title} \u2013 MuLan${formatEta(inferenceEta)}",
+                                completedSteps, totalSteps)
                             val embeddings = processor.processTrack(
                                 audioFile, preDecodedAudio = audio24k,
                                 onProgress = { status ->
                                     updateNotification("$trackProgress $status",
-                                        completedChunks, totalChunks)
+                                        completedSteps, totalSteps)
                                 },
                                 onChunkDone = {
-                                    completedChunks++
-                                    val updatedEta = chunkEta()
+                                    completedSteps++
+                                    val updatedEta = eta()
                                     updateProcessingState(updatedEta)
                                     updateNotification(
                                         "$trackProgress ${track.title} \u2013 MuLan${formatEta(updatedEta)}",
-                                        completedChunks, totalChunks,
+                                        completedSteps, totalSteps,
                                     )
                                 },
                             )
@@ -394,8 +404,7 @@ class IndexingService : Service() {
                         for ((i, track) in unindexed.withIndex()) {
                             ensureActive()
                             val trackProgress = "${i + 1}/${unindexed.size}"
-                            val eta = chunkEta()
-                            fun updateProcessingState(etaMs: Long = eta) {
+                            fun updateProcessingState(etaMs: Long = eta()) {
                                 _state.value = IndexingState.Processing(
                                     current = i + 1,
                                     total = unindexed.size,
@@ -414,18 +423,30 @@ class IndexingService : Service() {
                             }
 
                             // Use cached 16kHz audio from MuLan pass (decode-once optimization)
-                            val cached16k = cachedAudio16k?.remove(track)
-                            if (cached16k != null) {
-                                cachedAudio16kBytes -= cached16k.samples.size.toLong() * 4
+                            var audio16k = cachedAudio16k?.remove(track)
+                            if (audio16k != null) {
+                                cachedAudio16kBytes -= audio16k.samples.size.toLong() * 4
                             }
 
-                            if (cached16k == null) {
-                                updateNotification("$trackProgress ${track.title} \u2013 decoding${formatEta(eta)}",
-                                    completedChunks, totalChunks)
-                            } else {
-                                updateNotification("$trackProgress ${track.title} \u2013 Flamingo${formatEta(eta)}",
-                                    completedChunks, totalChunks)
+                            // Cache miss or no MuLan pass — decode externally for step tracking
+                            if (audio16k == null) {
+                                // Cache miss with both models: decode wasn't budgeted in totalSteps
+                                if (hasMulan) totalSteps += DECODE_WEIGHT
+                                updateNotification("$trackProgress ${track.title} \u2013 decoding${formatEta(eta())}",
+                                    completedSteps, totalSteps)
+                                audio16k = audioDecoder.decode(audioFile, 16000, maxDurationS = 1800)
+                                if (audio16k == null) {
+                                    Log.w(TAG, "Decode failed for: ${track.title}")
+                                    failed++
+                                    continue
+                                }
+                                completedSteps += DECODE_WEIGHT
                             }
+
+                            val inferenceEta = eta()
+                            updateProcessingState(inferenceEta)
+                            updateNotification("$trackProgress ${track.title} \u2013 Flamingo${formatEta(inferenceEta)}",
+                                completedSteps, totalSteps)
 
                             // Read MuLan embedding from pass 1 for fusion
                             val existingTrackId = trackIds[track]
@@ -436,18 +457,18 @@ class IndexingService : Service() {
                             val embeddings = processor.processTrack(
                                 audioFile,
                                 existingMulan = existingMulan,
-                                preDecodedAudio = cached16k,
+                                preDecodedAudio = audio16k,
                                 onProgress = { status ->
                                     updateNotification("$trackProgress $status",
-                                        completedChunks, totalChunks)
+                                        completedSteps, totalSteps)
                                 },
                                 onChunkDone = {
-                                    completedChunks++
-                                    val updatedEta = chunkEta()
+                                    completedSteps++
+                                    val updatedEta = eta()
                                     updateProcessingState(updatedEta)
                                     updateNotification(
                                         "$trackProgress ${track.title} \u2013 Flamingo${formatEta(updatedEta)}",
-                                        completedChunks, totalChunks,
+                                        completedSteps, totalSteps,
                                     )
                                 },
                             )
