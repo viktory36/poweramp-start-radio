@@ -91,6 +91,20 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         val dbFile = File(app.filesDir, "embeddings.db")
         val powerampCount = getPowerampTrackCount(app)
 
+        // Check if DB was replaced since we last saved dismissed IDs
+        val currentFingerprint = if (dbFile.exists())
+            "${dbFile.length()}_${dbFile.lastModified()}" else ""
+        val savedFingerprint = prefs.getString("dismissed_db_fingerprint", "") ?: ""
+        if (currentFingerprint != savedFingerprint) {
+            // DB changed — clear stale dismissed IDs
+            _dismissedIds.value = emptySet()
+            prefs.edit()
+                .remove("dismissed_track_ids")
+                .putString("dismissed_db_fingerprint", currentFingerprint)
+                .apply()
+            invalidateCache()
+        }
+
         // Use cached result if neither the DB nor the Poweramp library has changed
         if (!forceRefresh && cachedTracks != null && dbFile.exists()
             && dbFile.lastModified() == cachedDbLastModified

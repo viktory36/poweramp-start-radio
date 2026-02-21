@@ -22,6 +22,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.powerampstartradio.ui.theme.PowerampStartRadioTheme
 
@@ -66,6 +68,12 @@ fun IndexingScreen(
     val isDetecting by viewModel.isDetecting.collectAsState()
     val detectingStatus by viewModel.detectingStatus.collectAsState()
     val indexingState by viewModel.indexingState.collectAsState()
+
+    // Re-detect when activity resumes (e.g. user replaced DB while app was backgrounded).
+    // detectUnindexed() has its own cache check so this is cheap when nothing changed.
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        viewModel.detectUnindexed()
+    }
 
     val visibleTracks = remember(unindexedTracks, dismissedIds) {
         unindexedTracks.filter { it.powerampFileId !in dismissedIds }
