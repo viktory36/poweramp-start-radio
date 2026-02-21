@@ -96,22 +96,27 @@ class FlamingoInference(
     // ── Phase 1: Encoder ──────────────────────────────────────────────
 
     /**
-     * Encode all chunks for a track. Returns raw encoder outputs,
-     * each [NUM_FRAMES * ENCODER_DIM] floats (750 × 1280 = 3.84MB).
+     * Encode all chunks for a track, streaming each result to [onChunkEncoded].
      *
-     * Call closeEncoder() after encoding all tracks to free GPU for the projector.
+     * Unlike the list-returning variant, this writes each chunk's hidden state
+     * immediately via the callback and does NOT accumulate them in memory.
+     * This keeps per-track peak memory at ~3.84MB (one chunk) instead of
+     * numChunks × 3.84MB (up to 230MB for a 30-min track with 60 chunks).
+     *
+     * @return Number of successfully encoded chunks (0 = failure)
      */
-    fun encodeTrack(
+    fun encodeTrackStreaming(
         audio: AudioDecoder.DecodedAudio,
+        onChunkEncoded: (FloatArray) -> Unit,
         onChunkDone: (() -> Unit)? = null,
-    ): List<FloatArray>? {
+    ): Int {
         require(audio.sampleRate == SAMPLE_RATE) {
             "Flamingo requires ${SAMPLE_RATE}Hz audio, got ${audio.sampleRate}Hz"
         }
 
         if (audio.durationS < 3.0f) {
             Log.w(TAG, "Audio too short (${audio.durationS}s)")
-            return null
+            return 0
         }
 
         val numChunks = calculateNumChunks(audio.durationS)
@@ -119,7 +124,7 @@ class FlamingoInference(
 
         Log.d(TAG, "Encoding ${positions.size} chunks from ${audio.durationS}s audio")
 
-        val results = mutableListOf<FloatArray>()
+        var count = 0
         var totalMelMs = 0L
         var totalEncoderMs = 0L
 
@@ -128,14 +133,29 @@ class FlamingoInference(
                 totalMelMs += melMs
                 totalEncoderMs += encMs
             } ?: continue
-            results.add(hidden)
+            onChunkEncoded(hidden)
+            count++
             onChunkDone?.invoke()
         }
 
         Log.i(TAG, "TIMING: flamingo_encode ${positions.size} chunks: mel=${totalMelMs}ms, " +
             "encoder=${totalEncoderMs}ms, total=${totalMelMs + totalEncoderMs}ms")
 
-        return results.ifEmpty { null }
+        return count
+    }
+
+    /**
+     * Convenience wrapper: encode all chunks and return as a list.
+     * Accumulates all hidden states in memory — only use for short tracks
+     * or benchmarking. For production indexing, prefer [encodeTrackStreaming].
+     */
+    fun encodeTrack(
+        audio: AudioDecoder.DecodedAudio,
+        onChunkDone: (() -> Unit)? = null,
+    ): List<FloatArray>? {
+        val results = mutableListOf<FloatArray>()
+        val count = encodeTrackStreaming(audio, { results.add(it) }, onChunkDone)
+        return if (count > 0) results else null
     }
 
     /**

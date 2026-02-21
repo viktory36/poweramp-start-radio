@@ -528,12 +528,25 @@ class IndexingService : Service() {
                             chunksDone = 0
                             emitProgress("chunk 0/$totalFChunks")
 
+                            // Stream each encoded chunk directly to disk instead of
+                            // accumulating all chunks in memory. This keeps per-track
+                            // peak memory at ~3.84MB (one chunk) vs up to 230MB for
+                            // a 30-min track (60 chunks × 3.84MB).
                             val encInferStart = System.nanoTime()
-                            val hiddens = flamingoInference.encodeTrack(audio16k) {
-                                completedSteps++
-                                chunksDone++
-                                emitProgress("chunk $chunksDone/$totalFChunks")
-                            }
+                            val numEncoded = flamingoInference.encodeTrackStreaming(
+                                audio16k,
+                                onChunkEncoded = { hidden ->
+                                    writeBuf.clear()
+                                    writeBuf.asFloatBuffer().put(hidden)
+                                    writeBuf.rewind()
+                                    writeChannel.write(writeBuf)
+                                },
+                                onChunkDone = {
+                                    completedSteps++
+                                    chunksDone++
+                                    emitProgress("chunk $chunksDone/$totalFChunks")
+                                },
+                            )
                             val encInferMs = (System.nanoTime() - encInferStart) / 1_000_000
 
                             val trackMs = (System.nanoTime() - flTrackStart) / 1_000_000
@@ -541,15 +554,8 @@ class IndexingService : Service() {
                                 "\"${track.artist} - ${track.title}\" = ${trackMs}ms " +
                                 "(encode=${encInferMs}ms)")
 
-                            if (hiddens != null) {
-                                // Spill hidden states to disk instead of holding in memory
-                                chunkCounts[i] = hiddens.size
-                                for (hidden in hiddens) {
-                                    writeBuf.clear()
-                                    writeBuf.asFloatBuffer().put(hidden)
-                                    writeBuf.rewind()
-                                    writeChannel.write(writeBuf)
-                                }
+                            if (numEncoded > 0) {
+                                chunkCounts[i] = numEncoded
                             } else {
                                 failed++
                             }
