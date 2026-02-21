@@ -370,7 +370,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         .remove("dismissed_track_ids")
                         .putString("dismissed_db_fingerprint", currentFingerprint)
                         .apply()
-                    IndexingViewModel.invalidateCache()
                 }
                 // Exclude dismissed tracks from the count
                 val dismissedJson = indexingPrefs.getString("dismissed_track_ids", null)
