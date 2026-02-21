@@ -485,7 +485,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     _importStatus.value = status
                 }
 
-                checkUnindexedTracks()
+                _importStatus.value = "Detecting unindexed tracks..."
+                try {
+                    val countDb = EmbeddingDatabase.open(destFile)
+                    val detector = NewTrackDetector(countDb)
+                    val unindexed = detector.findUnindexedTracks(app)
+                    _unindexedCount.value = unindexed.size
+                    countDb.close()
+                } catch (_: Exception) {
+                    _unindexedCount.value = 0
+                }
                 checkModels()
                 _importStatus.value = null
             } catch (e: Exception) {
