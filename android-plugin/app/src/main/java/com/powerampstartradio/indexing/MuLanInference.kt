@@ -89,7 +89,7 @@ class MuLanInference(
                 MelParams()
             }
         } else {
-            Log.i(TAG, "No mel_params.json found, using MuLan defaults")
+            Log.d(TAG, "No mel_params.json found, using MuLan defaults")
             MelParams()
         }
 
