@@ -82,6 +82,14 @@ class IndexingService : Service() {
             activeJob?.cancel()
             _state.value = IndexingState.Idle
         }
+
+        /** Reset from terminal states (Complete/Error) back to Idle. */
+        fun resetState() {
+            val cur = _state.value
+            if (cur is IndexingState.Complete || cur is IndexingState.Error) {
+                _state.value = IndexingState.Idle
+            }
+        }
     }
 
     /**

@@ -84,6 +84,9 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
     fun detectUnindexed(forceRefresh: Boolean = false) {
         if (_isDetecting.value) return
 
+        // Reset service state from Complete/Error so UI shows detecting spinner
+        IndexingService.resetState()
+
         val app = getApplication<Application>()
         val dbFile = File(app.filesDir, "embeddings.db")
         val powerampCount = getPowerampTrackCount(app)
