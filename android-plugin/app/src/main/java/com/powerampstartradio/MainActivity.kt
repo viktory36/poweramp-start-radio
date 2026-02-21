@@ -663,12 +663,9 @@ fun IdleContent(
             }
         }
         if (databaseInfo == null) {
-            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text("No embedding database", style = MaterialTheme.typography.titleSmall)
-                    Text("Import via Settings", style = MaterialTheme.typography.bodySmall)
-                }
-            }
+            Text("No embedding database \u2014 import via Settings",
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         if (indexStatus != null && indexStatus != "Index ready") {
             Text(indexStatus, style = MaterialTheme.typography.bodySmall,
