@@ -6,23 +6,15 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * Orchestrates MuQ-MuLan + Flamingo inference and applies projection matrices
- * from the embedding database to produce final fused embeddings.
+ * Orchestrates MuQ-MuLan inference for on-device embedding generation.
  *
- * Pipeline per track:
- * 1. Decode audio -> PCM
- * 2. Resample to 24kHz -> MuQ-MuLan LiteRT -> 512d mulan embedding
- * 3. Resample to 16kHz -> Flamingo LiteRT -> 3584d
- *    -> flamingo_projection[3584, 512] -> 512d flamingo embedding
- * 4. Concatenate [mulan_512, flamingo_512] -> 1024d
- *    -> fused_projection[512, 1024].T -> 512d fused embedding
- * 5. L2-normalize all embeddings
+ * Flamingo inference and fusion are handled directly in IndexingService
+ * via FlamingoInference's two-phase GPU API.
  */
 class EmbeddingProcessor(
     private val mulanModel: MuLanInference?,
-    private val flamingoModel: FlamingoInference?,
-    private val flamingoProjection: FloatMatrix?,  // [512, 3584] (transposed from stored [3584, 512])
-    private val fusedProjection: FloatMatrix?,      // [512, 1024] stored as row-major
+    private val flamingoProjection: FloatMatrix?,  // unused here, kept for API compat
+    private val fusedProjection: FloatMatrix?,      // unused here, kept for API compat
 ) {
 
     companion object {
@@ -111,9 +103,6 @@ class EmbeddingProcessor(
         onChunkDone: (() -> Unit)? = null,
     ): EmbeddingResult? {
         var mulanEmbedding: FloatArray? = null
-        var flamingoRawEmbedding: FloatArray? = null
-        var flamingoReduced: FloatArray? = null
-        var fusedEmbedding: FloatArray? = null
 
         // MuQ-MuLan: decode at 24kHz
         if (mulanModel != null) {
@@ -126,58 +115,24 @@ class EmbeddingProcessor(
             }
         }
 
-        // Flamingo: decode at 16kHz
-        if (flamingoModel != null) {
-            onProgress?.invoke("Decoding ${audioFile.name}...")
-            val audio16k = if (preDecodedAudio?.sampleRate == 16000) preDecodedAudio
-                           else audioDecoder.decode(audioFile, 16000, maxDurationS = 1800)
-            if (audio16k != null) {
-                onProgress?.invoke("Flamingo inference...")
-                flamingoRawEmbedding = flamingoModel.generateEmbedding(audio16k, onChunkDone = onChunkDone)
-            }
-        }
-
         // For fusion: use inferred MuLan embedding, or fall back to provided one
         val mulanForFusion = mulanEmbedding ?: existingMulan
 
-        if (mulanEmbedding == null && flamingoRawEmbedding == null && existingMulan == null) {
-            Log.w(TAG, "Both models failed for ${audioFile.name}")
+        if (mulanEmbedding == null && existingMulan == null) {
+            Log.w(TAG, "MuLan failed for ${audioFile.name}")
             return null
         }
 
-        // Apply Flamingo projection: 3584d -> 512d
-        if (flamingoRawEmbedding != null && flamingoProjection != null) {
-            flamingoReduced = flamingoProjection.multiplyVector(flamingoRawEmbedding)
-            l2Normalize(flamingoReduced)
-        }
-
-        // Fuse: concatenate [mulan_512, flamingo_512] and project
-        if (mulanForFusion != null && flamingoReduced != null && fusedProjection != null) {
-            onProgress?.invoke("Fusing embeddings...")
-
-            // Concatenate: [mulan_512 | flamingo_512] -> 1024d
-            val concatenated = FloatArray(MULAN_DIM * 2)
-            mulanForFusion.copyInto(concatenated, 0)
-            flamingoReduced.copyInto(concatenated, MULAN_DIM)
-
-            // Apply fused projection: concatenated[1024] x projection[1024, 512] -> [512]
-            // The projection matrix is stored as [target_dim x source_dim] = [512 x 1024]
-            // So we compute: result = projection * concatenated (matrix-vector multiply)
-            fusedEmbedding = fusedProjection.multiplyVector(concatenated)
-            l2Normalize(fusedEmbedding)
-        }
-
         return EmbeddingResult(
-            mulanEmbedding = mulanEmbedding,  // null when model wasn't loaded (pass 2)
-            flamingoEmbedding = flamingoRawEmbedding,
-            flamingoReduced = flamingoReduced,
-            fusedEmbedding = fusedEmbedding,
+            mulanEmbedding = mulanEmbedding,
+            flamingoEmbedding = null,
+            flamingoReduced = null,
+            fusedEmbedding = null,
         )
     }
 
     fun close() {
         mulanModel?.close()
-        flamingoModel?.close()
     }
 }
 

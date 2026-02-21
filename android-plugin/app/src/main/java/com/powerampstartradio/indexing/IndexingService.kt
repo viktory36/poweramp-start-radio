@@ -279,7 +279,6 @@ class IndexingService : Service() {
                     if (mulanInference != null) {
                         val processor = EmbeddingProcessor(
                             mulanModel = mulanInference,
-                            flamingoModel = null,
                             flamingoProjection = null,
                             fusedProjection = null,
                         )
@@ -423,11 +422,16 @@ class IndexingService : Service() {
                     }
                 }
 
-                // ── Pass 2: Flamingo + Fusion ──────────────────────────
+                // ── Pass 2: Flamingo + Fusion (two-phase GPU) ────────
+                // Phase 2a: Encoder — encode all tracks on GPU
+                // Phase 2b: Projector — close encoder, load projector on GPU,
+                //           project all, fuse with MuLan, write to DB.
+                // Two CL environments can't coexist on Adreno GPUs, so we
+                // must close the encoder before loading the projector.
                 val flamingoPassStart = System.currentTimeMillis()
                 if (hasFlamingo) {
-                    _state.value = IndexingState.Detecting("Loading Flamingo model (GPU)...")
-                    updateNotification("Loading Flamingo model...")
+                    _state.value = IndexingState.Detecting("Loading Flamingo encoder (GPU)...")
+                    updateNotification("Loading Flamingo encoder...")
                     val flamingoLoadStart = System.nanoTime()
                     val flamingoInference = try {
                         FlamingoInference(flamingoFile, projectorFile)
@@ -435,7 +439,7 @@ class IndexingService : Service() {
                         Log.e(TAG, "Failed to load Flamingo", e)
                         null
                     }
-                    Log.i(TAG, "TIMING: flamingo_model_load = ${(System.nanoTime() - flamingoLoadStart) / 1_000_000}ms")
+                    Log.i(TAG, "TIMING: flamingo_encoder_load = ${(System.nanoTime() - flamingoLoadStart) / 1_000_000}ms")
 
                     if (flamingoInference != null) {
                         // Adjust projection matrix dims if projector is absent
@@ -446,12 +450,9 @@ class IndexingService : Service() {
                             )?.transpose()
                         } else flamingoProjection
 
-                        val processor = EmbeddingProcessor(
-                            mulanModel = null,
-                            flamingoModel = flamingoInference,
-                            flamingoProjection = actualFlamingoProjection,
-                            fusedProjection = fusedProjection,
-                        )
+                        // ── Phase 2a: Encode all tracks ──
+                        // Each entry: track → list of raw encoder outputs [750×1280]
+                        val encoderResults = linkedMapOf<NewTrackDetector.UnindexedTrack, List<FloatArray>>()
 
                         for ((i, track) in unindexed.withIndex()) {
                             ensureActive()
@@ -463,7 +464,7 @@ class IndexingService : Service() {
                                     current = i + 1,
                                     total = unindexed.size,
                                     trackName = "${track.artist} - ${track.title}",
-                                    passName = "Flamingo pass",
+                                    passName = "Flamingo encode",
                                     detail = detail,
                                     progressFraction = if (totalSteps > 0) completedSteps.toFloat() / totalSteps else 0f,
                                     estimatedRemainingMs = etaMs,
@@ -505,39 +506,71 @@ class IndexingService : Service() {
                             val durS = track.durationMs / 1000f
                             val totalFChunks = maxOf(1, minOf(kotlin.math.ceil(durS / 30.0).toInt(), 60))
                             chunksDone = 0
-
                             emitProgress("chunk 0/$totalFChunks")
 
-                            // Use in-memory MuLan embedding from pass 1 for fusion
-                            val mulanEmbedding = mulanResults[track]?.mulanEmbedding
+                            val encInferStart = System.nanoTime()
+                            val hiddens = flamingoInference.encodeTrack(audio16k) {
+                                completedSteps++
+                                chunksDone++
+                                emitProgress("chunk $chunksDone/$totalFChunks")
+                            }
+                            val encInferMs = (System.nanoTime() - encInferStart) / 1_000_000
 
-                            val flInferStart = System.nanoTime()
-                            val embeddings = processor.processTrack(
-                                audioFile,
-                                existingMulan = mulanEmbedding,
-                                preDecodedAudio = audio16k,
-                                onProgress = { /* ignore internal progress */ },
-                                onChunkDone = {
-                                    completedSteps++
-                                    chunksDone++
-                                    emitProgress("chunk $chunksDone/$totalFChunks")
-                                },
-                            )
-                            val flInferMs = (System.nanoTime() - flInferStart) / 1_000_000
+                            val trackMs = (System.nanoTime() - flTrackStart) / 1_000_000
+                            Log.i(TAG, "TIMING: flamingo_encode ${i+1}/${unindexed.size} " +
+                                "\"${track.artist} - ${track.title}\" = ${trackMs}ms " +
+                                "(encode=${encInferMs}ms)")
 
-                            if (embeddings == null) {
+                            if (hiddens != null) {
+                                encoderResults[track] = hiddens
+                            } else {
+                                failed++
+                            }
+                        }
+
+                        // ── Phase transition: encoder → projector ──
+                        flamingoInference.closeEncoder()
+                        val projLoadStart = System.nanoTime()
+                        _state.value = IndexingState.Detecting("Loading Flamingo projector (GPU)...")
+                        updateNotification("Loading Flamingo projector...")
+                        flamingoInference.loadProjector()
+                        Log.i(TAG, "TIMING: flamingo_projector_load = ${(System.nanoTime() - projLoadStart) / 1_000_000}ms")
+
+                        // ── Phase 2b: Project + Fuse + Write ──
+                        for ((track, hiddens) in encoderResults) {
+                            ensureActive()
+                            val projStart = System.nanoTime()
+
+                            val flamingoRaw = flamingoInference.projectAndAverage(hiddens)
+                            if (flamingoRaw == null) {
                                 failed++
                                 continue
                             }
 
-                            // Merge MuLan embedding into the Flamingo result for a complete write
+                            // Apply flamingo_projection: 3584d → 512d
+                            var flamingoReduced: FloatArray? = null
+                            if (actualFlamingoProjection != null) {
+                                flamingoReduced = actualFlamingoProjection.multiplyVector(flamingoRaw)
+                                l2Normalize(flamingoReduced)
+                            }
+
+                            // Fuse with MuLan
+                            val mulanEmbedding = mulanResults[track]?.mulanEmbedding
+                            var fusedEmbedding: FloatArray? = null
+                            if (mulanEmbedding != null && flamingoReduced != null && fusedProjection != null) {
+                                val concat = FloatArray(1024)
+                                mulanEmbedding.copyInto(concat, 0)
+                                flamingoReduced.copyInto(concat, 512)
+                                fusedEmbedding = fusedProjection.multiplyVector(concat)
+                                l2Normalize(fusedEmbedding)
+                            }
+
                             val merged = EmbeddingProcessor.EmbeddingResult(
                                 mulanEmbedding = mulanEmbedding,
-                                flamingoEmbedding = embeddings.flamingoEmbedding,
-                                flamingoReduced = embeddings.flamingoReduced,
-                                fusedEmbedding = embeddings.fusedEmbedding,
+                                flamingoEmbedding = flamingoRaw,
+                                flamingoReduced = flamingoReduced,
+                                fusedEmbedding = fusedEmbedding,
                             )
-                            val dbWriteStart = System.nanoTime()
                             val trackId = writer.writeTrack(
                                 metadataKey = track.metadataKey,
                                 filenameKey = track.filenameKey,
@@ -545,24 +578,22 @@ class IndexingService : Service() {
                                 album = track.album.ifEmpty { null },
                                 title = track.title.ifEmpty { null },
                                 durationMs = track.durationMs,
-                                filePath = track.path ?: audioFile.absolutePath,
+                                filePath = track.path ?: "",
                                 embeddings = merged,
                                 source = "phone",
                             )
-                            val dbWriteMs = (System.nanoTime() - dbWriteStart) / 1_000_000
-                            val flTrackMs = (System.nanoTime() - flTrackStart) / 1_000_000
+                            val projMs = (System.nanoTime() - projStart) / 1_000_000
                             if (trackId > 0) {
                                 indexed++
                                 mulanResults.remove(track)  // Free memory
                             } else {
                                 failed++
                             }
-                            Log.i(TAG, "TIMING: flamingo_track ${i+1}/${unindexed.size} " +
-                                "\"${track.artist} - ${track.title}\" = ${flTrackMs}ms " +
-                                "(inference=${flInferMs}ms, db_write=${dbWriteMs}ms)")
+                            Log.i(TAG, "TIMING: flamingo_project " +
+                                "\"${track.artist} - ${track.title}\" = ${projMs}ms")
                         }
 
-                        processor.close()
+                        flamingoInference.close()
                         val flamingoPassMs = System.currentTimeMillis() - flamingoPassStart
                         Log.i(TAG, "TIMING: flamingo_pass_total = ${flamingoPassMs}ms " +
                             "($indexed tracks, ${flamingoPassMs / maxOf(indexed, 1)}ms/track avg)")

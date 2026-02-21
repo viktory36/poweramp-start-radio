@@ -11,29 +11,23 @@ import kotlin.math.min
 /**
  * Music Flamingo LiteRT inference for on-device audio embedding generation.
  *
- * Uses two TFLite models (converted from PyTorch via litert-torch):
+ * Two-phase GPU operation to avoid dual OpenCL environments on Adreno GPUs:
+ * - Phase 1 (encoder): encodeTrack() runs the encoder on GPU for all chunks
+ * - Between phases: closeEncoder() frees GPU, loadProjector() claims it
+ * - Phase 2 (projector): projectAndAverage() runs the projector on GPU
+ *
+ * Models (converted from PyTorch via litert-torch):
  * - Encoder: mel [1,128,3000] + audio_times [1,750] -> hidden [1,750,1280]
- *   (No mask input — the TFLite model assumes full 30s chunks with no padding)
  * - Projector: hidden [1,750,1280] -> projected [1,750,3584]
- *
- * Replicates the desktop FlamingoEmbeddingGenerator:
- * - Full non-overlapping 30s coverage, max 60 chunks
- * - Compute Whisper-compatible mel spectrogram for each chunk -> [128, 3000]
- * - Construct audio_times with absolute timestamps (frame_idx * 0.04 + chunk_start)
- * - Run encoder + projector -> [750, 3584]
- * - Mean pool over time -> 3584d per chunk
- * - Average across chunks, L2-normalize
- *
- * If no projector model is found, output is 1280-dim (encoder-only).
  *
  * @param encoderFile Path to the encoder .tflite model
  * @param projectorFile Path to the projector .tflite model (optional)
- * @param accelerator Hardware accelerator to use (GPU or CPU). Falls back to CPU if GPU fails.
+ * @param accelerator Hardware accelerator to use (GPU or CPU)
  */
 class FlamingoInference(
     encoderFile: File,
-    projectorFile: File? = null,
-    accelerator: Accelerator = Accelerator.GPU,
+    private val projectorFile: File? = null,
+    private val accelerator: Accelerator = Accelerator.GPU,
 ) {
 
     companion object {
@@ -50,22 +44,22 @@ class FlamingoInference(
         private const val PROJECTED_DIM = 3584
     }
 
-    private val encoderModel: CompiledModel
-    private val projectorModel: CompiledModel?
     private val melSpectrogram = MelSpectrogram(center = true, melScale = MelScale.SLANEY)
 
-    val outputDim: Int
+    val outputDim: Int = if (projectorFile != null && projectorFile.exists()) PROJECTED_DIM else ENCODER_DIM
 
     /** Which accelerator is actually in use for the encoder. */
     val activeAccelerator: Accelerator
 
-    // Pre-allocated TensorBuffers for encoder
-    private val encoderInputBuffers: List<TensorBuffer>
-    private val encoderOutputBuffers: List<TensorBuffer>
+    // Encoder (loaded at init, released by closeEncoder)
+    private var encoderModel: CompiledModel?
+    private var encoderInputBuffers: List<TensorBuffer>?
+    private var encoderOutputBuffers: List<TensorBuffer>?
 
-    // Pre-allocated TensorBuffers for projector (if available)
-    private val projectorInputBuffers: List<TensorBuffer>?
-    private val projectorOutputBuffers: List<TensorBuffer>?
+    // Projector (loaded on demand by loadProjector)
+    private var projectorModel: CompiledModel? = null
+    private var projectorInputBuffers: List<TensorBuffer>? = null
+    private var projectorOutputBuffers: List<TensorBuffer>? = null
 
     // Pre-allocated flat array for mel input
     private val melFlat = FloatArray(N_MELS * NUM_MEL_FRAMES)
@@ -74,41 +68,18 @@ class FlamingoInference(
     private val chunkBuffer = FloatArray(CHUNK_SAMPLES)
 
     init {
-        // Load encoder with GPU→CPU fallback (covers both compilation and buffer allocation)
         val encResult = createReadyModel(encoderFile.absolutePath, accelerator)
         encoderModel = encResult.model
         activeAccelerator = encResult.accelerator
         encoderInputBuffers = encResult.inputBuffers
         encoderOutputBuffers = encResult.outputBuffers
 
-        // Load projector with the same accelerator as the encoder.
-        // At 34MB FP16, it's tiny compared to the 1.3GB encoder, so GPU can hold both.
-        // CPU was measured at ~1.8s/chunk (87% of Flamingo time); GPU should be <5ms.
-        if (projectorFile != null && projectorFile.exists()) {
-            val projResult = createReadyModel(projectorFile.absolutePath, accelerator)
-            projectorModel = projResult.model
-            projectorInputBuffers = projResult.inputBuffers
-            projectorOutputBuffers = projResult.outputBuffers
-            outputDim = PROJECTED_DIM
-        } else {
-            projectorModel = null
-            projectorInputBuffers = null
-            projectorOutputBuffers = null
-            outputDim = ENCODER_DIM
-        }
-
-        Log.i(TAG, "Flamingo loaded: encoder=${encoderFile.name} " +
+        Log.i(TAG, "Flamingo encoder loaded: ${encoderFile.name} " +
                 "(${encoderFile.length() / 1024 / 1024}MB), " +
                 "projector=${projectorFile?.name ?: "none"}, " +
                 "output_dim=$outputDim, accelerator=$activeAccelerator")
     }
 
-    /**
-     * Generate embedding from decoded audio.
-     *
-     * @param audio Decoded audio at 16kHz
-     * @return 3584-dim (or 1280-dim) L2-normalized embedding, or null on failure
-     */
     /**
      * Compute the number of inference calls (chunks) for audio of this duration.
      */
@@ -117,10 +88,18 @@ class FlamingoInference(
         return calculateNumChunks(durationS)
     }
 
-    fun generateEmbedding(
+    // ── Phase 1: Encoder ──────────────────────────────────────────────
+
+    /**
+     * Encode all chunks for a track. Returns raw encoder outputs,
+     * each [NUM_FRAMES * ENCODER_DIM] floats (750 × 1280 = 3.84MB).
+     *
+     * Call closeEncoder() after encoding all tracks to free GPU for the projector.
+     */
+    fun encodeTrack(
         audio: AudioDecoder.DecodedAudio,
         onChunkDone: (() -> Unit)? = null,
-    ): FloatArray? {
+    ): List<FloatArray>? {
         require(audio.sampleRate == SAMPLE_RATE) {
             "Flamingo requires ${SAMPLE_RATE}Hz audio, got ${audio.sampleRate}Hz"
         }
@@ -130,58 +109,42 @@ class FlamingoInference(
             return null
         }
 
-        // Select chunk positions (stratified, non-overlapping)
         val numChunks = calculateNumChunks(audio.durationS)
         val positions = selectChunkPositions(audio.durationS, numChunks)
 
-        Log.d(TAG, "Processing ${positions.size} chunks from ${audio.durationS}s audio")
+        Log.d(TAG, "Encoding ${positions.size} chunks from ${audio.durationS}s audio")
 
-        val sumEmbedding = FloatArray(outputDim)
-        var count = 0
-
+        val results = mutableListOf<FloatArray>()
         var totalMelMs = 0L
         var totalEncoderMs = 0L
-        var totalProjectorMs = 0L
 
         for (pos in positions) {
-            val embedding = processChunk(audio.samples, pos) { melMs, encMs, projMs ->
+            val hidden = encodeChunk(audio.samples, pos) { melMs, encMs ->
                 totalMelMs += melMs
                 totalEncoderMs += encMs
-                totalProjectorMs += projMs
             } ?: continue
-            for (i in 0 until outputDim) {
-                sumEmbedding[i] += embedding[i]
-            }
-            count++
+            results.add(hidden)
             onChunkDone?.invoke()
         }
-        Log.i(TAG, "TIMING: flamingo ${positions.size} chunks: mel=${totalMelMs}ms, " +
-            "encoder=${totalEncoderMs}ms, projector=${totalProjectorMs}ms, " +
-            "total=${totalMelMs + totalEncoderMs + totalProjectorMs}ms")
 
-        if (count == 0) {
-            Log.w(TAG, "All chunk inferences failed")
-            return null
-        }
+        Log.i(TAG, "TIMING: flamingo_encode ${positions.size} chunks: mel=${totalMelMs}ms, " +
+            "encoder=${totalEncoderMs}ms, total=${totalMelMs + totalEncoderMs}ms")
 
-        // Average and L2-normalize
-        val countF = count.toFloat()
-        for (i in 0 until outputDim) {
-            sumEmbedding[i] /= countF
-        }
-        l2Normalize(sumEmbedding)
-
-        return sumEmbedding
+        return results.ifEmpty { null }
     }
 
     /**
-     * Process a single 30s chunk: compute mel, run encoder+projector, mean-pool.
+     * Encode a single chunk. Returns raw encoder output [NUM_FRAMES * ENCODER_DIM].
      */
-    private fun processChunk(
+    private fun encodeChunk(
         samples: FloatArray,
         positionS: Float,
-        onTiming: ((melMs: Long, encoderMs: Long, projectorMs: Long) -> Unit)? = null,
+        onTiming: ((melMs: Long, encoderMs: Long) -> Unit)? = null,
     ): FloatArray? {
+        val enc = encoderModel ?: return null
+        val encIn = encoderInputBuffers ?: return null
+        val encOut = encoderOutputBuffers ?: return null
+
         // Copy audio into pre-allocated chunk buffer, zero-pad remainder if needed
         val startSample = (positionS * SAMPLE_RATE).toInt()
         val actualLen = min(CHUNK_SAMPLES, samples.size - startSample)
@@ -197,84 +160,153 @@ class FlamingoInference(
         MelSpectrogram.whisperNormalize(rawMel)
         val melMs = (System.nanoTime() - melStart) / 1_000_000
 
-        // Construct audio_times: absolute timestamps per post-pool frame
+        // Flatten mel to pre-allocated melFlat
+        for (m in 0 until N_MELS) {
+            val rowOffset = m * NUM_MEL_FRAMES
+            val srcFrames = min(rawMel[m].size, NUM_MEL_FRAMES)
+            rawMel[m].copyInto(melFlat, rowOffset, 0, srcFrames)
+            for (t in srcFrames until NUM_MEL_FRAMES) {
+                melFlat[rowOffset + t] = 0f
+            }
+        }
+
+        // Audio times: absolute timestamps per post-pool frame
         val audioTimes = FloatArray(NUM_FRAMES) { frame ->
             frame * FRAME_DURATION_S + positionS
         }
 
-        return runInference(rawMel, audioTimes) { encMs, projMs ->
-            onTiming?.invoke(melMs, encMs, projMs)
+        return try {
+            encIn[0].writeFloat(melFlat)
+            encIn[1].writeFloat(audioTimes)
+
+            val encStart = System.nanoTime()
+            enc.run(encIn, encOut)
+            val encoderMs = (System.nanoTime() - encStart) / 1_000_000
+            onTiming?.invoke(melMs, encoderMs)
+
+            encOut[0].readFloat()
+        } catch (e: Exception) {
+            Log.e(TAG, "Encoder inference failed: ${e.message}", e)
+            null
         }
     }
 
+    /** Release encoder GPU resources to make room for the projector. */
+    fun closeEncoder() {
+        encoderInputBuffers?.forEach { it.close() }
+        encoderOutputBuffers?.forEach { it.close() }
+        encoderModel?.close()
+        encoderModel = null
+        encoderInputBuffers = null
+        encoderOutputBuffers = null
+        Log.i(TAG, "Encoder released")
+    }
+
+    // ── Phase 2: Projector ────────────────────────────────────────────
+
+    /** Load projector on GPU (call after closeEncoder). */
+    fun loadProjector() {
+        if (projectorModel != null) return
+        val pf = projectorFile ?: return
+        if (!pf.exists()) return
+        val projResult = createReadyModel(pf.absolutePath, accelerator)
+        projectorModel = projResult.model
+        projectorInputBuffers = projResult.inputBuffers
+        projectorOutputBuffers = projResult.outputBuffers
+        Log.i(TAG, "Projector loaded on ${projResult.accelerator}")
+    }
+
     /**
-     * Run inference: encoder -> [optional projector] -> mean pool.
+     * Project encoder outputs and produce the final embedding.
+     * Each encoder output is [NUM_FRAMES * ENCODER_DIM] floats.
      *
-     * @param mel [128, numFrames] mel spectrogram
-     * @param audioTimes [750] absolute timestamps
-     * @return Mean-pooled embedding [outputDim], or null on failure
+     * If no projector is available, mean-pools encoder outputs to [ENCODER_DIM].
+     * With projector: projects each chunk [750,1280] → [750,3584], mean-pools,
+     * averages across chunks, L2-normalizes → [PROJECTED_DIM].
      */
-    private fun runInference(
-        mel: Array<FloatArray>,
-        audioTimes: FloatArray,
-        onTiming: ((encoderMs: Long, projectorMs: Long) -> Unit)? = null,
+    fun projectAndAverage(
+        encoderOutputs: List<FloatArray>,
+        onChunkDone: (() -> Unit)? = null,
     ): FloatArray? {
-        return try {
-            // Flatten mel [128, 3000] to flat array with zero-padding
-            for (m in 0 until N_MELS) {
-                val rowOffset = m * NUM_MEL_FRAMES
-                val srcFrames = min(mel[m].size, NUM_MEL_FRAMES)
-                mel[m].copyInto(melFlat, rowOffset, 0, srcFrames)
-                for (t in srcFrames until NUM_MEL_FRAMES) {
-                    melFlat[rowOffset + t] = 0f
-                }
-            }
-
-            // Write inputs: [mel, audio_times]
-            encoderInputBuffers[0].writeFloat(melFlat)
-            encoderInputBuffers[1].writeFloat(audioTimes)
-
-            // Step 1: Encoder [1,128,3000] + [1,750] -> [1,750,1280]
-            val encStart = System.nanoTime()
-            encoderModel.run(encoderInputBuffers, encoderOutputBuffers)
-            val encoderMs = (System.nanoTime() - encStart) / 1_000_000
-
-            // Step 2: Projector (if available) [1,750,1280] -> [1,750,3584]
-            val projStart = System.nanoTime()
-            val finalOutput: FloatArray
-            val finalDim: Int
-            if (projectorModel != null && projectorInputBuffers != null && projectorOutputBuffers != null) {
-                // Pass encoder output to projector input
-                val encoderOutput = encoderOutputBuffers[0].readFloat()
-                projectorInputBuffers[0].writeFloat(encoderOutput)
-                projectorModel.run(projectorInputBuffers, projectorOutputBuffers)
-                finalOutput = projectorOutputBuffers[0].readFloat()
-                finalDim = PROJECTED_DIM
-            } else {
-                finalOutput = encoderOutputBuffers[0].readFloat()
-                finalDim = ENCODER_DIM
-            }
-            val projectorMs = (System.nanoTime() - projStart) / 1_000_000
-            onTiming?.invoke(encoderMs, projectorMs)
-
-            // Mean pool over time dimension: [1, 750, dim] -> [dim]
-            val pooled = FloatArray(finalDim)
-            for (frame in 0 until NUM_FRAMES) {
-                val frameOffset = frame * finalDim
-                for (i in 0 until finalDim) {
-                    pooled[i] += finalOutput[frameOffset + i]
-                }
-            }
-            val numFramesF = NUM_FRAMES.toFloat()
-            for (i in 0 until finalDim) {
-                pooled[i] /= numFramesF
-            }
-
-            pooled
-        } catch (e: Exception) {
-            Log.e(TAG, "Flamingo inference failed: ${e.message}", e)
-            null
+        val proj = projectorModel
+        val projIn = projectorInputBuffers
+        val projOut = projectorOutputBuffers
+        if (proj == null || projIn == null || projOut == null) {
+            return meanPoolEncoderOutputs(encoderOutputs)
         }
+
+        val sumEmbedding = FloatArray(PROJECTED_DIM)
+        var count = 0
+        var totalMs = 0L
+
+        for (hidden in encoderOutputs) {
+            try {
+                projIn[0].writeFloat(hidden)
+                val start = System.nanoTime()
+                proj.run(projIn, projOut)
+                totalMs += (System.nanoTime() - start) / 1_000_000
+                val output = projOut[0].readFloat()
+
+                // Mean pool [750, 3584] → [3584]
+                for (frame in 0 until NUM_FRAMES) {
+                    val off = frame * PROJECTED_DIM
+                    for (i in 0 until PROJECTED_DIM) {
+                        sumEmbedding[i] += output[off + i]
+                    }
+                }
+                count++
+                onChunkDone?.invoke()
+            } catch (e: Exception) {
+                Log.e(TAG, "Projector inference failed: ${e.message}", e)
+            }
+        }
+
+        Log.i(TAG, "TIMING: flamingo_project ${encoderOutputs.size} chunks: ${totalMs}ms")
+
+        if (count == 0) return null
+
+        // Average over frames and chunks
+        val scale = 1f / (NUM_FRAMES.toFloat() * count)
+        for (i in 0 until PROJECTED_DIM) {
+            sumEmbedding[i] *= scale
+        }
+        l2Normalize(sumEmbedding)
+        return sumEmbedding
+    }
+
+    /**
+     * Mean-pool encoder outputs when no projector is available.
+     * Returns [ENCODER_DIM]-dim L2-normalized embedding.
+     */
+    private fun meanPoolEncoderOutputs(encoderOutputs: List<FloatArray>): FloatArray? {
+        if (encoderOutputs.isEmpty()) return null
+        val sumEmbedding = FloatArray(ENCODER_DIM)
+        for (hidden in encoderOutputs) {
+            for (frame in 0 until NUM_FRAMES) {
+                val off = frame * ENCODER_DIM
+                for (i in 0 until ENCODER_DIM) {
+                    sumEmbedding[i] += hidden[off + i]
+                }
+            }
+        }
+        val scale = 1f / (NUM_FRAMES.toFloat() * encoderOutputs.size)
+        for (i in 0 until ENCODER_DIM) {
+            sumEmbedding[i] *= scale
+        }
+        l2Normalize(sumEmbedding)
+        return sumEmbedding
+    }
+
+    // ── Lifecycle ─────────────────────────────────────────────────────
+
+    fun close() {
+        closeEncoder()
+        projectorInputBuffers?.forEach { it.close() }
+        projectorOutputBuffers?.forEach { it.close() }
+        projectorModel?.close()
+        projectorModel = null
+        projectorInputBuffers = null
+        projectorOutputBuffers = null
     }
 
     private fun calculateNumChunks(durationS: Float): Int {
@@ -286,14 +318,5 @@ class FlamingoInference(
         if (usable <= 0) return listOf(0f)
         if (numChunks == 1) return listOf(usable / 2f)
         return (0 until numChunks).map { i -> usable * i / (numChunks - 1) }
-    }
-
-    fun close() {
-        encoderInputBuffers.forEach { it.close() }
-        encoderOutputBuffers.forEach { it.close() }
-        encoderModel.close()
-        projectorInputBuffers?.forEach { it.close() }
-        projectorOutputBuffers?.forEach { it.close() }
-        projectorModel?.close()
     }
 }

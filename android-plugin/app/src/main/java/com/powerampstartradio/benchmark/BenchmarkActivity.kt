@@ -415,15 +415,15 @@ class BenchmarkActivity : ComponentActivity() {
             log("MuLan model not found at ${mulanFile.absolutePath}")
         }
 
-        // ── Flamingo Pass ──
+        // ── Flamingo Pass (two-phase GPU) ──
         if (hasFlamingo) {
-            log("\nLoading Flamingo model (requesting $accelerator)...")
+            log("\nLoading Flamingo encoder (requesting $accelerator)...")
             val loadStart = System.nanoTime()
             var flamingoInference: FlamingoInference? = null
             try {
                 flamingoInference = FlamingoInference(flamingoFile, projectorFile, accelerator)
                 val loadMs = (System.nanoTime() - loadStart) / 1_000_000
-                log("  Flamingo loaded in ${loadMs}ms (${flamingoInference.activeAccelerator})")
+                log("  Encoder loaded in ${loadMs}ms (${flamingoInference.activeAccelerator})")
                 log("  Output dim: ${flamingoInference.outputDim}")
             } catch (e: Exception) {
                 log("  Flamingo load FAILED: ${e.message}")
@@ -431,42 +431,69 @@ class BenchmarkActivity : ComponentActivity() {
 
             if (flamingoInference != null) {
                 flamingoEp = "LiteRT ${flamingoInference.activeAccelerator}"
-                log("")
+
+                // Phase 1: Encode all tracks
+                log("\n── Encoder phase ──")
+                val encoderHiddens = arrayOfNulls<List<FloatArray>>(testTracks.size)
+                val encodeTimes = LongArray(testTracks.size)
+
                 for ((i, track) in testTracks.withIndex()) {
-                    log("Flamingo [${i + 1}/${testTracks.size}] ${track.artist} - ${track.title}")
-
+                    log("Encode [${i + 1}/${testTracks.size}] ${track.artist} - ${track.title}")
                     val audioFile = resolveFile(track.path)!!
-
                     try {
-                        // Use cached 16kHz audio from MuLan pass (decode-once optimization)
                         val cached = cachedAudio16k[i]
-                        cachedAudio16k[i] = null  // free memory as we go
+                        cachedAudio16k[i] = null
 
                         val decodeStart = System.nanoTime()
                         val audio = cached ?: decoder.decode(audioFile, 16000, maxDurationS = 1800)
                         val decodeMs = (System.nanoTime() - decodeStart) / 1_000_000
-                        if (audio == null) {
-                            log("  Decode failed")
-                            continue
-                        }
+                        if (audio == null) { log("  Decode failed"); continue }
                         val source = if (cached != null) "cached" else "decoded"
                         log("  Audio: ${audio.durationS}s @ ${audio.sampleRate}Hz ($source: ${decodeMs}ms)")
 
                         val inferStart = System.nanoTime()
-                        val embedding = flamingoInference.generateEmbedding(audio)
-                        val inferMs = (System.nanoTime() - inferStart) / 1_000_000
+                        val hiddens = flamingoInference.encodeTrack(audio)
+                        encodeTimes[i] = (System.nanoTime() - inferStart) / 1_000_000
+                        encoderHiddens[i] = hiddens
+
+                        if (hiddens != null) {
+                            log("  Encoded ${hiddens.size} chunks in ${encodeTimes[i]}ms")
+                        } else {
+                            log("  Encode FAILED")
+                        }
+                    } catch (e: Throwable) {
+                        log("  ERROR: ${e.javaClass.simpleName}: ${e.message}")
+                    }
+                }
+
+                // Phase transition: encoder → projector
+                flamingoInference.closeEncoder()
+                log("\n── Projector phase ──")
+                val projLoadStart = System.nanoTime()
+                flamingoInference.loadProjector()
+                log("  Projector loaded in ${(System.nanoTime() - projLoadStart) / 1_000_000}ms")
+
+                // Phase 2: Project all tracks
+                for ((i, track) in testTracks.withIndex()) {
+                    val hiddens = encoderHiddens[i] ?: continue
+                    log("Project [${i + 1}/${testTracks.size}] ${track.artist} - ${track.title}")
+                    try {
+                        val projStart = System.nanoTime()
+                        val embedding = flamingoInference.projectAndAverage(hiddens)
+                        val projMs = (System.nanoTime() - projStart) / 1_000_000
+                        val totalMs = encodeTimes[i] + projMs
 
                         if (embedding != null) {
-                            log("  Embedding: ${embedding.size}d in ${inferMs}ms")
+                            log("  Embedding: ${embedding.size}d (encode=${encodeTimes[i]}ms, project=${projMs}ms, total=${totalMs}ms)")
                             log("  First 5: ${embedding.take(5).map { "%.4f".format(it) }}")
                             results[i].flamingo = EmbeddingResult(
                                 ep = flamingoEp!!,
-                                timingMs = inferMs,
+                                timingMs = totalMs,
                                 dim = embedding.size,
                                 embedding = embedding.toList(),
                             )
                         } else {
-                            log("  Inference FAILED")
+                            log("  Projection FAILED")
                         }
                     } catch (e: Throwable) {
                         log("  ERROR: ${e.javaClass.simpleName}: ${e.message}")
