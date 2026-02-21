@@ -731,6 +731,23 @@ fun SettingsScreen(
     val isRandomWalk = selectionMode == SelectionMode.RANDOM_WALK
     val isDpp = selectionMode == SelectionMode.DPP
 
+    // Slider track styles: clean (continuous) and stepped (discrete with stop indicators)
+    val cleanTrack: @Composable (SliderState) -> Unit = { state ->
+        SliderDefaults.Track(
+            sliderState = state,
+            drawStopIndicator = null,
+            thumbTrackGapSize = 0.dp,
+            trackInsideCornerSize = 0.dp,
+        )
+    }
+    val steppedTrack: @Composable (SliderState) -> Unit = { state ->
+        SliderDefaults.Track(
+            sliderState = state,
+            thumbTrackGapSize = 0.dp,
+            trackInsideCornerSize = 0.dp,
+        )
+    }
+
     // Group keys by what affects each mode
     val commonKeys = remember(numTracks, maxPerArtist, minArtistSpacing) { Any() }
     val driftKeys = remember(driftEnabled, driftMode, anchorStrength, anchorDecay, momentumBeta) { Any() }
@@ -770,7 +787,7 @@ fun SettingsScreen(
                 Column {
                     Text("Queue Size: $numTracks tracks", style = MaterialTheme.typography.titleMedium)
                     Slider(value = numTracks.toFloat(), onValueChange = { viewModel.setNumTracks(it.toInt()) },
-                        valueRange = 10f..100f, steps = 8)
+                        valueRange = 10f..100f, steps = 8, track = steppedTrack)
                 }
             }
 
@@ -848,7 +865,7 @@ fun SettingsScreen(
                             Text("Max diversity penalty", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                             Slider(value = diversityLambda, onValueChange = { viewModel.setDiversityLambda(it) },
-                                valueRange = 0f..1f, modifier = Modifier.weight(1f))
+                                valueRange = 0f..1f, modifier = Modifier.weight(1f), track = cleanTrack)
                             Text("No penalty", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                         }
@@ -869,7 +886,7 @@ fun SettingsScreen(
                             Text("Rarely returns", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                             Slider(value = pageRankAlpha, onValueChange = { viewModel.setPageRankAlpha(it) },
-                                valueRange = 0.05f..0.95f, modifier = Modifier.weight(1f))
+                                valueRange = 0.05f..0.95f, modifier = Modifier.weight(1f), track = cleanTrack)
                             Text("Returns often", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                         }
@@ -944,7 +961,7 @@ fun SettingsScreen(
                                         Text("Mostly last pick", style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                                         Slider(value = anchorStrength, onValueChange = { viewModel.setAnchorStrength(it) },
-                                            valueRange = 0f..1f, modifier = Modifier.weight(1f))
+                                            valueRange = 0f..1f, modifier = Modifier.weight(1f), track = cleanTrack)
                                         Text("Mostly seed", style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                                     }
@@ -958,7 +975,7 @@ fun SettingsScreen(
                                         Text("Latest pick dominates", style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                                         Slider(value = momentumBeta, onValueChange = { viewModel.setMomentumBeta(it) },
-                                            valueRange = 0f..1f, modifier = Modifier.weight(1f))
+                                            valueRange = 0f..1f, modifier = Modifier.weight(1f), track = cleanTrack)
                                         Text("Slow to change", style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                                     }
@@ -981,14 +998,14 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Slider(value = maxPerArtist.toFloat(), onValueChange = { viewModel.setMaxPerArtist(it.roundToInt()) },
-                    valueRange = 1f..10f, steps = 8)
+                    valueRange = 1f..10f, steps = 8, track = steppedTrack)
 
                 Text("Min Artist Spacing: $minArtistSpacing tracks", style = MaterialTheme.typography.titleSmall)
                 Text("At least this many tracks between songs by the same artist.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Slider(value = minArtistSpacing.toFloat(), onValueChange = { viewModel.setMinArtistSpacing(it.roundToInt()) },
-                    valueRange = 0f..20f, steps = 19)
+                    valueRange = 0f..20f, steps = 19, track = steppedTrack)
             }
 
             item { HorizontalDivider() }
