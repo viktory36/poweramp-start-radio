@@ -76,6 +76,9 @@ class MuLanInference(
     // Pre-allocated flat array for mel input [1 * 128 * 1000]
     private val melFlat = FloatArray(N_MELS * EXPECTED_MEL_FRAMES)
 
+    // Pre-allocated buffer for 10s clip (reused across all clips in a track)
+    private val clipBuffer = FloatArray(CLIP_SAMPLES)
+
     init {
         // Load mel params from JSON sidecar if available, else use defaults
         val jsonFile = File(modelFile.parent, modelFile.nameWithoutExtension + ".mel_params.json")
@@ -149,9 +152,14 @@ class MuLanInference(
         val numChunks = calculateNumChunks(durationS)
         val positions = selectChunkPositions(durationS, numChunks)
 
-        // Extract 10s clips from each 30s chunk position
-        val clips = mutableListOf<FloatArray>()
+        // Process 10s clips from each 30s chunk position (reuses pre-allocated clipBuffer)
         val chunkSamples = CHUNK_DURATION_S * SAMPLE_RATE
+        val sumEmbedding = FloatArray(EMBEDDING_DIM)
+        var count = 0
+        var totalClips = 0
+
+        var totalMelMs = 0L
+        var totalInferMs = 0L
 
         for (pos in positions) {
             val startSample = (pos * SAMPLE_RATE).toInt()
@@ -162,38 +170,28 @@ class MuLanInference(
             for (clipIdx in 0 until 3) {
                 val clipStart = startSample + clipIdx * CLIP_SAMPLES
                 val clipEnd = clipStart + CLIP_SAMPLES
-                if (clipEnd <= audio.samples.size) {
-                    clips.add(audio.samples.copyOfRange(clipStart, clipEnd))
+                if (clipEnd > audio.samples.size) continue
+                System.arraycopy(audio.samples, clipStart, clipBuffer, 0, CLIP_SAMPLES)
+                totalClips++
+                val embedding = runInference(clipBuffer) { melMs, inferMs ->
+                    totalMelMs += melMs
+                    totalInferMs += inferMs
+                } ?: continue
+                for (i in 0 until EMBEDDING_DIM) {
+                    sumEmbedding[i] += embedding[i]
                 }
+                count++
+                onClipDone?.invoke()
             }
         }
 
-        if (clips.isEmpty()) {
+        if (totalClips == 0) {
             Log.w(TAG, "No valid clips extracted")
             return null
         }
 
-        Log.d(TAG, "Running inference on ${clips.size} clips")
-
-        // Run each clip through model and accumulate embeddings
-        val sumEmbedding = FloatArray(EMBEDDING_DIM)
-        var count = 0
-
-        var totalMelMs = 0L
-        var totalInferMs = 0L
-
-        for (clip in clips) {
-            val embedding = runInference(clip) { melMs, inferMs ->
-                totalMelMs += melMs
-                totalInferMs += inferMs
-            } ?: continue
-            for (i in 0 until EMBEDDING_DIM) {
-                sumEmbedding[i] += embedding[i]
-            }
-            count++
-            onClipDone?.invoke()
-        }
-        Log.i(TAG, "TIMING: mulan ${clips.size} clips: mel=${totalMelMs}ms, " +
+        Log.d(TAG, "Processed $totalClips clips ($count successful)")
+        Log.i(TAG, "TIMING: mulan $totalClips clips: mel=${totalMelMs}ms, " +
             "inference=${totalInferMs}ms, total=${totalMelMs + totalInferMs}ms")
 
         if (count == 0) {

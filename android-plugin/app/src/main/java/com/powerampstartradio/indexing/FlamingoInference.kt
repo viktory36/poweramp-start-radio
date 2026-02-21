@@ -70,6 +70,9 @@ class FlamingoInference(
     // Pre-allocated flat array for mel input
     private val melFlat = FloatArray(N_MELS * NUM_MEL_FRAMES)
 
+    // Pre-allocated buffer for 30s chunk (reused across all chunks in a track)
+    private val chunkBuffer = FloatArray(CHUNK_SAMPLES)
+
     init {
         // Load encoder with GPU→CPU fallback (covers both compilation and buffer allocation)
         val encResult = createReadyModel(encoderFile.absolutePath, accelerator)
@@ -179,23 +182,19 @@ class FlamingoInference(
         positionS: Float,
         onTiming: ((melMs: Long, encoderMs: Long, projectorMs: Long) -> Unit)? = null,
     ): FloatArray? {
+        // Copy audio into pre-allocated chunk buffer, zero-pad remainder if needed
         val startSample = (positionS * SAMPLE_RATE).toInt()
-        val endSample = min(startSample + CHUNK_SAMPLES, samples.size)
-        val chunkSamples = samples.copyOfRange(startSample, endSample)
-
-        // Pad to full 30s if needed
-        val paddedChunk = if (chunkSamples.size < CHUNK_SAMPLES) {
-            FloatArray(CHUNK_SAMPLES).also { chunkSamples.copyInto(it) }
-        } else {
-            chunkSamples
+        val actualLen = min(CHUNK_SAMPLES, samples.size - startSample)
+        System.arraycopy(samples, startSample, chunkBuffer, 0, actualLen)
+        if (actualLen < CHUNK_SAMPLES) {
+            chunkBuffer.fill(0f, actualLen, CHUNK_SAMPLES)
         }
 
         // Compute mel spectrogram and apply Whisper log normalization.
-        // Center padding produces 3001 frames; drop last to match Whisper's [:, :-1].
+        // Center padding produces 3001 frames; the flatten loop's min() trims to 3000.
         val melStart = System.nanoTime()
-        val rawMel = melSpectrogram.compute(paddedChunk)
-        val mel = Array(rawMel.size) { m -> rawMel[m].copyOf(rawMel[m].size - 1) }
-        MelSpectrogram.whisperNormalize(mel)
+        val rawMel = melSpectrogram.compute(chunkBuffer)
+        MelSpectrogram.whisperNormalize(rawMel)
         val melMs = (System.nanoTime() - melStart) / 1_000_000
 
         // Construct audio_times: absolute timestamps per post-pool frame
@@ -203,7 +202,7 @@ class FlamingoInference(
             frame * FRAME_DURATION_S + positionS
         }
 
-        return runInference(mel, audioTimes) { encMs, projMs ->
+        return runInference(rawMel, audioTimes) { encMs, projMs ->
             onTiming?.invoke(melMs, encMs, projMs)
         }
     }
