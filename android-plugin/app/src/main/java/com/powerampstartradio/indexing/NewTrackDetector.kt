@@ -381,15 +381,14 @@ class NewTrackDetector(
         if (artist.isEmpty()) {
             keysByArtist["unknown artist"]?.let { result.addAll(it) }
         }
-        // ID3v1 30-char artist truncation: phone has full name, DB has truncated
-        if (artist.length > 30) {
-            val truncated = artist.substring(0, 30)
-            keysByArtist[truncated]?.let { result.addAll(it) }
-        }
-        // Reverse: DB has full name, phone has truncated artist
-        if (artist.length == 30) {
+        // ID3v1 artist truncation: prefix match when one side is 25-30 chars
+        // (30-byte ID3v1 field, trailing spaces stripped by mutagen → 25-30 chars)
+        if (artist.length >= 25) {
             for ((dbArtist, keys) in keysByArtist) {
-                if (dbArtist.length > 30 && dbArtist.startsWith(artist)) {
+                if (dbArtist == artist || dbArtist.length < 25) continue
+                val shorter = if (artist.length <= dbArtist.length) artist else dbArtist
+                val longer = if (artist.length > dbArtist.length) artist else dbArtist
+                if (shorter.length in 25..30 && longer.startsWith(shorter)) {
                     result.addAll(keys)
                 }
             }
@@ -450,9 +449,10 @@ class NewTrackDetector(
             if (phoneTitleStripped == dbTitle) return true
             if (dbTitleStripped == phoneTitleStripped && dbTitleStripped != dbTitle) return true
 
-            // ID3v1 truncation: DB field exactly 30 chars is prefix of phone title
-            if (dbTitle.length == 30 && phoneTitle.length > 30 && phoneTitle.startsWith(dbTitle)) return true
-            if (phoneTitle.length == 30 && dbTitle.length > 30 && dbTitle.startsWith(phoneTitle)) return true
+            // ID3v1 truncation: field in 25-30 chars is prefix of the other
+            // (30-byte ID3v1 field, trailing spaces stripped by mutagen → 25-30 chars)
+            if (dbTitle.length in 25..30 && phoneTitle.length > dbTitle.length && phoneTitle.startsWith(dbTitle)) return true
+            if (phoneTitle.length in 25..30 && dbTitle.length > phoneTitle.length && dbTitle.startsWith(phoneTitle)) return true
 
             // Audio extension in DB title: DB has "welcome.wav", phone has "welcome"
             val dbTitleNoExt = stripAudioExtension(dbTitle)
