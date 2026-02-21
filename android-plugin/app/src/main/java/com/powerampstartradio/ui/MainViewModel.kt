@@ -96,8 +96,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // --- Indexing state ---
     // -2 = never checked, -1 = checking now, 0+ = actual count
-    private val _unindexedCount = MutableStateFlow(prefs.getInt("unindexed_count", -2))
+    private val _unindexedCount = MutableStateFlow(initUnindexedCount())
     val unindexedCount: StateFlow<Int> = _unindexedCount.asStateFlow()
+
+    /** Load persisted count, but reset if DB has changed since last check. */
+    private fun initUnindexedCount(): Int {
+        val app = getApplication<Application>()
+        val dbFile = File(app.filesDir, "embeddings.db")
+        val currentFp = if (dbFile.exists()) "${dbFile.length()}_${dbFile.lastModified()}" else ""
+        val savedFp = app.getSharedPreferences("indexing", Context.MODE_PRIVATE)
+            .getString("dismissed_db_fingerprint", "") ?: ""
+        if (currentFp != savedFp) {
+            // DB changed — stale count, force re-check
+            prefs.edit().remove("unindexed_count").apply()
+            return -2
+        }
+        return prefs.getInt("unindexed_count", -2)
+    }
 
     private val _unindexedCheckStatus = MutableStateFlow<String?>(null)
     val unindexedCheckStatus: StateFlow<String?> = _unindexedCheckStatus.asStateFlow()
@@ -345,9 +360,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             try {
                 val result = deferred.await()
+                // Check if DB changed — clear stale dismissed IDs if so
+                val indexingPrefs = app.getSharedPreferences("indexing", Context.MODE_PRIVATE)
+                val currentFingerprint = if (dbFile.exists())
+                    "${dbFile.length()}_${dbFile.lastModified()}" else ""
+                val savedFingerprint = indexingPrefs.getString("dismissed_db_fingerprint", "") ?: ""
+                if (currentFingerprint != savedFingerprint) {
+                    indexingPrefs.edit()
+                        .remove("dismissed_track_ids")
+                        .putString("dismissed_db_fingerprint", currentFingerprint)
+                        .apply()
+                    IndexingViewModel.invalidateCache()
+                }
                 // Exclude dismissed tracks from the count
-                val dismissedJson = app.getSharedPreferences("indexing", Context.MODE_PRIVATE)
-                    .getString("dismissed_track_ids", null)
+                val dismissedJson = indexingPrefs.getString("dismissed_track_ids", null)
                 val dismissed = if (dismissedJson != null) {
                     try {
                         val arr = org.json.JSONArray(dismissedJson)
