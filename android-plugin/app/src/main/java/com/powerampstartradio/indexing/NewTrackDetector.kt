@@ -17,6 +17,7 @@ class NewTrackDetector(
 ) {
     companion object {
         private const val TAG = "NewTrackDetector"
+        private val TRACK_NUMBER_PREFIX = Regex("^\\d+[.\\-\\s]+")
     }
 
     /** Categorized reason why a track didn't match any embedded key. */
@@ -113,6 +114,9 @@ class NewTrackDetector(
         Log.d(TAG, "Poweramp: ${powerampEntries.size} tracks, " +
             "Embedded: ${embeddedKeys.size} metadata keys, ${embeddedPaths.size} paths")
 
+        // Build artist → keys index for fuzzy matching
+        val keysByArtist = buildKeysByArtist(embeddedKeys)
+
         // Find unmatched entries
         val unindexed = mutableListOf<UnindexedTrack>()
 
@@ -139,6 +143,10 @@ class NewTrackDetector(
                 }
                 if (hasPrimaryMatch) continue
             }
+
+            // Check fuzzy title matching (track number prefix, ID3v1 truncation, extensions,
+            // empty/"unknown artist" equivalence)
+            if (fuzzyMatchesAny(entry, keysByArtist)) continue
 
             // Check file path match (Poweramp path may match embedded file_path)
             if (entry.path != null && entry.path in embeddedPaths) continue
@@ -234,7 +242,14 @@ class NewTrackDetector(
                 }
             }
 
-            // Strategy 3: File path match
+            // Strategy 3: Fuzzy title matching (track number prefix, ID3v1 truncation,
+            // extensions, empty/"unknown artist" equivalence)
+            if (fuzzyMatchesAny(entry, keysByArtist)) {
+                partialMatches++
+                continue
+            }
+
+            // Strategy 4: File path match
             if (entry.path != null && entry.path in embeddedPaths) {
                 pathMatches++
                 continue
@@ -288,9 +303,9 @@ class NewTrackDetector(
             return FailureReason.PIPE_IN_METADATA
         }
 
-        // Find keys with same artist
-        val sameArtist = keysByArtist[entry.artist]
-        if (sameArtist == null) {
+        // Find keys with same artist (also check semicolon-split and unknown artist)
+        val sameArtist = resolveArtistKeys(entry.artist, keysByArtist)
+        if (sameArtist.isEmpty()) {
             return FailureReason.NO_SIMILAR_KEY
         }
 
@@ -330,6 +345,96 @@ class NewTrackDetector(
         }
 
         return null
+    }
+
+    /** Build artist → keys index from embedded keys. */
+    private fun buildKeysByArtist(embeddedKeys: Set<String>): Map<String, List<String>> {
+        val map = HashMap<String, MutableList<String>>(embeddedKeys.size / 10)
+        for (key in embeddedKeys) {
+            val pipeIdx = key.indexOf('|')
+            val artist = if (pipeIdx >= 0) key.substring(0, pipeIdx) else key
+            map.getOrPut(artist) { mutableListOf() }.add(key)
+        }
+        return map
+    }
+
+    /**
+     * Resolve all DB keys that could belong to the same artist, accounting for:
+     * - Exact artist match
+     * - Semicolon-split primary artist (Poweramp: "a; b", DB: "a")
+     * - Empty ↔ "unknown artist" equivalence
+     */
+    private fun resolveArtistKeys(
+        artist: String,
+        keysByArtist: Map<String, List<String>>,
+    ): List<String> {
+        val result = mutableListOf<String>()
+        keysByArtist[artist]?.let { result.addAll(it) }
+        // Semicolon split
+        if (';' in artist) {
+            val primary = artist.substringBefore(';').trim()
+            if (primary != artist) keysByArtist[primary]?.let { result.addAll(it) }
+        }
+        // Empty ↔ "unknown artist"
+        if (artist.isEmpty()) {
+            keysByArtist["unknown artist"]?.let { result.addAll(it) }
+        }
+        return result
+    }
+
+    /**
+     * Fuzzy title matching for edge cases that exact/partial strategies miss:
+     * - Track number prefix (DB: "18 song", phone: "song" — from filename-as-title)
+     * - ID3v1 truncation (DB title exactly 30 chars is a prefix of phone title)
+     * - Audio extension in DB title (DB: "welcome.wav", phone: "welcome")
+     * - Empty ↔ "unknown artist" equivalence
+     *
+     * Only runs for tracks that fail all faster strategies, so iterating same-artist
+     * keys (typically a few dozen) is acceptable.
+     */
+    private fun fuzzyMatchesAny(
+        entry: PowerampEntryWithPath,
+        keysByArtist: Map<String, List<String>>,
+    ): Boolean {
+        val sameArtistKeys = resolveArtistKeys(entry.artist, keysByArtist)
+        if (sameArtistKeys.isEmpty()) return false
+
+        val phoneTitle = entry.title
+        val phoneTitleStripped = phoneTitle.replace(TRACK_NUMBER_PREFIX, "")
+
+        for (key in sameArtistKeys) {
+            val dbTitle = extractTitleFromKey(key)
+
+            // Track number prefix: DB has "18 title", phone has "title" (or vice versa)
+            val dbTitleStripped = dbTitle.replace(TRACK_NUMBER_PREFIX, "")
+            if (dbTitleStripped == phoneTitle) return true
+            if (phoneTitleStripped == dbTitle) return true
+            if (dbTitleStripped == phoneTitleStripped && dbTitleStripped != dbTitle) return true
+
+            // ID3v1 truncation: DB field exactly 30 chars is prefix of phone title
+            if (dbTitle.length == 30 && phoneTitle.length > 30 && phoneTitle.startsWith(dbTitle)) return true
+            if (phoneTitle.length == 30 && dbTitle.length > 30 && dbTitle.startsWith(phoneTitle)) return true
+
+            // Audio extension in DB title: DB has "welcome.wav", phone has "welcome"
+            val dbTitleNoExt = stripAudioExtension(dbTitle)
+            if (dbTitleNoExt != dbTitle && dbTitleNoExt == phoneTitle) return true
+        }
+
+        return false
+    }
+
+    /** Extract the title field (3rd pipe-delimited segment) from a metadata key. */
+    private fun extractTitleFromKey(key: String): String {
+        var start = -1
+        var count = 0
+        for (i in key.indices) {
+            if (key[i] == '|') {
+                count++
+                if (count == 2) start = i + 1
+                if (count == 3) return key.substring(start, i)
+            }
+        }
+        return ""
     }
 
     /**
