@@ -46,6 +46,7 @@ class AudioDecoder {
      * @return Decoded audio, or null on failure
      */
     fun decode(file: File, targetSampleRate: Int, maxDurationS: Int = 0): DecodedAudio? {
+        val decodeStart = System.nanoTime()
         val extractor = MediaExtractor()
         try {
             extractor.setDataSource(file.absolutePath)
@@ -80,15 +81,22 @@ class AudioDecoder {
                 return null
             }
 
+            val decodeMs = (System.nanoTime() - decodeStart) / 1_000_000
+            Log.i(TAG, "TIMING: decode_pcm ${file.name} = ${decodeMs}ms " +
+                "(${rawSamples.size} samples @ ${nativeSampleRate}Hz)")
+
             // Resample if needed
+            val resampleStart = System.nanoTime()
             val resampled = if (nativeSampleRate != targetSampleRate) {
                 resample(rawSamples, nativeSampleRate, targetSampleRate)
             } else {
                 rawSamples
             }
+            val resampleMs = (System.nanoTime() - resampleStart) / 1_000_000
 
             val durationS = resampled.size.toFloat() / targetSampleRate
-            Log.d(TAG, "Decoded ${file.name}: ${resampled.size} samples, ${durationS}s @ ${targetSampleRate}Hz")
+            Log.i(TAG, "TIMING: resample ${file.name} ${nativeSampleRate}->${targetSampleRate}Hz = ${resampleMs}ms")
+            Log.i(TAG, "TIMING: decode_total ${file.name} = ${decodeMs + resampleMs}ms (${durationS}s audio)")
 
             return DecodedAudio(resampled, targetSampleRate, durationS)
 

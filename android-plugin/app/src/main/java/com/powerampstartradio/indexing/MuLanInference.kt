@@ -179,14 +179,22 @@ class MuLanInference(
         val sumEmbedding = FloatArray(EMBEDDING_DIM)
         var count = 0
 
+        var totalMelMs = 0L
+        var totalInferMs = 0L
+
         for (clip in clips) {
-            val embedding = runInference(clip) ?: continue
+            val embedding = runInference(clip) { melMs, inferMs ->
+                totalMelMs += melMs
+                totalInferMs += inferMs
+            } ?: continue
             for (i in 0 until EMBEDDING_DIM) {
                 sumEmbedding[i] += embedding[i]
             }
             count++
             onClipDone?.invoke()
         }
+        Log.i(TAG, "TIMING: mulan ${clips.size} clips: mel=${totalMelMs}ms, " +
+            "inference=${totalInferMs}ms, total=${totalMelMs + totalInferMs}ms")
 
         if (count == 0) {
             Log.w(TAG, "All clip inferences failed")
@@ -207,9 +215,13 @@ class MuLanInference(
      * Run inference on a single 10s clip.
      * Computes mel spectrogram, normalizes, feeds to model.
      */
-    private fun runInference(clip: FloatArray): FloatArray? {
+    private fun runInference(
+        clip: FloatArray,
+        onTiming: ((melMs: Long, inferMs: Long) -> Unit)? = null,
+    ): FloatArray? {
         return try {
             // Compute raw power mel spectrogram
+            val melStart = System.nanoTime()
             val mel = melSpectrogram.compute(clip)
 
             // Apply dB conversion if required: 10 * log10(max(mel, 1e-10))
@@ -237,12 +249,17 @@ class MuLanInference(
                 }
             }
 
+            val melMs = (System.nanoTime() - melStart) / 1_000_000
+
             // Write input and run
+            val inferStart = System.nanoTime()
             inputBuffers[0].writeFloat(melFlat)
             model.run(inputBuffers, outputBuffers)
 
             // Read output [1, 512] → flat [512]
             val output = outputBuffers[0].readFloat()
+            val inferMs = (System.nanoTime() - inferStart) / 1_000_000
+            onTiming?.invoke(melMs, inferMs)
             if (output.size >= EMBEDDING_DIM) {
                 output.copyOf(EMBEDDING_DIM)
             } else {

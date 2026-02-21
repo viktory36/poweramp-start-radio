@@ -268,11 +268,13 @@ class IndexingService : Service() {
                 if (hasMulan) {
                     _state.value = IndexingState.Detecting("Loading MuQ-MuLan model (GPU)...")
                     updateNotification("Loading MuQ-MuLan model...")
+                    val mulanLoadStart = System.nanoTime()
                     val mulanInference = try { MuLanInference(mulanFile) }
                     catch (e: Exception) {
                         Log.e(TAG, "Failed to load MuQ-MuLan", e)
                         null
                     }
+                    Log.i(TAG, "TIMING: mulan_model_load = ${(System.nanoTime() - mulanLoadStart) / 1_000_000}ms")
 
                     if (mulanInference != null) {
                         val processor = EmbeddingProcessor(
@@ -300,6 +302,7 @@ class IndexingService : Service() {
                                 updateNotification(msg, completedSteps, totalSteps)
                             }
                             emitProgress("decoding")
+                            val trackStart = System.nanoTime()
 
                             val audioFile = resolveAudioFile(track)
                             if (audioFile == null) {
@@ -345,6 +348,7 @@ class IndexingService : Service() {
                             clipsDone = 0
 
                             // MuLan inference (GPU) — runs concurrently with CPU resample
+                            val mulanInferStart = System.nanoTime()
                             emitProgress("clip 0/$totalClips")
                             val embeddings = processor.processTrack(
                                 audioFile, preDecodedAudio = audio24k,
@@ -355,6 +359,7 @@ class IndexingService : Service() {
                                     emitProgress("clip $clipsDone/$totalClips")
                                 },
                             )
+                            val mulanInferMs = (System.nanoTime() - mulanInferStart) / 1_000_000
 
                             // Collect resample result (should be done by now — inference takes longer)
                             if (resampleDeferred != null) {
@@ -375,6 +380,11 @@ class IndexingService : Service() {
                                 }
                                 completedSteps += RESAMPLE_WEIGHT
                             }
+
+                            val trackMs = (System.nanoTime() - trackStart) / 1_000_000
+                            Log.i(TAG, "TIMING: mulan_track ${i+1}/${unindexed.size} " +
+                                "\"${track.artist} - ${track.title}\" = ${trackMs}ms " +
+                                "(inference=${mulanInferMs}ms)")
 
                             if (embeddings == null) {
                                 if (!hasFlamingo) failed++
@@ -407,20 +417,25 @@ class IndexingService : Service() {
                         }
 
                         processor.close()
-                        Log.i(TAG, "Pass 1 (MuLan) complete: ${mulanResults.size} tracks")
+                        val mulanPassMs = (System.currentTimeMillis() - batchStartTime)
+                        Log.i(TAG, "TIMING: mulan_pass_total = ${mulanPassMs}ms " +
+                            "(${mulanResults.size} tracks, ${mulanPassMs / maxOf(mulanResults.size, 1)}ms/track avg)")
                     }
                 }
 
                 // ── Pass 2: Flamingo + Fusion ──────────────────────────
+                val flamingoPassStart = System.currentTimeMillis()
                 if (hasFlamingo) {
                     _state.value = IndexingState.Detecting("Loading Flamingo model (GPU)...")
                     updateNotification("Loading Flamingo model...")
+                    val flamingoLoadStart = System.nanoTime()
                     val flamingoInference = try {
                         FlamingoInference(flamingoFile, projectorFile)
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to load Flamingo", e)
                         null
                     }
+                    Log.i(TAG, "TIMING: flamingo_model_load = ${(System.nanoTime() - flamingoLoadStart) / 1_000_000}ms")
 
                     if (flamingoInference != null) {
                         // Adjust projection matrix dims if projector is absent
@@ -455,6 +470,8 @@ class IndexingService : Service() {
                                 )
                                 updateNotification(msg, completedSteps, totalSteps)
                             }
+
+                            val flTrackStart = System.nanoTime()
 
                             val audioFile = resolveAudioFile(track)
                             if (audioFile == null) {
@@ -494,6 +511,7 @@ class IndexingService : Service() {
                             // Use in-memory MuLan embedding from pass 1 for fusion
                             val mulanEmbedding = mulanResults[track]?.mulanEmbedding
 
+                            val flInferStart = System.nanoTime()
                             val embeddings = processor.processTrack(
                                 audioFile,
                                 existingMulan = mulanEmbedding,
@@ -505,6 +523,7 @@ class IndexingService : Service() {
                                     emitProgress("chunk $chunksDone/$totalFChunks")
                                 },
                             )
+                            val flInferMs = (System.nanoTime() - flInferStart) / 1_000_000
 
                             if (embeddings == null) {
                                 failed++
@@ -518,6 +537,7 @@ class IndexingService : Service() {
                                 flamingoReduced = embeddings.flamingoReduced,
                                 fusedEmbedding = embeddings.fusedEmbedding,
                             )
+                            val dbWriteStart = System.nanoTime()
                             val trackId = writer.writeTrack(
                                 metadataKey = track.metadataKey,
                                 filenameKey = track.filenameKey,
@@ -529,23 +549,30 @@ class IndexingService : Service() {
                                 embeddings = merged,
                                 source = "phone",
                             )
+                            val dbWriteMs = (System.nanoTime() - dbWriteStart) / 1_000_000
+                            val flTrackMs = (System.nanoTime() - flTrackStart) / 1_000_000
                             if (trackId > 0) {
                                 indexed++
                                 mulanResults.remove(track)  // Free memory
                             } else {
                                 failed++
                             }
-                            Log.i(TAG, "Track ${i + 1}/${unindexed.size} indexed: ${track.artist} - ${track.title}")
+                            Log.i(TAG, "TIMING: flamingo_track ${i+1}/${unindexed.size} " +
+                                "\"${track.artist} - ${track.title}\" = ${flTrackMs}ms " +
+                                "(inference=${flInferMs}ms, db_write=${dbWriteMs}ms)")
                         }
 
                         processor.close()
-                        Log.i(TAG, "Pass 2 (Flamingo) complete")
+                        val flamingoPassMs = System.currentTimeMillis() - flamingoPassStart
+                        Log.i(TAG, "TIMING: flamingo_pass_total = ${flamingoPassMs}ms " +
+                            "($indexed tracks, ${flamingoPassMs / maxOf(indexed, 1)}ms/track avg)")
                     }
                 }
 
                 // Rebuild indices after indexing new tracks
                 if (indexed > 0) {
                     val refusion = pendingRefusion.also { pendingRefusion = false }
+                    val rebuildStart = System.currentTimeMillis()
 
                     if (refusion) {
                         // Full re-fusion: recompute SVD, re-project ALL tracks,
@@ -559,6 +586,7 @@ class IndexingService : Service() {
                             _state.value = IndexingState.RebuildingIndices(status)
                             updateNotification(status)
                         }
+                        Log.i(TAG, "TIMING: refusion_total = ${System.currentTimeMillis() - rebuildStart}ms")
                     } else {
                         // Incremental: rebuild .emb file and extract/build kNN graph.
                         // Uses the existing desktop SVD projection (adequate when
@@ -571,10 +599,15 @@ class IndexingService : Service() {
                             _state.value = IndexingState.RebuildingIndices(status)
                             updateNotification(status)
                         }
+                        Log.i(TAG, "TIMING: rebuild_indices = ${System.currentTimeMillis() - rebuildStart}ms")
                     }
                 }
 
                 db.close()
+
+                val totalBatchMs = System.currentTimeMillis() - batchStartTime
+                Log.i(TAG, "TIMING: batch_total = ${totalBatchMs}ms " +
+                    "($indexed indexed, $failed failed, ${totalBatchMs / maxOf(indexed, 1)}ms/track avg)")
 
                 _state.value = IndexingState.Complete(indexed, failed)
                 val message = "$indexed tracks indexed" +

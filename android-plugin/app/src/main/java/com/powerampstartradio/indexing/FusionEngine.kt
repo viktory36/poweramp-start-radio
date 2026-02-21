@@ -51,6 +51,7 @@ class FusionEngine(
      * @param onProgress Status callback for UI updates
      */
     fun recomputeFusion(onProgress: ((String) -> Unit)? = null) {
+        val fusionStart = System.currentTimeMillis()
         fun progress(msg: String) {
             Log.i(TAG, msg)
             onProgress?.invoke(msg)
@@ -84,6 +85,7 @@ class FusionEngine(
         }
 
         // Compute covariance matrix C = X^T X by streaming (memory: ~8 MB for 1024×1024 doubles)
+        val covStart = System.currentTimeMillis()
         progress("Computing covariance matrix ($nTracks tracks, ${concatDim}d)...")
         val covariance = DoubleArray(concatDim * concatDim)
         val mulanSet = mulanTrackIds.toHashSet()
@@ -118,7 +120,10 @@ class FusionEngine(
             }
         }
 
+        Log.i(TAG, "TIMING: covariance = ${System.currentTimeMillis() - covStart}ms")
+
         // --- Step 2: Eigendecomposition ---
+        val eigenStart = System.currentTimeMillis()
         progress("Eigendecomposition ($concatDim x $concatDim)...")
         val (eigenvalues, eigenvectors) = jacobiEigen(covariance, concatDim, onProgress)
 
@@ -137,7 +142,10 @@ class FusionEngine(
         val retainedVar = eigenvalues.take(targetDim).sum() / totalVar
         progress("Variance retained: ${"%.2f".format(retainedVar * 100)}%")
 
+        Log.i(TAG, "TIMING: eigendecomposition = ${System.currentTimeMillis() - eigenStart}ms")
+
         // --- Step 3: Re-project all tracks ---
+        val projStart = System.currentTimeMillis()
         progress("Projecting $nTracks tracks to ${targetDim}d...")
 
         // Ensure tables exist
@@ -198,7 +206,10 @@ class FusionEngine(
             arrayOf("fused_variance_retained", "%.6f".format(retainedVar))
         )
 
+        Log.i(TAG, "TIMING: projection = ${System.currentTimeMillis() - projStart}ms")
+
         // --- Step 4: k-means clustering ---
+        val kmeansStart = System.currentTimeMillis()
         progress("Loading fused embeddings for clustering...")
         val flatEmbeddings = loadAllFusedEmbeddingsFlat(allTrackIds)
 
@@ -241,18 +252,27 @@ class FusionEngine(
             rawDb.endTransaction()
         }
 
+        Log.i(TAG, "TIMING: kmeans = ${System.currentTimeMillis() - kmeansStart}ms")
+
         // --- Step 5: kNN graph ---
+        val knnStart = System.currentTimeMillis()
         progress("Building kNN graph (K=$knnK)...")
         buildKnnGraph(flatEmbeddings, nTracks, targetDim,
             allTrackIds, labels, centroids,
             onProgress = { progress(it) })
 
+        Log.i(TAG, "TIMING: knn_graph = ${System.currentTimeMillis() - knnStart}ms")
+
         // --- Step 6: Extract .emb and graph.bin files ---
+        val extractStart = System.currentTimeMillis()
         progress("Extracting index files...")
         EmbeddingIndex.extractFromDatabase(db, File(filesDir, "fused.emb")) { cur, total ->
             if (cur % 10000 == 0) progress("Extracting embeddings: $cur/$total")
         }
         GraphIndex.extractFromDatabase(db, File(filesDir, "graph.bin"))
+
+        Log.i(TAG, "TIMING: extract_indices = ${System.currentTimeMillis() - extractStart}ms")
+        Log.i(TAG, "TIMING: fusion_total = ${System.currentTimeMillis() - fusionStart}ms")
 
         progress("Re-fusion complete: $nTracks tracks, ${targetDim}d, " +
             "${"%.1f".format(retainedVar * 100)}% variance")

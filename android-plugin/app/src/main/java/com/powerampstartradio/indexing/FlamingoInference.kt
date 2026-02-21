@@ -135,14 +135,25 @@ class FlamingoInference(
         val sumEmbedding = FloatArray(outputDim)
         var count = 0
 
+        var totalMelMs = 0L
+        var totalEncoderMs = 0L
+        var totalProjectorMs = 0L
+
         for (pos in positions) {
-            val embedding = processChunk(audio.samples, pos) ?: continue
+            val embedding = processChunk(audio.samples, pos) { melMs, encMs, projMs ->
+                totalMelMs += melMs
+                totalEncoderMs += encMs
+                totalProjectorMs += projMs
+            } ?: continue
             for (i in 0 until outputDim) {
                 sumEmbedding[i] += embedding[i]
             }
             count++
             onChunkDone?.invoke()
         }
+        Log.i(TAG, "TIMING: flamingo ${positions.size} chunks: mel=${totalMelMs}ms, " +
+            "encoder=${totalEncoderMs}ms, projector=${totalProjectorMs}ms, " +
+            "total=${totalMelMs + totalEncoderMs + totalProjectorMs}ms")
 
         if (count == 0) {
             Log.w(TAG, "All chunk inferences failed")
@@ -162,7 +173,11 @@ class FlamingoInference(
     /**
      * Process a single 30s chunk: compute mel, run encoder+projector, mean-pool.
      */
-    private fun processChunk(samples: FloatArray, positionS: Float): FloatArray? {
+    private fun processChunk(
+        samples: FloatArray,
+        positionS: Float,
+        onTiming: ((melMs: Long, encoderMs: Long, projectorMs: Long) -> Unit)? = null,
+    ): FloatArray? {
         val startSample = (positionS * SAMPLE_RATE).toInt()
         val endSample = min(startSample + CHUNK_SAMPLES, samples.size)
         val chunkSamples = samples.copyOfRange(startSample, endSample)
@@ -176,16 +191,20 @@ class FlamingoInference(
 
         // Compute mel spectrogram and apply Whisper log normalization.
         // Center padding produces 3001 frames; drop last to match Whisper's [:, :-1].
+        val melStart = System.nanoTime()
         val rawMel = melSpectrogram.compute(paddedChunk)
         val mel = Array(rawMel.size) { m -> rawMel[m].copyOf(rawMel[m].size - 1) }
         MelSpectrogram.whisperNormalize(mel)
+        val melMs = (System.nanoTime() - melStart) / 1_000_000
 
         // Construct audio_times: absolute timestamps per post-pool frame
         val audioTimes = FloatArray(NUM_FRAMES) { frame ->
             frame * FRAME_DURATION_S + positionS
         }
 
-        return runInference(mel, audioTimes)
+        return runInference(mel, audioTimes) { encMs, projMs ->
+            onTiming?.invoke(melMs, encMs, projMs)
+        }
     }
 
     /**
@@ -195,7 +214,11 @@ class FlamingoInference(
      * @param audioTimes [750] absolute timestamps
      * @return Mean-pooled embedding [outputDim], or null on failure
      */
-    private fun runInference(mel: Array<FloatArray>, audioTimes: FloatArray): FloatArray? {
+    private fun runInference(
+        mel: Array<FloatArray>,
+        audioTimes: FloatArray,
+        onTiming: ((encoderMs: Long, projectorMs: Long) -> Unit)? = null,
+    ): FloatArray? {
         return try {
             // Flatten mel [128, 3000] to flat array with zero-padding
             for (m in 0 until N_MELS) {
@@ -212,9 +235,12 @@ class FlamingoInference(
             encoderInputBuffers[1].writeFloat(audioTimes)
 
             // Step 1: Encoder [1,128,3000] + [1,750] -> [1,750,1280]
+            val encStart = System.nanoTime()
             encoderModel.run(encoderInputBuffers, encoderOutputBuffers)
+            val encoderMs = (System.nanoTime() - encStart) / 1_000_000
 
             // Step 2: Projector (if available) [1,750,1280] -> [1,750,3584]
+            val projStart = System.nanoTime()
             val finalOutput: FloatArray
             val finalDim: Int
             if (projectorModel != null && projectorInputBuffers != null && projectorOutputBuffers != null) {
@@ -228,6 +254,8 @@ class FlamingoInference(
                 finalOutput = encoderOutputBuffers[0].readFloat()
                 finalDim = ENCODER_DIM
             }
+            val projectorMs = (System.nanoTime() - projStart) / 1_000_000
+            onTiming?.invoke(encoderMs, projectorMs)
 
             // Mean pool over time dimension: [1, 750, dim] -> [dim]
             val pooled = FloatArray(finalDim)
