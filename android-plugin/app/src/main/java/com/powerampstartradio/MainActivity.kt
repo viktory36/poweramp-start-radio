@@ -30,6 +30,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -1053,8 +1054,10 @@ fun SettingsScreen(
                 item {
                     val context = LocalContext.current
                     val unindexedCount by viewModel.unindexedCount.collectAsState()
+                    val checkStatus by viewModel.unindexedCheckStatus.collectAsState()
                     val hasModels by viewModel.hasModels.collectAsState()
                     val indexingState by viewModel.indexingState.collectAsState()
+                    val isChecking = unindexedCount == -1
 
                     Column {
                         Text("On-Device Indexing", style = MaterialTheme.typography.titleMedium)
@@ -1071,23 +1074,37 @@ fun SettingsScreen(
                             // Show brief status summary
                             when (val state = indexingState) {
                                 is IndexingService.IndexingState.Idle -> {
-                                    if (unindexedCount < 0) {
-                                        // Still checking
-                                        Row(verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        if (isChecking) {
                                             CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
-                                            Text("Checking...",
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text(checkStatus ?: "Checking...",
                                                 style = MaterialTheme.typography.bodySmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier.weight(1f))
+                                        } else {
+                                            Text(
+                                                when {
+                                                    unindexedCount == -2 -> "Not checked"
+                                                    unindexedCount > 0 -> "$unindexedCount unindexed tracks"
+                                                    else -> "All tracks indexed"
+                                                },
+                                                style = if (unindexedCount > 0) MaterialTheme.typography.bodyMedium
+                                                    else MaterialTheme.typography.bodySmall,
+                                                color = if (unindexedCount > 0) MaterialTheme.colorScheme.primary
+                                                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier.weight(1f),
+                                            )
+                                            IconButton(
+                                                onClick = { viewModel.checkUnindexedTracks() },
+                                                modifier = Modifier.size(32.dp),
+                                            ) {
+                                                Icon(Icons.Default.Refresh,
+                                                    contentDescription = "Check now",
+                                                    modifier = Modifier.size(18.dp),
+                                                    tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            }
                                         }
-                                    } else if (unindexedCount > 0) {
-                                        Text("$unindexedCount unindexed tracks",
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            color = MaterialTheme.colorScheme.primary)
-                                    } else {
-                                        Text("All tracks indexed",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     }
                                 }
                                 is IndexingService.IndexingState.Processing -> {

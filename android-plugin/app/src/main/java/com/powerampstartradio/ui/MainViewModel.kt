@@ -94,8 +94,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val indexStatus: StateFlow<String?> = _indexStatus.asStateFlow()
 
     // --- Indexing state ---
-    private val _unindexedCount = MutableStateFlow(-1) // -1 = not yet checked
+    // -2 = never checked, -1 = checking now, 0+ = actual count
+    private val _unindexedCount = MutableStateFlow(prefs.getInt("unindexed_count", -2))
     val unindexedCount: StateFlow<Int> = _unindexedCount.asStateFlow()
+
+    private val _unindexedCheckStatus = MutableStateFlow<String?>(null)
+    val unindexedCheckStatus: StateFlow<String?> = _unindexedCheckStatus.asStateFlow()
 
     private val _hasModels = MutableStateFlow(false)
     val hasModels: StateFlow<Boolean> = _hasModels.asStateFlow()
@@ -319,19 +323,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
             if (!dbFile.exists()) {
-                _unindexedCount.value = 0
+                setUnindexedCount(0)
                 return@launch
             }
             try {
                 val db = EmbeddingDatabase.open(dbFile)
                 val detector = NewTrackDetector(db)
-                val unindexed = detector.findUnindexedTracks(getApplication())
-                _unindexedCount.value = unindexed.size
+                val unindexed = detector.findUnindexedTracks(getApplication()) { status ->
+                    _unindexedCheckStatus.value = status
+                }
+                setUnindexedCount(unindexed.size)
                 db.close()
             } catch (e: Exception) {
-                _unindexedCount.value = 0
+                setUnindexedCount(0)
+            } finally {
+                _unindexedCheckStatus.value = null
             }
         }
+    }
+
+    private fun setUnindexedCount(count: Int) {
+        _unindexedCount.value = count
+        prefs.edit().putInt("unindexed_count", count).apply()
     }
 
     fun checkModels() {
@@ -522,7 +535,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     db.close()
                     _databaseInfo.value = info
                     prepareIndices()
-                    checkUnindexedTracks()
                     checkModels()
                 } catch (e: Exception) {
                     _databaseInfo.value = null
