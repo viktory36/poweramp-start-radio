@@ -319,13 +319,21 @@ private fun ProcessingContent(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
+        if (state.passName.isNotEmpty()) {
+            Text(
+                text = state.passName,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+        }
         Text(
             "${state.current} / ${state.total}",
             style = MaterialTheme.typography.headlineMedium,
         )
         Spacer(modifier = Modifier.height(16.dp))
         LinearProgressIndicator(
-            progress = { state.current.toFloat() / state.total },
+            progress = { state.progressFraction.coerceIn(0f, 1f) },
             modifier = Modifier.fillMaxWidth(),
         )
         Spacer(modifier = Modifier.height(12.dp))
@@ -335,6 +343,14 @@ private fun ProcessingContent(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
+        if (state.detail.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = state.detail,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         if (state.estimatedRemainingMs > 0) {
             val minutes = state.estimatedRemainingMs / 60_000
             val etaText = if (minutes < 1) "Less than a minute remaining"
