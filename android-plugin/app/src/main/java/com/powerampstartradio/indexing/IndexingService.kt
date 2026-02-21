@@ -580,7 +580,9 @@ class IndexingService : Service() {
                         flamingoInference.loadProjector()
                         Log.i(TAG, "TIMING: flamingo_projector_load = ${(System.nanoTime() - projLoadStart) / 1_000_000}ms")
 
-                        // ── Phase 2b: Read hidden states from disk, project + fuse + write ──
+                        // ── Phase 2b: Stream hidden states from disk, project + fuse + write ──
+                        // Each chunk is read lazily via callback — only one 3.84MB
+                        // chunk in memory at a time, vs 230MB for a 30-min track.
                         val readBuf = java.nio.ByteBuffer.allocate(chunkBytes)
                             .order(java.nio.ByteOrder.LITTLE_ENDIAN)
                         val readChannel = java.io.FileInputStream(hiddenFile).channel
@@ -593,17 +595,18 @@ class IndexingService : Service() {
                             ensureActive()
                             val projStart = System.nanoTime()
 
-                            // Read hidden states for this track from disk
-                            val hiddens = (0 until numChunks).map {
-                                readBuf.clear()
-                                readChannel.read(readBuf)
-                                readBuf.flip()
-                                FloatArray(FlamingoInference.HIDDEN_STATE_FLOATS).also { arr ->
-                                    readBuf.asFloatBuffer().get(arr)
-                                }
-                            }
-
-                            val flamingoRaw = flamingoInference.projectAndAverage(hiddens)
+                            // Stream hidden states from disk one chunk at a time
+                            val flamingoRaw = flamingoInference.projectAndAverageStreaming(
+                                numChunks = numChunks,
+                                readNextChunk = {
+                                    readBuf.clear()
+                                    readChannel.read(readBuf)
+                                    readBuf.flip()
+                                    FloatArray(FlamingoInference.HIDDEN_STATE_FLOATS).also { arr ->
+                                        readBuf.asFloatBuffer().get(arr)
+                                    }
+                                },
+                            )
                             if (flamingoRaw == null) {
                                 failed++
                                 continue

@@ -243,41 +243,57 @@ class FlamingoInference(
     }
 
     /**
-     * Project encoder outputs and produce the final embedding.
-     * Each encoder output is [NUM_FRAMES * ENCODER_DIM] floats.
+     * Project encoder outputs and produce the final embedding, reading
+     * chunks lazily via [readNextChunk] to avoid loading all hidden states
+     * into memory simultaneously.
      *
-     * If no projector is available, mean-pools encoder outputs to [ENCODER_DIM].
-     * With projector: projects each chunk [750,1280] → [750,3584], mean-pools,
-     * averages across chunks, L2-normalizes → [PROJECTED_DIM].
+     * Each chunk is [NUM_FRAMES * ENCODER_DIM] floats (3.84MB). For a 30-min
+     * track (60 chunks), loading all at once would require 230MB. This method
+     * keeps only one chunk in memory at a time (~3.84MB).
+     *
+     * @param numChunks Number of chunks to project
+     * @param readNextChunk Callback that returns the next encoder hidden state
+     * @param onChunkDone Optional callback invoked after each chunk is projected
+     * @return L2-normalized embedding, or null if all chunks fail
      */
-    fun projectAndAverage(
-        encoderOutputs: List<FloatArray>,
+    fun projectAndAverageStreaming(
+        numChunks: Int,
+        readNextChunk: () -> FloatArray,
         onChunkDone: (() -> Unit)? = null,
     ): FloatArray? {
         val proj = projectorModel
         val projIn = projectorInputBuffers
         val projOut = projectorOutputBuffers
-        if (proj == null || projIn == null || projOut == null) {
-            return meanPoolEncoderOutputs(encoderOutputs)
-        }
 
-        val sumEmbedding = FloatArray(PROJECTED_DIM)
+        val dim = if (proj != null) PROJECTED_DIM else ENCODER_DIM
+        val sumEmbedding = FloatArray(dim)
         var count = 0
         var totalMs = 0L
 
-        for (hidden in encoderOutputs) {
+        for (c in 0 until numChunks) {
+            val hidden = readNextChunk()
             try {
-                projIn[0].writeFloat(hidden)
-                val start = System.nanoTime()
-                proj.run(projIn, projOut)
-                totalMs += (System.nanoTime() - start) / 1_000_000
-                val output = projOut[0].readFloat()
+                if (proj != null && projIn != null && projOut != null) {
+                    projIn[0].writeFloat(hidden)
+                    val start = System.nanoTime()
+                    proj.run(projIn, projOut)
+                    totalMs += (System.nanoTime() - start) / 1_000_000
+                    val output = projOut[0].readFloat()
 
-                // Mean pool [750, 3584] → [3584]
-                for (frame in 0 until NUM_FRAMES) {
-                    val off = frame * PROJECTED_DIM
-                    for (i in 0 until PROJECTED_DIM) {
-                        sumEmbedding[i] += output[off + i]
+                    // Mean pool [750, 3584] → accumulate into [3584]
+                    for (frame in 0 until NUM_FRAMES) {
+                        val off = frame * PROJECTED_DIM
+                        for (i in 0 until PROJECTED_DIM) {
+                            sumEmbedding[i] += output[off + i]
+                        }
+                    }
+                } else {
+                    // No projector — mean pool encoder output [750, 1280]
+                    for (frame in 0 until NUM_FRAMES) {
+                        val off = frame * ENCODER_DIM
+                        for (i in 0 until ENCODER_DIM) {
+                            sumEmbedding[i] += hidden[off + i]
+                        }
                     }
                 }
                 count++
@@ -287,13 +303,12 @@ class FlamingoInference(
             }
         }
 
-        Log.i(TAG, "TIMING: flamingo_project ${encoderOutputs.size} chunks: ${totalMs}ms")
+        Log.i(TAG, "TIMING: flamingo_project $numChunks chunks: ${totalMs}ms")
 
         if (count == 0) return null
 
-        // Average over frames and chunks
         val scale = 1f / (NUM_FRAMES.toFloat() * count)
-        for (i in 0 until PROJECTED_DIM) {
+        for (i in 0 until dim) {
             sumEmbedding[i] *= scale
         }
         l2Normalize(sumEmbedding)
@@ -301,26 +316,15 @@ class FlamingoInference(
     }
 
     /**
-     * Mean-pool encoder outputs when no projector is available.
-     * Returns [ENCODER_DIM]-dim L2-normalized embedding.
+     * Convenience wrapper: project from a pre-built list.
+     * For production indexing, prefer [projectAndAverageStreaming].
      */
-    private fun meanPoolEncoderOutputs(encoderOutputs: List<FloatArray>): FloatArray? {
-        if (encoderOutputs.isEmpty()) return null
-        val sumEmbedding = FloatArray(ENCODER_DIM)
-        for (hidden in encoderOutputs) {
-            for (frame in 0 until NUM_FRAMES) {
-                val off = frame * ENCODER_DIM
-                for (i in 0 until ENCODER_DIM) {
-                    sumEmbedding[i] += hidden[off + i]
-                }
-            }
-        }
-        val scale = 1f / (NUM_FRAMES.toFloat() * encoderOutputs.size)
-        for (i in 0 until ENCODER_DIM) {
-            sumEmbedding[i] *= scale
-        }
-        l2Normalize(sumEmbedding)
-        return sumEmbedding
+    fun projectAndAverage(
+        encoderOutputs: List<FloatArray>,
+        onChunkDone: (() -> Unit)? = null,
+    ): FloatArray? {
+        val iter = encoderOutputs.iterator()
+        return projectAndAverageStreaming(encoderOutputs.size, { iter.next() }, onChunkDone)
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────
