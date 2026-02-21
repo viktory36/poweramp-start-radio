@@ -16,6 +16,7 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -731,10 +732,18 @@ fun SettingsScreen(
     val isRandomWalk = selectionMode == SelectionMode.RANDOM_WALK
     val isDpp = selectionMode == SelectionMode.DPP
 
-    // Slider track styles: clean (continuous) and stepped (discrete with stop indicators)
+    // Minimal slider: thin track (color-only position), small circle thumb
+    val slimThumb: @Composable (SliderState) -> Unit = {
+        Box(
+            Modifier
+                .size(16.dp)
+                .background(MaterialTheme.colorScheme.primary, CircleShape)
+        )
+    }
     val cleanTrack: @Composable (SliderState) -> Unit = { state ->
         SliderDefaults.Track(
             sliderState = state,
+            modifier = Modifier.height(6.dp),
             drawStopIndicator = null,
             thumbTrackGapSize = 0.dp,
             trackInsideCornerSize = 0.dp,
@@ -743,6 +752,8 @@ fun SettingsScreen(
     val steppedTrack: @Composable (SliderState) -> Unit = { state ->
         SliderDefaults.Track(
             sliderState = state,
+            modifier = Modifier.height(6.dp),
+            drawStopIndicator = null,
             thumbTrackGapSize = 0.dp,
             trackInsideCornerSize = 0.dp,
         )
@@ -787,7 +798,7 @@ fun SettingsScreen(
                 Column {
                     Text("Queue Size: $numTracks tracks", style = MaterialTheme.typography.titleMedium)
                     Slider(value = numTracks.toFloat(), onValueChange = { viewModel.setNumTracks(it.toInt()) },
-                        valueRange = 10f..100f, steps = 8, track = steppedTrack)
+                        valueRange = 10f..100f, steps = 8, thumb = slimThumb, track = steppedTrack)
                 }
             }
 
@@ -865,7 +876,7 @@ fun SettingsScreen(
                             Text("Max diversity penalty", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                             Slider(value = diversityLambda, onValueChange = { viewModel.setDiversityLambda(it) },
-                                valueRange = 0f..1f, modifier = Modifier.weight(1f), track = cleanTrack)
+                                valueRange = 0f..1f, modifier = Modifier.weight(1f), thumb = slimThumb, track = cleanTrack)
                             Text("No penalty", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                         }
@@ -886,7 +897,7 @@ fun SettingsScreen(
                             Text("Rarely returns", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                             Slider(value = pageRankAlpha, onValueChange = { viewModel.setPageRankAlpha(it) },
-                                valueRange = 0.05f..0.95f, modifier = Modifier.weight(1f), track = cleanTrack)
+                                valueRange = 0.05f..0.95f, modifier = Modifier.weight(1f), thumb = slimThumb, track = cleanTrack)
                             Text("Returns often", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                         }
@@ -961,7 +972,7 @@ fun SettingsScreen(
                                         Text("Mostly last pick", style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                                         Slider(value = anchorStrength, onValueChange = { viewModel.setAnchorStrength(it) },
-                                            valueRange = 0f..1f, modifier = Modifier.weight(1f), track = cleanTrack)
+                                            valueRange = 0f..1f, modifier = Modifier.weight(1f), thumb = slimThumb, track = cleanTrack)
                                         Text("Mostly seed", style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                                     }
@@ -975,7 +986,7 @@ fun SettingsScreen(
                                         Text("Latest pick dominates", style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                                         Slider(value = momentumBeta, onValueChange = { viewModel.setMomentumBeta(it) },
-                                            valueRange = 0f..1f, modifier = Modifier.weight(1f), track = cleanTrack)
+                                            valueRange = 0f..1f, modifier = Modifier.weight(1f), thumb = slimThumb, track = cleanTrack)
                                         Text("Slow to change", style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                                     }
@@ -998,14 +1009,14 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Slider(value = maxPerArtist.toFloat(), onValueChange = { viewModel.setMaxPerArtist(it.roundToInt()) },
-                    valueRange = 1f..10f, steps = 8, track = steppedTrack)
+                    valueRange = 1f..10f, steps = 8, thumb = slimThumb, track = steppedTrack)
 
                 Text("Min Artist Spacing: $minArtistSpacing tracks", style = MaterialTheme.typography.titleSmall)
                 Text("At least this many tracks between songs by the same artist.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Slider(value = minArtistSpacing.toFloat(), onValueChange = { viewModel.setMinArtistSpacing(it.roundToInt()) },
-                    valueRange = 0f..20f, steps = 19, track = steppedTrack)
+                    valueRange = 0f..20f, steps = 19, thumb = slimThumb, track = steppedTrack)
             }
 
             item { HorizontalDivider() }
