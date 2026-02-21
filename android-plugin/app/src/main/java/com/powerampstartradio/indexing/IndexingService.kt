@@ -553,8 +553,9 @@ class IndexingService : Service() {
             Intent(this, IndexingService::class.java).apply { action = ACTION_CANCEL },
             PendingIntent.FLAG_IMMUTABLE,
         )
+        val title = if (total > 0) "Indexing Tracks ($current/$total)" else "Indexing Tracks"
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Indexing Tracks")
+            .setContentTitle(title)
             .setContentText(message)
             .setSmallIcon(R.drawable.ic_radio)
             .setContentIntent(pendingIntent)
