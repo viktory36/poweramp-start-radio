@@ -24,12 +24,12 @@ import kotlin.math.sqrt
  * matrix + eigenvector matrix, plus ~150 MB for k-means (75K × 512d).
  *
  * Computation time on Snapdragon 8 Gen 3 (~75K tracks):
- * - Covariance matrix: ~10-20s (streaming 75K×1024)
- * - Eigendecomposition: ~5-15s (Jacobi, 1024×1024)
- * - Projection pass: ~5-10s (streaming 75K×1024 → 512)
- * - k-means: ~30-60s (75K × 200 clusters × 512d, ~15 iterations)
- * - kNN graph: ~5-10s (already implemented)
- * Total: ~1-2 minutes
+ * - Covariance matrix: ~4 min (streaming 75K×1024 with 150K SQLite queries)
+ * - Eigendecomposition: ~4 min (Jacobi, 1024×1024)
+ * - Projection pass: ~1.5 min (streaming 75K×1024 → 512)
+ * - k-means: ~14 min (75K × 200 clusters × 512d, ~55 iterations)
+ * - kNN graph: ~8 min (cluster-accelerated, 75K nodes)
+ * Total: ~30 minutes
  */
 class FusionEngine(
     private val db: EmbeddingDatabase,
@@ -446,32 +446,39 @@ class FusionEngine(
         val n = embeddings.size
         val d = embeddings[0].size
 
-        // k-means++ initialization
+        // k-means++ initialization with incremental min-distance tracking.
+        // Only computes distance to the NEWLY added centroid each round,
+        // updating the running minimum. O(K*n*d) instead of O(K²*n*d).
+        // For K=200, n=75K, d=512: ~15s instead of ~26 min.
         val rng = java.util.Random(42)
         val centroids = Array(k) { FloatArray(d) }
 
         // First centroid: random
-        embeddings[rng.nextInt(n)].copyInto(centroids[0])
+        val firstIdx = rng.nextInt(n)
+        embeddings[firstIdx].copyInto(centroids[0])
 
-        // Remaining: probabilistic furthest-first
+        // Track minimum squared distance from each point to its nearest centroid
+        val minDistSq = FloatArray(n) { Float.MAX_VALUE }
+
         for (ci in 1 until k) {
-            val dists = FloatArray(n)
+            if (ci % 50 == 0) onProgress?.invoke("k-means++ init: $ci/$k centroids")
+
+            // Update minDistSq with distance to the just-added centroid (ci-1)
+            val prev = centroids[ci - 1]
             for (i in 0 until n) {
-                var maxSim = Float.NEGATIVE_INFINITY
-                for (j in 0 until ci) {
-                    val sim = dotProduct(embeddings[i], centroids[j])
-                    if (sim > maxSim) maxSim = sim
-                }
-                val dist = maxOf(1f - maxSim, 0f)
-                dists[i] = dist * dist
+                val sim = dotProduct(embeddings[i], prev)
+                val distSq = maxOf(1f - sim, 0f).let { it * it }
+                if (distSq < minDistSq[i]) minDistSq[i] = distSq
             }
-            // Weighted random selection
-            val total = dists.sum()
+
+            // Weighted random selection using accumulated minDistSq
+            var total = 0.0
+            for (i in 0 until n) total += minDistSq[i]
             if (total > 0) {
-                var r = rng.nextFloat() * total
-                var selected = n - 1  // fallback for floating-point rounding
+                var r = rng.nextDouble() * total
+                var selected = n - 1
                 for (i in 0 until n) {
-                    r -= dists[i]
+                    r -= minDistSq[i]
                     if (r <= 0) { selected = i; break }
                 }
                 embeddings[selected].copyInto(centroids[ci])
@@ -479,9 +486,12 @@ class FusionEngine(
                 embeddings[rng.nextInt(n)].copyInto(centroids[ci])
             }
         }
+        onProgress?.invoke("k-means++ init complete")
 
-        // Iterate
+        // Iterate with early stopping when < 0.1% of points change
         val labels = IntArray(n)
+        val convergeThreshold = maxOf(n / 1000, 1)
+
         for (iter in 0 until maxIter) {
             // Assign each point to nearest centroid
             var changed = 0
@@ -501,10 +511,11 @@ class FusionEngine(
                 }
             }
 
-            if (iter % 10 == 0 || changed == 0) {
-                onProgress?.invoke("k-means iter $iter: $changed reassignments")
+            if (iter % 10 == 0 || changed <= convergeThreshold) {
+                onProgress?.invoke("k-means iter $iter: $changed reassignments" +
+                    if (changed <= convergeThreshold) " (converged)" else "")
             }
-            if (changed == 0) break
+            if (changed <= convergeThreshold) break
 
             // Update centroids: mean of assigned points, then re-normalize
             for (j in 0 until k) {
