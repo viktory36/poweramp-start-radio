@@ -663,7 +663,7 @@ fun IdleContent(
             }
         }
         if (databaseInfo == null) {
-            Text("No embedding database \u2014 import via Settings",
+            Text("No embedding database, import via Settings",
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
