@@ -223,8 +223,8 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
             saveDismissedIds(newDismissed)
         }
 
-        // Invalidate cache since DB will change
-        invalidateCache()
+        // Cache auto-invalidates when DB modification time changes after indexing.
+        // Don't invalidate eagerly — if the user cancels, the cache is still valid.
         IndexingService.startIndexing(getApplication(), tracks, refusion = refusion)
     }
 
