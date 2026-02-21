@@ -713,6 +713,14 @@ class FusionEngine(
             }
         }
 
+        // Free per-cluster flat embedding copies (~153MB for 75K tracks) before
+        // allocating the graph binary ByteBuffer. Without this, OOM is inevitable
+        // since both flatEmbeddings (153MB) and clusterFlatEmbeddings (153MB) are alive.
+        for (i in clusterFlatEmbeddings.indices) {
+            clusterFlatEmbeddings[i] = FloatArray(0)
+        }
+        System.gc()
+
         // Build binary blob
         onProgress?.invoke("Writing graph binary...")
         val size = 8 + n * 8 + n * k * 8

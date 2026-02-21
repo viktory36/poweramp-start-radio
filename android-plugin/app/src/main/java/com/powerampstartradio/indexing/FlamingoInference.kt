@@ -78,10 +78,11 @@ class FlamingoInference(
         encoderInputBuffers = encResult.inputBuffers
         encoderOutputBuffers = encResult.outputBuffers
 
-        // Load projector on CPU — it's only 7 ops (linear projection), negligible
-        // overhead, and keeps GPU memory free for the encoder.
+        // Load projector with the same accelerator as the encoder.
+        // At 34MB FP16, it's tiny compared to the 1.3GB encoder, so GPU can hold both.
+        // CPU was measured at ~1.8s/chunk (87% of Flamingo time); GPU should be <5ms.
         if (projectorFile != null && projectorFile.exists()) {
-            val projResult = createReadyModel(projectorFile.absolutePath, Accelerator.CPU)
+            val projResult = createReadyModel(projectorFile.absolutePath, accelerator)
             projectorModel = projResult.model
             projectorInputBuffers = projResult.inputBuffers
             projectorOutputBuffers = projResult.outputBuffers
