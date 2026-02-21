@@ -437,17 +437,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _importStatus.value = "Copying database..."
                 val app = getApplication<Application>()
                 val destFile = File(app.filesDir, "embeddings.db")
+                val tempFile = File(app.filesDir, "embeddings.db.import")
 
                 // Invalidate mmap'd index pointing at stale files
                 rankIndex = null
+
+                // Copy to temp file first — avoids corrupting the live DB mid-write
+                // (refreshDatabaseInfo from onResume can race with us)
+                app.contentResolver.openInputStream(uri)?.use { input ->
+                    java.io.FileOutputStream(tempFile).use { output ->
+                        input.copyTo(output)
+                    }
+                } ?: throw IllegalArgumentException("Cannot open URI: $uri")
 
                 // Delete stale derived files so they're re-extracted from the new DB
                 File(app.filesDir, "fused.emb").delete()
                 File(app.filesDir, "graph.bin").delete()
 
-                // Copy and open — use the returned DB handle for reading info
-                val db = EmbeddingDatabase.importFrom(app, uri, destFile)
+                // Atomic replace: delete old, rename temp to final
+                destFile.delete()
+                if (!tempFile.renameTo(destFile)) {
+                    throw java.io.IOException("Failed to move imported database")
+                }
+
                 IndexingViewModel.invalidateCache()
+
+                val db = EmbeddingDatabase.open(destFile)
 
                 _importStatus.value = "Reading database info..."
                 val info = DatabaseInfo(
@@ -484,6 +499,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun refreshDatabaseInfo() {
+        if (_importStatus.value != null) return // import in progress, skip
         viewModelScope.launch {
             val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
             if (dbFile.exists()) {
