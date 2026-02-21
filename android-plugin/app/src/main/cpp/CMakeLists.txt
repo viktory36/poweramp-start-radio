@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.22.1)
 project(soxr-jni C)
 
-# libsoxr - minimal build for Android (CR32 + CR64 + VR32, no SIMD, no OpenMP)
+# libsoxr - Android build with NEON SIMD (CR32 + CR32S + CR64 + VR32, PFFFT)
 set(SOXR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/soxr)
 
 add_library(soxr STATIC
@@ -12,9 +12,12 @@ add_library(soxr STATIC
     ${SOXR_DIR}/fft4g64.c
     ${SOXR_DIR}/cr.c
     ${SOXR_DIR}/cr32.c
+    ${SOXR_DIR}/cr32s.c
     ${SOXR_DIR}/cr64.c
     ${SOXR_DIR}/fft4g32.c
     ${SOXR_DIR}/fft4g.c
+    ${SOXR_DIR}/pffft32s.c
+    ${SOXR_DIR}/util32s.c
     ${SOXR_DIR}/vr32.c
 )
 
