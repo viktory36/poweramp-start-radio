@@ -363,6 +363,8 @@ class NewTrackDetector(
      * - Exact artist match
      * - Semicolon-split primary artist (Poweramp: "a; b", DB: "a")
      * - Empty ↔ "unknown artist" equivalence
+     * - ID3v1 30-char artist truncation (DB: "wanderwelle & bandhagens musik",
+     *   phone: "wanderwelle & bandhagens musikförening")
      */
     private fun resolveArtistKeys(
         artist: String,
@@ -378,6 +380,19 @@ class NewTrackDetector(
         // Empty ↔ "unknown artist"
         if (artist.isEmpty()) {
             keysByArtist["unknown artist"]?.let { result.addAll(it) }
+        }
+        // ID3v1 30-char artist truncation: phone has full name, DB has truncated
+        if (artist.length > 30) {
+            val truncated = artist.substring(0, 30)
+            keysByArtist[truncated]?.let { result.addAll(it) }
+        }
+        // Reverse: DB has full name, phone has truncated artist
+        if (artist.length == 30) {
+            for ((dbArtist, keys) in keysByArtist) {
+                if (dbArtist.length > 30 && dbArtist.startsWith(artist)) {
+                    result.addAll(keys)
+                }
+            }
         }
         return result
     }
@@ -397,12 +412,36 @@ class NewTrackDetector(
         keysByArtist: Map<String, List<String>>,
     ): Boolean {
         val sameArtistKeys = resolveArtistKeys(entry.artist, keysByArtist)
-        if (sameArtistKeys.isEmpty()) return false
 
         val phoneTitle = entry.title
         val phoneTitleStripped = phoneTitle.replace(TRACK_NUMBER_PREFIX, "")
 
-        for (key in sameArtistKeys) {
+        if (sameArtistKeys.isNotEmpty() && fuzzyTitleMatch(phoneTitle, phoneTitleStripped, sameArtistKeys)) {
+            return true
+        }
+
+        // Empty artist on phone but DB has a real artist: search by title+album across all keys.
+        // Only for non-generic titles (>5 chars) to avoid false positives on "intro", "untitled", etc.
+        if (entry.artist.isEmpty() && phoneTitle.length > 5 && entry.album != "unknown album") {
+            val albumPart = "|${entry.album}|"
+            val titlePart = "|$phoneTitle|"
+            for ((_, keys) in keysByArtist) {
+                for (key in keys) {
+                    if (key.contains(albumPart) && key.contains(titlePart)) return true
+                }
+            }
+        }
+
+        return false
+    }
+
+    /** Check if any key in the list has a title that fuzzy-matches the phone title. */
+    private fun fuzzyTitleMatch(
+        phoneTitle: String,
+        phoneTitleStripped: String,
+        keys: List<String>,
+    ): Boolean {
+        for (key in keys) {
             val dbTitle = extractTitleFromKey(key)
 
             // Track number prefix: DB has "18 title", phone has "title" (or vice versa)
@@ -419,7 +458,6 @@ class NewTrackDetector(
             val dbTitleNoExt = stripAudioExtension(dbTitle)
             if (dbTitleNoExt != dbTitle && dbTitleNoExt == phoneTitle) return true
         }
-
         return false
     }
 
