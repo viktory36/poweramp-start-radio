@@ -211,6 +211,17 @@ fun IndexingScreen(
     }
 }
 
+/** Format ETA as "Xm Ys remaining" / "Xs remaining" for better granularity. */
+private fun formatEtaText(ms: Long): String {
+    val totalSeconds = (ms / 1000).toInt()
+    return when {
+        totalSeconds >= 120 -> "${totalSeconds / 60}m ${totalSeconds % 60}s remaining"
+        totalSeconds >= 10 -> "${totalSeconds}s remaining"
+        totalSeconds > 0 -> "A few seconds remaining"
+        else -> ""
+    }
+}
+
 @Composable
 private fun DetectingContent(status: String = "") {
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -376,12 +387,9 @@ private fun ProcessingContent(
             )
         }
         if (state.estimatedRemainingMs > 0) {
-            val minutes = state.estimatedRemainingMs / 60_000
-            val etaText = if (minutes < 1) "Less than a minute remaining"
-            else "$minutes min remaining"
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = etaText,
+                text = formatEtaText(state.estimatedRemainingMs),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -423,12 +431,9 @@ private fun RebuildingContent(state: IndexingService.IndexingState.RebuildingInd
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         if (state.estimatedRemainingMs > 0) {
-            val minutes = state.estimatedRemainingMs / 60_000
-            val etaText = if (minutes < 1) "Less than a minute remaining"
-            else "$minutes min remaining"
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = etaText,
+                text = formatEtaText(state.estimatedRemainingMs),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

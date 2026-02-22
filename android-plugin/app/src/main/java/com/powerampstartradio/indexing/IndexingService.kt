@@ -224,32 +224,58 @@ class IndexingService : Service() {
                 var failed = 0
 
                 // Pre-compute total work steps for ETA.
-                // Each track has: decode step + resample step (if caching) + inference chunks.
-                // MuLan: 3 clips per chunk, chunks = max(1, min(floor(dur/60), 30))
-                // Flamingo: 1 chunk per 30s, chunks = max(1, min(ceil(dur/30), 60))
-                // Decode/resample steps are weighted to ~match one inference chunk's time.
-                val DECODE_WEIGHT = 6  // decode takes roughly 6x one inference chunk
-                val RESAMPLE_WEIGHT = 2  // resample takes roughly 2x one inference chunk
+                // Step weights calibrated from Snapdragon 8 Gen 3 benchmarks (14 tracks):
+                // - MuLan clip inference: ~0.27s (base unit, weight=1)
+                // - Audio decode: ~12.2s/track (weight=45 clip-equivalents)
+                // - Resample 24→16kHz: ~4.4s/track (weight=16)
+                // - Flamingo chunk inference: ~1.9s/chunk (weight=7)
+                // - Flamingo project+fuse+write: ~2ms/track (weight=1, minimal but provides UI feedback)
+                val DECODE_WEIGHT = 45
+                val RESAMPLE_WEIGHT = 16
+                val FLAMINGO_CHUNK_WEIGHT = 7
+                val FLAMINGO_PROJECT_WEIGHT = 1
                 var totalSteps = 0
                 for (t in unindexed) {
                     val durS = t.durationMs / 1000f
                     if (hasMulan && durS >= 30f) {
-                        totalSteps += DECODE_WEIGHT  // decode
-                        if (hasFlamingo) totalSteps += RESAMPLE_WEIGHT  // resample for cache
+                        totalSteps += DECODE_WEIGHT
+                        if (hasFlamingo) totalSteps += RESAMPLE_WEIGHT
                         val mulanChunks = maxOf(1, minOf((durS / 60f).toInt(), 30))
-                        totalSteps += mulanChunks * 3  // 3 clips per chunk
+                        totalSteps += mulanChunks * 3  // MuLan clips, weight=1 each
                     }
                     if (hasFlamingo && durS >= 3f) {
-                        if (!hasMulan) totalSteps += DECODE_WEIGHT  // decode only if not done in pass 1
-                        totalSteps += maxOf(1, minOf(kotlin.math.ceil(durS / 30.0).toInt(), 60))
+                        if (!hasMulan) totalSteps += DECODE_WEIGHT
+                        val flamingoChunks = maxOf(1, minOf(kotlin.math.ceil(durS / 30.0).toInt(), 60))
+                        totalSteps += flamingoChunks * FLAMINGO_CHUNK_WEIGHT
+                        totalSteps += FLAMINGO_PROJECT_WEIGHT  // project+fuse+write per track
                     }
                 }
                 var completedSteps = 0
+                // Floor prevents progress bar regression when cache misses
+                // dynamically increase totalSteps (line ~540).
+                var fractionFloor = 0f
+                // ETA clock starts after model loading (not batchStartTime which
+                // includes model load). Prevents inflated early ETAs from 4-7s
+                // GPU JIT compilation being amortized across the first few steps.
+                var etaStartTime = 0L
+                var lastEta = 0L
+
+                fun fraction(): Float {
+                    val raw = if (totalSteps > 0) completedSteps.toFloat() / totalSteps else 0f
+                    fractionFloor = maxOf(fractionFloor, raw)
+                    return fractionFloor
+                }
 
                 fun eta(): Long {
-                    if (completedSteps == 0) return 0L
-                    val elapsed = System.currentTimeMillis() - batchStartTime
-                    return elapsed * (totalSteps - completedSteps) / completedSteps
+                    if (completedSteps == 0 || etaStartTime == 0L) return 0L
+                    val elapsed = System.currentTimeMillis() - etaStartTime
+                    val rawEta = elapsed * (totalSteps - completedSteps) / completedSteps
+                    // Smooth: ETA can drop freely but only increase by 20% per update
+                    // to prevent jarring jumps when a slow track inflates the average.
+                    lastEta = if (rawEta > lastEta && lastEta > 0L) {
+                        minOf(rawEta, (lastEta * 1.2).toLong())
+                    } else rawEta
+                    return lastEta
                 }
 
                 // MuLan results held in memory until Flamingo pass completes.
@@ -275,7 +301,13 @@ class IndexingService : Service() {
                 // large models in memory simultaneously.
 
                 if (hasMulan) {
-                    _state.value = IndexingState.Detecting("Loading MuQ-MuLan model (GPU)...")
+                    _state.value = IndexingState.Processing(
+                        current = 0, total = unindexed.size,
+                        trackName = "", passName = "MuLan pass",
+                        detail = "Loading MuQ-MuLan model (GPU)...",
+                        progressFraction = 0f,
+                        estimatedRemainingMs = 0,
+                    )
                     updateNotification("Loading MuQ-MuLan model...")
                     val mulanLoadStart = System.nanoTime()
                     val mulanInference = try { MuLanInference(mulanFile) }
@@ -291,6 +323,7 @@ class IndexingService : Service() {
                             flamingoProjection = null,
                             fusedProjection = null,
                         )
+                        etaStartTime = System.currentTimeMillis()
 
                         for ((i, track) in unindexed.withIndex()) {
                             ensureActive()
@@ -304,12 +337,15 @@ class IndexingService : Service() {
                                     trackName = "${track.artist} - ${track.title}",
                                     passName = "MuLan pass",
                                     detail = detail,
-                                    progressFraction = if (totalSteps > 0) completedSteps.toFloat() / totalSteps else 0f,
+                                    progressFraction = fraction(),
                                     estimatedRemainingMs = etaMs,
                                 )
                                 updateNotification(msg, completedSteps, totalSteps)
                             }
-                            emitProgress("decoding")
+                            val durMin = track.durationMs / 60000
+                            val durSec = (track.durationMs / 1000) % 60
+                            val durStr = if (durMin > 0) "${durMin}m${durSec}s" else "${durSec}s"
+                            emitProgress("decoding ($durStr)")
                             val trackStart = System.nanoTime()
 
                             val audioFile = resolveAudioFile(track)
@@ -444,7 +480,15 @@ class IndexingService : Service() {
                 // must close the encoder before loading the projector.
                 val flamingoPassStart = System.currentTimeMillis()
                 if (hasFlamingo) {
-                    _state.value = IndexingState.Detecting("Loading Flamingo encoder (GPU)...")
+                    // Use Processing state (not Detecting) to preserve progress bar during model load.
+                    // The fraction stays at its current value while the detail shows loading status.
+                    _state.value = IndexingState.Processing(
+                        current = 0, total = unindexed.size,
+                        trackName = "", passName = "Flamingo encode",
+                        detail = "Loading Flamingo encoder (GPU)...",
+                        progressFraction = fraction(),
+                        estimatedRemainingMs = eta(),
+                    )
                     updateNotification("Loading Flamingo encoder...")
                     val flamingoLoadStart = System.nanoTime()
                     val flamingoInference = try {
@@ -456,6 +500,8 @@ class IndexingService : Service() {
                     Log.i(TAG, "TIMING: flamingo_encoder_load = ${(System.nanoTime() - flamingoLoadStart) / 1_000_000}ms")
 
                     if (flamingoInference != null) {
+                        if (etaStartTime == 0L) etaStartTime = System.currentTimeMillis()
+
                         // Adjust projection matrix dims if projector is absent
                         val actualFlamingoProjection = if (flamingoInference.outputDim != 3584) {
                             EmbeddingProcessor.loadProjectionMatrix(
@@ -491,7 +537,7 @@ class IndexingService : Service() {
                                     trackName = "${track.artist} - ${track.title}",
                                     passName = "Flamingo encode",
                                     detail = detail,
-                                    progressFraction = if (totalSteps > 0) completedSteps.toFloat() / totalSteps else 0f,
+                                    progressFraction = fraction(),
                                     estimatedRemainingMs = etaMs,
                                 )
                                 updateNotification(msg, completedSteps, totalSteps)
@@ -516,7 +562,10 @@ class IndexingService : Service() {
                             if (audio16k == null) {
                                 // Cache miss with both models: decode wasn't budgeted in totalSteps
                                 if (hasMulan) totalSteps += DECODE_WEIGHT
-                                emitProgress("decoding")
+                                val durMin = track.durationMs / 60000
+                                val durSec = (track.durationMs / 1000) % 60
+                                val durStr = if (durMin > 0) "${durMin}m${durSec}s" else "${durSec}s"
+                                emitProgress("decoding ($durStr)")
                                 val maxDurFlamingo = minOf((track.durationMs / 1000).toInt() + 10, 1800)
                                 audio16k = audioDecoder.decode(audioFile, 16000, maxDurationS = maxDurFlamingo)
                                 if (audio16k == null) {
@@ -547,7 +596,7 @@ class IndexingService : Service() {
                                     writeChannel.write(writeBuf)
                                 },
                                 onChunkDone = {
-                                    completedSteps++
+                                    completedSteps += FLAMINGO_CHUNK_WEIGHT
                                     chunksDone++
                                     emitProgress("chunk $chunksDone/$totalFChunks")
                                 },
@@ -580,7 +629,13 @@ class IndexingService : Service() {
                         // ── Phase transition: encoder → projector ──
                         flamingoInference.closeEncoder()
                         val projLoadStart = System.nanoTime()
-                        _state.value = IndexingState.Detecting("Loading Flamingo projector (GPU)...")
+                        _state.value = IndexingState.Processing(
+                            current = 0, total = unindexed.size,
+                            trackName = "", passName = "Flamingo project + fuse",
+                            detail = "Loading Flamingo projector (GPU)...",
+                            progressFraction = fraction(),
+                            estimatedRemainingMs = eta(),
+                        )
                         updateNotification("Loading Flamingo projector...")
                         flamingoInference.loadProjector()
                         Log.i(TAG, "TIMING: flamingo_projector_load = ${(System.nanoTime() - projLoadStart) / 1_000_000}ms")
@@ -593,11 +648,25 @@ class IndexingService : Service() {
                         val readChannel = java.io.FileInputStream(hiddenFile).channel
 
                         try {
+                        val projectableCount = chunkCounts.count { it > 0 }
+                        var projected = 0
                         for ((i, track) in unindexed.withIndex()) {
                             val numChunks = chunkCounts[i]
                             if (numChunks == 0) continue  // failed during encode
 
                             ensureActive()
+                            projected++
+                            val projMsg = "Flamingo project $projected/$projectableCount ${track.title}"
+                            _state.value = IndexingState.Processing(
+                                current = projected,
+                                total = projectableCount,
+                                trackName = "${track.artist} - ${track.title}",
+                                passName = "Flamingo project + fuse",
+                                detail = "projecting + writing to DB",
+                                progressFraction = fraction(),
+                                estimatedRemainingMs = eta(),
+                            )
+                            updateNotification(projMsg, completedSteps, totalSteps)
                             val projStart = System.nanoTime()
 
                             // Stream hidden states from disk one chunk at a time
@@ -652,6 +721,7 @@ class IndexingService : Service() {
                                 embeddings = merged,
                                 source = "phone",
                             )
+                            completedSteps += FLAMINGO_PROJECT_WEIGHT
                             val projMs = (System.nanoTime() - projStart) / 1_000_000
                             if (trackId > 0) {
                                 indexed++
