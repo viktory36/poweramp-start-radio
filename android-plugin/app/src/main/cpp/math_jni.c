@@ -429,13 +429,11 @@ Java_com_powerampstartradio_indexing_NativeMath_nativeInt16ToMonoFloat(
         for (; i + 7 < totalFrames; i += 8) {
             /* Load 8 stereo frames: 16 interleaved int16 → deinterleaved L[8], R[8] */
             int16x8x2_t stereo = vld2q_s16(src + i * 2);
-            /* Sum L + R channels */
-            int16x8_t sum = vaddq_s16(stereo.val[0], stereo.val[1]);
-            /* Convert lower 4 frames: int16 → int32 → float, scale */
-            int32x4_t lo32 = vmovl_s16(vget_low_s16(sum));
+            /* Sum L + R in int32 to avoid int16 overflow (L+R can exceed ±32767) */
+            int32x4_t lo32 = vaddl_s16(vget_low_s16(stereo.val[0]),
+                                        vget_low_s16(stereo.val[1]));
             float32x4_t flo = vmulq_f32(vcvtq_f32_s32(lo32), vscale);
-            /* Convert upper 4 frames */
-            int32x4_t hi32 = vmovl_s16(vget_high_s16(sum));
+            int32x4_t hi32 = vaddl_high_s16(stereo.val[0], stereo.val[1]);
             float32x4_t fhi = vmulq_f32(vcvtq_f32_s32(hi32), vscale);
             /* Store 8 mono floats */
             vst1q_f32(out + i, flo);
