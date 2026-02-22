@@ -3,7 +3,6 @@ package com.powerampstartradio
 import android.content.IntentFilter
 import android.net.Uri
 import android.os.Bundle
-import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -16,6 +15,7 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -30,6 +30,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -45,12 +46,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.poweramp.PowerampTrack
 import com.powerampstartradio.poweramp.TrackMatcher
+import com.powerampstartradio.indexing.IndexingService
 import com.powerampstartradio.services.RadioService
+import com.powerampstartradio.ui.AppFileStatus
 import com.powerampstartradio.ui.DatabaseInfo
 import com.powerampstartradio.ui.DecaySchedule
 import com.powerampstartradio.ui.DriftMode
@@ -63,7 +65,6 @@ import com.powerampstartradio.ui.RadioUiState
 import com.powerampstartradio.ui.SelectionMode
 import com.powerampstartradio.ui.theme.PowerampStartRadioTheme
 import kotlinx.coroutines.launch
-import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -74,10 +75,6 @@ private fun RadioUiState.isActiveSearch(): Boolean =
     this is RadioUiState.Loading || this is RadioUiState.Searching || this is RadioUiState.Streaming
 
 class MainActivity : ComponentActivity() {
-
-    companion object {
-        private const val TAG = "MainActivity"
-    }
 
     private val trackReceiver = PowerampReceiver()
     private var onResumeCallback: (() -> Unit)? = null
@@ -162,18 +159,7 @@ fun MainScreen(
     val importLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
-        uri?.let {
-            statusMessage = "Importing database..."
-            try {
-                val destFile = File(context.filesDir, "embeddings.db")
-                EmbeddingDatabase.importFrom(context, it, destFile).close()
-                viewModel.refreshDatabaseInfo()
-                statusMessage = "Database imported!"
-            } catch (e: Exception) {
-                statusMessage = "Import failed: ${e.message}"
-                Log.e("MainActivity", "Import failed", e)
-            }
-        }
+        uri?.let { viewModel.importDatabase(it) }
     }
 
 
@@ -678,12 +664,9 @@ fun IdleContent(
             }
         }
         if (databaseInfo == null) {
-            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text("No embedding database", style = MaterialTheme.typography.titleSmall)
-                    Text("Import via Settings", style = MaterialTheme.typography.bodySmall)
-                }
-            }
+            Text("No embedding database, import via Settings",
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         if (indexStatus != null && indexStatus != "Index ready") {
             Text(indexStatus, style = MaterialTheme.typography.bodySmall,
@@ -729,6 +712,33 @@ fun SettingsScreen(
     val isRandomWalk = selectionMode == SelectionMode.RANDOM_WALK
     val isDpp = selectionMode == SelectionMode.DPP
 
+    // Minimal slider: thin track (color-only position), small circle thumb
+    val slimThumb: @Composable (SliderState) -> Unit = {
+        Box(
+            Modifier
+                .size(16.dp)
+                .background(MaterialTheme.colorScheme.primary, CircleShape)
+        )
+    }
+    val cleanTrack: @Composable (SliderState) -> Unit = { state ->
+        SliderDefaults.Track(
+            sliderState = state,
+            modifier = Modifier.height(8.dp),
+            drawStopIndicator = null,
+            thumbTrackGapSize = 0.dp,
+            trackInsideCornerSize = 0.dp,
+        )
+    }
+    val steppedTrack: @Composable (SliderState) -> Unit = { state ->
+        SliderDefaults.Track(
+            sliderState = state,
+            modifier = Modifier.height(8.dp),
+            drawStopIndicator = null,
+            thumbTrackGapSize = 0.dp,
+            trackInsideCornerSize = 0.dp,
+        )
+    }
+
     // Group keys by what affects each mode
     val commonKeys = remember(numTracks, maxPerArtist, minArtistSpacing) { Any() }
     val driftKeys = remember(driftEnabled, driftMode, anchorStrength, anchorDecay, momentumBeta) { Any() }
@@ -768,7 +778,7 @@ fun SettingsScreen(
                 Column {
                     Text("Queue Size: $numTracks tracks", style = MaterialTheme.typography.titleMedium)
                     Slider(value = numTracks.toFloat(), onValueChange = { viewModel.setNumTracks(it.toInt()) },
-                        valueRange = 10f..100f, steps = 8)
+                        valueRange = 10f..100f, steps = 8, thumb = slimThumb, track = steppedTrack)
                 }
             }
 
@@ -846,7 +856,7 @@ fun SettingsScreen(
                             Text("Max diversity penalty", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                             Slider(value = diversityLambda, onValueChange = { viewModel.setDiversityLambda(it) },
-                                valueRange = 0f..1f, modifier = Modifier.weight(1f))
+                                valueRange = 0f..1f, modifier = Modifier.weight(1f), thumb = slimThumb, track = cleanTrack)
                             Text("No penalty", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                         }
@@ -867,7 +877,7 @@ fun SettingsScreen(
                             Text("Rarely returns", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                             Slider(value = pageRankAlpha, onValueChange = { viewModel.setPageRankAlpha(it) },
-                                valueRange = 0.05f..0.95f, modifier = Modifier.weight(1f))
+                                valueRange = 0.05f..0.95f, modifier = Modifier.weight(1f), thumb = slimThumb, track = cleanTrack)
                             Text("Returns often", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                         }
@@ -942,7 +952,7 @@ fun SettingsScreen(
                                         Text("Mostly last pick", style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                                         Slider(value = anchorStrength, onValueChange = { viewModel.setAnchorStrength(it) },
-                                            valueRange = 0f..1f, modifier = Modifier.weight(1f))
+                                            valueRange = 0f..1f, modifier = Modifier.weight(1f), thumb = slimThumb, track = cleanTrack)
                                         Text("Mostly seed", style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                                     }
@@ -956,7 +966,7 @@ fun SettingsScreen(
                                         Text("Latest pick dominates", style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                                         Slider(value = momentumBeta, onValueChange = { viewModel.setMomentumBeta(it) },
-                                            valueRange = 0f..1f, modifier = Modifier.weight(1f))
+                                            valueRange = 0f..1f, modifier = Modifier.weight(1f), thumb = slimThumb, track = cleanTrack)
                                         Text("Slow to change", style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                                     }
@@ -979,14 +989,14 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Slider(value = maxPerArtist.toFloat(), onValueChange = { viewModel.setMaxPerArtist(it.roundToInt()) },
-                    valueRange = 1f..10f, steps = 8)
+                    valueRange = 1f..10f, steps = 8, thumb = slimThumb, track = steppedTrack)
 
                 Text("Min Artist Spacing: $minArtistSpacing tracks", style = MaterialTheme.typography.titleSmall)
                 Text("At least this many tracks between songs by the same artist.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Slider(value = minArtistSpacing.toFloat(), onValueChange = { viewModel.setMinArtistSpacing(it.roundToInt()) },
-                    valueRange = 0f..20f, steps = 19)
+                    valueRange = 0f..20f, steps = 19, thumb = slimThumb, track = steppedTrack)
             }
 
             item { HorizontalDivider() }
@@ -1000,38 +1010,141 @@ fun SettingsScreen(
                         val trackCountFmt = "%,d".format(databaseInfo.trackCount)
                         val dimLabel = if (databaseInfo.embeddingDim != null) "${databaseInfo.embeddingDim}-dim" else ""
                         val modelNames = databaseInfo.availableModels.map { it.first }
-                        val modelLine = if (databaseInfo.hasFused && modelNames.containsAll(listOf("mulan", "flamingo"))) {
-                            "Models: MuLan + Flamingo \u2192 Fused"
-                        } else if (databaseInfo.hasFused) {
-                            "Models: Fused"
-                        } else if (modelNames.size == 1) {
-                            val name = modelNames.first().replaceFirstChar { it.uppercase() }
-                            "Single model: $name"
-                        } else {
-                            "Models: ${modelNames.joinToString(", ") { it.replaceFirstChar { c -> c.uppercase() } }}"
-                        }
                         val embType = if (databaseInfo.hasFused) "fused" else modelNames.firstOrNull()?.replaceFirstChar { it.uppercase() } ?: "unknown"
                         Text("$trackCountFmt tracks \u00b7 $dimLabel $embType embeddings",
                             style = MaterialTheme.typography.bodyMedium)
-                        Text(modelLine, style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Text(if (databaseInfo.hasGraph) "Similarity graph: available (PageRank enabled)"
-                            else "No similarity graph (PageRank will fall back to MMR)",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        val poolSize = (databaseInfo.trackCount * 0.02f).toInt().coerceAtLeast(100)
-                        Text("Pool size: %,d tracks (2%% of library)".format(poolSize),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Text("Size: ${databaseInfo.sizeKb / 1024} MB",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                     } else {
                         Text("No database imported", color = MaterialTheme.colorScheme.error)
                     }
                     Spacer(modifier = Modifier.height(8.dp))
-                    OutlinedButton(onClick = onImportDatabase, modifier = Modifier.fillMaxWidth()) {
-                        Text(if (databaseInfo != null) "Replace Database" else "Import Database")
+                    val importStatus by viewModel.importStatus.collectAsState()
+                    if (importStatus != null) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                            Text(importStatus!!, style = MaterialTheme.typography.bodyMedium)
+                        }
+                    } else {
+                        OutlinedButton(onClick = onImportDatabase, modifier = Modifier.fillMaxWidth()) {
+                            Text(if (databaseInfo != null) "Replace Database" else "Import Database")
+                        }
+                    }
+                }
+            }
+
+            // App files status
+            item {
+                val fileStatuses by viewModel.fileStatuses.collectAsState()
+                if (fileStatuses.isNotEmpty()) {
+                    Column {
+                        Text("App Files", style = MaterialTheme.typography.titleMedium)
+                        Spacer(modifier = Modifier.height(4.dp))
+                        for (file in fileStatuses) {
+                            FileStatusRow(file)
+                        }
+                    }
+                }
+            }
+
+            // On-device indexing section
+            if (databaseInfo != null) {
+                item {
+                    val context = LocalContext.current
+                    val unindexedCount by viewModel.unindexedCount.collectAsState()
+                    val checkStatus by viewModel.unindexedCheckStatus.collectAsState()
+                    val hasModels by viewModel.hasModels.collectAsState()
+                    val indexingState by viewModel.indexingState.collectAsState()
+                    val isChecking = unindexedCount == -1
+
+                    Column {
+                        Text("On-Device Indexing", style = MaterialTheme.typography.titleMedium)
+                        Spacer(modifier = Modifier.height(4.dp))
+
+                        if (!hasModels) {
+                            Text("TFLite models not found",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("Transfer mulan_audio.tflite and flamingo_encoder.tflite to app data",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        } else {
+                            // Show brief status summary
+                            when (val state = indexingState) {
+                                is IndexingService.IndexingState.Idle -> {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        if (isChecking) {
+                                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text(checkStatus ?: "Checking...",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier.weight(1f))
+                                        } else {
+                                            Text(
+                                                when {
+                                                    unindexedCount == -2 -> "Not checked"
+                                                    unindexedCount > 0 -> "$unindexedCount new unindexed tracks"
+                                                    else -> "All tracks indexed"
+                                                },
+                                                style = if (unindexedCount > 0) MaterialTheme.typography.bodyMedium
+                                                    else MaterialTheme.typography.bodySmall,
+                                                color = if (unindexedCount > 0) MaterialTheme.colorScheme.primary
+                                                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier.weight(1f),
+                                            )
+                                            IconButton(
+                                                onClick = { viewModel.checkUnindexedTracks() },
+                                                modifier = Modifier.size(32.dp),
+                                            ) {
+                                                Icon(Icons.Default.Refresh,
+                                                    contentDescription = "Check now",
+                                                    modifier = Modifier.size(18.dp),
+                                                    tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            }
+                                        }
+                                    }
+                                }
+                                is IndexingService.IndexingState.Processing -> {
+                                    LinearProgressIndicator(
+                                        progress = { state.current.toFloat() / state.total },
+                                        modifier = Modifier.fillMaxWidth(),
+                                    )
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text("${state.current}/${state.total}: ${state.trackName}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                                is IndexingService.IndexingState.Complete -> {
+                                    val msg = "${state.indexed} tracks indexed" +
+                                        if (state.failed > 0) " (${state.failed} failed)" else ""
+                                    Text(msg, style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.primary)
+                                }
+                                is IndexingService.IndexingState.Error -> {
+                                    Text(state.message,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.error)
+                                }
+                                else -> {
+                                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            OutlinedButton(
+                                onClick = {
+                                    context.startActivity(
+                                        android.content.Intent(context, com.powerampstartradio.indexing.IndexingActivity::class.java)
+                                    )
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("Manage Tracks")
+                            }
+                        }
                     }
                 }
             }
@@ -1119,6 +1232,46 @@ private fun AlgorithmOption(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun FileStatusRow(file: AppFileStatus) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = if (file.present) "\u2713" else "\u2717",
+            color = if (file.present) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.error,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.width(20.dp),
+        )
+        Text(
+            text = file.name,
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace,
+            modifier = Modifier.weight(1f),
+        )
+        if (file.sizeMb != null) {
+            Text(
+                text = file.sizeMb,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+    if (file.detail != null) {
+        Text(
+            text = file.detail,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(start = 20.dp),
+        )
     }
 }
 

@@ -2,10 +2,15 @@ package com.powerampstartradio.ui
 
 import android.app.Application
 import android.content.Context
+import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.data.EmbeddingIndex
+import com.powerampstartradio.indexing.IndexingService
+import com.powerampstartradio.indexing.IndexingViewModel
+import com.powerampstartradio.indexing.NewTrackDetector
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.poweramp.TrackMatcher
@@ -13,6 +18,7 @@ import com.powerampstartradio.services.RadioService
 import com.powerampstartradio.similarity.RecommendationEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -88,6 +94,40 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _indexStatus = MutableStateFlow<String?>(null)
     val indexStatus: StateFlow<String?> = _indexStatus.asStateFlow()
 
+    // --- Indexing state ---
+    // -2 = never checked, -1 = checking now, 0+ = actual count
+    private val _unindexedCount = MutableStateFlow(initUnindexedCount())
+    val unindexedCount: StateFlow<Int> = _unindexedCount.asStateFlow()
+
+    /** Load persisted count, but reset if DB has changed since last check. */
+    private fun initUnindexedCount(): Int {
+        val app = getApplication<Application>()
+        val dbFile = File(app.filesDir, "embeddings.db")
+        val currentFp = if (dbFile.exists()) "${dbFile.length()}_${dbFile.lastModified()}" else ""
+        val savedFp = app.getSharedPreferences("indexing", Context.MODE_PRIVATE)
+            .getString("dismissed_db_fingerprint", "") ?: ""
+        if (currentFp != savedFp) {
+            // DB changed — stale count, force re-check
+            prefs.edit().remove("unindexed_count").apply()
+            return -2
+        }
+        return prefs.getInt("unindexed_count", -2)
+    }
+
+    private val _unindexedCheckStatus = MutableStateFlow<String?>(null)
+    val unindexedCheckStatus: StateFlow<String?> = _unindexedCheckStatus.asStateFlow()
+
+    private val _hasModels = MutableStateFlow(false)
+    val hasModels: StateFlow<Boolean> = _hasModels.asStateFlow()
+
+    private val _fileStatuses = MutableStateFlow<List<AppFileStatus>>(emptyList())
+    val fileStatuses: StateFlow<List<AppFileStatus>> = _fileStatuses.asStateFlow()
+
+    private val _importStatus = MutableStateFlow<String?>(null)
+    val importStatus: StateFlow<String?> = _importStatus.asStateFlow()
+
+    val indexingState: StateFlow<IndexingService.IndexingState> = IndexingService.state
+
     private val _previews = MutableStateFlow<Map<SelectionMode, List<String>>>(emptyMap())
     val previews: StateFlow<Map<SelectionMode, List<String>>> = _previews.asStateFlow()
 
@@ -120,7 +160,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         refreshDatabaseInfo()
         checkPermission()
         prepareIndices()
+        checkModels()
         PowerampReceiver.addTrackChangeListener(trackChangeListener)
+
+        // Re-check unindexed count when indexing completes and user dismisses the result
+        viewModelScope.launch {
+            var wasComplete = false
+            IndexingService.state.collect { state ->
+                if (state is IndexingService.IndexingState.Complete) wasComplete = true
+                if (wasComplete && state is IndexingService.IndexingState.Idle) {
+                    wasComplete = false
+                    checkUnindexedTracks()
+                }
+            }
+        }
     }
 
     override fun onCleared() {
@@ -291,6 +344,125 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         } catch (_: Exception) { null }
     }
 
+    // --- Indexing actions ---
+
+    fun checkUnindexedTracks() {
+        _unindexedCount.value = -1 // signal "checking" to UI
+        val app = getApplication<Application>()
+        val dbFile = File(app.filesDir, "embeddings.db")
+
+        val deferred = viewModelScope.async(Dispatchers.IO) {
+            if (!dbFile.exists()) return@async emptyList()
+            val db = EmbeddingDatabase.open(dbFile)
+            val detector = NewTrackDetector(db)
+            val tracks = detector.findUnindexedTracks(app) { status ->
+                _unindexedCheckStatus.value = status
+                IndexingViewModel.detectionStatus.value = status
+            }
+            val sorted = tracks.sortedByDescending { it.durationMs }
+            db.close()
+            // Cache in IndexingViewModel so Manage Tracks can reuse
+            val powerampCount = getPowerampTrackCount(app)
+            IndexingViewModel.cacheResults(sorted, dbFile.lastModified(), powerampCount)
+            sorted
+        }
+        // Expose so IndexingViewModel can await if user opens Manage Tracks mid-check
+        IndexingViewModel.pendingDetection = deferred
+
+        viewModelScope.launch {
+            try {
+                val result = deferred.await()
+                // Check if DB changed — clear stale dismissed IDs if so
+                val indexingPrefs = app.getSharedPreferences("indexing", Context.MODE_PRIVATE)
+                val currentFingerprint = if (dbFile.exists())
+                    "${dbFile.length()}_${dbFile.lastModified()}" else ""
+                val savedFingerprint = indexingPrefs.getString("dismissed_db_fingerprint", "") ?: ""
+                if (currentFingerprint != savedFingerprint) {
+                    indexingPrefs.edit()
+                        .remove("dismissed_track_ids")
+                        .putString("dismissed_db_fingerprint", currentFingerprint)
+                        .apply()
+                }
+                // Exclude dismissed tracks from the count
+                val dismissedJson = indexingPrefs.getString("dismissed_track_ids", null)
+                val dismissed = if (dismissedJson != null) {
+                    try {
+                        val arr = org.json.JSONArray(dismissedJson)
+                        (0 until arr.length()).map { arr.getLong(it) }.toSet()
+                    } catch (_: Exception) { emptySet() }
+                } else emptySet<Long>()
+                val visible = result.count { it.powerampFileId !in dismissed }
+                setUnindexedCount(visible)
+            } catch (_: Exception) {
+                setUnindexedCount(0)
+            } finally {
+                IndexingViewModel.pendingDetection = null
+                IndexingViewModel.detectionStatus.value = null
+                _unindexedCheckStatus.value = null
+            }
+        }
+    }
+
+    private fun setUnindexedCount(count: Int) {
+        _unindexedCount.value = count
+        prefs.edit().putInt("unindexed_count", count).apply()
+    }
+
+    private fun getPowerampTrackCount(context: Context): Int {
+        return try {
+            val filesUri = PowerampHelper.ROOT_URI.buildUpon()
+                .appendEncodedPath("files").build()
+            context.contentResolver.query(
+                filesUri, arrayOf("COUNT(*)"), null, null, null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getInt(0) else -1
+            } ?: -1
+        } catch (_: Exception) { -1 }
+    }
+
+    fun checkModels() {
+        val filesDir = getApplication<Application>().filesDir
+        val variants = listOf("_fp16", "")
+
+        fun findModel(base: String): File? {
+            for (suffix in variants) {
+                val f = File(filesDir, "${base}${suffix}.tflite")
+                if (f.exists()) return f
+            }
+            return null
+        }
+
+        val mulanFile = findModel("mulan_audio")
+        val flamingoFile = findModel("flamingo_encoder")
+        val projectorFile = findModel("flamingo_projector")
+        _hasModels.value = mulanFile != null || flamingoFile != null
+
+        fun fileSizeMb(f: File?): String? {
+            if (f == null) return null
+            val mb = f.length() / 1024 / 1024
+            return "${mb} MB"
+        }
+
+        val dbFile = File(filesDir, "embeddings.db")
+        val embFile = File(filesDir, "fused.emb")
+        val graphFile = File(filesDir, "graph.bin")
+
+        _fileStatuses.value = listOf(
+            AppFileStatus("embeddings.db", dbFile.exists(), fileSizeMb(dbFile),
+                "Embedding database (required)"),
+            AppFileStatus("fused.emb", embFile.exists(), fileSizeMb(embFile),
+                "Auto-generated from database"),
+            AppFileStatus("graph.bin", graphFile.exists(), fileSizeMb(graphFile),
+                "kNN graph for Random Walk"),
+            AppFileStatus("mulan_audio", mulanFile != null, fileSizeMb(mulanFile),
+                if (mulanFile != null) mulanFile.name else "MuQ-MuLan model"),
+            AppFileStatus("flamingo_encoder", flamingoFile != null, fileSizeMb(flamingoFile),
+                if (flamingoFile != null) flamingoFile.name else "Flamingo encoder model"),
+            AppFileStatus("flamingo_projector", projectorFile != null, fileSizeMb(projectorFile),
+                if (projectorFile != null) projectorFile.name else "Flamingo projector"),
+        )
+    }
+
     fun resetToDefaults() {
         val defaults = RadioConfig()
         setNumTracks(defaults.numTracks)
@@ -308,19 +480,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun prepareIndices() {
         viewModelScope.launch(Dispatchers.IO) {
-            val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
-            if (!dbFile.exists()) return@launch
-            try {
-                val db = EmbeddingDatabase.open(dbFile)
-                val engine = RecommendationEngine(db, getApplication<Application>().filesDir)
-                engine.ensureIndices { message ->
-                    _indexStatus.value = message
-                }
-                _indexStatus.value = "Index ready"
-                db.close()
-            } catch (e: Exception) {
-                _indexStatus.value = "Index error: ${e.message}"
+            prepareIndicesWithProgress { message ->
+                _indexStatus.value = message
             }
+        }
+    }
+
+    private suspend fun prepareIndicesWithProgress(onProgress: (String) -> Unit) {
+        val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
+        if (!dbFile.exists()) return
+        try {
+            val db = EmbeddingDatabase.open(dbFile)
+            val engine = RecommendationEngine(db, getApplication<Application>().filesDir)
+            engine.ensureIndices { message ->
+                onProgress(message)
+                _indexStatus.value = message
+            }
+            _indexStatus.value = "Index ready"
+            onProgress("Index ready")
+            db.close()
+        } catch (e: Exception) {
+            _indexStatus.value = "Index error: ${e.message}"
         }
     }
 
@@ -334,7 +514,81 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         PowerampHelper.requestDataPermission(getApplication())
     }
 
+    /**
+     * Import a database from the given URI asynchronously.
+     * Shows progress in importStatus, then refreshes everything.
+     */
+    fun importDatabase(uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                _importStatus.value = "Copying database..."
+                val app = getApplication<Application>()
+                val destFile = File(app.filesDir, "embeddings.db")
+                val tempFile = File(app.filesDir, "embeddings.db.import")
+
+                // Invalidate mmap'd index pointing at stale files
+                rankIndex = null
+
+                // Copy to temp file first — avoids corrupting the live DB mid-write
+                // (refreshDatabaseInfo from onResume can race with us)
+                app.contentResolver.openInputStream(uri)?.use { input ->
+                    java.io.FileOutputStream(tempFile).use { output ->
+                        input.copyTo(output)
+                    }
+                } ?: throw IllegalArgumentException("Cannot open URI: $uri")
+
+                // Delete stale derived files so they're re-extracted from the new DB
+                File(app.filesDir, "fused.emb").delete()
+                File(app.filesDir, "graph.bin").delete()
+
+                // Atomic replace: delete old, rename temp to final
+                destFile.delete()
+                if (!tempFile.renameTo(destFile)) {
+                    throw java.io.IOException("Failed to move imported database")
+                }
+
+                IndexingViewModel.invalidateCache()
+
+                val db = EmbeddingDatabase.open(destFile)
+
+                _importStatus.value = "Reading database info..."
+                val info = DatabaseInfo(
+                    trackCount = db.getTrackCount(),
+                    embeddingCount = db.getEmbeddingCount(),
+                    embeddingDim = db.getEmbeddingDim(),
+                    version = db.getMetadata("version"),
+                    sizeKb = destFile.length() / 1024,
+                    hasFused = db.hasFusedEmbeddings,
+                    hasGraph = db.hasBinaryData("knn_graph"),
+                    embeddingTable = db.embeddingTable,
+                    availableModels = db.getAvailableModels(),
+                )
+                db.close()
+                _databaseInfo.value = info
+
+                // Extract indices with progress updates
+                _importStatus.value = "Extracting search index..."
+                prepareIndicesWithProgress { status ->
+                    _importStatus.value = status
+                }
+
+                checkModels()
+                _importStatus.value = null
+
+                // Fire-and-forget: unindexed count updates independently
+                checkUnindexedTracks()
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "Import failed", e)
+                _importStatus.value = "Import failed: ${e.message}"
+                // Clear error after a few seconds so the import button reappears
+                kotlinx.coroutines.delay(5000)
+                _importStatus.value = null
+            }
+        }
+    }
+
     fun refreshDatabaseInfo() {
+        if (_importStatus.value != null) return // import in progress, skip
         viewModelScope.launch {
             val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
             if (dbFile.exists()) {
@@ -354,6 +608,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     db.close()
                     _databaseInfo.value = info
                     prepareIndices()
+                    checkModels()
                 } catch (e: Exception) {
                     _databaseInfo.value = null
                 }
@@ -377,4 +632,11 @@ data class DatabaseInfo(
     val hasGraph: Boolean = false,
     val embeddingTable: String = "embeddings_fused",
     val availableModels: List<Pair<String, Int>> = emptyList(),
+)
+
+data class AppFileStatus(
+    val name: String,
+    val present: Boolean,
+    val sizeMb: String? = null,
+    val detail: String? = null,
 )

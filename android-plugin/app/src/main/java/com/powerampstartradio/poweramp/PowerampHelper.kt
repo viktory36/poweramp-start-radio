@@ -216,7 +216,7 @@ object PowerampHelper {
                     val artist = (it.getString(artistIdx) ?: "").lowercase().trim()
                     val album = (it.getString(albumIdx) ?: "").lowercase().trim()
                     val title = (it.getString(titleIdx) ?: "").lowercase().trim()
-                    val durationMs = it.getInt(durationIdx) * 1000
+                    val durationMs = it.getInt(durationIdx)
 
                     // Create metadata key matching desktop indexer format (rounds to 100ms)
                     val durationRounded = (durationMs / 100) * 100
@@ -263,7 +263,7 @@ object PowerampHelper {
                         artist = normalizeNfc(normalizePowerampArtist(rawArtist)),
                         album = normalizeNfc((it.getString(albumIdx) ?: "").lowercase().trim()),
                         title = normalizeNfc(stripAudioExtension(rawTitle)),
-                        durationMs = it.getInt(durationIdx) * 1000
+                        durationMs = it.getInt(durationIdx)
                     ))
                 }
             }
