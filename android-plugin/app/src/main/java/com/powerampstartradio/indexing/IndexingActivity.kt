@@ -509,7 +509,7 @@ private fun tierLabel(tier: IndexingService.FusionTier) = when (tier) {
 }
 
 private fun tierTiming(tier: IndexingService.FusionTier, knn: Boolean) = when (tier) {
-    IndexingService.FusionTier.QUICK_UPDATE -> if (knn) "~5 min" else "~30s"
+    IndexingService.FusionTier.QUICK_UPDATE -> if (knn) "~15s" else "~10s"
     IndexingService.FusionTier.RECLUSTER -> if (knn) "~6 min" else "~2 min"
     IndexingService.FusionTier.FULL_REFUSION -> if (knn) "~8 min" else "~4 min"
 }
@@ -569,8 +569,8 @@ private fun BottomBar(
 
                     FusionTierOption(
                         label = "Incremental update",
-                        description = "Uses the existing SVD projection to place new tracks into the fused embedding space, then assigns them to the nearest existing cluster. Fast, but won't improve cluster quality.",
-                        timing = "~30s",
+                        description = "Projects only new tracks into the fused space, assigns to nearest cluster, and updates the kNN graph. Existing embeddings and clusters are untouched.",
+                        timing = "~10s",
                         selected = fusionTier == IndexingService.FusionTier.QUICK_UPDATE,
                         enabled = hasSvdMatrix,
                         onClick = { onFusionTierChanged(IndexingService.FusionTier.QUICK_UPDATE) },
@@ -612,13 +612,13 @@ private fun BottomBar(
                                 style = MaterialTheme.typography.bodyMedium,
                             )
                             Text(
-                                "Precomputes a neighbor graph over all tracks. Only needed for PageRank mode.",
+                                "Precomputes a neighbor graph over all tracks. Only needed for PageRank mode. Incremental update adds ~5s; full rebuild adds ~4 min.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
                         Text(
-                            "+4 min",
+                            "+5s/4m",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

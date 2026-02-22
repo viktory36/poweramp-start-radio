@@ -15,8 +15,8 @@ import kotlin.math.sqrt
  *
  * Supports three tiers of post-indexing update:
  *
- * - **quickUpdate**: Load existing SVD, project new+old tracks, assign to existing clusters.
- *   ~30s on Snapdragon 8 Gen 3 (~75K tracks).
+ * - **quickUpdate**: Load existing SVD, project only new tracks, assign to existing clusters,
+ *   incrementally update kNN graph. ~5s for M new tracks in a 75K corpus.
  *
  * - **recluster**: Load existing SVD, project all tracks, full k-means from scratch.
  *   ~2 min.
@@ -53,6 +53,11 @@ class FusionEngine(
         private const val W_KMEANS_ASSIGN = 3f
         private const val W_KNN = 225f
         private const val W_EXTRACT = 8f
+
+        // Incremental phase weights (M << N, near-instant for most phases)
+        private const val W_PROJECTION_INCR = 0.5f
+        private const val W_KMEANS_ASSIGN_INCR = 0.5f
+        private const val W_KNN_INCR = 5f
     }
 
     // Shared state populated by setup()
@@ -94,8 +99,9 @@ class FusionEngine(
     // ── Orchestrators ────────────────────────────────────────────────
 
     /**
-     * Quick update: project all tracks through existing SVD, assign to existing clusters.
-     * Fastest option (~30s) — suitable when adding a few tracks to a large desktop-fused corpus.
+     * Quick update: project only new tracks through existing SVD, assign them to existing clusters,
+     * and incrementally update the kNN graph.
+     * ~5s for M=14 new tracks in a 75K corpus.
      */
     fun quickUpdate(
         buildGraph: Boolean,
@@ -108,21 +114,21 @@ class FusionEngine(
             ?: throw IllegalStateException("No existing SVD matrix — use fullRefusion instead")
 
         val phases = buildList {
-            add("Projecting tracks" to W_PROJECTION)
-            add("Assigning clusters" to W_KMEANS_ASSIGN)
-            if (buildGraph) add("Building kNN graph" to W_KNN)
+            add("Projecting new tracks" to W_PROJECTION_INCR)
+            add("Assigning clusters" to W_KMEANS_ASSIGN_INCR)
+            if (buildGraph) add("Updating kNN graph" to W_KNN_INCR)
             add("Extracting indices" to W_EXTRACT)
         }
         val tracker = PhaseTracker(phases, onProgress)
 
-        projectAllTracks(projection, tracker.current())
+        projectNewTracks(projection, tracker.current())
         tracker.advance()
 
-        clusterAssignOnly(tracker.current())
+        clusterAssignNew(tracker.current())
         tracker.advance()
 
         if (buildGraph) {
-            buildKnnGraphPhase(tracker.current())
+            incrementalKnnGraph(tracker.current())
             tracker.advance()
         }
 
@@ -133,7 +139,7 @@ class FusionEngine(
     }
 
     /**
-     * Re-cluster: project all tracks through existing SVD, full k-means from scratch.
+     * Re-cluster: project new tracks through existing SVD, full k-means from scratch.
      * ~2 min — use when cluster assignments have drifted after many incremental updates.
      */
     fun recluster(
@@ -147,14 +153,14 @@ class FusionEngine(
             ?: throw IllegalStateException("No existing SVD matrix — use fullRefusion instead")
 
         val phases = buildList {
-            add("Projecting tracks" to W_PROJECTION)
+            add("Projecting new tracks" to W_PROJECTION_INCR)
             add("Clustering" to W_KMEANS_FULL)
             if (buildGraph) add("Building kNN graph" to W_KNN)
             add("Extracting indices" to W_EXTRACT)
         }
         val tracker = PhaseTracker(phases, onProgress)
 
-        projectAllTracks(projection, tracker.current())
+        projectNewTracks(projection, tracker.current())
         tracker.advance()
 
         clusterFull(tracker.current())
@@ -432,6 +438,68 @@ class FusionEngine(
     }
 
     /**
+     * Project only tracks that don't yet have fused embeddings.
+     * Same math as projectAllTracks but skips existing rows — O(M) instead of O(N).
+     */
+    private fun projectNewTracks(
+        projectionData: FloatArray,
+        onProgress: ((String, Float) -> Unit)? = null,
+    ) {
+        val rawDb = db.getRawDatabase()
+        val projStart = System.currentTimeMillis()
+
+        // Find tracks that don't have fused embeddings yet
+        val existingFusedIds = getTrackIdsForTable("embeddings_fused").toHashSet()
+        val newTrackIds = allTrackIds.filter { it !in existingFusedIds }
+
+        if (newTrackIds.isEmpty()) {
+            Log.i(TAG, "All ${allTrackIds.size} tracks already projected — nothing to do")
+            onProgress?.invoke("All tracks already projected", 1f)
+            return
+        }
+
+        Log.i(TAG, "Projecting ${newTrackIds.size} new tracks (${existingFusedIds.size} existing)")
+        onProgress?.invoke("${newTrackIds.size} new tracks to ${targetDim}d...", 0f)
+
+        // Ensure tables exist
+        rawDb.execSQL("""
+            CREATE TABLE IF NOT EXISTS embeddings_fused (
+                track_id INTEGER PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
+            )
+        """)
+        rawDb.execSQL("""
+            CREATE TABLE IF NOT EXISTS binary_data (
+                key TEXT PRIMARY KEY,
+                data BLOB NOT NULL
+            )
+        """)
+
+        rawDb.beginTransaction()
+        try {
+            for ((idx, trackId) in newTrackIds.withIndex()) {
+                if (idx % 1000 == 0 && idx > 0) {
+                    onProgress?.invoke("$idx / ${newTrackIds.size}", idx.toFloat() / newTrackIds.size)
+                }
+
+                val concat = getConcatenatedEmbedding(trackId, sourceDim, mulanSet, flamingoSet)
+                val fused = NativeMath.matVecMul(projectionData, targetDim, concatDim, concat)
+                    ?: FloatMatrix(projectionData, targetDim, concatDim).multiplyVector(concat)
+                l2Normalize(fused)
+                db.insertEmbedding("embeddings_fused", trackId, fused)
+            }
+            rawDb.setTransactionSuccessful()
+        } finally {
+            rawDb.endTransaction()
+        }
+
+        Log.i(TAG, "TIMING: projection_incr = ${System.currentTimeMillis() - projStart}ms " +
+            "(${newTrackIds.size} tracks)")
+        onProgress?.invoke("${newTrackIds.size} new tracks projected", 1f)
+    }
+
+    /**
      * Full k-means clustering from scratch.
      * Sub-progress: delegates to kmeans (init 0-0.2, iterations 0.2-1.0).
      */
@@ -500,6 +568,85 @@ class FusionEngine(
     }
 
     /**
+     * Assign-only clustering for new tracks: load existing centroids, assign only tracks
+     * that don't have a cluster_id yet. O(M) instead of O(N).
+     * Falls back to full clusterAssignOnly if no centroids exist.
+     */
+    private fun clusterAssignNew(onProgress: ((String, Float) -> Unit)? = null) {
+        val rawDb = db.getRawDatabase()
+
+        val existingCentroids = db.loadCentroids()
+        if (existingCentroids.isEmpty()) {
+            Log.i(TAG, "No existing centroids — falling back to full cluster assign")
+            clusterAssignOnly(onProgress)
+            return
+        }
+
+        val assignStart = System.currentTimeMillis()
+        val k = existingCentroids.size
+        val d = targetDim
+
+        // Find tracks with NULL cluster_id
+        val newTrackIds = mutableListOf<Long>()
+        rawDb.rawQuery(
+            "SELECT id FROM tracks WHERE cluster_id IS NULL AND id IN " +
+                "(SELECT track_id FROM embeddings_fused)",
+            null
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                newTrackIds.add(cursor.getLong(0))
+            }
+        }
+
+        if (newTrackIds.isEmpty()) {
+            Log.i(TAG, "All tracks already have cluster assignments")
+            onProgress?.invoke("All tracks assigned", 1f)
+            return
+        }
+
+        Log.i(TAG, "Assigning ${newTrackIds.size} new tracks to $k clusters")
+        onProgress?.invoke("${newTrackIds.size} new tracks to $k clusters...", 0f)
+
+        // Load fused embeddings only for new tracks
+        val flatEmbeddings = FloatArray(newTrackIds.size * d)
+        for (i in newTrackIds.indices) {
+            val emb = db.getEmbeddingFromTable("embeddings_fused", newTrackIds[i])
+            if (emb != null) {
+                emb.copyInto(flatEmbeddings, i * d, 0, minOf(emb.size, d))
+            }
+        }
+
+        // Flatten centroids for native assignment
+        val flatCentroids = FloatArray(k * d)
+        for ((clusterId, centroid) in existingCentroids) {
+            if (clusterId < k) {
+                centroid.copyInto(flatCentroids, clusterId * d, 0, minOf(centroid.size, d))
+            }
+        }
+
+        val labels = NativeMath.kmeansAssign(flatEmbeddings, newTrackIds.size, flatCentroids, k, d)
+            ?: IntArray(newTrackIds.size) // fallback: all cluster 0
+
+        // Update only new tracks
+        rawDb.beginTransaction()
+        try {
+            for (i in newTrackIds.indices) {
+                rawDb.execSQL(
+                    "UPDATE tracks SET cluster_id = ? WHERE id = ?",
+                    arrayOf<Any>(labels[i], newTrackIds[i])
+                )
+            }
+            rawDb.setTransactionSuccessful()
+        } finally {
+            rawDb.endTransaction()
+        }
+
+        Log.i(TAG, "TIMING: cluster_assign_incr = ${System.currentTimeMillis() - assignStart}ms " +
+            "(${newTrackIds.size} tracks)")
+        onProgress?.invoke("${newTrackIds.size} new tracks assigned", 1f)
+    }
+
+    /**
      * Build kNN graph from fused embeddings + cluster assignments.
      * Sub-progress: linear with tracks processed (i/n).
      */
@@ -537,6 +684,312 @@ class FusionEngine(
             allTrackIds, labels, centroids, onProgress)
 
         Log.i(TAG, "TIMING: knn_graph = ${System.currentTimeMillis() - knnStart}ms")
+    }
+
+    /**
+     * Incrementally update the kNN graph when M new tracks are added to N existing tracks.
+     *
+     * Phase 1: Find K nearest neighbors for each new track among all N+M tracks.
+     * Phase 2: For each old track, check if any new track beats its current worst neighbor.
+     *
+     * Falls back to full rebuild if no existing graph is found.
+     */
+    private fun incrementalKnnGraph(onProgress: ((String, Float) -> Unit)? = null) {
+        val graphFile = File(filesDir, "graph.bin")
+        if (!graphFile.exists() || !db.hasBinaryData("knn_graph")) {
+            Log.i(TAG, "No existing graph — falling back to full kNN build")
+            buildKnnGraphPhase(onProgress)
+            return
+        }
+
+        val knnStart = System.currentTimeMillis()
+        onProgress?.invoke("Loading graph and embeddings...", 0f)
+
+        val k = knnK
+        val d = targetDim
+        val n = allTrackIds.size
+
+        // Parse existing graph from file
+        val graphBytes = graphFile.readBytes()
+        val graphBuf = ByteBuffer.wrap(graphBytes).order(ByteOrder.LITTLE_ENDIAN)
+        val oldN = graphBuf.getInt(0)
+        val oldK = graphBuf.getInt(4)
+
+        if (oldK != k) {
+            Log.w(TAG, "Graph K mismatch (old=$oldK, current=$k) — full rebuild")
+            buildKnnGraphPhase(onProgress)
+            return
+        }
+
+        // Read old ID map
+        val oldIdMap = LongArray(oldN)
+        val oldIdToIndex = HashMap<Long, Int>(oldN)
+        for (i in 0 until oldN) {
+            val tid = graphBuf.getLong(8 + i * 8)
+            oldIdMap[i] = tid
+            oldIdToIndex[tid] = i
+        }
+
+        // Identify new track IDs (in allTrackIds but not in old graph)
+        val newTrackIds = allTrackIds.filter { it !in oldIdToIndex }
+        if (newTrackIds.isEmpty()) {
+            Log.i(TAG, "All tracks already in graph — nothing to do")
+            onProgress?.invoke("Graph up to date", 1f)
+            return
+        }
+
+        Log.i(TAG, "Incremental kNN: ${newTrackIds.size} new tracks, $oldN existing")
+
+        // Build combined ID map: old IDs first (preserving order), then new ones
+        val combinedIds = LongArray(oldN + newTrackIds.size)
+        oldIdMap.copyInto(combinedIds)
+        for (i in newTrackIds.indices) combinedIds[oldN + i] = newTrackIds[i]
+
+        // Build index from combined IDs to allTrackIds position (for embedding lookup)
+        val allIdToIndex = HashMap<Long, Int>(n)
+        for (i in allTrackIds.indices) allIdToIndex[allTrackIds[i]] = i
+
+        // Load ALL fused embeddings as flat array (needed for both phases)
+        val flatEmbeddings = loadAllFusedEmbeddingsFlat(allTrackIds)
+
+        // Parse old graph into neighbors + weights arrays
+        val totalN = combinedIds.size
+        val neighbors = Array(totalN) { IntArray(k) }
+        val weights = Array(totalN) { FloatArray(k) }
+
+        val graphDataOffset = 8 + oldN * 8
+        for (i in 0 until oldN) {
+            for (j in 0 until k) {
+                val entryOffset = graphDataOffset + (i.toLong() * k + j) * 8
+                val oldNeighborIdx = graphBuf.getInt(entryOffset.toInt())
+                val w = graphBuf.getFloat(entryOffset.toInt() + 4)
+                // Old neighbor indices are still valid — they reference positions in oldIdMap
+                // which we preserved as the first oldN entries in combinedIds
+                neighbors[i][j] = oldNeighborIdx
+                weights[i][j] = w
+            }
+        }
+
+        // Load cluster data for cluster-accelerated search
+        val labels = IntArray(n)
+        val rawDb = db.getRawDatabase()
+        rawDb.rawQuery(
+            "SELECT id, cluster_id FROM tracks WHERE id IN (${allTrackIds.joinToString(",")})",
+            null
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                val trackId = cursor.getLong(0)
+                val clusterId = if (cursor.isNull(1)) 0 else cursor.getInt(1)
+                allIdToIndex[trackId]?.let { labels[it] = clusterId }
+            }
+        }
+
+        val centroidsMap = db.loadCentroids()
+        val numClusters = centroidsMap.size
+        val centroids = Array(numClusters) { cid ->
+            centroidsMap[cid] ?: FloatArray(d)
+        }
+        val searchClusters = minOf(10, numClusters)
+        val flatCentroids = FloatArray(numClusters * d)
+        for (c in 0 until numClusters) {
+            centroids[c].copyInto(flatCentroids, c * d)
+        }
+
+        // Build cluster membership arrays from allTrackIds indices
+        val clusterMembers = Array(numClusters) { mutableListOf<Int>() }
+        for (i in 0 until n) clusterMembers[labels[i]].add(i)
+        val clusterMemberArrays = Array(numClusters) { c -> clusterMembers[c].toIntArray() }
+        val maxClusterSize = clusterMemberArrays.maxOfOrNull { it.size } ?: 0
+        var clusterBuf = FloatArray(maxOf(maxClusterSize, 1) * d)
+
+        // Map from allTrackIds index → combinedIds index
+        val allIdxToCombinedIdx = IntArray(n)
+        for (ci in combinedIds.indices) {
+            val allIdx = allIdToIndex[combinedIds[ci]]
+            if (allIdx != null) allIdxToCombinedIdx[allIdx] = ci
+        }
+
+        // ── Phase 1: outbound neighbors for M new tracks ──
+        onProgress?.invoke("Finding neighbors for ${newTrackIds.size} new tracks...", 0.1f)
+
+        val queryBuf = FloatArray(d)
+        for (mi in newTrackIds.indices) {
+            val allIdx = allIdToIndex[newTrackIds[mi]] ?: continue
+            val combinedIdx = oldN + mi
+            System.arraycopy(flatEmbeddings, allIdx * d, queryBuf, 0, d)
+
+            val clusterSims = NativeMath.batchDot(queryBuf, flatCentroids, numClusters, d)
+                ?: FloatArray(numClusters) { c -> dotProduct(queryBuf, centroids[c]) }
+            val topClusters = clusterSims.indices
+                .sortedByDescending { clusterSims[it] }
+                .take(searchClusters)
+
+            val heap = java.util.PriorityQueue<IntArray>(k + 1,
+                compareBy { java.lang.Float.intBitsToFloat(it[1]) })
+
+            for (c in topClusters) {
+                val members = clusterMemberArrays[c]
+                for ((idx, memberIdx) in members.withIndex()) {
+                    System.arraycopy(flatEmbeddings, memberIdx * d, clusterBuf, idx * d, d)
+                }
+                val sims = NativeMath.batchDot(queryBuf, clusterBuf, members.size, d)
+
+                if (sims != null) {
+                    for (idx in members.indices) {
+                        val memberAllIdx = members[idx]
+                        val memberCombinedIdx = allIdxToCombinedIdx[memberAllIdx]
+                        if (memberCombinedIdx == combinedIdx) continue
+                        val sim = sims[idx]
+                        if (heap.size < k) {
+                            heap.add(intArrayOf(memberCombinedIdx,
+                                java.lang.Float.floatToRawIntBits(sim)))
+                        } else {
+                            val minSim = java.lang.Float.intBitsToFloat(heap.peek()!![1])
+                            if (sim > minSim) {
+                                heap.poll()
+                                heap.add(intArrayOf(memberCombinedIdx,
+                                    java.lang.Float.floatToRawIntBits(sim)))
+                            }
+                        }
+                    }
+                }
+            }
+
+            val sorted = heap.sortedByDescending { java.lang.Float.intBitsToFloat(it[1]) }
+            for (j in sorted.indices) {
+                neighbors[combinedIdx][j] = sorted[j][0]
+                weights[combinedIdx][j] = maxOf(java.lang.Float.intBitsToFloat(sorted[j][1]), 0f)
+            }
+            for (j in sorted.size until k) {
+                neighbors[combinedIdx][j] = 0
+                weights[combinedIdx][j] = 0f
+            }
+
+            // Normalize weights
+            var total = 0f
+            for (j in 0 until k) total += weights[combinedIdx][j]
+            if (total > 0f) {
+                for (j in 0 until k) weights[combinedIdx][j] /= total
+            }
+        }
+
+        // ── Phase 2: check if new tracks displace old tracks' neighbors ──
+        onProgress?.invoke("Checking ${oldN} existing nodes...", 0.4f)
+
+        // Load embeddings for new tracks into a flat buffer for batch dot
+        val mCount = newTrackIds.size
+        val newEmbeddings = FloatArray(mCount * d)
+        for (mi in newTrackIds.indices) {
+            val allIdx = allIdToIndex[newTrackIds[mi]] ?: continue
+            System.arraycopy(flatEmbeddings, allIdx * d, newEmbeddings, mi * d, d)
+        }
+
+        var updatedCount = 0
+        for (i in 0 until oldN) {
+            if (i % 10000 == 0 && i > 0) {
+                onProgress?.invoke("Checking $i / $oldN existing nodes",
+                    0.4f + 0.5f * i.toFloat() / oldN)
+            }
+
+            // Find current worst neighbor similarity (un-normalized)
+            // We need raw similarities to compare, so recompute from embeddings
+            val oldTrackId = combinedIds[i]
+            val allIdx = allIdToIndex[oldTrackId] ?: continue
+            System.arraycopy(flatEmbeddings, allIdx * d, queryBuf, 0, d)
+
+            // Compute similarities to all M new tracks
+            val sims = NativeMath.batchDot(queryBuf, newEmbeddings, mCount, d)
+                ?: FloatArray(mCount) { mi ->
+                    var s = 0f
+                    val off = mi * d
+                    for (di in 0 until d) s += queryBuf[di] * newEmbeddings[off + di]
+                    s
+                }
+
+            // Find best new track similarity
+            var bestNewSim = Float.NEGATIVE_INFINITY
+            var bestNewMi = -1
+            for (mi in 0 until mCount) {
+                val combinedIdx = oldN + mi
+                if (combinedIdx == i) continue // can't be own neighbor
+                if (sims[mi] > bestNewSim) {
+                    bestNewSim = sims[mi]
+                    bestNewMi = mi
+                }
+            }
+
+            if (bestNewMi < 0) continue
+
+            // Recompute raw similarities for current neighbors to find worst
+            var worstJ = 0
+            var worstSim = Float.MAX_VALUE
+            for (j in 0 until k) {
+                val neighborIdx = neighbors[i][j]
+                if (neighborIdx >= totalN) continue
+                val neighborTrackId = combinedIds[neighborIdx]
+                val neighborAllIdx = allIdToIndex[neighborTrackId] ?: continue
+                var sim = 0f
+                for (di in 0 until d) {
+                    sim += flatEmbeddings[allIdx * d + di] * flatEmbeddings[neighborAllIdx * d + di]
+                }
+                if (sim < worstSim) {
+                    worstSim = sim
+                    worstJ = j
+                }
+            }
+
+            // If best new track beats worst existing neighbor, swap it in
+            if (bestNewSim > worstSim) {
+                neighbors[i][worstJ] = oldN + bestNewMi
+                // Re-normalize weights with updated neighbor set
+                // Recompute all raw sims for this node's neighbors
+                var totalWeight = 0f
+                for (j in 0 until k) {
+                    val neighborIdx = neighbors[i][j]
+                    if (neighborIdx >= totalN) { weights[i][j] = 0f; continue }
+                    val neighborTrackId = combinedIds[neighborIdx]
+                    val neighborAllIdx = allIdToIndex[neighborTrackId] ?: continue
+                    var sim = 0f
+                    for (di in 0 until d) {
+                        sim += flatEmbeddings[allIdx * d + di] * flatEmbeddings[neighborAllIdx * d + di]
+                    }
+                    weights[i][j] = maxOf(sim, 0f)
+                    totalWeight += weights[i][j]
+                }
+                if (totalWeight > 0f) {
+                    for (j in 0 until k) weights[i][j] /= totalWeight
+                }
+                updatedCount++
+            }
+        }
+
+        Log.i(TAG, "Incremental kNN: $updatedCount / $oldN old nodes updated")
+
+        @Suppress("UNUSED_VALUE")
+        clusterBuf = FloatArray(0)
+
+        // ── Write expanded graph ──
+        onProgress?.invoke("Writing graph binary...", 0.95f)
+        val size = 8 + totalN * 8 + totalN * k * 8
+        val outBuffer = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN)
+        outBuffer.putInt(totalN)
+        outBuffer.putInt(k)
+        for (tid in combinedIds) outBuffer.putLong(tid)
+        for (i in 0 until totalN) {
+            for (j in 0 until k) {
+                outBuffer.putInt(neighbors[i][j])
+                outBuffer.putFloat(weights[i][j])
+            }
+        }
+        val graphBlob = outBuffer.array()
+
+        db.setBinaryData("knn_graph", graphBlob)
+        graphFile.writeBytes(graphBlob)
+
+        val sizeMB = graphBlob.size / 1024 / 1024
+        Log.i(TAG, "TIMING: knn_incr = ${System.currentTimeMillis() - knnStart}ms " +
+            "($totalN nodes, ${newTrackIds.size} new, $updatedCount old updated)")
+        onProgress?.invoke("$totalN nodes, ${newTrackIds.size} new, $sizeMB MB", 1f)
     }
 
     /**
