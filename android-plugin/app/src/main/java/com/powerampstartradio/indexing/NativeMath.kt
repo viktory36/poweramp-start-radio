@@ -87,6 +87,21 @@ object NativeMath {
      * @param maxFrames Maximum frames to convert (duration cap)
      * @return Number of mono frames written
      */
+    /**
+     * Jacobi eigendecomposition for a symmetric matrix, fully in native code.
+     *
+     * @param matrix Symmetric n×n matrix as flat DoubleArray (row-major)
+     * @param n Matrix dimension
+     * @param maxSweeps Maximum Jacobi sweeps
+     * @param eps Convergence threshold
+     * @return Flat array [eigenvalues[n], eigenvectors[n×n]] sorted by descending eigenvalue,
+     *         or null on failure
+     */
+    fun jacobiEigen(
+        matrix: DoubleArray, n: Int,
+        maxSweeps: Int = 50, eps: Double = 1e-10,
+    ): DoubleArray? = nativeJacobiEigen(matrix, n, maxSweeps, eps)
+
     fun int16ToMonoFloat(
         buffer: java.nio.ByteBuffer,
         offsetBytes: Int, sizeBytes: Int,
@@ -102,6 +117,8 @@ object NativeMath {
         covariance: DoubleArray, vectors: FloatArray, batch: Int, dim: Int)
     @JvmStatic private external fun nativeMatVecMul(
         matrix: FloatArray, rows: Int, cols: Int, vector: FloatArray): FloatArray?
+    @JvmStatic private external fun nativeJacobiEigen(
+        matrix: DoubleArray, n: Int, maxSweeps: Int, eps: Double): DoubleArray?
     @JvmStatic private external fun nativeInt16ToMonoFloat(
         buffer: java.nio.ByteBuffer, offsetBytes: Int, sizeBytes: Int, channels: Int,
         output: FloatArray, dstOffset: Int, maxFrames: Int): Int

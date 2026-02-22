@@ -15,6 +15,7 @@
 #include <android/log.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <float.h>
 #include <stdint.h>
 
@@ -221,6 +222,157 @@ Java_com_powerampstartradio_indexing_NativeMath_nativeMatVecMul(
     (*env)->ReleaseFloatArrayElements(env, jMatrix, matrix, JNI_ABORT);
     (*env)->ReleaseFloatArrayElements(env, jVector, vector, JNI_ABORT);
     (*env)->ReleaseFloatArrayElements(env, jResult, result, 0);
+    return jResult;
+}
+
+/* ── Jacobi eigendecomposition ──────────────────────────── */
+/*
+ * Full cyclic Jacobi eigendecomposition for a symmetric n×n matrix.
+ * Returns eigenvalues (sorted descending) + eigenvectors in a single
+ * flat array of size n + n*n: [eigenvalues[n], eigenvectors[n*n]].
+ *
+ * Eigenvectors are stored column-major in the output: column i is the
+ * eigenvector for eigenvalue[i].
+ *
+ * Moving the entire algorithm to C avoids JNI overhead per rotation
+ * and lets the compiler optimize the inner loops (loop unrolling,
+ * register allocation, prefetch). Expected ~5-10x speedup over Kotlin.
+ */
+JNIEXPORT jdoubleArray JNICALL
+Java_com_powerampstartradio_indexing_NativeMath_nativeJacobiEigen(
+    JNIEnv *env, jclass cls,
+    jdoubleArray jMatrix, jint n, jint maxSweeps, jdouble eps)
+{
+    double *a = (*env)->GetDoubleArrayElements(env, jMatrix, NULL);
+    if (!a) return NULL;
+
+    /* Work on a copy so we don't modify the input */
+    double *work = (double *)malloc((size_t)n * n * sizeof(double));
+    double *v = (double *)malloc((size_t)n * n * sizeof(double));
+    if (!work || !v) {
+        free(work);
+        free(v);
+        (*env)->ReleaseDoubleArrayElements(env, jMatrix, a, JNI_ABORT);
+        return NULL;
+    }
+    memcpy(work, a, (size_t)n * n * sizeof(double));
+    (*env)->ReleaseDoubleArrayElements(env, jMatrix, a, JNI_ABORT);
+    a = work;
+
+    /* Initialize eigenvector matrix to identity */
+    memset(v, 0, (size_t)n * n * sizeof(double));
+    for (int i = 0; i < n; i++) v[(long)i * n + i] = 1.0;
+
+    for (int sweep = 0; sweep < maxSweeps; sweep++) {
+        /* Compute sum of squared off-diagonal elements */
+        double offDiagSum = 0.0;
+        for (int i = 0; i < n; i++) {
+            for (int j = i + 1; j < n; j++) {
+                double val = a[(long)i * n + j];
+                offDiagSum += val * val;
+            }
+        }
+        if (offDiagSum < eps) break;
+
+        /* Threshold: higher for first 3 sweeps */
+        double threshold = (sweep < 3) ? 0.2 * offDiagSum / ((double)n * n) : 0.0;
+
+        /* Sweep through all upper-triangle pairs */
+        for (int p = 0; p < n - 1; p++) {
+            for (int q = p + 1; q < n; q++) {
+                double apq = a[(long)p * n + q];
+                if (apq > -threshold && apq < threshold) continue;
+
+                double app = a[(long)p * n + p];
+                double aqq = a[(long)q * n + q];
+                double diff = aqq - app;
+
+                double t;
+                double abs_apq = apq < 0 ? -apq : apq;
+                double abs_diff = diff < 0 ? -diff : diff;
+                if (abs_apq < eps * abs_diff) {
+                    t = apq / diff;
+                } else {
+                    double phi = diff / (2.0 * apq);
+                    double abs_phi = phi < 0 ? -phi : phi;
+                    double sign_phi = phi >= 0 ? 1.0 : -1.0;
+                    t = sign_phi / (abs_phi + sqrt(1.0 + phi * phi));
+                }
+
+                double c = 1.0 / sqrt(1.0 + t * t);
+                double s = t * c;
+                double tau = s / (1.0 + c);
+
+                /* Update diagonal */
+                a[(long)p * n + p] -= t * apq;
+                a[(long)q * n + q] += t * apq;
+                a[(long)p * n + q] = 0.0;
+                a[(long)q * n + p] = 0.0;
+
+                /* Update off-diagonal elements for rows r != p, q */
+                for (int r = 0; r < n; r++) {
+                    if (r == p || r == q) continue;
+                    double arp = a[(long)r * n + p];
+                    double arq = a[(long)r * n + q];
+                    double newP = arp - s * (arq + tau * arp);
+                    double newQ = arq + s * (arp - tau * arq);
+                    a[(long)r * n + p] = newP;
+                    a[(long)p * n + r] = newP;
+                    a[(long)r * n + q] = newQ;
+                    a[(long)q * n + r] = newQ;
+                }
+
+                /* Accumulate eigenvectors */
+                for (int r = 0; r < n; r++) {
+                    double vrp = v[(long)r * n + p];
+                    double vrq = v[(long)r * n + q];
+                    v[(long)r * n + p] = vrp - s * (vrq + tau * vrp);
+                    v[(long)r * n + q] = vrq + s * (vrp - tau * vrq);
+                }
+            }
+        }
+    }
+
+    /* Sort eigenvalues descending and reorder eigenvectors */
+    int *indices = (int *)malloc(n * sizeof(int));
+    if (!indices) { free(a); free(v); return NULL; }
+    for (int i = 0; i < n; i++) indices[i] = i;
+
+    /* Simple insertion sort on eigenvalues (n=1024, fast enough) */
+    for (int i = 1; i < n; i++) {
+        int key = indices[i];
+        double keyVal = a[(long)key * n + key];
+        int j = i - 1;
+        while (j >= 0 && a[(long)indices[j] * n + indices[j]] < keyVal) {
+            indices[j + 1] = indices[j];
+            j--;
+        }
+        indices[j + 1] = key;
+    }
+
+    /* Build output: eigenvalues[n] + eigenvectors[n*n] */
+    jint outSize = n + n * n;
+    jdoubleArray jResult = (*env)->NewDoubleArray(env, outSize);
+    if (!jResult) { free(a); free(v); free(indices); return NULL; }
+    double *result = (*env)->GetDoubleArrayElements(env, jResult, NULL);
+
+    /* Eigenvalues */
+    for (int i = 0; i < n; i++) {
+        result[i] = a[(long)indices[i] * n + indices[i]];
+    }
+
+    /* Eigenvectors: column i of output = column indices[i] of v */
+    for (int col = 0; col < n; col++) {
+        int srcCol = indices[col];
+        for (int row = 0; row < n; row++) {
+            result[n + (long)row * n + col] = v[(long)row * n + srcCol];
+        }
+    }
+
+    (*env)->ReleaseDoubleArrayElements(env, jResult, result, 0);
+    free(a);
+    free(v);
+    free(indices);
     return jResult;
 }
 

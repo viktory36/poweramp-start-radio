@@ -125,7 +125,14 @@ class FusionEngine(
         // --- Step 2: Eigendecomposition ---
         val eigenStart = System.currentTimeMillis()
         progress("Eigendecomposition ($concatDim x $concatDim)...")
-        val (eigenvalues, eigenvectors) = jacobiEigen(covariance, concatDim, onProgress)
+        val nativeResult = nativeJacobiEigen(covariance, concatDim)
+        val (eigenvalues, eigenvectors) = if (nativeResult != null) {
+            Log.i(TAG, "Native Jacobi completed in ${System.currentTimeMillis() - eigenStart}ms")
+            nativeResult
+        } else {
+            Log.w(TAG, "Native Jacobi failed, falling back to Kotlin")
+            jacobiEigen(covariance, concatDim, onProgress)
+        }
 
         // eigenvalues are sorted descending; eigenvectors columns correspond to them.
         // Projection matrix = top targetDim eigenvectors as rows (Vt convention):
@@ -353,6 +360,20 @@ class FusionEngine(
         return flat
     }
 
+    /**
+     * Try native Jacobi eigendecomposition (C, ~5-10x faster than Kotlin).
+     * Returns null on failure, caller should fall back to Kotlin implementation.
+     */
+    private fun nativeJacobiEigen(
+        matrix: DoubleArray, n: Int,
+    ): Pair<DoubleArray, DoubleArray>? {
+        val result = NativeMath.jacobiEigen(matrix, n) ?: return null
+        if (result.size != n + n * n) return null
+        val eigenvalues = result.copyOfRange(0, n)
+        val eigenvectors = result.copyOfRange(n, n + n * n)
+        return Pair(eigenvalues, eigenvectors)
+    }
+
     // --- Jacobi eigenvalue decomposition ---
 
     /**
@@ -533,7 +554,7 @@ class FusionEngine(
 
         // Iterate with early stopping when < 0.1% of points change
         var labels = IntArray(n)
-        val convergeThreshold = maxOf(n / 1000, 1)
+        val convergeThreshold = maxOf(n / 200, 1)  // 0.5% — sufficient for kNN cluster search
 
         for (iter in 0 until maxIter) {
             // Flatten current centroids
