@@ -385,8 +385,9 @@ class IndexingService : Service() {
                                 }
                             }
 
-                            // Compute total clips for this track for progress detail
-                            val durS = track.durationMs / 1000f
+                            // Compute total clips from actual decoded duration (not metadata,
+                            // which may exceed the 900s decode cap)
+                            val durS = audio24k.durationS
                             val mulanChunks = maxOf(1, minOf((durS / 60f).toInt(), 30))
                             val totalClips = mulanChunks * 3
                             clipsDone = 0
@@ -570,9 +571,10 @@ class IndexingService : Service() {
                                 completedSteps += DECODE_WEIGHT
                             }
 
-                            // Compute total Flamingo chunks for progress detail
-                            val durS = track.durationMs / 1000f
-                            val totalFChunks = maxOf(1, minOf(kotlin.math.ceil(durS / 30.0).toInt(), 60))
+                            // Compute total Flamingo chunks from actual audio duration
+                            // (may be shorter than metadata if resampled from MuLan's 900s cap)
+                            val flDurS = audio16k.durationS
+                            val totalFChunks = maxOf(1, minOf(kotlin.math.ceil(flDurS.toDouble() / 30.0).toInt(), 60))
                             chunksDone = 0
                             emitProgress("chunk 0/$totalFChunks")
 
