@@ -312,14 +312,10 @@ class IndexingService : Service() {
 
                             // Tighter pre-alloc: use actual duration instead of 900s cap.
                             // A 3-min track at 48kHz: 35MB vs 165MB with the blanket 900s cap.
-                            // MQ resample quality: 16-bit precision is more than sufficient
-                            // for MuLan's mel spectrogram (80dB dynamic range after dB conversion).
-                            // soxr MQ is 2-3x faster than HQ on ARM (~4s vs ~10s per track).
                             val maxDurMulan = minOf((track.durationMs / 1000).toInt() + 10, 900)
                             val audio24k = audioDecoder.decode(
                                 audioFile, 24000,
                                 maxDurationS = maxDurMulan,
-                                resampleQuality = NativeResampler.QUALITY_MQ,
                             )
                             if (audio24k == null) {
                                 Log.w(TAG, "Decode failed for: ${track.title}")
