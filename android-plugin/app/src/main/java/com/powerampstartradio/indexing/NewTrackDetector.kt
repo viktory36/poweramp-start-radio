@@ -137,21 +137,15 @@ class NewTrackDetector(
             if (metadataKey in embeddedKeys) continue
 
             // Check partial metadata key (artist|*|title|*)
-            val artistTitlePrefix = "${entry.artist}|"
             val titlePart = "|${entry.title}|"
-            val hasPartialMatch = embeddedKeys.any { key ->
-                key.startsWith(artistTitlePrefix) && key.contains(titlePart)
-            }
-            if (hasPartialMatch) continue
+            val artistKeys = keysByArtist[entry.artist]
+            if (artistKeys != null && artistKeys.any { it.contains(titlePart) }) continue
 
             // Check semicolon artist split (Poweramp: "artist1; artist2", DB: "artist1")
             if (';' in entry.artist) {
                 val primaryArtist = entry.artist.substringBefore(';').trim()
-                val primaryPrefix = "$primaryArtist|"
-                val hasPrimaryMatch = embeddedKeys.any { key ->
-                    key.startsWith(primaryPrefix) && key.contains(titlePart)
-                }
-                if (hasPrimaryMatch) continue
+                val primaryKeys = keysByArtist[primaryArtist]
+                if (primaryKeys != null && primaryKeys.any { it.contains(titlePart) }) continue
             }
 
             // Check fuzzy title matching (track number prefix, ID3v1 truncation, extensions,
@@ -230,12 +224,9 @@ class NewTrackDetector(
             }
 
             // Strategy 2: Partial match (artist+title, ignoring album+duration)
-            val artistTitlePrefix = "${entry.artist}|"
             val titlePart = "|${entry.title}|"
-            val hasPartialMatch = embeddedKeys.any { key ->
-                key.startsWith(artistTitlePrefix) && key.contains(titlePart)
-            }
-            if (hasPartialMatch) {
+            val artistKeys = keysByArtist[entry.artist]
+            if (artistKeys != null && artistKeys.any { it.contains(titlePart) }) {
                 partialMatches++
                 continue
             }
@@ -243,11 +234,8 @@ class NewTrackDetector(
             // Strategy 2b: Semicolon artist split (Poweramp: "artist1; artist2", DB: "artist1")
             if (';' in entry.artist) {
                 val primaryArtist = entry.artist.substringBefore(';').trim()
-                val primaryPrefix = "$primaryArtist|"
-                val hasPrimaryMatch = embeddedKeys.any { key ->
-                    key.startsWith(primaryPrefix) && key.contains(titlePart)
-                }
-                if (hasPrimaryMatch) {
+                val primaryKeys = keysByArtist[primaryArtist]
+                if (primaryKeys != null && primaryKeys.any { it.contains(titlePart) }) {
                     partialMatches++
                     continue
                 }
