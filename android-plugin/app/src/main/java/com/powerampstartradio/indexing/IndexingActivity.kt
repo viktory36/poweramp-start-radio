@@ -525,7 +525,8 @@ private fun BottomBar(
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Text(
-                        if (hasSvdMatrix) "~15s" else "~8 min",
+                        if (hasSvdMatrix) "Usually under a minute"
+                        else "Several minutes, depending on library size",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -571,7 +572,7 @@ private fun BottomBar(
                                     style = MaterialTheme.typography.bodyMedium,
                                 )
                                 Text(
-                                    "Rebuilds track clusters from scratch. Useful after adding many tracks over several sessions \u2014 if the Explorer (Random Walk) mode stops surfacing good connections, re-clustering helps. Adds ~2 min.",
+                                    "Rebuilds track clusters from scratch. Useful after adding many tracks over several sessions \u2014 if the Explorer (Random Walk) mode stops surfacing good connections, re-clustering helps. Adds a few minutes.",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
