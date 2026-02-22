@@ -193,7 +193,7 @@ fun IndexingScreen(
                     ProcessingContent(state = state, onCancel = { viewModel.cancelIndexing() })
                 }
                 is IndexingService.IndexingState.RebuildingIndices -> {
-                    RebuildingContent(message = state.message)
+                    RebuildingContent(state = state)
                 }
                 is IndexingService.IndexingState.Complete -> {
                     CompleteContent(
@@ -394,12 +394,44 @@ private fun ProcessingContent(
 }
 
 @Composable
-private fun RebuildingContent(message: String) {
-    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            CircularProgressIndicator()
-            Spacer(modifier = Modifier.height(16.dp))
-            Text(message, style = MaterialTheme.typography.bodyMedium)
+private fun RebuildingContent(state: IndexingService.IndexingState.RebuildingIndices) {
+    Column(
+        modifier = Modifier.fillMaxSize().padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        if (state.phaseName.isNotEmpty()) {
+            Text(
+                text = state.phaseName,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+        }
+        if (state.progressFraction >= 0f) {
+            LinearProgressIndicator(
+                progress = { state.progressFraction.coerceIn(0f, 1f) },
+                modifier = Modifier.fillMaxWidth(),
+            )
+        } else {
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        }
+        Spacer(modifier = Modifier.height(12.dp))
+        Text(
+            text = state.message,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (state.estimatedRemainingMs > 0) {
+            val minutes = state.estimatedRemainingMs / 60_000
+            val etaText = if (minutes < 1) "Less than a minute remaining"
+            else "$minutes min remaining"
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = etaText,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }

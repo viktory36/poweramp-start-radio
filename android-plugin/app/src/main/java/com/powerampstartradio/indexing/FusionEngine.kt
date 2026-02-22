@@ -26,6 +26,11 @@ import kotlin.math.sqrt
  *
  * Each tier can optionally build the kNN graph (+4 min), required only for Random Walk mode.
  *
+ * Progress callback: `(phase: String, detail: String, overallFraction: Float) -> Unit`
+ * - phase: Human-readable name of current sub-step (e.g. "Projecting tracks")
+ * - detail: Specific status (e.g. "5000/74726")
+ * - overallFraction: [0, 1] across the entire operation, for progress bar + ETA
+ *
  * Uses NEON-accelerated native math (NativeMath JNI) for dot products in
  * k-means and kNN, giving ~6-10x speedup over scalar Kotlin loops.
  */
@@ -38,6 +43,16 @@ class FusionEngine(
 ) {
     companion object {
         private const val TAG = "FusionEngine"
+
+        // Phase weights based on real timing (Snapdragon 8 Gen 3, 75K tracks).
+        // Values are approximate seconds; only their ratios matter.
+        private const val W_COVARIANCE = 22f
+        private const val W_EIGEN = 85f
+        private const val W_PROJECTION = 18f
+        private const val W_KMEANS_FULL = 72f
+        private const val W_KMEANS_ASSIGN = 3f
+        private const val W_KNN = 225f
+        private const val W_EXTRACT = 8f
     }
 
     // Shared state populated by setup()
@@ -47,83 +62,177 @@ class FusionEngine(
     private var sourceDim: Int = 0
     private var concatDim: Int = 0
 
+    /**
+     * Tracks progress across sequential phases with relative weights.
+     * Each phase reports sub-fraction [0,1]; this maps it to an overall fraction.
+     */
+    private class PhaseTracker(
+        private val phases: List<Pair<String, Float>>,
+        private val onProgress: ((String, String, Float) -> Unit)?,
+    ) {
+        private val totalWeight = phases.sumOf { it.second.toDouble() }.toFloat()
+        private var phaseIdx = 0
+        private var completedWeight = 0f
+
+        /** Get a callback for the current phase. */
+        fun current(): (String, Float) -> Unit = { detail, sub ->
+            val weight = if (phaseIdx < phases.size) phases[phaseIdx].second else 0f
+            val frac = (completedWeight + weight * sub.coerceIn(0f, 1f)) / totalWeight
+            val name = if (phaseIdx < phases.size) phases[phaseIdx].first else ""
+            onProgress?.invoke(name, detail, frac.coerceIn(0f, 1f))
+        }
+
+        /** Mark current phase complete and advance to the next. */
+        fun advance() {
+            if (phaseIdx < phases.size) {
+                completedWeight += phases[phaseIdx].second
+                phaseIdx++
+            }
+        }
+    }
+
     // ── Orchestrators ────────────────────────────────────────────────
 
     /**
      * Quick update: project all tracks through existing SVD, assign to existing clusters.
      * Fastest option (~30s) — suitable when adding a few tracks to a large desktop-fused corpus.
      */
-    fun quickUpdate(buildGraph: Boolean, onProgress: ((String) -> Unit)? = null) {
+    fun quickUpdate(
+        buildGraph: Boolean,
+        onProgress: ((phase: String, detail: String, fraction: Float) -> Unit)? = null,
+    ) {
         val start = System.currentTimeMillis()
-        fun progress(msg: String) { Log.i(TAG, msg); onProgress?.invoke(msg) }
+        setup()
 
-        setup(onProgress)
         val projection = loadExistingSvd()
             ?: throw IllegalStateException("No existing SVD matrix — use fullRefusion instead")
-        projectAllTracks(projection, onProgress)
-        clusterAssignOnly(onProgress)
-        if (buildGraph) buildKnnGraphPhase(onProgress)
-        extractIndices(buildGraph, onProgress)
+
+        val phases = buildList {
+            add("Projecting tracks" to W_PROJECTION)
+            add("Assigning clusters" to W_KMEANS_ASSIGN)
+            if (buildGraph) add("Building kNN graph" to W_KNN)
+            add("Extracting indices" to W_EXTRACT)
+        }
+        val tracker = PhaseTracker(phases, onProgress)
+
+        projectAllTracks(projection, tracker.current())
+        tracker.advance()
+
+        clusterAssignOnly(tracker.current())
+        tracker.advance()
+
+        if (buildGraph) {
+            buildKnnGraphPhase(tracker.current())
+            tracker.advance()
+        }
+
+        extractIndices(buildGraph, tracker.current())
+        tracker.advance()
 
         Log.i(TAG, "TIMING: quick_update_total = ${System.currentTimeMillis() - start}ms")
-        progress("Quick update complete: ${allTrackIds.size} tracks")
     }
 
     /**
      * Re-cluster: project all tracks through existing SVD, full k-means from scratch.
      * ~2 min — use when cluster assignments have drifted after many incremental updates.
      */
-    fun recluster(buildGraph: Boolean, onProgress: ((String) -> Unit)? = null) {
+    fun recluster(
+        buildGraph: Boolean,
+        onProgress: ((phase: String, detail: String, fraction: Float) -> Unit)? = null,
+    ) {
         val start = System.currentTimeMillis()
-        fun progress(msg: String) { Log.i(TAG, msg); onProgress?.invoke(msg) }
+        setup()
 
-        setup(onProgress)
         val projection = loadExistingSvd()
             ?: throw IllegalStateException("No existing SVD matrix — use fullRefusion instead")
-        projectAllTracks(projection, onProgress)
-        clusterFull(onProgress)
-        if (buildGraph) buildKnnGraphPhase(onProgress)
-        extractIndices(buildGraph, onProgress)
+
+        val phases = buildList {
+            add("Projecting tracks" to W_PROJECTION)
+            add("Clustering" to W_KMEANS_FULL)
+            if (buildGraph) add("Building kNN graph" to W_KNN)
+            add("Extracting indices" to W_EXTRACT)
+        }
+        val tracker = PhaseTracker(phases, onProgress)
+
+        projectAllTracks(projection, tracker.current())
+        tracker.advance()
+
+        clusterFull(tracker.current())
+        tracker.advance()
+
+        if (buildGraph) {
+            buildKnnGraphPhase(tracker.current())
+            tracker.advance()
+        }
+
+        extractIndices(buildGraph, tracker.current())
+        tracker.advance()
 
         Log.i(TAG, "TIMING: recluster_total = ${System.currentTimeMillis() - start}ms")
-        progress("Re-cluster complete: ${allTrackIds.size} tracks")
     }
 
     /**
      * Full re-fusion: SVD + project + cluster + optional kNN graph.
      * ~4 min without kNN — use for first-time on-device fusion or when corpus changes significantly.
      */
-    fun fullRefusion(buildGraph: Boolean, onProgress: ((String) -> Unit)? = null) {
+    fun fullRefusion(
+        buildGraph: Boolean,
+        onProgress: ((phase: String, detail: String, fraction: Float) -> Unit)? = null,
+    ) {
         val start = System.currentTimeMillis()
-        fun progress(msg: String) { Log.i(TAG, msg); onProgress?.invoke(msg) }
+        setup()
 
-        setup(onProgress)
-        val projection = computeSvd(onProgress)
-        projectAllTracks(projection, onProgress)
-        clusterFull(onProgress)
-        if (buildGraph) buildKnnGraphPhase(onProgress)
-        extractIndices(buildGraph, onProgress)
+        val phases = buildList {
+            add("Computing covariance" to W_COVARIANCE)
+            add("Eigendecomposition" to W_EIGEN)
+            add("Projecting tracks" to W_PROJECTION)
+            add("Clustering" to W_KMEANS_FULL)
+            if (buildGraph) add("Building kNN graph" to W_KNN)
+            add("Extracting indices" to W_EXTRACT)
+        }
+        val tracker = PhaseTracker(phases, onProgress)
+
+        val covariance = computeCovariance(tracker.current())
+        tracker.advance()
+
+        val projection = computeEigen(covariance, tracker.current())
+        tracker.advance()
+
+        projectAllTracks(projection, tracker.current())
+        tracker.advance()
+
+        clusterFull(tracker.current())
+        tracker.advance()
+
+        if (buildGraph) {
+            buildKnnGraphPhase(tracker.current())
+            tracker.advance()
+        }
+
+        extractIndices(buildGraph, tracker.current())
+        tracker.advance()
 
         Log.i(TAG, "TIMING: fusion_total = ${System.currentTimeMillis() - start}ms")
-        progress("Full re-fusion complete: ${allTrackIds.size} tracks")
     }
 
     /**
      * Legacy entry point — equivalent to fullRefusion(buildGraph = true).
      */
     fun recomputeFusion(onProgress: ((String) -> Unit)? = null) {
-        fullRefusion(buildGraph = true, onProgress)
+        fullRefusion(buildGraph = true) { _, detail, _ ->
+            onProgress?.invoke(detail)
+        }
     }
 
     // ── Phase methods ────────────────────────────────────────────────
+    // Each phase method accepts (detail: String, subFraction: Float) -> Unit
+    // where subFraction is [0, 1] within this phase only.
 
     /**
      * Load track IDs, detect dimensions, populate shared state.
      */
-    private fun setup(onProgress: ((String) -> Unit)? = null) {
-        fun progress(msg: String) { Log.i(TAG, msg); onProgress?.invoke(msg) }
-
-        progress("Loading embeddings for fusion...")
+    private fun setup() {
+        Log.i(TAG, "Loading embeddings for fusion...")
         sourceDim = detectSourceDim()
         concatDim = sourceDim * 2
 
@@ -140,7 +249,7 @@ class FusionEngine(
         val nTracks = allTrackIds.size
         val bothCount = mulanSet.intersect(flamingoSet).size
 
-        progress("Tracks: $nTracks total ($bothCount with both models, " +
+        Log.i(TAG, "Tracks: $nTracks total ($bothCount with both models, " +
             "${mulanTrackIds.size - bothCount} MuLan-only, " +
             "${flamingoTrackIds.size - bothCount} Flamingo-only)")
 
@@ -150,18 +259,16 @@ class FusionEngine(
     }
 
     /**
-     * Compute SVD projection from covariance matrix eigendecomposition.
-     * Stores projection matrix + metadata in DB.
-     * Returns the projection data as FloatArray[targetDim * concatDim].
+     * Compute covariance matrix C = X^T X by streaming embeddings.
+     * Sub-progress: linear with tracks processed.
      */
-    private fun computeSvd(onProgress: ((String) -> Unit)? = null): FloatArray {
-        fun progress(msg: String) { Log.i(TAG, msg); onProgress?.invoke(msg) }
-        val rawDb = db.getRawDatabase()
+    private fun computeCovariance(
+        onProgress: ((String, Float) -> Unit)? = null,
+    ): DoubleArray {
         val nTracks = allTrackIds.size
-
-        // Compute covariance matrix C = X^T X by streaming
         val covStart = System.currentTimeMillis()
-        progress("Computing covariance matrix ($nTracks tracks, ${concatDim}d)...")
+        onProgress?.invoke("$nTracks tracks, ${concatDim}d...", 0f)
+
         val covariance = DoubleArray(concatDim * concatDim)
 
         val covBatchSize = 500
@@ -170,7 +277,7 @@ class FusionEngine(
 
         for ((idx, trackId) in allTrackIds.withIndex()) {
             if (idx % 5000 == 0 && idx > 0) {
-                progress("Covariance: $idx/$nTracks")
+                onProgress?.invoke("$idx / $nTracks tracks", idx.toFloat() / nTracks)
             }
 
             val concat = getConcatenatedEmbedding(trackId, sourceDim, mulanSet, flamingoSet)
@@ -193,17 +300,31 @@ class FusionEngine(
         }
 
         Log.i(TAG, "TIMING: covariance = ${System.currentTimeMillis() - covStart}ms")
+        onProgress?.invoke("Covariance complete", 1f)
+        return covariance
+    }
 
-        // Eigendecomposition
+    /**
+     * Eigendecomposition + build projection matrix + store in DB.
+     * Sub-progress: 0 at start, 1 when complete (native Jacobi is blocking).
+     */
+    private fun computeEigen(
+        covariance: DoubleArray,
+        onProgress: ((String, Float) -> Unit)? = null,
+    ): FloatArray {
+        val rawDb = db.getRawDatabase()
         val eigenStart = System.currentTimeMillis()
-        progress("Eigendecomposition ($concatDim x $concatDim)...")
+        onProgress?.invoke("${concatDim}x$concatDim matrix...", 0f)
+
         val nativeResult = nativeJacobiEigen(covariance, concatDim)
         val (eigenvalues, eigenvectors) = if (nativeResult != null) {
             Log.i(TAG, "Native Jacobi completed in ${System.currentTimeMillis() - eigenStart}ms")
             nativeResult
         } else {
             Log.w(TAG, "Native Jacobi failed, falling back to Kotlin")
-            jacobiEigen(covariance, concatDim, onProgress)
+            jacobiEigen(covariance, concatDim) { detail, sub ->
+                onProgress?.invoke(detail, sub)
+            }
         }
 
         // Projection matrix = top targetDim eigenvectors as rows (Vt convention)
@@ -217,9 +338,9 @@ class FusionEngine(
         // Compute variance retained
         val totalVar = eigenvalues.sum()
         val retainedVar = eigenvalues.take(targetDim).sum() / totalVar
-        progress("Variance retained: ${"%.2f".format(retainedVar * 100)}%")
 
         Log.i(TAG, "TIMING: eigendecomposition = ${System.currentTimeMillis() - eigenStart}ms")
+        Log.i(TAG, "Variance retained: ${"%.2f".format(retainedVar * 100)}%")
 
         // Store projection matrix and metadata
         val projBlob = ByteBuffer.allocate(projectionData.size * 4).order(ByteOrder.LITTLE_ENDIAN)
@@ -241,6 +362,7 @@ class FusionEngine(
             arrayOf("fused_variance_retained", "%.6f".format(retainedVar))
         )
 
+        onProgress?.invoke("${"%.1f".format(retainedVar * 100)}% variance retained", 1f)
         return projectionData
     }
 
@@ -258,17 +380,17 @@ class FusionEngine(
 
     /**
      * Project all tracks through SVD and write fused embeddings to DB.
+     * Sub-progress: linear with tracks processed.
      */
     private fun projectAllTracks(
         projectionData: FloatArray,
-        onProgress: ((String) -> Unit)? = null,
+        onProgress: ((String, Float) -> Unit)? = null,
     ) {
-        fun progress(msg: String) { Log.i(TAG, msg); onProgress?.invoke(msg) }
         val rawDb = db.getRawDatabase()
         val nTracks = allTrackIds.size
 
         val projStart = System.currentTimeMillis()
-        progress("Projecting $nTracks tracks to ${targetDim}d...")
+        onProgress?.invoke("$nTracks tracks to ${targetDim}d...", 0f)
 
         // Ensure tables exist
         rawDb.execSQL("""
@@ -291,7 +413,7 @@ class FusionEngine(
 
             for ((idx, trackId) in allTrackIds.withIndex()) {
                 if (idx % 5000 == 0 && idx > 0) {
-                    progress("Projecting: $idx/$nTracks")
+                    onProgress?.invoke("$idx / $nTracks", idx.toFloat() / nTracks)
                 }
 
                 val concat = getConcatenatedEmbedding(trackId, sourceDim, mulanSet, flamingoSet)
@@ -304,47 +426,46 @@ class FusionEngine(
         } finally {
             rawDb.endTransaction()
         }
-        progress("Projected $nTracks fused embeddings")
 
         Log.i(TAG, "TIMING: projection = ${System.currentTimeMillis() - projStart}ms")
+        onProgress?.invoke("$nTracks tracks projected", 1f)
     }
 
     /**
      * Full k-means clustering from scratch.
-     * Stores cluster assignments (tracks.cluster_id) and centroids (clusters table).
+     * Sub-progress: delegates to kmeans (init 0-0.2, iterations 0.2-1.0).
      */
-    private fun clusterFull(onProgress: ((String) -> Unit)? = null) {
-        fun progress(msg: String) { Log.i(TAG, msg); onProgress?.invoke(msg) }
+    private fun clusterFull(onProgress: ((String, Float) -> Unit)? = null) {
         val rawDb = db.getRawDatabase()
         val nTracks = allTrackIds.size
 
         val kmeansStart = System.currentTimeMillis()
-        progress("Loading fused embeddings for clustering...")
+        onProgress?.invoke("Loading embeddings...", 0f)
         val flatEmbeddings = loadAllFusedEmbeddingsFlat(allTrackIds)
 
         val actualClusters = minOf(nClusters, nTracks)
-        progress("k-means clustering (K=$actualClusters)...")
         val (labels, centroids) = kmeans(flatEmbeddings, nTracks, targetDim,
-            actualClusters, onProgress = { progress(it) })
+            actualClusters, onProgress = onProgress)
 
+        onProgress?.invoke("Writing clusters...", 0.98f)
         writeClusters(rawDb, labels, centroids, actualClusters)
 
         Log.i(TAG, "TIMING: kmeans = ${System.currentTimeMillis() - kmeansStart}ms")
+        onProgress?.invoke("$actualClusters clusters", 1f)
     }
 
     /**
      * Assign-only clustering: load existing centroids, single assignment pass.
      * Falls back to full k-means if no centroids exist.
-     * ~3s vs ~72s for full k-means on 75K tracks.
+     * Sub-progress: 0 → 1 (near-instant, ~3s).
      */
-    private fun clusterAssignOnly(onProgress: ((String) -> Unit)? = null) {
-        fun progress(msg: String) { Log.i(TAG, msg); onProgress?.invoke(msg) }
+    private fun clusterAssignOnly(onProgress: ((String, Float) -> Unit)? = null) {
         val rawDb = db.getRawDatabase()
         val nTracks = allTrackIds.size
 
         val existingCentroids = db.loadCentroids()
         if (existingCentroids.isEmpty()) {
-            progress("No existing centroids — falling back to full k-means")
+            Log.i(TAG, "No existing centroids — falling back to full k-means")
             clusterFull(onProgress)
             return
         }
@@ -352,7 +473,7 @@ class FusionEngine(
         val assignStart = System.currentTimeMillis()
         val k = existingCentroids.size
         val d = targetDim
-        progress("Assigning $nTracks tracks to $k existing clusters...")
+        onProgress?.invoke("$nTracks tracks to $k clusters...", 0f)
 
         val flatEmbeddings = loadAllFusedEmbeddingsFlat(allTrackIds)
 
@@ -375,18 +496,18 @@ class FusionEngine(
         writeClusters(rawDb, labels, centroidsArray, k)
 
         Log.i(TAG, "TIMING: cluster_assign = ${System.currentTimeMillis() - assignStart}ms")
-        progress("Assigned $nTracks tracks to $k clusters")
+        onProgress?.invoke("$nTracks tracks assigned", 1f)
     }
 
     /**
      * Build kNN graph from fused embeddings + cluster assignments.
+     * Sub-progress: linear with tracks processed (i/n).
      */
-    private fun buildKnnGraphPhase(onProgress: ((String) -> Unit)? = null) {
-        fun progress(msg: String) { Log.i(TAG, msg); onProgress?.invoke(msg) }
+    private fun buildKnnGraphPhase(onProgress: ((String, Float) -> Unit)? = null) {
         val nTracks = allTrackIds.size
 
         val knnStart = System.currentTimeMillis()
-        progress("Building kNN graph (K=$knnK)...")
+        onProgress?.invoke("Loading embeddings...", 0f)
 
         val flatEmbeddings = loadAllFusedEmbeddingsFlat(allTrackIds)
 
@@ -413,26 +534,35 @@ class FusionEngine(
         }
 
         buildKnnGraph(flatEmbeddings, nTracks, targetDim,
-            allTrackIds, labels, centroids,
-            onProgress = { progress(it) })
+            allTrackIds, labels, centroids, onProgress)
 
         Log.i(TAG, "TIMING: knn_graph = ${System.currentTimeMillis() - knnStart}ms")
     }
 
     /**
      * Extract .emb index and optionally graph.bin from database.
+     * Sub-progress: linear with embeddings extracted.
      */
-    private fun extractIndices(includeGraph: Boolean, onProgress: ((String) -> Unit)? = null) {
-        fun progress(msg: String) { Log.i(TAG, msg); onProgress?.invoke(msg) }
+    private fun extractIndices(
+        includeGraph: Boolean,
+        onProgress: ((String, Float) -> Unit)? = null,
+    ) {
         val extractStart = System.currentTimeMillis()
-        progress("Extracting index files...")
+        onProgress?.invoke("Extracting index files...", 0f)
+
+        var totalTracks = 0
         EmbeddingIndex.extractFromDatabase(db, File(filesDir, "fused.emb")) { cur, total ->
-            if (cur % 10000 == 0) progress("Extracting embeddings: $cur/$total")
+            totalTracks = total
+            if (cur % 10000 == 0) {
+                onProgress?.invoke("$cur / $total embeddings", cur.toFloat() / total)
+            }
         }
         if (includeGraph) {
             GraphIndex.extractFromDatabase(db, File(filesDir, "graph.bin"))
         }
+
         Log.i(TAG, "TIMING: extract_indices = ${System.currentTimeMillis() - extractStart}ms")
+        onProgress?.invoke("$totalTracks embeddings extracted", 1f)
     }
 
     // ── Helpers ──────────────────────────────────────────────────────
@@ -561,7 +691,7 @@ class FusionEngine(
     private fun jacobiEigen(
         matrix: DoubleArray,
         n: Int,
-        onProgress: ((String) -> Unit)? = null,
+        onProgress: ((String, Float) -> Unit)? = null,
     ): Pair<DoubleArray, DoubleArray> {
         val a = matrix.copyOf()
         val v = DoubleArray(n * n)
@@ -579,7 +709,8 @@ class FusionEngine(
             }
 
             if (offDiagSum < eps) {
-                onProgress?.invoke("Jacobi converged after $sweep sweeps")
+                onProgress?.invoke("Converged after $sweep sweeps",
+                    (sweep.toFloat() / maxSweeps).coerceAtMost(1f))
                 break
             }
 
@@ -631,7 +762,8 @@ class FusionEngine(
             }
 
             if ((sweep + 1) % 5 == 0) {
-                onProgress?.invoke("Jacobi sweep ${sweep + 1}, off-diag=${"%.2e".format(sqrt(offDiagSum))}")
+                onProgress?.invoke("Sweep ${sweep + 1}, off-diag=${"%.2e".format(sqrt(offDiagSum))}",
+                    (sweep + 1).toFloat() / maxSweeps)
             }
         }
 
@@ -651,13 +783,17 @@ class FusionEngine(
 
     // --- k-means clustering ---
 
+    /**
+     * Cosine-distance k-means with centroid re-normalization.
+     * Sub-progress: init 0→0.2, iterations 0.2→1.0.
+     */
     private fun kmeans(
         flatEmbeddings: FloatArray,
         n: Int,
         d: Int,
         k: Int,
         maxIter: Int = 100,
-        onProgress: ((String) -> Unit)? = null,
+        onProgress: ((String, Float) -> Unit)? = null,
     ): Pair<IntArray, Array<FloatArray>> {
 
         val rng = java.util.Random(42)
@@ -669,7 +805,10 @@ class FusionEngine(
         val minDistSq = FloatArray(n) { Float.MAX_VALUE }
 
         for (ci in 1 until k) {
-            if (ci % 50 == 0) onProgress?.invoke("k-means++ init: $ci/$k centroids")
+            if (ci % 50 == 0) {
+                onProgress?.invoke("k-means++ init: $ci/$k centroids",
+                    ci.toFloat() / k * 0.2f)
+            }
 
             val prev = centroids[ci - 1]
             val sims = NativeMath.batchDot(prev, flatEmbeddings, n, d)
@@ -695,12 +834,14 @@ class FusionEngine(
                 System.arraycopy(flatEmbeddings, idx * d, centroids[ci], 0, d)
             }
         }
-        onProgress?.invoke("k-means++ init complete")
+        onProgress?.invoke("k-means++ init complete", 0.2f)
 
         val flatCentroids = FloatArray(k * d)
 
         var labels = IntArray(n)
         val convergeThreshold = maxOf(n / 200, 1)
+        // Estimate ~40 iterations for ETA (typical convergence at ~34 iters)
+        val estimatedIters = 40f
 
         for (iter in 0 until maxIter) {
             for (j in 0 until k) {
@@ -731,9 +872,12 @@ class FusionEngine(
                 }
             }
 
+            val iterFrac = 0.2f + ((iter + 1).toFloat() / estimatedIters).coerceAtMost(1f) * 0.8f
+
             if (iter % 10 == 0 || changed <= convergeThreshold) {
-                onProgress?.invoke("k-means iter $iter: $changed reassignments" +
-                    if (changed <= convergeThreshold) " (converged)" else "")
+                val status = "Iter $iter: $changed reassignments" +
+                    if (changed <= convergeThreshold) " (converged)" else ""
+                onProgress?.invoke(status, if (changed <= convergeThreshold) 1f else iterFrac)
             }
             if (changed <= convergeThreshold) break
 
@@ -764,6 +908,10 @@ class FusionEngine(
 
     // --- kNN graph ---
 
+    /**
+     * Build kNN graph using cluster-accelerated search with NEON dot products.
+     * Sub-progress: linear with tracks processed (i/n).
+     */
     private fun buildKnnGraph(
         flatEmbeddings: FloatArray,
         n: Int,
@@ -771,7 +919,7 @@ class FusionEngine(
         trackIds: LongArray,
         labels: IntArray,
         centroids: Array<FloatArray>,
-        onProgress: ((String) -> Unit)? = null,
+        onProgress: ((String, Float) -> Unit)? = null,
     ) {
         val k = knnK
         val numClusters = centroids.size
@@ -798,7 +946,7 @@ class FusionEngine(
 
         for (i in 0 until n) {
             if (i % 1000 == 0) {
-                onProgress?.invoke("kNN: $i/$n")
+                onProgress?.invoke("$i / $n nodes", i.toFloat() / n)
             }
 
             System.arraycopy(flatEmbeddings, i * d, queryBuf, 0, d)
@@ -857,7 +1005,7 @@ class FusionEngine(
         @Suppress("UNUSED_VALUE")
         clusterBuf = FloatArray(0)
 
-        onProgress?.invoke("Writing graph binary...")
+        onProgress?.invoke("Writing graph binary...", 0.98f)
         val size = 8 + n * 8 + n * k * 8
         val buffer = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN)
         buffer.putInt(n)
@@ -875,7 +1023,7 @@ class FusionEngine(
         File(filesDir, "graph.bin").writeBytes(graphBlob)
 
         val sizeMB = graphBlob.size / 1024 / 1024
-        onProgress?.invoke("Graph built: $n nodes, K=$k, $sizeMB MB")
+        onProgress?.invoke("$n nodes, K=$k, $sizeMB MB", 1f)
     }
 
     private fun dotProduct(a: FloatArray, b: FloatArray): Float {

@@ -114,7 +114,12 @@ class IndexingService : Service() {
             val progressFraction: Float = 0f,
             val estimatedRemainingMs: Long = 0,
         ) : IndexingState()
-        data class RebuildingIndices(val message: String) : IndexingState()
+        data class RebuildingIndices(
+            val message: String,
+            val phaseName: String = "",
+            val progressFraction: Float = -1f,
+            val estimatedRemainingMs: Long = 0,
+        ) : IndexingState()
         data class Complete(val indexed: Int, val failed: Int) : IndexingState()
         data class Error(val message: String) : IndexingState()
     }
@@ -683,14 +688,26 @@ class IndexingService : Service() {
                             FusionTier.RECLUSTER -> "Re-cluster"
                             FusionTier.FULL_REFUSION -> "Full re-fusion"
                         }
-                        _state.value = IndexingState.RebuildingIndices("$tierName...")
+                        _state.value = IndexingState.RebuildingIndices(
+                            message = "Starting...", phaseName = tierName)
                         updateNotification("$tierName...")
 
                         val fusionEngine = FusionEngine(db, filesDir)
-                        val progressCb: (String) -> Unit = { status ->
-                            _state.value = IndexingState.RebuildingIndices(status)
-                            updateNotification(status)
-                        }
+                        val fusionStart = System.currentTimeMillis()
+                        val progressCb: (String, String, Float) -> Unit =
+                            { phase, detail, fraction ->
+                                val elapsed = System.currentTimeMillis() - fusionStart
+                                val eta = if (fraction > 0.02f) {
+                                    ((elapsed / fraction) * (1f - fraction)).toLong()
+                                } else 0L
+                                _state.value = IndexingState.RebuildingIndices(
+                                    message = detail,
+                                    phaseName = phase,
+                                    progressFraction = fraction,
+                                    estimatedRemainingMs = eta,
+                                )
+                                updateNotification("$phase: $detail")
+                            }
                         when (options.tier) {
                             FusionTier.QUICK_UPDATE -> fusionEngine.quickUpdate(options.buildKnnGraph, progressCb)
                             FusionTier.RECLUSTER -> fusionEngine.recluster(options.buildKnnGraph, progressCb)
@@ -698,13 +715,15 @@ class IndexingService : Service() {
                         }
                         Log.i(TAG, "TIMING: fusion_${options.tier.name.lowercase()} = ${System.currentTimeMillis() - rebuildStart}ms")
                     } else {
-                        // No fusion — just extract indices
-                        _state.value = IndexingState.RebuildingIndices("Rebuilding search indices...")
+                        // No fusion — just extract indices (indeterminate progress)
+                        _state.value = IndexingState.RebuildingIndices(
+                            message = "Rebuilding search indices...")
                         updateNotification("Rebuilding indices...")
 
                         val graphUpdater = GraphUpdater(db, filesDir)
                         graphUpdater.rebuildIndices { status ->
-                            _state.value = IndexingState.RebuildingIndices(status)
+                            _state.value = IndexingState.RebuildingIndices(
+                                message = status)
                             updateNotification(status)
                         }
                         Log.i(TAG, "TIMING: rebuild_indices = ${System.currentTimeMillis() - rebuildStart}ms")
