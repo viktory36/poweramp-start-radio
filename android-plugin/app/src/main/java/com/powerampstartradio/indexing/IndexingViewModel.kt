@@ -235,19 +235,9 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         }
         if (tracks.isEmpty()) return
 
-        // Auto-dismiss unchecked visible tracks so they don't count as unindexed
-        val unchecked = _unindexedTracks.value
-            .filter { it.powerampFileId !in selected && it.powerampFileId !in dismissed }
-            .map { it.powerampFileId }
-            .toSet()
-        if (unchecked.isNotEmpty()) {
-            val newDismissed = dismissed + unchecked
-            _dismissedIds.value = newDismissed
-            saveDismissedIds(newDismissed)
-        }
-
-        // Cache auto-invalidates when DB modification time changes after indexing.
-        // Don't invalidate eagerly — if the user cancels, the cache is still valid.
+        // Invalidate cache so the next detectUnindexed() re-scans from the DB.
+        // Can't rely on dbFile.lastModified() — SQLite WAL may not flush to the main file.
+        invalidateCache()
         IndexingService.startIndexing(getApplication(), tracks, fusionOptions = fusionOptions)
     }
 
