@@ -342,10 +342,7 @@ class IndexingService : Service() {
                                 )
                                 updateNotification(msg, completedSteps, totalSteps)
                             }
-                            val durMin = track.durationMs / 60000
-                            val durSec = (track.durationMs / 1000) % 60
-                            val durStr = if (durMin > 0) "${durMin}m${durSec}s" else "${durSec}s"
-                            emitProgress("decoding ($durStr)")
+                            emitProgress("decoding")
                             val trackStart = System.nanoTime()
 
                             val audioFile = resolveAudioFile(track)
@@ -562,10 +559,7 @@ class IndexingService : Service() {
                             if (audio16k == null) {
                                 // Cache miss with both models: decode wasn't budgeted in totalSteps
                                 if (hasMulan) totalSteps += DECODE_WEIGHT
-                                val durMin = track.durationMs / 60000
-                                val durSec = (track.durationMs / 1000) % 60
-                                val durStr = if (durMin > 0) "${durMin}m${durSec}s" else "${durSec}s"
-                                emitProgress("decoding ($durStr)")
+                                emitProgress("decoding")
                                 val maxDurFlamingo = minOf((track.durationMs / 1000).toInt() + 10, 1800)
                                 audio16k = audioDecoder.decode(audioFile, 16000, maxDurationS = maxDurFlamingo)
                                 if (audio16k == null) {
