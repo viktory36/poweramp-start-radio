@@ -68,6 +68,7 @@ fun IndexingScreen(
     val isDetecting by viewModel.isDetecting.collectAsState()
     val detectingStatus by viewModel.detectingStatus.collectAsState()
     val indexingState by viewModel.indexingState.collectAsState()
+    val hasSvdMatrix by viewModel.hasSvdMatrix.collectAsState()
 
     // Re-detect when activity resumes (e.g. user replaced DB while app was backgrounded).
     // detectUnindexed() has its own cache check so this is cheap when nothing changed.
@@ -84,7 +85,15 @@ fun IndexingScreen(
     val hasDismissed = dismissedIds.isNotEmpty()
 
     var showMenu by remember { mutableStateOf(false) }
-    var refusion by remember { mutableStateOf(false) }
+
+    // Fusion tier state: default to Quick update if SVD exists, Full re-fusion otherwise
+    var fusionTier by remember(hasSvdMatrix) {
+        mutableStateOf(
+            if (hasSvdMatrix) IndexingService.FusionTier.QUICK_UPDATE
+            else IndexingService.FusionTier.FULL_REFUSION
+        )
+    }
+    var buildKnnGraph by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -137,9 +146,16 @@ fun IndexingScreen(
                 && visibleTracks.isNotEmpty() && !isDetecting) {
                 BottomBar(
                     selectedCount = selectedCount,
-                    refusion = refusion,
-                    onRefusionChanged = { refusion = it },
-                    onStartIndexing = { viewModel.startIndexing(refusion = refusion) },
+                    fusionTier = fusionTier,
+                    onFusionTierChanged = { fusionTier = it },
+                    buildKnnGraph = buildKnnGraph,
+                    onBuildKnnGraphChanged = { buildKnnGraph = it },
+                    hasSvdMatrix = hasSvdMatrix,
+                    onStartIndexing = {
+                        viewModel.startIndexing(
+                            fusionOptions = IndexingService.FusionOptions(fusionTier, buildKnnGraph)
+                        )
+                    },
                 )
             }
         }
@@ -447,36 +463,80 @@ private fun ErrorContent(message: String, onBack: () -> Unit) {
 @Composable
 private fun BottomBar(
     selectedCount: Int,
-    refusion: Boolean,
-    onRefusionChanged: (Boolean) -> Unit,
+    fusionTier: IndexingService.FusionTier,
+    onFusionTierChanged: (IndexingService.FusionTier) -> Unit,
+    buildKnnGraph: Boolean,
+    onBuildKnnGraphChanged: (Boolean) -> Unit,
+    hasSvdMatrix: Boolean,
     onStartIndexing: () -> Unit,
 ) {
     Surface(tonalElevation = 3.dp) {
-        Column(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
+            Text(
+                "Post-indexing update",
+                style = MaterialTheme.typography.labelMedium,
+                modifier = Modifier.padding(horizontal = 16.dp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+
+            FusionTierOption(
+                label = "Quick update",
+                description = "Project new tracks, assign to clusters",
+                timing = "~30s",
+                selected = fusionTier == IndexingService.FusionTier.QUICK_UPDATE,
+                enabled = hasSvdMatrix,
+                onClick = { onFusionTierChanged(IndexingService.FusionTier.QUICK_UPDATE) },
+            )
+            FusionTierOption(
+                label = "Re-cluster",
+                description = "Recompute all clusters",
+                timing = "~2 min",
+                selected = fusionTier == IndexingService.FusionTier.RECLUSTER,
+                enabled = hasSvdMatrix,
+                onClick = { onFusionTierChanged(IndexingService.FusionTier.RECLUSTER) },
+            )
+            FusionTierOption(
+                label = "Full re-fusion",
+                description = "New SVD + clusters from scratch",
+                timing = "~4 min",
+                selected = fusionTier == IndexingService.FusionTier.FULL_REFUSION,
+                enabled = true,
+                onClick = { onFusionTierChanged(IndexingService.FusionTier.FULL_REFUSION) },
+            )
+
+            HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
+
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { onRefusionChanged(!refusion) }
+                    .clickable { onBuildKnnGraphChanged(!buildKnnGraph) }
                     .padding(horizontal = 16.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Checkbox(
-                    checked = refusion,
-                    onCheckedChange = onRefusionChanged,
+                    checked = buildKnnGraph,
+                    onCheckedChange = onBuildKnnGraphChanged,
                 )
                 Spacer(modifier = Modifier.width(4.dp))
-                Column {
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        "Rebuild similarity index",
+                        "Build kNN graph",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Text(
-                        "Recompute all track similarities from scratch",
+                        "Required only for Random Walk mode",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+                Text(
+                    "+4 min",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
+
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -492,5 +552,50 @@ private fun BottomBar(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun FusionTierOption(
+    label: String,
+    description: String,
+    timing: String,
+    selected: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RadioButton(
+            selected = selected,
+            onClick = onClick,
+            enabled = enabled,
+        )
+        Spacer(modifier = Modifier.width(4.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                label,
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (enabled) MaterialTheme.colorScheme.onSurface
+                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
+            )
+            Text(
+                description,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (enabled) MaterialTheme.colorScheme.onSurfaceVariant
+                else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f),
+            )
+        }
+        Text(
+            timing,
+            style = MaterialTheme.typography.labelSmall,
+            color = if (enabled) MaterialTheme.colorScheme.onSurfaceVariant
+            else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f),
+        )
     }
 }

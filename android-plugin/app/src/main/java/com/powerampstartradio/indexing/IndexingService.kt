@@ -39,6 +39,10 @@ import java.io.File
  */
 class IndexingService : Service() {
 
+    enum class FusionTier { QUICK_UPDATE, RECLUSTER, FULL_REFUSION }
+
+    data class FusionOptions(val tier: FusionTier, val buildKnnGraph: Boolean = false)
+
     companion object {
         private const val TAG = "IndexingService"
         private const val NOTIFICATION_ID = 2
@@ -61,18 +65,18 @@ class IndexingService : Service() {
         @Volatile
         var pendingTracks: List<NewTrackDetector.UnindexedTrack>? = null
 
-        /** When true, run full SVD re-fusion instead of incremental graph update. */
+        /** Post-indexing fusion options. Null = extract indices only (no fusion). */
         @Volatile
-        var pendingRefusion: Boolean = false
+        var pendingFusionOptions: FusionOptions? = null
 
         fun startIndexing(
             context: Context,
             selectedTracks: List<NewTrackDetector.UnindexedTrack>? = null,
-            refusion: Boolean = false,
+            fusionOptions: FusionOptions? = null,
         ) {
             if (isActive) return
             pendingTracks = selectedTracks
-            pendingRefusion = refusion
+            pendingFusionOptions = fusionOptions
             _state.value = IndexingState.Starting
             val intent = Intent(context, IndexingService::class.java).apply {
                 action = ACTION_START_INDEXING
@@ -670,26 +674,31 @@ class IndexingService : Service() {
 
                 // Rebuild indices after indexing new tracks
                 if (indexed > 0) {
-                    val refusion = pendingRefusion.also { pendingRefusion = false }
+                    val options = pendingFusionOptions.also { pendingFusionOptions = null }
                     val rebuildStart = System.currentTimeMillis()
 
-                    if (refusion) {
-                        // Full re-fusion: recompute SVD, re-project ALL tracks,
-                        // rebuild clusters and kNN graph from scratch.
-                        // For users who index entirely on-device (no desktop DB).
-                        _state.value = IndexingState.RebuildingIndices("Recomputing fusion...")
-                        updateNotification("Recomputing fusion...")
+                    if (options != null) {
+                        val tierName = when (options.tier) {
+                            FusionTier.QUICK_UPDATE -> "Quick update"
+                            FusionTier.RECLUSTER -> "Re-cluster"
+                            FusionTier.FULL_REFUSION -> "Full re-fusion"
+                        }
+                        _state.value = IndexingState.RebuildingIndices("$tierName...")
+                        updateNotification("$tierName...")
 
                         val fusionEngine = FusionEngine(db, filesDir)
-                        fusionEngine.recomputeFusion { status ->
+                        val progressCb: (String) -> Unit = { status ->
                             _state.value = IndexingState.RebuildingIndices(status)
                             updateNotification(status)
                         }
-                        Log.i(TAG, "TIMING: refusion_total = ${System.currentTimeMillis() - rebuildStart}ms")
+                        when (options.tier) {
+                            FusionTier.QUICK_UPDATE -> fusionEngine.quickUpdate(options.buildKnnGraph, progressCb)
+                            FusionTier.RECLUSTER -> fusionEngine.recluster(options.buildKnnGraph, progressCb)
+                            FusionTier.FULL_REFUSION -> fusionEngine.fullRefusion(options.buildKnnGraph, progressCb)
+                        }
+                        Log.i(TAG, "TIMING: fusion_${options.tier.name.lowercase()} = ${System.currentTimeMillis() - rebuildStart}ms")
                     } else {
-                        // Incremental: rebuild .emb file and extract/build kNN graph.
-                        // Uses the existing desktop SVD projection (adequate when
-                        // adding a small number of tracks to a large desktop corpus).
+                        // No fusion — just extract indices
                         _state.value = IndexingState.RebuildingIndices("Rebuilding search indices...")
                         updateNotification("Rebuilding indices...")
 

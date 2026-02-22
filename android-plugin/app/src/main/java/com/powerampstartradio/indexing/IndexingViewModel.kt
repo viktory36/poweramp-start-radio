@@ -75,6 +75,9 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
     private val _detectingStatus = MutableStateFlow("")
     val detectingStatus: StateFlow<String> = _detectingStatus.asStateFlow()
 
+    private val _hasSvdMatrix = MutableStateFlow(false)
+    val hasSvdMatrix: StateFlow<Boolean> = _hasSvdMatrix.asStateFlow()
+
     val indexingState: StateFlow<IndexingService.IndexingState> = IndexingService.state
 
     init {
@@ -112,6 +115,7 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
             val tracks = cachedTracks!!
             _unindexedTracks.value = tracks
             autoSelect(tracks)
+            probeSvdMatrix(dbFile)
             return
         }
 
@@ -163,6 +167,8 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
                 cachedTracks = sorted
                 cachedDbLastModified = dbFile.lastModified()
                 cachedPowerampTrackCount = powerampCount
+                // Check for existing SVD matrix
+                _hasSvdMatrix.value = checkSvdExists(db)
             } catch (e: Exception) {
                 _unindexedTracks.value = emptyList()
             } finally {
@@ -220,7 +226,7 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
             .toSet()
     }
 
-    fun startIndexing(refusion: Boolean = false) {
+    fun startIndexing(fusionOptions: IndexingService.FusionOptions? = null) {
         val selected = _selectedIds.value
         if (selected.isEmpty()) return
         val dismissed = _dismissedIds.value
@@ -242,7 +248,7 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
 
         // Cache auto-invalidates when DB modification time changes after indexing.
         // Don't invalidate eagerly — if the user cancels, the cache is still valid.
-        IndexingService.startIndexing(getApplication(), tracks, refusion = refusion)
+        IndexingService.startIndexing(getApplication(), tracks, fusionOptions = fusionOptions)
     }
 
     fun cancelIndexing() {
@@ -310,5 +316,29 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
     private fun getDbFingerprint(): String {
         val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
         return if (dbFile.exists()) "${dbFile.length()}_${dbFile.lastModified()}" else ""
+    }
+
+    /** Check if the DB has a fused_projection entry (SVD matrix from a prior fusion). */
+    private fun checkSvdExists(db: EmbeddingDatabase): Boolean {
+        return try {
+            db.getRawDatabase().rawQuery(
+                "SELECT 1 FROM metadata WHERE key = 'fused_projection' LIMIT 1", null
+            ).use { it.moveToFirst() }
+        } catch (_: Exception) { false }
+    }
+
+    /** Probe SVD existence from the file path (opens DB briefly on IO thread). */
+    private fun probeSvdMatrix(dbFile: File) {
+        viewModelScope.launch(Dispatchers.IO) {
+            var db: EmbeddingDatabase? = null
+            try {
+                db = EmbeddingDatabase.open(dbFile)
+                _hasSvdMatrix.value = checkSvdExists(db)
+            } catch (_: Exception) {
+                _hasSvdMatrix.value = false
+            } finally {
+                db?.close()
+            }
+        }
     }
 }
