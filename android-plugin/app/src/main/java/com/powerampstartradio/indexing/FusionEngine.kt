@@ -49,7 +49,7 @@ class FusionEngine(
         private const val W_COVARIANCE = 22f
         private const val W_EIGEN = 85f
         private const val W_PROJECTION = 18f
-        private const val W_KMEANS_FULL = 72f
+        private const val W_KMEANS_FULL = 135f
         private const val W_KMEANS_ASSIGN = 3f
         private const val W_KNN = 225f
         private const val W_EXTRACT = 8f
@@ -1292,9 +1292,9 @@ class FusionEngine(
         val flatCentroids = FloatArray(k * d)
 
         var labels = IntArray(n)
-        val convergeThreshold = maxOf(n / 200, 1)
-        // Estimate ~40 iterations for ETA (typical convergence at ~34 iters)
-        val estimatedIters = 40f
+        val convergeThreshold = 0
+        // Estimate ~90 iterations for ETA (full convergence)
+        val estimatedIters = 90f
 
         for (iter in 0 until maxIter) {
             for (j in 0 until k) {
