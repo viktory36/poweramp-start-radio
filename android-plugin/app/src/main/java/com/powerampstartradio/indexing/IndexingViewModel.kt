@@ -33,6 +33,7 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         private var cachedTracks: List<NewTrackDetector.UnindexedTrack>? = null
         private var cachedDbLastModified: Long = 0L
         private var cachedPowerampTrackCount: Int = -1
+        private var cachedHasSvdMatrix: Boolean? = null
 
         /**
          * A pending detection started by MainViewModel. IndexingViewModel will
@@ -48,6 +49,7 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
             cachedTracks = null
             cachedDbLastModified = 0L
             cachedPowerampTrackCount = -1
+            cachedHasSvdMatrix = null
         }
 
         /** Store results from an external detection (e.g. MainViewModel's check). */
@@ -119,6 +121,7 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
             val tracks = cachedTracks!!
             _unindexedTracks.value = tracks
             autoSelect(tracks)
+            cachedHasSvdMatrix?.let { _hasSvdMatrix.value = it }
             probeSvdMatrix(dbFile)
             return
         }
@@ -174,7 +177,9 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
                 // Sync dismissed fingerprint with current DB state
                 updateDismissedFingerprint()
                 // Check for existing SVD matrix
-                _hasSvdMatrix.value = checkSvdExists(db)
+                val hasSvd = checkSvdExists(db)
+                _hasSvdMatrix.value = hasSvd
+                cachedHasSvdMatrix = hasSvd
             } catch (e: Exception) {
                 _unindexedTracks.value = emptyList()
             } finally {
@@ -232,6 +237,19 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
             .toSet()
     }
 
+    /** Get dismissed track details from the full unindexedTracks list. */
+    fun getDismissedTracks(): List<NewTrackDetector.UnindexedTrack> {
+        return _unindexedTracks.value.filter { it.powerampFileId in _dismissedIds.value }
+    }
+
+    /** Restore specific tracks from dismissed back to visible (and auto-select them). */
+    fun restoreFromDismissed(ids: Set<Long>) {
+        val newDismissed = _dismissedIds.value - ids
+        _dismissedIds.value = newDismissed
+        saveDismissedIds(newDismissed)
+        _selectedIds.value = _selectedIds.value + ids
+    }
+
     fun startIndexing(fusionOptions: IndexingService.FusionOptions? = null) {
         val selected = _selectedIds.value
         if (selected.isEmpty()) return
@@ -240,6 +258,16 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
             it.powerampFileId in selected && it.powerampFileId !in dismissed
         }
         if (tracks.isEmpty()) return
+
+        // Auto-dismiss unselected visible tracks — user has seen the list and acknowledged it
+        val unselectedVisible = _unindexedTracks.value.filter {
+            it.powerampFileId !in selected && it.powerampFileId !in dismissed
+        }.map { it.powerampFileId }.toSet()
+        if (unselectedVisible.isNotEmpty()) {
+            val newDismissed = dismissed + unselectedVisible
+            _dismissedIds.value = newDismissed
+            saveDismissedIds(newDismissed)
+        }
 
         // Invalidate cache so the next detectUnindexed() re-scans from the DB.
         // Can't rely on dbFile.lastModified() — SQLite WAL may not flush to the main file.
@@ -337,7 +365,9 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
             var db: EmbeddingDatabase? = null
             try {
                 db = EmbeddingDatabase.open(dbFile)
-                _hasSvdMatrix.value = checkSvdExists(db)
+                val hasSvd = checkSvdExists(db)
+                _hasSvdMatrix.value = hasSvd
+                cachedHasSvdMatrix = hasSvd
             } catch (_: Exception) {
                 _hasSvdMatrix.value = false
             } finally {

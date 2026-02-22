@@ -88,8 +88,22 @@ fun IndexingScreen(
     val hasDismissed = dismissedIds.isNotEmpty()
 
     var showMenu by remember { mutableStateOf(false) }
+    var showHiddenTracks by remember { mutableStateOf(false) }
 
     var recluster by remember { mutableStateOf(false) }
+
+    // When all dismissed tracks are restored, auto-navigate back
+    LaunchedEffect(showHiddenTracks, hasDismissed) {
+        if (showHiddenTracks && !hasDismissed) showHiddenTracks = false
+    }
+
+    if (showHiddenTracks) {
+        HiddenTracksScreen(
+            viewModel = viewModel,
+            onBack = { showHiddenTracks = false },
+        )
+        return
+    }
 
     Scaffold(
         topBar = {
@@ -101,9 +115,9 @@ fun IndexingScreen(
                     }
                 },
                 actions = {
-                    // Always show overflow when there are visible tracks (idle state)
+                    // Show overflow when idle with tracks or dismissed tracks available
                     if (indexingState is IndexingService.IndexingState.Idle
-                        && visibleTracks.isNotEmpty() && !isDetecting) {
+                        && (visibleTracks.isNotEmpty() || hasDismissed) && !isDetecting) {
                         Box {
                             IconButton(onClick = { showMenu = true }) {
                                 Icon(Icons.Default.MoreVert, contentDescription = "More")
@@ -123,9 +137,9 @@ fun IndexingScreen(
                                 }
                                 if (hasDismissed) {
                                     DropdownMenuItem(
-                                        text = { Text("Show hidden tracks") },
+                                        text = { Text("View hidden tracks") },
                                         onClick = {
-                                            viewModel.clearDismissed()
+                                            showHiddenTracks = true
                                             showMenu = false
                                         }
                                     )
@@ -195,14 +209,14 @@ fun IndexingScreen(
                     RebuildingContent(state = state)
                 }
                 is IndexingService.IndexingState.Complete -> {
-                    // Auto-detect remaining unindexed tracks
-                    LaunchedEffect(Unit) {
-                        viewModel.detectUnindexed(forceRefresh = true)
-                    }
-                    DetectingContent(
-                        status = if (state.failed > 0)
-                            "${state.indexed} indexed, ${state.failed} failed \u2014 refreshing..."
-                        else "Refreshing track list...",
+                    CompleteContent(
+                        indexed = state.indexed,
+                        failed = state.failed,
+                        onDone = {
+                            IndexingService.resetState()
+                            viewModel.detectUnindexed(forceRefresh = true)
+                            onBack()
+                        },
                     )
                 }
                 is IndexingService.IndexingState.Error -> {
@@ -467,6 +481,121 @@ private fun ErrorContent(message: String, onBack: () -> Unit) {
 }
 
 @Composable
+private fun CompleteContent(indexed: Int, failed: Int, onDone: () -> Unit) {
+    Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("Indexing complete", style = MaterialTheme.typography.headlineSmall)
+            Spacer(modifier = Modifier.height(8.dp))
+            val message = if (failed > 0) {
+                "$indexed tracks indexed, $failed failed"
+            } else {
+                "$indexed tracks indexed"
+            }
+            Text(
+                message,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(modifier = Modifier.height(24.dp))
+            Button(onClick = onDone) {
+                Text("Done")
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun HiddenTracksScreen(
+    viewModel: IndexingViewModel,
+    onBack: () -> Unit,
+) {
+    val dismissedTracks = remember(viewModel.dismissedIds.collectAsState().value) {
+        viewModel.getDismissedTracks()
+    }
+    var localSelected by remember { mutableStateOf(emptySet<Long>()) }
+
+    // Clean up local selection if tracks change
+    LaunchedEffect(dismissedTracks) {
+        val validIds = dismissedTracks.map { it.powerampFileId }.toSet()
+        localSelected = localSelected.intersect(validIds)
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Hidden Tracks") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+            )
+        },
+        bottomBar = {
+            if (localSelected.isNotEmpty()) {
+                Surface(tonalElevation = 3.dp) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Spacer(modifier = Modifier.weight(1f))
+                        Button(onClick = {
+                            viewModel.restoreFromDismissed(localSelected)
+                            localSelected = emptySet()
+                        }) {
+                            Text("Restore selected (${localSelected.size})")
+                        }
+                    }
+                }
+            }
+        }
+    ) { padding ->
+        if (dismissedTracks.isEmpty()) {
+            Box(
+                modifier = Modifier.fillMaxSize().padding(padding),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    "No hidden tracks",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        } else {
+            Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+                Text(
+                    "${dismissedTracks.size} hidden tracks",
+                    style = MaterialTheme.typography.titleSmall,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                )
+                HorizontalDivider()
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(vertical = 4.dp),
+                ) {
+                    items(dismissedTracks, key = { it.powerampFileId }) { track ->
+                        TrackRow(
+                            track = track,
+                            isSelected = track.powerampFileId in localSelected,
+                            onToggle = {
+                                localSelected = if (track.powerampFileId in localSelected) {
+                                    localSelected - track.powerampFileId
+                                } else {
+                                    localSelected + track.powerampFileId
+                                }
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun BottomBar(
     selectedCount: Int,
     hasSvdMatrix: Boolean,
@@ -493,12 +622,6 @@ private fun BottomBar(
                     Text(
                         if (hasSvdMatrix) "Incremental update" else "Full fusion",
                         style = MaterialTheme.typography.bodyMedium,
-                    )
-                    Text(
-                        if (hasSvdMatrix) "Usually under a minute"
-                        else "Several minutes, depending on library size",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
                 if (hasSvdMatrix) {
@@ -542,7 +665,7 @@ private fun BottomBar(
                                     style = MaterialTheme.typography.bodyMedium,
                                 )
                                 Text(
-                                    "Rebuilds track clusters from scratch. Useful after adding many tracks over several sessions \u2014 if the Explorer (Random Walk) mode stops surfacing good connections, re-clustering helps. Adds a few minutes.",
+                                    "Rebuilds track clusters from scratch. Useful after adding many tracks over several sessions. If the Explorer (Random Walk) mode stops surfacing good connections, re-clustering helps.",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )

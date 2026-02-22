@@ -162,6 +162,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         prepareIndices()
         checkModels()
         PowerampReceiver.addTrackChangeListener(trackChangeListener)
+
+        // Re-check unindexed count when indexing completes and user dismisses the result
+        viewModelScope.launch {
+            var wasComplete = false
+            IndexingService.state.collect { state ->
+                if (state is IndexingService.IndexingState.Complete) wasComplete = true
+                if (wasComplete && state is IndexingService.IndexingState.Idle) {
+                    wasComplete = false
+                    checkUnindexedTracks()
+                }
+            }
+        }
     }
 
     override fun onCleared() {

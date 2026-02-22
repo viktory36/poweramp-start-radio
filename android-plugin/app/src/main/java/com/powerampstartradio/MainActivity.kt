@@ -1086,7 +1086,7 @@ fun SettingsScreen(
                                             Text(
                                                 when {
                                                     unindexedCount == -2 -> "Not checked"
-                                                    unindexedCount > 0 -> "$unindexedCount unindexed tracks"
+                                                    unindexedCount > 0 -> "$unindexedCount new unindexed tracks"
                                                     else -> "All tracks indexed"
                                                 },
                                                 style = if (unindexedCount > 0) MaterialTheme.typography.bodyMedium
