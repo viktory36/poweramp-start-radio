@@ -286,13 +286,15 @@ class IndexingService : Service() {
 
                 // Decode-once optimization: cache 16kHz audio during MuLan pass
                 // for Flamingo pass. Avoids redundant decode+resample (~50s/track).
-                // Use a LinkedHashMap to maintain insertion order for LRU eviction.
-                // Cap at 128MB to prevent OOM on large batches (heap limit ~368MB).
-                val cachedAudio16k = if (hasMulan && hasFlamingo)
-                    linkedMapOf<NewTrackDetector.UnindexedTrack, AudioDecoder.DecodedAudio>()
-                else null
-                var cachedAudio16kBytes = 0L
-                val maxCacheBytes = 128L * 1024 * 1024  // 128MB
+                // Disk-backed: write temp files instead of an in-memory LRU cache.
+                // No size limit — even a 30-min opus file is only 115MB at 16kHz,
+                // and disk I/O is <0.5s on UFS 4.0. Guarantees cache hits for all
+                // tracks, preventing OOM from re-decoding long files at native rate.
+                val audioCacheDir = if (hasMulan && hasFlamingo) {
+                    File(cacheDir, "audio_cache_16k").also {
+                        it.mkdirs()
+                    }
+                } else null
                 val audioDecoder = AudioDecoder()
 
                 // ── Pass 1: MuLan ──────────────────────────────────────
@@ -367,20 +369,36 @@ class IndexingService : Service() {
                             completedSteps += DECODE_WEIGHT
 
                             // Launch 16kHz resample on CPU in background while MuLan runs on GPU.
-                            // Resample output is small (~11MB for 3-min track) so no OOM risk.
-                            var resampleDeferred: Deferred<FloatArray?>? = null
-                            if (cachedAudio16k != null) {
+                            // Writes result to a temp file (disk-backed cache) so Flamingo
+                            // never needs to re-decode, even for long tracks.
+                            var resampleDeferred: Deferred<Boolean>? = null
+                            if (audioCacheDir != null) {
                                 emitProgress("resampling")
+                                val cacheFile = File(audioCacheDir, "${i}.pcm")
                                 resampleDeferred = async(Dispatchers.Default) {
                                     try {
-                                        audioDecoder.resample(audio24k.samples, 24000, 16000)
+                                        val samples16k = audioDecoder.resample(audio24k.samples, 24000, 16000)
+                                        java.io.FileOutputStream(cacheFile).channel.use { ch ->
+                                            val buf = java.nio.ByteBuffer.allocate(65536)
+                                                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                                            var pos = 0
+                                            while (pos < samples16k.size) {
+                                                buf.clear()
+                                                val count = minOf(buf.capacity() / 4, samples16k.size - pos)
+                                                buf.asFloatBuffer().put(samples16k, pos, count)
+                                                buf.limit(count * 4)
+                                                ch.write(buf)
+                                                pos += count
+                                            }
+                                        }
+                                        true
                                     } catch (e: OutOfMemoryError) {
                                         Log.w(TAG, "OOM resampling for ${track.title} — skipping cache", e)
                                         System.gc()
-                                        null
+                                        false
                                     } catch (e: Exception) {
                                         Log.w(TAG, "16kHz cache failed for ${track.title}: ${e.message}")
-                                        null
+                                        false
                                     }
                                 }
                             }
@@ -406,23 +424,9 @@ class IndexingService : Service() {
                             )
                             val mulanInferMs = (System.nanoTime() - mulanInferStart) / 1_000_000
 
-                            // Collect resample result (should be done by now — inference takes longer)
+                            // Wait for background resample + disk write to complete
                             if (resampleDeferred != null) {
-                                val samples16k = resampleDeferred.await()
-                                if (samples16k != null) {
-                                    val entryBytes = samples16k.size.toLong() * 4
-                                    // Evict oldest entries if cache would exceed budget
-                                    while (cachedAudio16kBytes + entryBytes > maxCacheBytes
-                                        && cachedAudio16k!!.isNotEmpty()) {
-                                        val oldest = cachedAudio16k.entries.first()
-                                        cachedAudio16kBytes -= oldest.value.samples.size.toLong() * 4
-                                        cachedAudio16k.remove(oldest.key)
-                                    }
-                                    cachedAudio16k!![track] = AudioDecoder.DecodedAudio(
-                                        samples16k, 16000, samples16k.size.toFloat() / 16000
-                                    )
-                                    cachedAudio16kBytes += entryBytes
-                                }
+                                resampleDeferred.await()
                                 completedSteps += RESAMPLE_WEIGHT
                             }
 
@@ -550,18 +554,40 @@ class IndexingService : Service() {
                                 continue
                             }
 
-                            // Use cached 16kHz audio from MuLan pass (decode-once optimization)
-                            var audio16k = cachedAudio16k?.remove(track)
-                            if (audio16k != null) {
-                                cachedAudio16kBytes -= audio16k.samples.size.toLong() * 4
+                            // Read cached 16kHz audio from disk (written during MuLan pass)
+                            var audio16k: AudioDecoder.DecodedAudio? = null
+                            val cacheFile = audioCacheDir?.let { File(it, "${i}.pcm") }
+                            if (cacheFile != null && cacheFile.exists()) {
+                                try {
+                                    val totalSamples = (cacheFile.length() / 4).toInt()
+                                    val samples = FloatArray(totalSamples)
+                                    java.io.FileInputStream(cacheFile).channel.use { ch ->
+                                        val buf = java.nio.ByteBuffer.allocate(65536)
+                                            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                                        var pos = 0
+                                        while (ch.read(buf) > 0) {
+                                            buf.flip()
+                                            val count = buf.remaining() / 4
+                                            buf.asFloatBuffer().get(samples, pos, count)
+                                            pos += count
+                                            buf.clear()
+                                        }
+                                    }
+                                    audio16k = AudioDecoder.DecodedAudio(
+                                        samples, 16000, totalSamples.toFloat() / 16000
+                                    )
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "Failed to read cached audio for ${track.title}: ${e.message}")
+                                }
                             }
 
-                            // Cache miss or no MuLan pass — decode externally for step tracking
+                            // Cache miss or no MuLan pass — decode from source file
                             if (audio16k == null) {
-                                // Cache miss with both models: decode wasn't budgeted in totalSteps
                                 if (hasMulan) totalSteps += DECODE_WEIGHT
                                 emitProgress("decoding")
-                                val maxDurFlamingo = minOf((track.durationMs / 1000).toInt() + 10, 1800)
+                                // Cap at 900s (same as MuLan) to prevent OOM on long files.
+                                // At 48kHz native, 1800s pre-alloc = 345MB > heap limit.
+                                val maxDurFlamingo = minOf((track.durationMs / 1000).toInt() + 10, 900)
                                 audio16k = audioDecoder.decode(audioFile, 16000, maxDurationS = maxDurFlamingo)
                                 if (audio16k == null) {
                                     Log.w(TAG, "Decode failed for: ${track.title}")
@@ -618,9 +644,8 @@ class IndexingService : Service() {
                         val spillMB = totalChunks.toLong() * chunkBytes / (1024 * 1024)
                         Log.i(TAG, "Flamingo encoder done: $totalChunks chunks spilled to disk (${spillMB}MB)")
 
-                        // Free audio cache — no longer needed
-                        cachedAudio16k?.clear()
-                        cachedAudio16kBytes = 0L
+                        // Clean up disk-backed audio cache — no longer needed
+                        audioCacheDir?.deleteRecursively()
 
                         // ── Phase transition: encoder → projector ──
                         flamingoInference.closeEncoder()
