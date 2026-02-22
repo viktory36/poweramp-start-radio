@@ -303,7 +303,7 @@ class IndexingService : Service() {
                 if (hasMulan) {
                     _state.value = IndexingState.Processing(
                         current = 0, total = unindexed.size,
-                        trackName = "", passName = "MuLan pass",
+                        trackName = "", passName = "MuQ-MuLan pass",
                         detail = "Loading MuQ-MuLan model (GPU)...",
                         progressFraction = 0f,
                         estimatedRemainingMs = 0,
@@ -330,12 +330,12 @@ class IndexingService : Service() {
                             val trackProgress = "${i + 1}/${unindexed.size}"
                             var clipsDone = 0
                             fun emitProgress(detail: String, etaMs: Long = eta()) {
-                                val msg = "MuLan $trackProgress ${track.title} \u2013 $detail${formatEta(etaMs)}"
+                                val msg = "MuQ-MuLan $trackProgress ${track.title} \u2013 $detail${formatEta(etaMs)}"
                                 _state.value = IndexingState.Processing(
                                     current = i + 1,
                                     total = unindexed.size,
                                     trackName = "${track.artist} - ${track.title}",
-                                    passName = "MuLan pass",
+                                    passName = "MuQ-MuLan pass",
                                     detail = detail,
                                     progressFraction = fraction(),
                                     estimatedRemainingMs = etaMs,

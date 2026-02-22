@@ -585,7 +585,7 @@ private fun BottomBar(
                     )
                     FusionTierOption(
                         label = "Full re-fusion",
-                        description = "Recomputes the SVD projection from all MuLan + Flamingo embeddings, reprojects every track, and rebuilds clusters. The most accurate option when many new tracks have been added.",
+                        description = "Recomputes the SVD projection from all MuQ-MuLan + Flamingo embeddings, reprojects every track, and rebuilds clusters. The most accurate option when many new tracks have been added.",
                         timing = "~4 min",
                         selected = fusionTier == IndexingService.FusionTier.FULL_REFUSION,
                         enabled = true,

@@ -344,22 +344,22 @@ class BenchmarkActivity : ComponentActivity() {
 
         // ── MuLan Pass ──
         if (mulanFile.exists()) {
-            log("Loading MuLan model (requesting $accelerator)...")
+            log("Loading MuQ-MuLan model (requesting $accelerator)...")
             val loadStart = System.nanoTime()
             var mulanInference: MuLanInference? = null
             try {
                 mulanInference = MuLanInference(mulanFile, accelerator)
                 val loadMs = (System.nanoTime() - loadStart) / 1_000_000
-                log("  MuLan loaded in ${loadMs}ms (${mulanInference.activeAccelerator})")
+                log("  MuQ-MuLan loaded in ${loadMs}ms (${mulanInference.activeAccelerator})")
             } catch (e: Exception) {
-                log("  MuLan load FAILED: ${e.message}")
+                log("  MuQ-MuLan load FAILED: ${e.message}")
             }
 
             if (mulanInference != null) {
                 mulanEp = "LiteRT ${mulanInference.activeAccelerator}"
                 log("")
                 for ((i, track) in testTracks.withIndex()) {
-                    log("MuLan [${i + 1}/${testTracks.size}] ${track.artist} - ${track.title}")
+                    log("MuQ-MuLan [${i + 1}/${testTracks.size}] ${track.artist} - ${track.title}")
 
                     val audioFile = resolveFile(track.path)!!
 
@@ -409,10 +409,10 @@ class BenchmarkActivity : ComponentActivity() {
                     }
                 }
                 mulanInference.close()
-                log("\nMuLan session closed.")
+                log("\nMuQ-MuLan session closed.")
             }
         } else {
-            log("MuLan model not found at ${mulanFile.absolutePath}")
+            log("MuQ-MuLan model not found at ${mulanFile.absolutePath}")
         }
 
         // ── Flamingo Pass (two-phase GPU) ──
@@ -525,13 +525,13 @@ class BenchmarkActivity : ComponentActivity() {
         log("\n=== Results saved ===")
         log("File: ${outputFile.absolutePath}")
         log("Pull via: adb pull ${outputFile.absolutePath}")
-        log("\nMuLan EP: ${mulanEp ?: "not loaded"}")
+        log("\nMuQ-MuLan EP: ${mulanEp ?: "not loaded"}")
         log("Flamingo EP: ${flamingoEp ?: "not loaded"}")
 
         log("\n=== Summary ===")
         for (r in results) {
             log("${r.artist} - ${r.title}")
-            r.mulan?.let { log("  MuLan: ${it.dim}d, ${it.timingMs}ms, EP=${it.ep}") }
+            r.mulan?.let { log("  MuQ-MuLan: ${it.dim}d, ${it.timingMs}ms, EP=${it.ep}") }
             r.flamingo?.let { log("  Flamingo: ${it.dim}d, ${it.timingMs}ms, EP=${it.ep}") }
         }
         log("\nBenchmark complete.")
