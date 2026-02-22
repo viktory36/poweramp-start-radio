@@ -13,13 +13,11 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.foundation.selection.selectable
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.ui.semantics.Role
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -91,14 +89,7 @@ fun IndexingScreen(
 
     var showMenu by remember { mutableStateOf(false) }
 
-    // Fusion tier state: default to Quick update if SVD exists, Full re-fusion otherwise
-    var fusionTier by remember(hasSvdMatrix) {
-        mutableStateOf(
-            if (hasSvdMatrix) IndexingService.FusionTier.QUICK_UPDATE
-            else IndexingService.FusionTier.FULL_REFUSION
-        )
-    }
-    var buildKnnGraph by remember { mutableStateOf(false) }
+    var recluster by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -151,14 +142,17 @@ fun IndexingScreen(
                 && visibleTracks.isNotEmpty() && !isDetecting) {
                 BottomBar(
                     selectedCount = selectedCount,
-                    fusionTier = fusionTier,
-                    onFusionTierChanged = { fusionTier = it },
-                    buildKnnGraph = buildKnnGraph,
-                    onBuildKnnGraphChanged = { buildKnnGraph = it },
                     hasSvdMatrix = hasSvdMatrix,
+                    recluster = recluster,
+                    onReclusterChanged = { recluster = it },
                     onStartIndexing = {
+                        val tier = when {
+                            !hasSvdMatrix -> IndexingService.FusionTier.FULL_REFUSION
+                            recluster -> IndexingService.FusionTier.RECLUSTER
+                            else -> IndexingService.FusionTier.QUICK_UPDATE
+                        }
                         viewModel.startIndexing(
-                            fusionOptions = IndexingService.FusionOptions(fusionTier, buildKnnGraph)
+                            fusionOptions = IndexingService.FusionOptions(tier, buildKnnGraph = true)
                         )
                     },
                 )
@@ -502,26 +496,12 @@ private fun ErrorContent(message: String, onBack: () -> Unit) {
     }
 }
 
-private fun tierLabel(tier: IndexingService.FusionTier) = when (tier) {
-    IndexingService.FusionTier.QUICK_UPDATE -> "Incremental update"
-    IndexingService.FusionTier.RECLUSTER -> "Re-cluster"
-    IndexingService.FusionTier.FULL_REFUSION -> "Full re-fusion"
-}
-
-private fun tierTiming(tier: IndexingService.FusionTier, knn: Boolean) = when (tier) {
-    IndexingService.FusionTier.QUICK_UPDATE -> if (knn) "~15s" else "~10s"
-    IndexingService.FusionTier.RECLUSTER -> if (knn) "~6 min" else "~2 min"
-    IndexingService.FusionTier.FULL_REFUSION -> if (knn) "~8 min" else "~4 min"
-}
-
 @Composable
 private fun BottomBar(
     selectedCount: Int,
-    fusionTier: IndexingService.FusionTier,
-    onFusionTierChanged: (IndexingService.FusionTier) -> Unit,
-    buildKnnGraph: Boolean,
-    onBuildKnnGraphChanged: (Boolean) -> Unit,
     hasSvdMatrix: Boolean,
+    recluster: Boolean,
+    onReclusterChanged: (Boolean) -> Unit,
     onStartIndexing: () -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
@@ -532,28 +512,33 @@ private fun BottomBar(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { expanded = !expanded }
+                    .then(
+                        if (hasSvdMatrix) Modifier.clickable { expanded = !expanded }
+                        else Modifier
+                    )
                     .padding(horizontal = 16.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        tierLabel(fusionTier),
+                        if (hasSvdMatrix) "Incremental update" else "Full fusion",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Text(
-                        tierTiming(fusionTier, buildKnnGraph) +
-                            if (buildKnnGraph) " (incl. kNN graph)" else "",
+                        if (hasSvdMatrix) "~15s" else "~8 min",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                Icon(
-                    if (expanded) Icons.Default.KeyboardArrowDown else Icons.Default.KeyboardArrowUp,
-                    contentDescription = if (expanded) "Collapse" else "Expand",
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(modifier = Modifier.width(8.dp))
+                if (hasSvdMatrix) {
+                    Icon(
+                        if (expanded) Icons.Default.KeyboardArrowDown
+                        else Icons.Default.KeyboardArrowUp,
+                        contentDescription = if (expanded) "Collapse" else "Expand",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                }
                 Button(
                     onClick = onStartIndexing,
                     enabled = selectedCount > 0,
@@ -562,116 +547,39 @@ private fun BottomBar(
                 }
             }
 
-            // Expanded options
-            AnimatedVisibility(visible = expanded) {
-                Column {
-                    HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
+            // Expanded options — only when SVD exists
+            if (hasSvdMatrix) {
+                AnimatedVisibility(visible = expanded) {
+                    Column {
+                        HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
 
-                    FusionTierOption(
-                        label = "Incremental update",
-                        description = "Projects only new tracks into the fused space, assigns to nearest cluster, and updates the kNN graph. Existing embeddings and clusters are untouched.",
-                        timing = "~10s",
-                        selected = fusionTier == IndexingService.FusionTier.QUICK_UPDATE,
-                        enabled = hasSvdMatrix,
-                        onClick = { onFusionTierChanged(IndexingService.FusionTier.QUICK_UPDATE) },
-                    )
-                    FusionTierOption(
-                        label = "Re-cluster",
-                        description = "Keeps the existing SVD projection but reruns k-means from scratch over all tracks. Clusters will reflect the new tracks, but the underlying embedding space stays the same.",
-                        timing = "~2 min",
-                        selected = fusionTier == IndexingService.FusionTier.RECLUSTER,
-                        enabled = hasSvdMatrix,
-                        onClick = { onFusionTierChanged(IndexingService.FusionTier.RECLUSTER) },
-                    )
-                    FusionTierOption(
-                        label = "Full re-fusion",
-                        description = "Recomputes the SVD projection from all MuQ-MuLan + Flamingo embeddings, reprojects every track, and rebuilds clusters. The most accurate option when many new tracks have been added.",
-                        timing = "~4 min",
-                        selected = fusionTier == IndexingService.FusionTier.FULL_REFUSION,
-                        enabled = true,
-                        onClick = { onFusionTierChanged(IndexingService.FusionTier.FULL_REFUSION) },
-                    )
-
-                    HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp))
-
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onBuildKnnGraphChanged(!buildKnnGraph) }
-                            .padding(horizontal = 16.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Checkbox(
-                            checked = buildKnnGraph,
-                            onCheckedChange = onBuildKnnGraphChanged,
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                "Build kNN graph",
-                                style = MaterialTheme.typography.bodyMedium,
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onReclusterChanged(!recluster) }
+                                .padding(horizontal = 16.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Checkbox(
+                                checked = recluster,
+                                onCheckedChange = onReclusterChanged,
                             )
-                            Text(
-                                "Precomputes a neighbor graph over all tracks. Only needed for PageRank mode. Incremental update adds ~5s; full rebuild adds ~4 min.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    "Re-cluster all tracks",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                )
+                                Text(
+                                    "Rebuilds track clusters from scratch. Useful after adding many tracks over several sessions \u2014 if the Explorer (Random Walk) mode stops surfacing good connections, re-clustering helps. Adds ~2 min.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                         }
-                        Text(
-                            "+5s/4m",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
                     }
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun FusionTierOption(
-    label: String,
-    description: String,
-    timing: String,
-    selected: Boolean,
-    enabled: Boolean,
-    onClick: () -> Unit,
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .selectable(selected = selected, enabled = enabled, role = Role.RadioButton, onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.Top,
-    ) {
-        RadioButton(
-            selected = selected,
-            onClick = null,
-            enabled = enabled,
-            modifier = Modifier.padding(top = 2.dp),
-        )
-        Spacer(modifier = Modifier.width(8.dp))
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                label,
-                style = MaterialTheme.typography.bodyMedium,
-                color = if (enabled) MaterialTheme.colorScheme.onSurface
-                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
-            )
-            Text(
-                description,
-                style = MaterialTheme.typography.bodySmall,
-                color = if (enabled) MaterialTheme.colorScheme.onSurfaceVariant
-                else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f),
-            )
-        }
-        Text(
-            timing,
-            style = MaterialTheme.typography.labelSmall,
-            color = if (enabled) MaterialTheme.colorScheme.onSurfaceVariant
-            else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f),
-            modifier = Modifier.padding(top = 4.dp),
-        )
     }
 }
