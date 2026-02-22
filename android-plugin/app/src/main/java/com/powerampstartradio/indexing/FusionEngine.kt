@@ -631,17 +631,14 @@ class FusionEngine(
         val clusterMembers = Array(numClusters) { mutableListOf<Int>() }
         for (i in 0 until n) clusterMembers[labels[i]].add(i)
 
-        // Convert cluster members to IntArrays and build flat candidate arrays per cluster
-        // for native batch dot product calls
         val clusterMemberArrays = Array(numClusters) { c -> clusterMembers[c].toIntArray() }
-        val clusterFlatEmbeddings = Array(numClusters) { c ->
-            val members = clusterMemberArrays[c]
-            val flat = FloatArray(members.size * d)
-            for ((idx, memberIdx) in members.withIndex()) {
-                System.arraycopy(flatEmbeddings, memberIdx * d, flat, idx * d, d)
-            }
-            flat
-        }
+
+        // Single reusable buffer for per-cluster embeddings, sized to the largest cluster.
+        // Avoids the ~150MB peak from pre-building all cluster flat arrays simultaneously.
+        val maxClusterSize = clusterMemberArrays.maxOf { it.size }
+        var clusterBuf = FloatArray(maxClusterSize * d)
+        Log.i(TAG, "kNN: max cluster size = $maxClusterSize, " +
+            "buffer = ${clusterBuf.size * 4 / 1024}KB")
 
         // Flatten centroids for batch dot
         val flatCentroids = FloatArray(numClusters * d)
@@ -672,9 +669,12 @@ class FusionEngine(
 
             for (c in topClusters) {
                 val members = clusterMemberArrays[c]
-                val clusterFlat = clusterFlatEmbeddings[c]
+                // Gather this cluster's embeddings into the reusable buffer
+                for ((idx, memberIdx) in members.withIndex()) {
+                    System.arraycopy(flatEmbeddings, memberIdx * d, clusterBuf, idx * d, d)
+                }
                 // Native batch dot: query vs all members of this cluster
-                val sims = NativeMath.batchDot(queryBuf, clusterFlat, members.size, d)
+                val sims = NativeMath.batchDot(queryBuf, clusterBuf, members.size, d)
 
                 if (sims != null) {
                     for (idx in members.indices) {
@@ -713,13 +713,9 @@ class FusionEngine(
             }
         }
 
-        // Free per-cluster flat embedding copies (~153MB for 75K tracks) before
-        // allocating the graph binary ByteBuffer. Without this, OOM is inevitable
-        // since both flatEmbeddings (153MB) and clusterFlatEmbeddings (153MB) are alive.
-        for (i in clusterFlatEmbeddings.indices) {
-            clusterFlatEmbeddings[i] = FloatArray(0)
-        }
-        System.gc()
+        // Free cluster buffer before allocating graph ByteBuffer
+        @Suppress("UNUSED_VALUE")
+        clusterBuf = FloatArray(0)
 
         // Build binary blob
         onProgress?.invoke("Writing graph binary...")
