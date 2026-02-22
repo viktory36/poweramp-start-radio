@@ -94,18 +94,22 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         val dbFile = File(app.filesDir, "embeddings.db")
         val powerampCount = getPowerampTrackCount(app)
 
-        // Check if DB was replaced since we last saved dismissed IDs
-        val currentFingerprint = if (dbFile.exists())
-            "${dbFile.length()}_${dbFile.lastModified()}" else ""
-        val savedFingerprint = prefs.getString("dismissed_db_fingerprint", "") ?: ""
-        if (currentFingerprint != savedFingerprint) {
-            // DB changed — clear stale dismissed IDs
-            _dismissedIds.value = emptySet()
-            prefs.edit()
-                .remove("dismissed_track_ids")
-                .putString("dismissed_db_fingerprint", currentFingerprint)
-                .apply()
-            invalidateCache()
+        // Check if DB was replaced externally since we last saved dismissed IDs.
+        // Only check when cache is populated — if cache was invalidated (e.g. by our
+        // own startIndexing()), the DB change was from us, not an external replacement.
+        if (cachedTracks != null) {
+            val currentFingerprint = if (dbFile.exists())
+                "${dbFile.length()}_${dbFile.lastModified()}" else ""
+            val savedFingerprint = prefs.getString("dismissed_db_fingerprint", "") ?: ""
+            if (currentFingerprint != savedFingerprint) {
+                // DB replaced externally — clear stale dismissed IDs
+                _dismissedIds.value = emptySet()
+                prefs.edit()
+                    .remove("dismissed_track_ids")
+                    .putString("dismissed_db_fingerprint", currentFingerprint)
+                    .apply()
+                invalidateCache()
+            }
         }
 
         // Use cached result if neither the DB nor the Poweramp library has changed
@@ -167,6 +171,8 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
                 cachedTracks = sorted
                 cachedDbLastModified = dbFile.lastModified()
                 cachedPowerampTrackCount = powerampCount
+                // Sync dismissed fingerprint with current DB state
+                updateDismissedFingerprint()
                 // Check for existing SVD matrix
                 _hasSvdMatrix.value = checkSvdExists(db)
             } catch (e: Exception) {
@@ -306,6 +312,14 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
     private fun getDbFingerprint(): String {
         val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
         return if (dbFile.exists()) "${dbFile.length()}_${dbFile.lastModified()}" else ""
+    }
+
+    /** Update saved fingerprint so dismissed IDs survive DB changes from our own indexing. */
+    private fun updateDismissedFingerprint() {
+        val fp = getDbFingerprint()
+        if (fp.isNotEmpty()) {
+            prefs.edit().putString("dismissed_db_fingerprint", fp).apply()
+        }
     }
 
     /** Check if the DB has a fused_projection entry (SVD matrix from a prior fusion). */

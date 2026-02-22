@@ -195,11 +195,14 @@ fun IndexingScreen(
                     RebuildingContent(state = state)
                 }
                 is IndexingService.IndexingState.Complete -> {
-                    CompleteContent(
-                        indexed = state.indexed,
-                        failed = state.failed,
-                        onBack = onBack,
-                        onDetectMore = { viewModel.detectUnindexed(forceRefresh = true) },
+                    // Auto-detect remaining unindexed tracks
+                    LaunchedEffect(Unit) {
+                        viewModel.detectUnindexed(forceRefresh = true)
+                    }
+                    DetectingContent(
+                        status = if (state.failed > 0)
+                            "${state.indexed} indexed, ${state.failed} failed \u2014 refreshing..."
+                        else "Refreshing track list...",
                     )
                 }
                 is IndexingService.IndexingState.Error -> {
@@ -436,39 +439,6 @@ private fun RebuildingContent(state: IndexingService.IndexingState.RebuildingInd
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-        }
-    }
-}
-
-@Composable
-private fun CompleteContent(
-    indexed: Int,
-    failed: Int,
-    onBack: () -> Unit,
-    onDetectMore: () -> Unit,
-) {
-    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(
-                "$indexed tracks indexed",
-                style = MaterialTheme.typography.headlineSmall,
-            )
-            if (failed > 0) {
-                Text(
-                    "$failed failed",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
-            Spacer(modifier = Modifier.height(24.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedButton(onClick = onBack) {
-                    Text("Back")
-                }
-                Button(onClick = onDetectMore) {
-                    Text("Check Again")
-                }
-            }
         }
     }
 }
