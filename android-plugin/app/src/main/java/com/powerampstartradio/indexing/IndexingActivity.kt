@@ -12,9 +12,14 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.ui.semantics.Role
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -213,11 +218,11 @@ fun IndexingScreen(
 
 /** Format ETA as "Xm Ys remaining" / "Xs remaining" for better granularity. */
 private fun formatEtaText(ms: Long): String {
-    val totalSeconds = (ms / 1000).toInt()
+    val minutes = (ms / 60_000).toInt()
     return when {
-        totalSeconds >= 120 -> "${totalSeconds / 60}m ${totalSeconds % 60}s remaining"
-        totalSeconds >= 10 -> "${totalSeconds}s remaining"
-        totalSeconds > 0 -> "A few seconds remaining"
+        minutes >= 2 -> "About $minutes min remaining"
+        minutes == 1 -> "About a minute remaining"
+        ms > 10_000 -> "Less than a minute remaining"
         else -> ""
     }
 }
@@ -497,6 +502,18 @@ private fun ErrorContent(message: String, onBack: () -> Unit) {
     }
 }
 
+private fun tierLabel(tier: IndexingService.FusionTier) = when (tier) {
+    IndexingService.FusionTier.QUICK_UPDATE -> "Incremental update"
+    IndexingService.FusionTier.RECLUSTER -> "Re-cluster"
+    IndexingService.FusionTier.FULL_REFUSION -> "Full re-fusion"
+}
+
+private fun tierTiming(tier: IndexingService.FusionTier, knn: Boolean) = when (tier) {
+    IndexingService.FusionTier.QUICK_UPDATE -> if (knn) "~5 min" else "~30s"
+    IndexingService.FusionTier.RECLUSTER -> if (knn) "~6 min" else "~2 min"
+    IndexingService.FusionTier.FULL_REFUSION -> if (knn) "~8 min" else "~4 min"
+}
+
 @Composable
 private fun BottomBar(
     selectedCount: Int,
@@ -507,85 +524,105 @@ private fun BottomBar(
     hasSvdMatrix: Boolean,
     onStartIndexing: () -> Unit,
 ) {
+    var expanded by remember { mutableStateOf(false) }
+
     Surface(tonalElevation = 3.dp) {
-        Column(modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
-            Text(
-                "Post-indexing update",
-                style = MaterialTheme.typography.labelMedium,
-                modifier = Modifier.padding(horizontal = 16.dp),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-
-            FusionTierOption(
-                label = "Quick update",
-                description = "Project new tracks, assign to clusters",
-                timing = "~30s",
-                selected = fusionTier == IndexingService.FusionTier.QUICK_UPDATE,
-                enabled = hasSvdMatrix,
-                onClick = { onFusionTierChanged(IndexingService.FusionTier.QUICK_UPDATE) },
-            )
-            FusionTierOption(
-                label = "Re-cluster",
-                description = "Recompute all clusters",
-                timing = "~2 min",
-                selected = fusionTier == IndexingService.FusionTier.RECLUSTER,
-                enabled = hasSvdMatrix,
-                onClick = { onFusionTierChanged(IndexingService.FusionTier.RECLUSTER) },
-            )
-            FusionTierOption(
-                label = "Full re-fusion",
-                description = "New SVD + clusters from scratch",
-                timing = "~4 min",
-                selected = fusionTier == IndexingService.FusionTier.FULL_REFUSION,
-                enabled = true,
-                onClick = { onFusionTierChanged(IndexingService.FusionTier.FULL_REFUSION) },
-            )
-
-            HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
-
+        Column(modifier = Modifier.fillMaxWidth()) {
+            // Collapsed header — always visible
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { onBuildKnnGraphChanged(!buildKnnGraph) }
-                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                    .clickable { expanded = !expanded }
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Checkbox(
-                    checked = buildKnnGraph,
-                    onCheckedChange = onBuildKnnGraphChanged,
-                )
-                Spacer(modifier = Modifier.width(4.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        "Build kNN graph",
+                        tierLabel(fusionTier),
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Text(
-                        "Required only for Random Walk mode",
+                        tierTiming(fusionTier, buildKnnGraph) +
+                            if (buildKnnGraph) " (incl. kNN graph)" else "",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                Text(
-                    "+4 min",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                Icon(
+                    if (expanded) Icons.Default.KeyboardArrowDown else Icons.Default.KeyboardArrowUp,
+                    contentDescription = if (expanded) "Collapse" else "Expand",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-            }
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                horizontalArrangement = Arrangement.End,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
+                Spacer(modifier = Modifier.width(8.dp))
                 Button(
                     onClick = onStartIndexing,
                     enabled = selectedCount > 0,
                 ) {
-                    Text("Start Indexing ($selectedCount)")
+                    Text("Start ($selectedCount)")
+                }
+            }
+
+            // Expanded options
+            AnimatedVisibility(visible = expanded) {
+                Column {
+                    HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
+
+                    FusionTierOption(
+                        label = "Incremental update",
+                        description = "Uses the existing SVD projection to place new tracks into the fused embedding space, then assigns them to the nearest existing cluster. Fast, but won't improve cluster quality.",
+                        timing = "~30s",
+                        selected = fusionTier == IndexingService.FusionTier.QUICK_UPDATE,
+                        enabled = hasSvdMatrix,
+                        onClick = { onFusionTierChanged(IndexingService.FusionTier.QUICK_UPDATE) },
+                    )
+                    FusionTierOption(
+                        label = "Re-cluster",
+                        description = "Keeps the existing SVD projection but reruns k-means from scratch over all tracks. Clusters will reflect the new tracks, but the underlying embedding space stays the same.",
+                        timing = "~2 min",
+                        selected = fusionTier == IndexingService.FusionTier.RECLUSTER,
+                        enabled = hasSvdMatrix,
+                        onClick = { onFusionTierChanged(IndexingService.FusionTier.RECLUSTER) },
+                    )
+                    FusionTierOption(
+                        label = "Full re-fusion",
+                        description = "Recomputes the SVD projection from all MuLan + Flamingo embeddings, reprojects every track, and rebuilds clusters. The most accurate option when many new tracks have been added.",
+                        timing = "~4 min",
+                        selected = fusionTier == IndexingService.FusionTier.FULL_REFUSION,
+                        enabled = true,
+                        onClick = { onFusionTierChanged(IndexingService.FusionTier.FULL_REFUSION) },
+                    )
+
+                    HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp))
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onBuildKnnGraphChanged(!buildKnnGraph) }
+                            .padding(horizontal = 16.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Checkbox(
+                            checked = buildKnnGraph,
+                            onCheckedChange = onBuildKnnGraphChanged,
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Build kNN graph",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            Text(
+                                "Precomputes a neighbor graph over all tracks. Only needed for PageRank mode.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Text(
+                            "+4 min",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             }
         }
@@ -604,16 +641,17 @@ private fun FusionTierOption(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
+            .selectable(selected = selected, enabled = enabled, role = Role.RadioButton, onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.Top,
     ) {
         RadioButton(
             selected = selected,
-            onClick = onClick,
+            onClick = null,
             enabled = enabled,
+            modifier = Modifier.padding(top = 2.dp),
         )
-        Spacer(modifier = Modifier.width(4.dp))
+        Spacer(modifier = Modifier.width(8.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 label,
@@ -633,6 +671,7 @@ private fun FusionTierOption(
             style = MaterialTheme.typography.labelSmall,
             color = if (enabled) MaterialTheme.colorScheme.onSurfaceVariant
             else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f),
+            modifier = Modifier.padding(top = 4.dp),
         )
     }
 }
