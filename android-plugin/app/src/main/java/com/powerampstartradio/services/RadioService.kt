@@ -375,7 +375,7 @@ class RadioService : Service() {
                                     }
                                     val c = PowerampHelper.replaceQueue(this@RadioService, seedDisplayTrack.realId, firstBatch)
                                     if (overrideSeedTrackId != null) {
-                                        PowerampHelper.playQueue(this@RadioService)
+                                        PowerampHelper.playFirstInQueue(this@RadioService)
                                     }
                                     c
                                 } else {
@@ -570,7 +570,7 @@ class RadioService : Service() {
 
                     // Text search: tell Poweramp to play from the start of the new queue
                     if (overrideSeedTrackId != null) {
-                        PowerampHelper.playQueue(this@RadioService)
+                        PowerampHelper.playFirstInQueue(this@RadioService)
                     }
 
                     val notFound = trackResults.count { it.status == QueueStatus.NOT_IN_LIBRARY }

@@ -429,15 +429,37 @@ object PowerampHelper {
     }
 
     /**
-     * Tell Poweramp to open and play the queue from the beginning.
-     * Used after text search populates a fresh queue.
+     * Tell Poweramp to play the first entry in the queue.
+     * Queries for the queue entry with the lowest sort value and sends
+     * an OPEN_TO_PLAY intent for that specific entry, forcing Poweramp
+     * to reset its playback position to the start of the queue.
      */
-    fun playQueue(context: Context) {
+    fun playFirstInQueue(context: Context) {
         val queueUri = ROOT_URI.buildUpon().appendEncodedPath("queue").build()
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setData(queueUri)
+        try {
+            val cursor = context.contentResolver.query(
+                queueUri,
+                arrayOf("queue._id"),
+                null,
+                null,
+                "queue.sort LIMIT 1"
+            )
+            val firstEntryId = cursor?.use {
+                if (it.moveToFirst()) it.getLong(0) else null
+            }
+            if (firstEntryId != null) {
+                val entryUri = ROOT_URI.buildUpon()
+                    .appendEncodedPath("queue")
+                    .appendEncodedPath(firstEntryId.toString())
+                    .build()
+                Log.d(TAG, "Playing first queue entry: id=$firstEntryId, uri=$entryUri")
+                sendIntent(context, Intent(Intent.ACTION_VIEW).apply { setData(entryUri) })
+            } else {
+                Log.w(TAG, "Queue is empty, cannot play")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to play first queue entry", e)
         }
-        sendIntent(context, intent)
     }
 
     /**
