@@ -23,7 +23,6 @@ object PowerampHelper {
     // Poweramp package and component names
     const val POWERAMP_PACKAGE = "com.maxmpz.audioplayer"
     private const val API_ACTIVITY = "com.maxmpz.audioplayer.apiactivity.ApiActivity"
-    private const val API_RECEIVER = "com.maxmpz.audioplayer.apiactivity.ApiReceiver"
 
     // Poweramp content provider authority
     private const val AUTHORITY = "com.maxmpz.audioplayer.data"
@@ -370,6 +369,13 @@ object PowerampHelper {
     }
 
     /**
+     * Check if a file is currently in the Poweramp queue.
+     */
+    fun isInQueue(context: Context, fileId: Long): Boolean {
+        return findQueueEntryByFileId(context, fileId) != null
+    }
+
+    /**
      * Replace queue contents, preserving the currently playing entry if it's in the queue.
      *
      * If [currentFileId] is found in the queue, all other entries are deleted and new tracks
@@ -379,35 +385,6 @@ object PowerampHelper {
      * If [currentFileId] is not in the queue (or is null), the queue is cleared entirely
      * before adding new tracks.
      */
-    /**
-     * Check if a file is currently in the Poweramp queue.
-     */
-    fun isInQueue(context: Context, fileId: Long): Boolean {
-        return findQueueEntryByFileId(context, fileId) != null
-    }
-
-    /**
-     * Ensure a file is present in the queue. If not, insert it.
-     * Used for text search: the seed track must be in the queue before
-     * replaceQueue so it takes the "preserve current" path.
-     */
-    fun ensureInQueue(context: Context, fileId: Long) {
-        val existing = findQueueEntryByFileId(context, fileId)
-        if (existing != null) return  // already in queue
-
-        val queueUri = ROOT_URI.buildUpon().appendEncodedPath("queue").build()
-        val values = ContentValues().apply {
-            put(QUEUE_FOLDER_FILE_ID, fileId)
-            put(QUEUE_SORT, 0)  // sort=0 puts it before everything else
-        }
-        try {
-            context.contentResolver.insert(queueUri, values)
-            Log.d(TAG, "Inserted seed track $fileId into queue")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to insert seed into queue", e)
-        }
-    }
-
     fun replaceQueue(context: Context, currentFileId: Long?, newFileIds: List<Long>): Int {
         val queueUri = ROOT_URI.buildUpon().appendEncodedPath("queue").build()
 
@@ -454,50 +431,6 @@ object PowerampHelper {
         } catch (e: Exception) {
             Log.e(TAG, "Error finding queue entry for file $fileId", e)
             null
-        }
-    }
-
-    // Poweramp API command constants
-    private const val ACTION_API_COMMAND = "com.maxmpz.audioplayer.API_COMMAND"
-    private const val EXTRA_COMMAND = "cmd"
-    private const val CMD_OPEN_TO_PLAY = 20
-
-    /**
-     * Tell Poweramp to play the first entry in the queue.
-     * Sends OPEN_TO_PLAY API command for the first queue entry,
-     * forcing Poweramp to jump to and start playing from position 0.
-     */
-    fun playFirstInQueue(context: Context) {
-        val queueUri = ROOT_URI.buildUpon().appendEncodedPath("queue").build()
-        try {
-            val cursor = context.contentResolver.query(
-                queueUri,
-                arrayOf("queue._id"),
-                null,
-                null,
-                "queue.sort LIMIT 1"
-            )
-            val firstEntryId = cursor?.use {
-                if (it.moveToFirst()) it.getLong(0) else null
-            }
-            if (firstEntryId != null) {
-                val entryUri = ROOT_URI.buildUpon()
-                    .appendEncodedPath("queue")
-                    .appendEncodedPath(firstEntryId.toString())
-                    .build()
-                Log.d(TAG, "OPEN_TO_PLAY first queue entry: id=$firstEntryId, uri=$entryUri")
-                // Send via broadcast to Poweramp's API receiver
-                val intent = Intent(ACTION_API_COMMAND).apply {
-                    setComponent(ComponentName(POWERAMP_PACKAGE, API_RECEIVER))
-                    putExtra(EXTRA_COMMAND, CMD_OPEN_TO_PLAY)
-                    setData(entryUri)
-                }
-                context.sendBroadcast(intent)
-            } else {
-                Log.w(TAG, "Queue is empty, cannot play")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to play first queue entry", e)
         }
     }
 
