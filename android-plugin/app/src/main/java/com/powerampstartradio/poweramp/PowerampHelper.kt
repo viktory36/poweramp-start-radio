@@ -429,6 +429,18 @@ object PowerampHelper {
     }
 
     /**
+     * Tell Poweramp to open and play the queue from the beginning.
+     * Used after text search populates a fresh queue.
+     */
+    fun playQueue(context: Context) {
+        val queueUri = ROOT_URI.buildUpon().appendEncodedPath("queue").build()
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setData(queueUri)
+        }
+        sendIntent(context, intent)
+    }
+
+    /**
      * Tell Poweramp to reload its data (after modifying queue).
      */
     fun reloadData(context: Context, table: String = TABLE_QUEUE) {

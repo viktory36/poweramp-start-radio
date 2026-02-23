@@ -290,8 +290,10 @@ class RadioService : Service() {
                         stopSelfDelayed()
                         return@launch
                     }
+                    // Resolve seed to Poweramp file ID for queue positioning
+                    val seedFileId = matcher.findFileId(this@RadioService, track) ?: -1L
                     seedDisplayTrack = PowerampTrack(
-                        realId = -1L,
+                        realId = seedFileId,
                         title = track.title ?: "Unknown",
                         artist = track.artist,
                         album = track.album,
@@ -299,7 +301,7 @@ class RadioService : Service() {
                         path = track.filePath,
                     )
                     matchType = TrackMatcher.MatchType.METADATA_EXACT
-                    Log.d(TAG, "Starting radio from text search seed: ${track.title} by ${track.artist}")
+                    Log.d(TAG, "Starting radio from text search seed: ${track.title} by ${track.artist} (fileId=$seedFileId)")
                 } else {
                     // Normal path: match current Poweramp track
                     val currentTrack = PowerampReceiver.currentTrack
@@ -365,7 +367,17 @@ class RadioService : Service() {
                             try {
                                 val count = if (isFirst) {
                                     isFirst = false
-                                    PowerampHelper.replaceQueue(this@RadioService, seedDisplayTrack.realId, batch)
+                                    // For text search: prepend seed track so it plays first
+                                    val firstBatch = if (overrideSeedTrackId != null && seedDisplayTrack.realId > 0) {
+                                        listOf(seedDisplayTrack.realId) + batch.filter { it != seedDisplayTrack.realId }
+                                    } else {
+                                        batch
+                                    }
+                                    val c = PowerampHelper.replaceQueue(this@RadioService, seedDisplayTrack.realId, firstBatch)
+                                    if (overrideSeedTrackId != null) {
+                                        PowerampHelper.playQueue(this@RadioService)
+                                    }
+                                    c
                                 } else {
                                     PowerampHelper.addTracksToQueue(this@RadioService, batch)
                                 }
@@ -509,8 +521,15 @@ class RadioService : Service() {
                         return@launch
                     }
 
-                    val queuedCount = PowerampHelper.replaceQueue(this@RadioService, seedDisplayTrack.realId, fileIds)
-                    val queuedFileIds = fileIds.take(queuedCount).toSet()
+                    // For text search: prepend seed track so it plays first
+                    val allFileIds = if (overrideSeedTrackId != null && seedDisplayTrack.realId > 0) {
+                        listOf(seedDisplayTrack.realId) + fileIds.filter { it != seedDisplayTrack.realId }
+                    } else {
+                        fileIds
+                    }
+
+                    val queuedCount = PowerampHelper.replaceQueue(this@RadioService, seedDisplayTrack.realId, allFileIds)
+                    val queuedFileIds = allFileIds.take(queuedCount).toSet()
 
                     val trackResults = mappedTracks.map { mapped ->
                         val status = when {
@@ -548,6 +567,11 @@ class RadioService : Service() {
                     saveHistory()
 
                     PowerampHelper.reloadData(this@RadioService)
+
+                    // Text search: tell Poweramp to play from the start of the new queue
+                    if (overrideSeedTrackId != null) {
+                        PowerampHelper.playQueue(this@RadioService)
+                    }
 
                     val notFound = trackResults.count { it.status == QueueStatus.NOT_IN_LIBRARY }
                     val message = buildQueueResultMessage(radioResult.queuedCount, notFound)
