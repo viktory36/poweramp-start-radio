@@ -31,12 +31,15 @@ import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
@@ -63,6 +66,7 @@ import com.powerampstartradio.ui.QueuedTrackResult
 import com.powerampstartradio.ui.RadioResult
 import com.powerampstartradio.ui.RadioUiState
 import com.powerampstartradio.ui.SelectionMode
+import com.powerampstartradio.ui.TextSearchResult
 import com.powerampstartradio.ui.theme.PowerampStartRadioTheme
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
@@ -133,6 +137,7 @@ fun MainScreen(
 
     var currentTrack by remember { mutableStateOf<PowerampTrack?>(PowerampReceiver.currentTrack) }
     var showSettings by remember { mutableStateOf(false) }
+    var showTextSearch by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf("") }
     var viewingSession by remember { mutableStateOf<Int?>(null) }
 
@@ -163,8 +168,11 @@ fun MainScreen(
     }
 
 
-    BackHandler(enabled = showSettings || viewingSession != null) {
-        if (showSettings) showSettings = false
+    BackHandler(enabled = showSettings || showTextSearch || viewingSession != null) {
+        if (showTextSearch) {
+            showTextSearch = false
+            viewModel.clearTextSearchResult()
+        } else if (showSettings) showSettings = false
         else {
             viewingSession = null
             viewModel.resetRadioState()
@@ -191,22 +199,31 @@ fun MainScreen(
             }
         }
     ) {
+        // Screen: 0=home, 1=settings, 2=text search
+        val screenIndex = when {
+            showTextSearch -> 2
+            showSettings -> 1
+            else -> 0
+        }
         AnimatedContent(
-            targetState = showSettings,
+            targetState = screenIndex,
             transitionSpec = {
-                slideInHorizontally { if (targetState) it else -it } togetherWith
-                    slideOutHorizontally { if (targetState) -it else it }
+                slideInHorizontally { if (targetState > initialState) it else -it } togetherWith
+                    slideOutHorizontally { if (targetState > initialState) -it else it }
             },
-            label = "settings_transition"
-        ) { isSettings ->
-            if (isSettings) {
-                SettingsScreen(viewModel = viewModel, databaseInfo = databaseInfo,
+            label = "screen_transition"
+        ) { screen ->
+            when (screen) {
+                1 -> SettingsScreen(viewModel = viewModel, databaseInfo = databaseInfo,
                     onImportDatabase = { importLauncher.launch(arrayOf("application/octet-stream", "*/*")) },
                     hasPermission = hasPermission,
                     onRequestPermission = { viewModel.requestPermission() },
                     onBack = { showSettings = false })
-            } else {
-                HomeScreen(
+                2 -> TextSearchScreen(viewModel = viewModel, onBack = {
+                    showTextSearch = false
+                    viewModel.clearTextSearchResult()
+                })
+                else -> HomeScreen(
                     radioState = radioState, currentTrack = currentTrack,
                     databaseInfo = databaseInfo, hasPermission = hasPermission,
                     sessionHistory = sessionHistory, statusMessage = statusMessage,
@@ -220,6 +237,7 @@ fun MainScreen(
                     onClearAndReset = { viewModel.resetRadioState() },
                     onRequestPermission = { viewModel.requestPermission() },
                     onOpenSettings = { showSettings = true },
+                    onOpenTextSearch = { showTextSearch = true },
                     onOpenDrawer = { scope.launch { drawerState.open() } },
                     viewingSession = viewingSession,
                     onViewSession = { viewingSession = it }
@@ -246,6 +264,7 @@ fun HomeScreen(
     onClearAndReset: () -> Unit,
     onRequestPermission: () -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenTextSearch: () -> Unit,
     onOpenDrawer: () -> Unit,
     viewingSession: Int?,
     onViewSession: (Int?) -> Unit
@@ -278,6 +297,9 @@ fun HomeScreen(
                         }) {
                             Icon(Icons.Default.Clear, contentDescription = "Clear")
                         }
+                    }
+                    IconButton(onClick = onOpenTextSearch) {
+                        Icon(Icons.Default.Search, contentDescription = "Text Search")
                     }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Default.Settings, contentDescription = "Settings")
@@ -679,6 +701,200 @@ fun IdleContent(
         if (isIdle && hasPermission && databaseInfo != null && statusMessage.isEmpty()) {
             Text("Ready when you are!", style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.primary)
+        }
+    }
+}
+
+// ---- Text Search Screen ----
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun TextSearchScreen(
+    viewModel: MainViewModel = viewModel(),
+    onBack: () -> Unit
+) {
+    val textSearchResult by viewModel.textSearchResult.collectAsState()
+    val isLoading by viewModel.textSearchLoading.collectAsState()
+    val recentSearches by viewModel.recentSearches.collectAsState()
+    var query by remember { mutableStateOf("") }
+    val focusRequester = remember { FocusRequester() }
+
+    LaunchedEffect(Unit) {
+        focusRequester.requestFocus()
+    }
+
+    fun doSearch(q: String) {
+        if (q.isBlank()) return
+        query = q
+        viewModel.performTextSearch(q.trim())
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Text Search") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                }
+            )
+        }
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(horizontal = 16.dp)
+        ) {
+            // Search input
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                label = { Text("Describe what you want to hear...") },
+                singleLine = true,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .focusRequester(focusRequester),
+                trailingIcon = {
+                    if (query.isNotEmpty()) {
+                        IconButton(onClick = { query = "" }) {
+                            Icon(Icons.Default.Clear, contentDescription = "Clear")
+                        }
+                    }
+                },
+                keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+                    onDone = { doSearch(query) }
+                ),
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                    imeAction = androidx.compose.ui.text.input.ImeAction.Search
+                ),
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Button(
+                onClick = { doSearch(query) },
+                enabled = query.isNotBlank() && !isLoading,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                if (isLoading) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(18.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Searching...")
+                } else {
+                    Text("Search")
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Results or recent searches
+            val result = textSearchResult
+            if (result != null) {
+                if (result.error != null) {
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer
+                        ),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            result.error,
+                            modifier = Modifier.padding(16.dp),
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                    }
+                } else if (result.matches.isNotEmpty()) {
+                    Text(
+                        "Results for \"${result.query}\"",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    LazyColumn(
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        items(result.matches.size) { i ->
+                            val match = result.matches[i]
+                            val simPct = (match.similarity * 100).roundToInt()
+                            Card(
+                                modifier = Modifier.fillMaxWidth().clickable {
+                                    viewModel.startRadioFromTextSearch(match.track.id)
+                                    onBack()
+                                },
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                match.track.title ?: "Unknown",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = FontWeight.Bold,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                            Text(
+                                                listOfNotNull(
+                                                    match.track.artist,
+                                                    match.track.album
+                                                ).joinToString(" \u00b7 "),
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                        Text(
+                                            "$simPct%",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = MaterialTheme.colorScheme.primary,
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        "Tap to start radio from this track",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if (!isLoading && recentSearches.isNotEmpty()) {
+                Text(
+                    "Recent searches",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                recentSearches.forEach { recent ->
+                    TextButton(
+                        onClick = {
+                            query = recent
+                            doSearch(recent)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                    ) {
+                        Text(
+                            recent,
+                            modifier = Modifier.fillMaxWidth(),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                }
+            }
         }
     }
 }

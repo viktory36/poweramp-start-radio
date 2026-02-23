@@ -6,6 +6,7 @@ on-device inference with LiteRT + QNN NPU acceleration.
 Usage:
     python -m poweramp_indexer.export_litert mulan
     python -m poweramp_indexer.export_litert flamingo
+    python -m poweramp_indexer.export_litert mulan_text
     python -m poweramp_indexer.export_litert all
 """
 
@@ -457,9 +458,270 @@ def convert_flamingo(output_dir: Path):
     return encoder_path
 
 
+class MuLanTextWrapper(nn.Module):
+    """MuQ-MuLan text tower for TFLite export.
+
+    Input:  input_ids [1, 64] INT64, attention_mask [1, 64] INT64
+    Output: L2-normalized embedding [1, 512]
+
+    Pipeline:
+      XLMRobertaModel(input_ids, attention_mask) → [1, seq, 768]
+      proj (Identity for xlm-roberta-base) → [1, seq, 768]
+      Transformer WITH mask → [1, seq, 768]
+      Masked mean pool → [1, 768]
+      text_to_latents (Linear 768→512) → [1, 512]
+      L2-normalize → [1, 512]
+
+    The original code does NOT pass the attention mask to the custom
+    Transformer, which is fine for batch=1 with no padding (HuggingFace
+    tokenizer produces no padding for a single string). But for TFLite
+    with static seq_len=64 and right-padding, we MUST pass the mask and
+    use masked mean pooling. Without this fix: cosine 0.924 vs 1.000.
+    """
+
+    # Static sequence length for TFLite (longest reasonable query ~21 tokens)
+    SEQ_LEN = 64
+
+    def __init__(self, mulan_model):
+        super().__init__()
+        mulan_inner = mulan_model.mulan  # MuLanModel
+        text = mulan_inner.text           # TextTransformerPretrained
+
+        # XLMRobertaModel (12 layers, 768d)
+        self.roberta = text.model
+
+        # Projection (Identity for xlm-roberta-base when model_dim is None)
+        self.proj = text.proj
+
+        # Custom Transformer (8 layers, 768d)
+        self.transformer = text.transformer
+
+        # Projection to latent space (Linear 768→512)
+        self.text_to_latents = mulan_inner.text_to_latents
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            input_ids: Token IDs [batch, 64] INT64
+            attention_mask: Padding mask [batch, 64] INT64 (1=valid, 0=pad)
+        Returns:
+            L2-normalized embedding [batch, 512]
+        """
+        # XLMRobertaModel with attention mask
+        outputs = self.roberta(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        x = outputs.last_hidden_state  # [batch, seq, 768]
+
+        # Project (Identity for xlm-roberta-base)
+        x = self.proj(x)
+
+        # Custom Transformer WITH mask (fixes padding sensitivity)
+        mask_bool = attention_mask.bool()
+        x, _ = self.transformer(x, mask=mask_bool, return_all_layers=True)
+
+        # Masked mean pooling (only average valid tokens, ignore padding)
+        mask_f = attention_mask.unsqueeze(-1).float()  # [batch, seq, 1]
+        x = (x * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1e-10)
+
+        # Project to latent: [batch, 768] → [batch, 512]
+        x = self.text_to_latents(x)
+
+        # L2 normalize
+        x = F.normalize(x, p=2, dim=-1)
+
+        return x
+
+
+def validate_text_wrapper(mulan_model, wrapper, device="cpu"):
+    """Validate that the text wrapper matches the full model's text output.
+
+    Tests with a real tokenized query to ensure the wrapper produces
+    identical embeddings to the original pipeline.
+    """
+    wrapper.eval().to(device)
+
+    # Tokenize a test query the same way the original model does
+    text_tower = mulan_model.mulan.text
+    tokenizer = text_tower.tokenizer
+    test_query = "ethereal ambient"
+
+    inputs = tokenizer([test_query], return_tensors="pt", padding=True)
+    input_ids = inputs["input_ids"].to(device)
+    attention_mask = inputs["attention_mask"].to(device)
+
+    # Reference: full model pipeline
+    mulan_model.eval().to(device)
+    with torch.no_grad():
+        ref_out = mulan_model(texts=[test_query]).cpu()
+
+    # Wrapper: same tokens, no padding
+    with torch.no_grad():
+        wrapper_out = wrapper(input_ids, attention_mask).cpu()
+
+    cosine_no_pad = torch.dot(
+        ref_out.flatten(), wrapper_out.flatten()
+    ).item() / (ref_out.norm() * wrapper_out.norm()).item()
+    logger.info(f"Wrapper vs original (no padding): cosine={cosine_no_pad:.6f}")
+
+    # Wrapper: padded to SEQ_LEN with mask
+    seq_len = MuLanTextWrapper.SEQ_LEN
+    padded_ids = F.pad(input_ids, (0, seq_len - input_ids.shape[1]), value=1)
+    padded_mask = F.pad(attention_mask, (0, seq_len - attention_mask.shape[1]), value=0)
+    with torch.no_grad():
+        padded_out = wrapper(padded_ids, padded_mask).cpu()
+
+    cosine_padded = torch.dot(
+        ref_out.flatten(), padded_out.flatten()
+    ).item() / (ref_out.norm() * padded_out.norm()).item()
+    logger.info(f"Wrapper vs original (padded to {seq_len}): cosine={cosine_padded:.6f}")
+
+    return wrapper_out
+
+
+def convert_mulan_text(output_dir: Path):
+    """Convert MuQ-MuLan text tower to TFLite."""
+    import litert_torch
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load full model
+    mulan_model = load_mulan_model()
+
+    # Create text wrapper
+    logger.info("Creating MuLanTextWrapper...")
+    wrapper = MuLanTextWrapper(mulan_model)
+    wrapper.eval()
+
+    # Validate wrapper
+    logger.info("Validating text wrapper...")
+    validate_text_wrapper(mulan_model, wrapper)
+
+    # Free full model to save memory (wrapper has references to submodules)
+    del mulan_model
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    # Sample inputs for tracing (static shape: batch=1, seq_len=64)
+    seq_len = MuLanTextWrapper.SEQ_LEN
+    sample_ids = torch.ones(1, seq_len, dtype=torch.long)  # all PAD tokens
+    sample_ids[0, :5] = torch.tensor([0, 82, 35593, 289, 2])  # BOS + "ethereal" + EOS
+    sample_mask = torch.zeros(1, seq_len, dtype=torch.long)
+    sample_mask[0, :5] = 1
+
+    # Convert to TFLite
+    logger.info("Converting MuQ-MuLan text tower to TFLite via litert_torch...")
+    t0 = time.perf_counter()
+    tflite_model = litert_torch.convert(
+        wrapper, sample_args=(sample_ids, sample_mask)
+    )
+    t_convert = time.perf_counter() - t0
+    logger.info(f"Conversion took {t_convert:.1f}s")
+
+    # Export
+    output_path = output_dir / "mulan_text.tflite"
+    tflite_model.export(str(output_path))
+    size_mb = output_path.stat().st_size / 1024 / 1024
+    logger.info(f"Saved: {output_path} ({size_mb:.1f} MB)")
+
+    # Validate TFLite output matches PyTorch wrapper
+    logger.info("Validating TFLite output vs PyTorch...")
+    with torch.no_grad():
+        pytorch_out = wrapper(sample_ids, sample_mask).numpy()
+
+    tflite_out = tflite_model(sample_ids, sample_mask)
+    if hasattr(tflite_out, "numpy"):
+        tflite_out = tflite_out.numpy()
+    else:
+        tflite_out = np.array(tflite_out)
+
+    cosine_sim = np.dot(pytorch_out.flatten(), tflite_out.flatten()) / (
+        np.linalg.norm(pytorch_out) * np.linalg.norm(tflite_out)
+    )
+    max_diff = np.max(np.abs(pytorch_out - tflite_out))
+    logger.info(f"TFLite vs PyTorch: cosine_sim={cosine_sim:.6f}, max_diff={max_diff:.6f}")
+
+    return output_path
+
+
+def export_tokenizer(output_dir: Path):
+    """Export the XLM-RoBERTa tokenizer vocabulary for on-device use.
+
+    Saves a JSON file with the full vocabulary (piece → id mapping)
+    that the Android SentencePieceTokenizer can load.
+    """
+    import json
+
+    from transformers import AutoTokenizer
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Loading xlm-roberta-base tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base")
+
+    # Export vocab: {piece: id} for all tokens
+    vocab = tokenizer.get_vocab()
+    logger.info(f"Vocabulary size: {len(vocab)}")
+
+    # Save as JSON
+    vocab_path = output_dir / "xlm_roberta_vocab.json"
+    with open(vocab_path, "w", encoding="utf-8") as f:
+        json.dump(vocab, f, ensure_ascii=False)
+    size_kb = vocab_path.stat().st_size / 1024
+    logger.info(f"Saved vocabulary: {vocab_path} ({size_kb:.0f} KB)")
+
+    # Also export the SentencePiece model file for reference
+    sp_model_file = None
+    if hasattr(tokenizer, "vocab_file") and tokenizer.vocab_file:
+        sp_model_file = Path(tokenizer.vocab_file)
+    if sp_model_file is None:
+        # Try to find it in the tokenizer's files
+        for attr in ["spm_file", "sp_model"]:
+            path = getattr(tokenizer, attr, None)
+            if path and Path(path).exists():
+                sp_model_file = Path(path)
+                break
+
+    if sp_model_file and sp_model_file.exists():
+        import shutil
+        dest = output_dir / "sentencepiece.bpe.model"
+        shutil.copy2(sp_model_file, dest)
+        sp_size_mb = dest.stat().st_size / 1024 / 1024
+        logger.info(f"Copied SentencePiece model: {dest} ({sp_size_mb:.1f} MB)")
+
+    # Export BPE merges from the tokenizer backend
+    # The HF tokenizer wraps SentencePiece; we extract the merge rules
+    # by encoding test strings and observing the vocabulary structure
+    if hasattr(tokenizer, "sp_model"):
+        sp = tokenizer.sp_model
+        pieces = []
+        for i in range(sp.get_piece_size()):
+            piece = sp.id_to_piece(i)
+            score = sp.get_score(i)
+            pieces.append({"id": i, "piece": piece, "score": score})
+        pieces_path = output_dir / "sp_pieces.json"
+        with open(pieces_path, "w", encoding="utf-8") as f:
+            json.dump(pieces, f, ensure_ascii=False)
+        logger.info(f"Saved {len(pieces)} SentencePiece pieces: {pieces_path}")
+
+    # Validate: encode a test string and print tokens
+    test = "ethereal ambient"
+    encoded = tokenizer.encode(test)
+    tokens = tokenizer.convert_ids_to_tokens(encoded)
+    logger.info(f"Test encode '{test}': ids={encoded}, tokens={tokens}")
+
+    return vocab_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Export models to TFLite")
-    parser.add_argument("model", choices=["mulan", "flamingo", "all"])
+    parser.add_argument(
+        "model", choices=["mulan", "flamingo", "mulan_text", "tokenizer", "all"]
+    )
     parser.add_argument("--output-dir", type=Path, default=MODELS_DIR)
     args = parser.parse_args()
 
@@ -470,6 +732,13 @@ def main():
 
     if args.model in ("flamingo", "all"):
         convert_flamingo(args.output_dir)
+
+    if args.model in ("mulan_text", "all"):
+        convert_mulan_text(args.output_dir)
+        export_tokenizer(args.output_dir)
+
+    if args.model == "tokenizer":
+        export_tokenizer(args.output_dir)
 
 
 if __name__ == "__main__":

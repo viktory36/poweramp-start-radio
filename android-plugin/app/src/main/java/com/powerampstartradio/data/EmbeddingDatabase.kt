@@ -288,15 +288,42 @@ class EmbeddingDatabase private constructor(
 
     /**
      * Stream embeddings one row at a time without holding them all in memory.
+     *
+     * @param table The embedding table to read from. Defaults to the auto-detected best table.
      */
-    fun forEachEmbeddingRaw(block: (trackId: Long, blob: ByteArray) -> Unit) {
-        db.rawQuery("SELECT track_id, embedding FROM [${embeddingTable}]", null).use { cursor ->
+    fun forEachEmbeddingRaw(
+        table: String = embeddingTable,
+        block: (trackId: Long, blob: ByteArray) -> Unit,
+    ) {
+        db.rawQuery("SELECT track_id, embedding FROM [$table]", null).use { cursor ->
             while (cursor.moveToNext()) {
                 val trackId = cursor.getLong(0)
                 val blob = cursor.getBlob(1)
                 block(trackId, blob)
             }
         }
+    }
+
+    /**
+     * Get the count of embeddings in a specific table.
+     */
+    fun getEmbeddingCountForTable(table: String): Int {
+        return try {
+            db.rawQuery("SELECT COUNT(*) FROM [$table]", null).use {
+                if (it.moveToFirst()) it.getInt(0) else 0
+            }
+        } catch (e: Exception) { 0 }
+    }
+
+    /**
+     * Detect the embedding dimension for a specific table.
+     */
+    fun getEmbeddingDimForTable(table: String): Int? {
+        return try {
+            db.rawQuery("SELECT length(embedding) FROM [$table] LIMIT 1", null).use {
+                if (it.moveToFirst()) it.getInt(0) / 4 else null
+            }
+        } catch (e: Exception) { null }
     }
 
     /**

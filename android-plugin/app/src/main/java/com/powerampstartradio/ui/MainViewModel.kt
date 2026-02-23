@@ -6,16 +6,19 @@ import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.powerampstartradio.data.EmbeddedTrack
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.data.EmbeddingIndex
 import com.powerampstartradio.indexing.IndexingService
 import com.powerampstartradio.indexing.IndexingViewModel
+import com.powerampstartradio.indexing.MuLanTextInference
 import com.powerampstartradio.indexing.NewTrackDetector
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.poweramp.TrackMatcher
 import com.powerampstartradio.services.RadioService
 import com.powerampstartradio.similarity.RecommendationEngine
+import com.google.ai.edge.litert.Accelerator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -344,6 +347,134 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         } catch (_: Exception) { null }
     }
 
+    // --- Text search state ---
+
+    /** Current text search result. Null when idle, non-null after a search completes. */
+    private val _textSearchResult = MutableStateFlow<TextSearchResult?>(null)
+    val textSearchResult: StateFlow<TextSearchResult?> = _textSearchResult.asStateFlow()
+
+    private val _textSearchLoading = MutableStateFlow(false)
+    val textSearchLoading: StateFlow<Boolean> = _textSearchLoading.asStateFlow()
+
+    /** Recent text search queries (persisted across sessions). */
+    private val _recentSearches = MutableStateFlow<List<String>>(
+        prefs.getString("recent_searches", null)?.split("\u0000")?.filter { it.isNotBlank() }
+            ?: emptyList()
+    )
+    val recentSearches: StateFlow<List<String>> = _recentSearches.asStateFlow()
+
+    private var textInference: MuLanTextInference? = null
+    private var mulanIndex: EmbeddingIndex? = null
+
+    /**
+     * Search for the best matching track by text query using MuQ-MuLan text embeddings.
+     */
+    fun performTextSearch(query: String) {
+        if (_textSearchLoading.value) return
+        _textSearchLoading.value = true
+        _textSearchResult.value = null
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val filesDir = getApplication<Application>().filesDir
+                val dbFile = File(filesDir, "embeddings.db")
+                if (!dbFile.exists()) {
+                    _textSearchResult.value = TextSearchResult(query = query, error = "No embedding database found")
+                    return@launch
+                }
+
+                // Lazy init text inference
+                val inference = textInference ?: run {
+                    val variants = listOf("_fp16", "")
+                    val modelFile = variants.firstNotNullOfOrNull { suffix ->
+                        File(filesDir, "mulan_text${suffix}.tflite").takeIf { it.exists() }
+                    }
+                    if (modelFile == null) {
+                        _textSearchResult.value = TextSearchResult(query = query, error = "MuQ-MuLan text model not found")
+                        return@launch
+                    }
+                    val vocabFile = File(filesDir, "xlm_roberta_vocab.json")
+                    if (!vocabFile.exists()) {
+                        _textSearchResult.value = TextSearchResult(query = query, error = "Tokenizer vocab not found")
+                        return@launch
+                    }
+                    MuLanTextInference(modelFile, vocabFile, Accelerator.GPU).also { textInference = it }
+                }
+
+                // Generate text embedding
+                val embedding = inference.generateEmbedding(query)
+                if (embedding == null) {
+                    _textSearchResult.value = TextSearchResult(query = query, error = "Text inference failed")
+                    return@launch
+                }
+
+                // Lazy init MuLan-specific embedding index
+                val index = mulanIndex ?: run {
+                    val embFile = File(filesDir, "mulan.emb")
+                    if (!embFile.exists()) {
+                        // Extract MuLan embeddings from DB
+                        val db = EmbeddingDatabase.open(dbFile)
+                        val mulanCount = db.getEmbeddingCountForTable("embeddings_mulan")
+                        if (mulanCount == 0) {
+                            db.close()
+                            _textSearchResult.value = TextSearchResult(query = query, error = "No MuLan embeddings in database")
+                            return@launch
+                        }
+                        EmbeddingIndex.extractFromDatabase(db, embFile, table = "embeddings_mulan")
+                        db.close()
+                    }
+                    if (!embFile.exists()) {
+                        _textSearchResult.value = TextSearchResult(query = query, error = "Failed to extract MuLan index")
+                        return@launch
+                    }
+                    EmbeddingIndex.mmap(embFile).also { mulanIndex = it }
+                }
+
+                // Find top matches
+                val topMatches = index.findTopK(embedding, topK = 5)
+                if (topMatches.isEmpty()) {
+                    _textSearchResult.value = TextSearchResult(query = query, error = "No matches found")
+                    return@launch
+                }
+
+                // Resolve track metadata
+                val db = EmbeddingDatabase.open(dbFile)
+                val matchedTracks = topMatches.mapNotNull { (trackId, score) ->
+                    db.getTrackById(trackId)?.let { track -> TextSearchMatch(track, score) }
+                }
+                db.close()
+
+                _textSearchResult.value = TextSearchResult(query = query, matches = matchedTracks)
+
+                // Save to recent searches
+                saveRecentSearch(query)
+
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "Text search failed", e)
+                _textSearchResult.value = TextSearchResult(query = query, error = "Search failed: ${e.message}")
+            } finally {
+                _textSearchLoading.value = false
+            }
+        }
+    }
+
+    /**
+     * Start radio using a text search match as seed.
+     */
+    fun startRadioFromTextSearch(trackId: Long) {
+        RadioService.startRadioFromSeed(getApplication(), trackId, buildConfig())
+    }
+
+    fun clearTextSearchResult() {
+        _textSearchResult.value = null
+    }
+
+    private fun saveRecentSearch(query: String) {
+        val updated = (listOf(query) + _recentSearches.value.filter { it != query }).take(10)
+        _recentSearches.value = updated
+        prefs.edit().putString("recent_searches", updated.joinToString("\u0000")).apply()
+    }
+
     // --- Indexing actions ---
 
     fun checkUnindexedTracks() {
@@ -433,6 +564,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val mulanFile = findModel("mulan_audio")
+        val mulanTextFile = findModel("mulan_text")
         val flamingoFile = findModel("flamingo_encoder")
         val projectorFile = findModel("flamingo_projector")
         _hasModels.value = mulanFile != null || flamingoFile != null
@@ -446,6 +578,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val dbFile = File(filesDir, "embeddings.db")
         val embFile = File(filesDir, "fused.emb")
         val graphFile = File(filesDir, "graph.bin")
+        val vocabFile = File(filesDir, "xlm_roberta_vocab.json")
 
         _fileStatuses.value = listOf(
             AppFileStatus("embeddings.db", dbFile.exists(), fileSizeMb(dbFile),
@@ -455,7 +588,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             AppFileStatus("graph.bin", graphFile.exists(), fileSizeMb(graphFile),
                 "kNN graph for Random Walk"),
             AppFileStatus("mulan_audio", mulanFile != null, fileSizeMb(mulanFile),
-                if (mulanFile != null) mulanFile.name else "MuQ-MuLan model"),
+                if (mulanFile != null) mulanFile.name else "MuQ-MuLan audio model"),
+            AppFileStatus("mulan_text", mulanTextFile != null, fileSizeMb(mulanTextFile),
+                if (mulanTextFile != null) mulanTextFile.name else "MuQ-MuLan text model (for text search)"),
+            AppFileStatus("vocab", vocabFile.exists(), fileSizeMb(vocabFile),
+                "xlm_roberta_vocab.json (for text search)"),
             AppFileStatus("flamingo_encoder", flamingoFile != null, fileSizeMb(flamingoFile),
                 if (flamingoFile != null) flamingoFile.name else "Flamingo encoder model"),
             AppFileStatus("flamingo_projector", projectorFile != null, fileSizeMb(projectorFile),
@@ -639,4 +776,15 @@ data class AppFileStatus(
     val present: Boolean,
     val sizeMb: String? = null,
     val detail: String? = null,
+)
+
+data class TextSearchMatch(
+    val track: EmbeddedTrack,
+    val similarity: Float,
+)
+
+data class TextSearchResult(
+    val query: String,
+    val matches: List<TextSearchMatch> = emptyList(),
+    val error: String? = null,
 )
