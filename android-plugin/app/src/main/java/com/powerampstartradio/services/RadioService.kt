@@ -281,6 +281,8 @@ class RadioService : Service() {
                 val matchType: TrackMatcher.MatchType
                 // For text search: the seed file ID to prepend to recommendations
                 var textSearchSeedFileId: Long? = null
+                // For text search: the currently-playing track to anchor queue pos 0 (Poweramp workaround)
+                var textSearchQueueAnchorId: Long? = null
 
                 if (overrideSeedTrackId != null) {
                     // Text search path: seed track ID is known
@@ -295,9 +297,7 @@ class RadioService : Service() {
                     // Resolve seed to Poweramp file ID
                     textSearchSeedFileId = matcher.findFileId(this@RadioService, track)
 
-                    // Text search always uses the selected seed as the display track.
-                    // Queue will be: [seed, rec1, rec2, ...] — full clear, no preservation.
-                    // After queue is built, playFirstInQueue() jumps Poweramp to pos 0.
+                    // Display: always show the text search pick as seed in UI/session history.
                     seedDisplayTrack = PowerampTrack(
                         realId = textSearchSeedFileId ?: -1L,
                         title = track.title ?: "Unknown",
@@ -306,9 +306,18 @@ class RadioService : Service() {
                         durationMs = track.durationMs,
                         path = track.filePath,
                     )
+                    // Queue: if currently in a Poweramp queue, keep that track at pos 0
+                    // (Poweramp breaks if we replace the queue without the current track).
+                    // Seed goes at pos 1, then recommendations.
+                    // If NOT in a queue, seed goes first — no preservation needed.
+                    val currentTrack = PowerampReceiver.currentTrack
+                    val currentInQueue = currentTrack?.realId?.takeIf { it > 0 }?.let {
+                        PowerampHelper.isInQueue(this@RadioService, it)
+                    } == true
+                    textSearchQueueAnchorId = if (currentInQueue) currentTrack!!.realId else null
                     matchType = TrackMatcher.MatchType.METADATA_EXACT
                     Log.d(TAG, "Text search seed: ${track.title} by ${track.artist} " +
-                            "(seedFileId=$textSearchSeedFileId)")
+                            "(seedFileId=$textSearchSeedFileId, queueAnchor=$textSearchQueueAnchorId)")
                 } else {
                     // Normal path: match current Poweramp track
                     val currentTrack = PowerampReceiver.currentTrack
@@ -374,18 +383,14 @@ class RadioService : Service() {
                             try {
                                 val count = if (isFirst) {
                                     isFirst = false
-                                    // For text search: prepend seed, clear queue fully, jump to pos 0
+                                    // For text search: prepend seed, anchor current track for Poweramp
                                     val firstBatch = if (textSearchSeedFileId != null) {
                                         listOf(textSearchSeedFileId) + batch.filter { it != textSearchSeedFileId }
                                     } else {
                                         batch
                                     }
-                                    val driftCurrentId = if (textSearchSeedFileId != null) null else seedDisplayTrack.realId
-                                    val c = PowerampHelper.replaceQueue(this@RadioService, driftCurrentId, firstBatch)
-                                    if (textSearchSeedFileId != null) {
-                                        PowerampHelper.playFirstInQueue(this@RadioService)
-                                    }
-                                    c
+                                    val driftCurrentId = textSearchQueueAnchorId ?: seedDisplayTrack.realId
+                                    PowerampHelper.replaceQueue(this@RadioService, driftCurrentId, firstBatch)
                                 } else {
                                     PowerampHelper.addTracksToQueue(this@RadioService, batch)
                                 }
@@ -529,19 +534,17 @@ class RadioService : Service() {
                         return@launch
                     }
 
-                    // For text search: prepend seed track, clear queue fully (null currentFileId),
-                    // then jump Poweramp to pos 0. Queue: [seed, rec1, rec2, ...]
+                    // For text search: prepend seed to recommendations.
+                    // If in queue, anchor current track at pos 0 for Poweramp stability.
+                    // Queue: [anchor?, seed, rec1, rec2, ...]
                     val allFileIds = if (textSearchSeedFileId != null) {
                         listOf(textSearchSeedFileId) + fileIds.filter { it != textSearchSeedFileId }
                     } else {
                         fileIds
                     }
 
-                    val queueCurrentId = if (textSearchSeedFileId != null) null else seedDisplayTrack.realId
+                    val queueCurrentId = textSearchQueueAnchorId ?: seedDisplayTrack.realId
                     val queuedCount = PowerampHelper.replaceQueue(this@RadioService, queueCurrentId, allFileIds)
-                    if (textSearchSeedFileId != null) {
-                        PowerampHelper.playFirstInQueue(this@RadioService)
-                    }
                     val queuedFileIds = allFileIds.take(queuedCount).toSet()
 
                     val trackResults = mappedTracks.map { mapped ->
