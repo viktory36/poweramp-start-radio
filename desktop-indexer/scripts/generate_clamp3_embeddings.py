@@ -266,6 +266,45 @@ def make_cache_key(file_path, music_dir):
 
 # ─── Phase 1: MERT feature extraction ────────────────────────────────────────
 
+def _load_audio_chunks(fpath, processor, max_duration):
+    """CPU-bound: load audio, resample, normalize, split into 5s chunks.
+
+    Runs in a background thread to overlap with GPU inference.
+
+    Returns:
+        (chunks, num_samples) where chunks is a list of [WINDOW_SAMPLES] tensors,
+        or raises on failure.
+    """
+    waveform, sr = torchaudio.load(str(fpath))
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    if sr != MERT_SR:
+        waveform = torchaudio.transforms.Resample(sr, MERT_SR)(waveform)
+
+    max_samples = max_duration * MERT_SR
+    if waveform.shape[-1] > max_samples:
+        waveform = waveform[:, :max_samples]
+
+    wav_np = waveform.squeeze(0).numpy()
+    wav = processor(
+        wav_np, return_tensors="pt",
+        sampling_rate=MERT_SR, padding=True,
+    ).input_values[0]  # [T] 1D normalized
+
+    chunks = []
+    for j in range(0, len(wav), WINDOW_SAMPLES):
+        chunk = wav[j:j + WINDOW_SAMPLES]
+        if len(chunk) < MERT_SR:
+            continue
+        if len(chunk) < WINDOW_SAMPLES:
+            chunk = torch.nn.functional.pad(
+                chunk, (0, WINDOW_SAMPLES - len(chunk))
+            )
+        chunks.append(chunk)
+
+    return chunks, waveform.shape[-1]
+
+
 def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False):
     """Extract MERT features from all audio files, cached as .npy.
 
@@ -274,7 +313,11 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False):
         → 5s non-overlapping windows (discard < 1s, pad last to 5s)
         → MERT-v1-95M: layer=None, reduction="mean" → [L, chunks, 768]
         → Mean over layers → [1, chunks, 768] → save .npy
+
+    CPU audio decoding runs in a background thread, overlapping with GPU inference.
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     print("=" * 70)
     print("PHASE 1: MERT Feature Extraction")
     print("=" * 70)
@@ -336,6 +379,11 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False):
     success = 0
     fail = 0
 
+    # Prefetch audio decoding on CPU while GPU runs MERT on previous track
+    pool = ThreadPoolExecutor(max_workers=2)
+    prefetch = pool.submit(_load_audio_chunks,
+                           to_process[0], processor, max_duration)
+
     for i, fpath in enumerate(to_process):
         if i > 0 and i % 50 == 0:
             elapsed = time.time() - t0
@@ -351,43 +399,31 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False):
         cache_key = make_cache_key(fpath, music_dir)
         npy_path = cache_dir / (cache_key + ".npy")
 
+        # Get prefetched audio (or wait for it)
         try:
-            # Load and resample to 24kHz mono (matches CLaMP3 MERT_utils.load_audio)
-            waveform, sr = torchaudio.load(str(fpath))
-            if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
-            if sr != MERT_SR:
-                waveform = torchaudio.transforms.Resample(sr, MERT_SR)(waveform)
+            chunks, num_samples = prefetch.result()
+        except Exception as e:
+            fail += 1
+            if fail <= 20 or verbose:
+                print(f"  FAIL [{i+1}/{len(to_process)}] {fpath.name[:60]}: {e}")
+            # Submit next prefetch before continuing
+            if i + 1 < len(to_process):
+                prefetch = pool.submit(_load_audio_chunks,
+                                       to_process[i + 1], processor,
+                                       max_duration)
+            continue
 
-            # Cap duration
-            max_samples = max_duration * MERT_SR
-            if waveform.shape[-1] > max_samples:
-                waveform = waveform[:, :max_samples]
+        # Submit next track's audio decode NOW (overlaps with GPU below)
+        if i + 1 < len(to_process):
+            prefetch = pool.submit(_load_audio_chunks,
+                                   to_process[i + 1], processor, max_duration)
 
-            # Normalize with Wav2Vec2FeatureExtractor (matching CLaMP3 pipeline)
-            wav_np = waveform.squeeze(0).numpy()
-            wav = processor(
-                wav_np, return_tensors="pt",
-                sampling_rate=MERT_SR, padding=True,
-            ).input_values[0]  # [T] 1D normalized
-
-            # Split into 5s non-overlapping windows
-            chunks = []
-            for j in range(0, len(wav), WINDOW_SAMPLES):
-                chunk = wav[j:j + WINDOW_SAMPLES]
-                if len(chunk) < MERT_SR:  # < 1s, discard
-                    continue
-                if len(chunk) < WINDOW_SAMPLES:  # Pad last window to 5s
-                    chunk = torch.nn.functional.pad(
-                        chunk, (0, WINDOW_SAMPLES - len(chunk))
-                    )
-                chunks.append(chunk)
-
+        try:
             if not chunks:
                 fail += 1
                 continue
 
-            # Batch process through MERT
+            # GPU: batch process through MERT
             features_list = []
             for b_start in range(0, len(chunks), batch_size):
                 batch = torch.stack(
@@ -409,7 +445,7 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False):
             np.save(str(npy_path), all_features.numpy())
             success += 1
             if verbose:
-                dur_s = waveform.shape[-1] / MERT_SR
+                dur_s = num_samples / MERT_SR
                 print(f"  OK [{i+1}/{len(to_process)}] {fpath.name[:60]} "
                       f"({dur_s:.0f}s, {len(chunks)} chunks)")
 
@@ -417,6 +453,8 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False):
             fail += 1
             if fail <= 20 or verbose:
                 print(f"  FAIL [{i+1}/{len(to_process)}] {fpath.name[:60]}: {e}")
+
+    pool.shutdown(wait=False)
 
     elapsed = time.time() - t0
     print(f"\nPhase 1 complete: {success} ok, {fail} fail in {elapsed:.0f}s "
