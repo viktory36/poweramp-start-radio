@@ -151,7 +151,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val state = RadioService.uiState.value
         if (state is RadioUiState.Success) {
             val result = state.result
-            val knownIds = result.queuedFileIds + result.seedTrack.realId
+            val knownIds = buildSet {
+                addAll(result.queuedFileIds)
+                add(result.seedTrack.realId)
+                result.queueAnchorId?.let { add(it) }
+            }
             if (track == null || track.realId !in knownIds) {
                 RadioService.resetState()
             }

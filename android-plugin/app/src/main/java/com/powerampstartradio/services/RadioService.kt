@@ -410,6 +410,7 @@ class RadioService : Service() {
                         matchType = matchType,
                         tracks = emptyList(),
                         config = resolvedConfig,
+                        queueAnchorId = textSearchQueueAnchorId,
                         isComplete = false,
                         totalExpected = resolvedConfig.numTracks
                     ))
@@ -448,6 +449,7 @@ class RadioService : Service() {
                                 matchType = matchType,
                                 tracks = streamingTracks.toList(),
                                 config = resolvedConfig,
+                                queueAnchorId = textSearchQueueAnchorId,
                                 isComplete = false,
                                 totalExpected = resolvedConfig.numTracks
                             ))
@@ -485,6 +487,7 @@ class RadioService : Service() {
                         tracks = streamingTracks.toList(),
                         config = resolvedConfig,
                         queuedFileIds = queuedFileIds.toSet(),
+                        queueAnchorId = textSearchQueueAnchorId,
                         isComplete = true,
                         totalExpected = resolvedConfig.numTracks,
                         metrics = driftMetrics
@@ -575,6 +578,7 @@ class RadioService : Service() {
                         tracks = trackResults,
                         config = resolvedConfig,
                         queuedFileIds = queuedFileIds,
+                        queueAnchorId = textSearchQueueAnchorId,
                         metrics = batchMetrics
                     )
 
