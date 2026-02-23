@@ -84,6 +84,7 @@ def convert_fp32_to_fp16(input_path: str, output_path: str | None = None):
     new_tensors = []
     new_ops = []
     tensor_remap = {}  # old_idx -> new_fp32_idx (output of DEQUANTIZE)
+    converted_buffers = set()  # track buffers already converted
 
     for tensor_idx, tensor in enumerate(subgraph.tensors):
         # Skip non-FP32, activation tensors (empty buffer), graph I/O
@@ -94,6 +95,14 @@ def convert_fp32_to_fp16(input_path: str, output_path: str | None = None):
         buf = model.buffers[tensor.buffer]
         if buf.data is None or len(buf.data) == 0:
             continue
+        # Skip buffers not aligned to 4 bytes (e.g. already converted or mixed-type)
+        if len(buf.data) % 4 != 0:
+            continue
+        # Skip buffers already converted by a previous tensor sharing the same buffer
+        if tensor.buffer in converted_buffers:
+            tensor.type = schema_fb.TensorType.FLOAT16
+            converted += 1
+            continue
 
         # Convert buffer from FP32 to FP16
         fp32_data = np.frombuffer(buf.data, dtype=np.float32)
@@ -103,6 +112,7 @@ def convert_fp32_to_fp16(input_path: str, output_path: str | None = None):
 
         buf.data = np.frombuffer(fp16_data.tobytes(), dtype=np.uint8)
         tensor.type = schema_fb.TensorType.FLOAT16
+        converted_buffers.add(tensor.buffer)
 
         # Create new FP32 tensor (DEQUANTIZE output, empty buffer — computed at runtime)
         new_buf = schema_fb.BufferT()
