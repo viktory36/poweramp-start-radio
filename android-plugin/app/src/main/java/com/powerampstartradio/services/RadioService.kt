@@ -367,17 +367,11 @@ class RadioService : Service() {
                             try {
                                 val count = if (isFirst) {
                                     isFirst = false
-                                    // For text search: prepend seed track so it plays first
-                                    val firstBatch = if (overrideSeedTrackId != null && seedDisplayTrack.realId > 0) {
-                                        listOf(seedDisplayTrack.realId) + batch.filter { it != seedDisplayTrack.realId }
-                                    } else {
-                                        batch
+                                    // For text search: ensure seed is in queue so replaceQueue preserves it
+                                    if (overrideSeedTrackId != null && seedDisplayTrack.realId > 0) {
+                                        PowerampHelper.ensureInQueue(this@RadioService, seedDisplayTrack.realId)
                                     }
-                                    val c = PowerampHelper.replaceQueue(this@RadioService, seedDisplayTrack.realId, firstBatch)
-                                    if (overrideSeedTrackId != null) {
-                                        PowerampHelper.playFirstInQueue(this@RadioService)
-                                    }
-                                    c
+                                    PowerampHelper.replaceQueue(this@RadioService, seedDisplayTrack.realId, batch)
                                 } else {
                                     PowerampHelper.addTracksToQueue(this@RadioService, batch)
                                 }
@@ -521,15 +515,15 @@ class RadioService : Service() {
                         return@launch
                     }
 
-                    // For text search: prepend seed track so it plays first
-                    val allFileIds = if (overrideSeedTrackId != null && seedDisplayTrack.realId > 0) {
-                        listOf(seedDisplayTrack.realId) + fileIds.filter { it != seedDisplayTrack.realId }
-                    } else {
-                        fileIds
+                    // For text search: ensure seed is in the queue first so replaceQueue
+                    // can find it and take the "preserve current, delete rest" path —
+                    // exactly like start-by-music where the seed is already playing.
+                    if (overrideSeedTrackId != null && seedDisplayTrack.realId > 0) {
+                        PowerampHelper.ensureInQueue(this@RadioService, seedDisplayTrack.realId)
                     }
 
-                    val queuedCount = PowerampHelper.replaceQueue(this@RadioService, seedDisplayTrack.realId, allFileIds)
-                    val queuedFileIds = allFileIds.take(queuedCount).toSet()
+                    val queuedCount = PowerampHelper.replaceQueue(this@RadioService, seedDisplayTrack.realId, fileIds)
+                    val queuedFileIds = fileIds.take(queuedCount).toSet()
 
                     val trackResults = mappedTracks.map { mapped ->
                         val status = when {
@@ -568,10 +562,6 @@ class RadioService : Service() {
 
                     PowerampHelper.reloadData(this@RadioService)
 
-                    // Text search: tell Poweramp to play from the start of the new queue
-                    if (overrideSeedTrackId != null) {
-                        PowerampHelper.playFirstInQueue(this@RadioService)
-                    }
 
                     val notFound = trackResults.count { it.status == QueueStatus.NOT_IN_LIBRARY }
                     val message = buildQueueResultMessage(radioResult.queuedCount, notFound)
