@@ -380,6 +380,13 @@ object PowerampHelper {
      * before adding new tracks.
      */
     /**
+     * Check if a file is currently in the Poweramp queue.
+     */
+    fun isInQueue(context: Context, fileId: Long): Boolean {
+        return findQueueEntryByFileId(context, fileId) != null
+    }
+
+    /**
      * Ensure a file is present in the queue. If not, insert it.
      * Used for text search: the seed track must be in the queue before
      * replaceQueue so it takes the "preserve current" path.

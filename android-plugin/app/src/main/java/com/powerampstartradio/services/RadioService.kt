@@ -292,21 +292,30 @@ class RadioService : Service() {
                         stopSelfDelayed()
                         return@launch
                     }
-                    // Resolve seed to Poweramp file ID — this goes FIRST in the queue
+                    // Resolve seed to Poweramp file ID
                     textSearchSeedFileId = matcher.findFileId(this@RadioService, track)
 
-                    // Use the CURRENTLY PLAYING track for queue preservation (same as start-by-music).
-                    // Queue will be: [current_track, text_search_seed, rec1, rec2, ...]
-                    // User presses next → gets the song they searched for → then recommendations.
+                    // If user is currently playing from the queue, preserve that track
+                    // so Poweramp's position stays valid (same as start-by-music).
+                    // Queue: [current_track, seed, rec1, rec2, ...]
+                    // If NOT in a queue, seed goes first — no need to preserve anything.
+                    // Queue: [seed, rec1, rec2, ...]
                     val currentTrack = PowerampReceiver.currentTrack
-                    seedDisplayTrack = currentTrack ?: PowerampTrack(
-                        realId = -1L,
-                        title = track.title ?: "Unknown",
-                        artist = track.artist,
-                        album = track.album,
-                        durationMs = track.durationMs,
-                        path = track.filePath,
-                    )
+                    val currentInQueue = currentTrack?.realId?.takeIf { it > 0 }?.let {
+                        PowerampHelper.isInQueue(this@RadioService, it)
+                    } == true
+                    seedDisplayTrack = if (currentInQueue) {
+                        currentTrack!!
+                    } else {
+                        PowerampTrack(
+                            realId = textSearchSeedFileId ?: -1L,
+                            title = track.title ?: "Unknown",
+                            artist = track.artist,
+                            album = track.album,
+                            durationMs = track.durationMs,
+                            path = track.filePath,
+                        )
+                    }
                     matchType = TrackMatcher.MatchType.METADATA_EXACT
                     Log.d(TAG, "Text search seed: ${track.title} by ${track.artist} " +
                             "(seedFileId=$textSearchSeedFileId, currentTrack=${currentTrack?.realId})")
