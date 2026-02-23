@@ -651,11 +651,14 @@ def convert_mulan_text(output_dir: Path):
 def export_tokenizer(output_dir: Path):
     """Export the XLM-RoBERTa tokenizer vocabulary for on-device use.
 
-    Saves a JSON file with the full vocabulary (piece → id mapping)
-    that the Android SentencePieceTokenizer can load.
+    Saves a JSON file with the vocabulary: {piece: [token_id, score]}.
+    The score is the Unigram log probability (higher = more probable).
+    The Android SentencePieceTokenizer uses Viterbi DP with these scores
+    to find the highest-probability segmentation, matching SentencePiece exactly.
     """
     import json
 
+    from tokenizers import Tokenizer as HFTokenizer
     from transformers import AutoTokenizer
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -663,56 +666,41 @@ def export_tokenizer(output_dir: Path):
     logger.info("Loading xlm-roberta-base tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base")
 
-    # Export vocab: {piece: id} for all tokens
-    vocab = tokenizer.get_vocab()
+    # Load the fast tokenizer backend to get Unigram vocab with scores
+    fast_tok = HFTokenizer.from_pretrained("xlm-roberta-base")
+    tok_json = json.loads(fast_tok.to_str())
+    unigram_vocab = tok_json["model"]["vocab"]  # [(piece, score), ...]
+    logger.info(f"Loaded Unigram model: {len(unigram_vocab)} pieces")
+
+    # Export vocab: {piece: [token_id, log_prob_score]}
+    # In the Unigram model, the vocab index IS the token ID (verified)
+    vocab = {}
+    for idx, (piece, score) in enumerate(unigram_vocab):
+        vocab[piece] = [idx, score]
+
     logger.info(f"Vocabulary size: {len(vocab)}")
 
-    # Save as JSON
     vocab_path = output_dir / "xlm_roberta_vocab.json"
     with open(vocab_path, "w", encoding="utf-8") as f:
         json.dump(vocab, f, ensure_ascii=False)
     size_kb = vocab_path.stat().st_size / 1024
     logger.info(f"Saved vocabulary: {vocab_path} ({size_kb:.0f} KB)")
 
-    # Also export the SentencePiece model file for reference
-    sp_model_file = None
-    if hasattr(tokenizer, "vocab_file") and tokenizer.vocab_file:
-        sp_model_file = Path(tokenizer.vocab_file)
-    if sp_model_file is None:
-        # Try to find it in the tokenizer's files
-        for attr in ["spm_file", "sp_model"]:
-            path = getattr(tokenizer, attr, None)
-            if path and Path(path).exists():
-                sp_model_file = Path(path)
-                break
-
-    if sp_model_file and sp_model_file.exists():
-        import shutil
+    # Copy SentencePiece model file for reference
+    import shutil
+    sp_model_path = tokenizer.vocab_file
+    if sp_model_path and Path(sp_model_path).exists():
         dest = output_dir / "sentencepiece.bpe.model"
-        shutil.copy2(sp_model_file, dest)
+        shutil.copy2(sp_model_path, dest)
         sp_size_mb = dest.stat().st_size / 1024 / 1024
         logger.info(f"Copied SentencePiece model: {dest} ({sp_size_mb:.1f} MB)")
 
-    # Export BPE merges from the tokenizer backend
-    # The HF tokenizer wraps SentencePiece; we extract the merge rules
-    # by encoding test strings and observing the vocabulary structure
-    if hasattr(tokenizer, "sp_model"):
-        sp = tokenizer.sp_model
-        pieces = []
-        for i in range(sp.get_piece_size()):
-            piece = sp.id_to_piece(i)
-            score = sp.get_score(i)
-            pieces.append({"id": i, "piece": piece, "score": score})
-        pieces_path = output_dir / "sp_pieces.json"
-        with open(pieces_path, "w", encoding="utf-8") as f:
-            json.dump(pieces, f, ensure_ascii=False)
-        logger.info(f"Saved {len(pieces)} SentencePiece pieces: {pieces_path}")
-
-    # Validate: encode a test string and print tokens
-    test = "ethereal ambient"
-    encoded = tokenizer.encode(test)
-    tokens = tokenizer.convert_ids_to_tokens(encoded)
-    logger.info(f"Test encode '{test}': ids={encoded}, tokens={tokens}")
+    # Validate: encode test strings
+    test_queries = ["ethereal ambient", "psychedelic", "trance", "melancholic"]
+    for test in test_queries:
+        hf_ids = tokenizer.encode(test)
+        hf_tokens = tokenizer.convert_ids_to_tokens(hf_ids)
+        logger.info(f"Validate '{test}': HF={hf_tokens} ids={hf_ids}")
 
     return vocab_path
 
