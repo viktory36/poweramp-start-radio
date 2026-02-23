@@ -383,22 +383,49 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     return@launch
                 }
 
-                // Lazy init text inference
+                // Lazy init text inference with fallback chain
                 val inference = textInference ?: run {
-                    val variants = listOf("_fp16", "")
-                    val modelFile = variants.firstNotNullOfOrNull { suffix ->
-                        File(filesDir, "mulan_text${suffix}.tflite").takeIf { it.exists() }
-                    }
-                    if (modelFile == null) {
-                        _textSearchResult.value = TextSearchResult(query = query, error = "MuQ-MuLan text model not found")
-                        return@launch
-                    }
                     val vocabFile = File(filesDir, "xlm_roberta_vocab.json")
                     if (!vocabFile.exists()) {
                         _textSearchResult.value = TextSearchResult(query = query, error = "Tokenizer vocab not found")
                         return@launch
                     }
-                    MuLanTextInference(modelFile, vocabFile, Accelerator.GPU).also { textInference = it }
+
+                    // Try: FP16+GPU → FP16+CPU → FP32+GPU → FP32+CPU
+                    val candidates = buildList {
+                        val fp16 = File(filesDir, "mulan_text_fp16.tflite")
+                        val fp32 = File(filesDir, "mulan_text.tflite")
+                        if (fp16.exists()) {
+                            add(fp16 to Accelerator.GPU)
+                            add(fp16 to Accelerator.CPU)
+                        }
+                        if (fp32.exists()) {
+                            add(fp32 to Accelerator.GPU)
+                            add(fp32 to Accelerator.CPU)
+                        }
+                    }
+                    if (candidates.isEmpty()) {
+                        _textSearchResult.value = TextSearchResult(query = query, error = "MuQ-MuLan text model not found")
+                        return@launch
+                    }
+
+                    var lastError: Exception? = null
+                    var result: MuLanTextInference? = null
+                    for ((modelFile, accel) in candidates) {
+                        try {
+                            result = MuLanTextInference(modelFile, vocabFile, accel)
+                            Log.i("MainViewModel", "Text model loaded: ${modelFile.name} on $accel")
+                            break
+                        } catch (e: Exception) {
+                            Log.w("MainViewModel", "Text model ${modelFile.name}+$accel failed: ${e.message}")
+                            lastError = e
+                        }
+                    }
+                    if (result == null) {
+                        _textSearchResult.value = TextSearchResult(query = query, error = "Failed to load text model: ${lastError?.message}")
+                        return@launch
+                    }
+                    result.also { textInference = it }
                 }
 
                 // Generate text embedding (save to debug dir for quality comparison)

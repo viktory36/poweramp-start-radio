@@ -60,21 +60,15 @@ class MuLanTextInference(
      * Generate a 512-dim text embedding from a query string.
      *
      * @param query Text query (e.g., "ethereal ambient", "heavy bass")
-     * @return 512-dim L2-normalized embedding, or null on failure
-     */
-    /**
-     * Generate a 512-dim text embedding from a query string.
-     *
-     * @param query Text query (e.g., "ethereal ambient", "heavy bass")
      * @param debugDir Optional directory to save the raw embedding for quality comparison.
-     *                 Saves as `text_emb_<sanitized_query>.bin` (512 × float32 LE).
+     *                 Saves as `text_emb_<sanitized_query>.bin` (512 x float32 LE).
      * @return 512-dim L2-normalized embedding, or null on failure
      */
     fun generateEmbedding(query: String, debugDir: File? = null): FloatArray? {
         return try {
             val t0 = System.nanoTime()
 
-            // Tokenize: text → (input_ids[64], attention_mask[64])
+            // Tokenize: text -> (input_ids[64], attention_mask[64])
             val (inputIds, attentionMask) = tokenizer.encode(query)
 
             val tokenMs = (System.nanoTime() - t0) / 1_000_000
