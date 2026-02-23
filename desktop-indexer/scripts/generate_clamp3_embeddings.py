@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torchaudio
+import librosa
 from transformers import AutoModel, BertConfig, BertModel, Wav2Vec2FeatureExtractor
 
 
@@ -352,20 +352,10 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size):
         npy_path = cache_dir / (cache_key + ".npy")
 
         try:
-            # Load and resample to 24kHz mono
-            waveform, sr = torchaudio.load(str(fpath))
-            if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
-            if sr != MERT_SR:
-                waveform = torchaudio.transforms.Resample(sr, MERT_SR)(waveform)
-
-            # Cap duration
-            max_samples = max_duration * MERT_SR
-            if waveform.shape[-1] > max_samples:
-                waveform = waveform[:, :max_samples]
-
-            # Normalize with Wav2Vec2FeatureExtractor (matching CLaMP3 pipeline)
-            wav_np = waveform.squeeze(0).numpy()
+            # Load as 24kHz mono (librosa handles all formats + resampling)
+            wav_np, _ = librosa.load(
+                str(fpath), sr=MERT_SR, mono=True, duration=max_duration
+            )
             wav = processor(
                 wav_np, return_tensors="pt",
                 sampling_rate=MERT_SR, padding=True,
