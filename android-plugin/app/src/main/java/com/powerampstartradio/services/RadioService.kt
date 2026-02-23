@@ -159,7 +159,7 @@ class RadioService : Service() {
          */
         fun startRadioFromSeed(context: Context, seedTrackId: Long, config: RadioConfig) {
             if (isSearchActive) return
-            _uiState.value = RadioUiState.Loading()
+            _uiState.value = RadioUiState.Searching("Starting radio...")
             val intent = Intent(context, RadioService::class.java).apply {
                 action = ACTION_START_RADIO
                 putExtra(EXTRA_SEED_TRACK_ID, seedTrackId)
