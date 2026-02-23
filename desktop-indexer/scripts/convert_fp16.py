@@ -95,13 +95,40 @@ def convert_fp32_to_fp16(input_path: str, output_path: str | None = None):
         buf = model.buffers[tensor.buffer]
         if buf.data is None or len(buf.data) == 0:
             continue
-        # Skip buffers not aligned to 4 bytes (e.g. already converted or mixed-type)
-        if len(buf.data) % 4 != 0:
-            continue
-        # Skip buffers already converted by a previous tensor sharing the same buffer
+        # Handle buffers already converted by a previous tensor sharing the same buffer:
+        # mark as FP16 and create DEQUANTIZE op (must check BEFORE alignment check,
+        # since the buffer has already been halved from 4→2 bytes)
         if tensor.buffer in converted_buffers:
             tensor.type = schema_fb.TensorType.FLOAT16
+
+            new_buf = schema_fb.BufferT()
+            model.buffers.append(new_buf)
+            new_buf_idx = len(model.buffers) - 1
+
+            new_tensor = schema_fb.TensorT()
+            new_tensor.shape = tensor.shape.copy() if tensor.shape is not None else None
+            new_tensor.type = schema_fb.TensorType.FLOAT32
+            new_tensor.buffer = new_buf_idx
+            new_tensor.name = (tensor.name or b"") + b"_dequantized"
+            new_tensor.shapeSignature = (
+                tensor.shapeSignature.copy() if tensor.shapeSignature is not None else None
+            )
+            new_tensors.append(new_tensor)
+            new_fp32_idx = len(subgraph.tensors) + len(new_tensors) - 1
+
+            dq_op = schema_fb.OperatorT()
+            dq_op.opcodeIndex = dequant_opcode_idx
+            dq_op.inputs = np.array([tensor_idx], dtype=np.int32)
+            dq_op.outputs = np.array([new_fp32_idx], dtype=np.int32)
+            dq_op.builtinOptionsType = schema_fb.BuiltinOptions.DequantizeOptions
+            dq_op.builtinOptions = schema_fb.DequantizeOptionsT()
+            new_ops.append(dq_op)
+
+            tensor_remap[tensor_idx] = new_fp32_idx
             converted += 1
+            continue
+        # Skip buffers not aligned to 4 bytes (e.g. mixed-type)
+        if len(buf.data) % 4 != 0:
             continue
 
         # Convert buffer from FP32 to FP16

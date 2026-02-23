@@ -5,6 +5,8 @@ import com.google.ai.edge.litert.Accelerator
 import com.google.ai.edge.litert.CompiledModel
 import com.google.ai.edge.litert.TensorBuffer
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 /**
  * MuQ-MuLan text tower LiteRT inference for text-to-music search.
@@ -60,7 +62,15 @@ class MuLanTextInference(
      * @param query Text query (e.g., "ethereal ambient", "heavy bass")
      * @return 512-dim L2-normalized embedding, or null on failure
      */
-    fun generateEmbedding(query: String): FloatArray? {
+    /**
+     * Generate a 512-dim text embedding from a query string.
+     *
+     * @param query Text query (e.g., "ethereal ambient", "heavy bass")
+     * @param debugDir Optional directory to save the raw embedding for quality comparison.
+     *                 Saves as `text_emb_<sanitized_query>.bin` (512 × float32 LE).
+     * @return 512-dim L2-normalized embedding, or null on failure
+     */
+    fun generateEmbedding(query: String, debugDir: File? = null): FloatArray? {
         return try {
             val t0 = System.nanoTime()
 
@@ -68,6 +78,7 @@ class MuLanTextInference(
             val (inputIds, attentionMask) = tokenizer.encode(query)
 
             val tokenMs = (System.nanoTime() - t0) / 1_000_000
+            Log.i(TAG, "Tokens: ${inputIds.take(attentionMask.count { it == 1 })}")
 
             // Write input_ids as INT64
             writeInt64Tensor(inputBuffers[0], inputIds)
@@ -86,12 +97,29 @@ class MuLanTextInference(
             Log.i(TAG, "Text inference: tokenize=${tokenMs}ms, inference=${inferMs}ms, " +
                     "total=${tokenMs + inferMs}ms, query='$query'")
 
-            if (output.size >= EMBEDDING_DIM) {
+            val embedding = if (output.size >= EMBEDDING_DIM) {
                 output.copyOf(EMBEDDING_DIM)
             } else {
                 Log.w(TAG, "Unexpected output size: ${output.size}")
                 null
             }
+
+            // Save embedding to file for quality comparison (adb pull)
+            if (embedding != null && debugDir != null) {
+                try {
+                    debugDir.mkdirs()
+                    val safeName = query.replace(Regex("[^a-zA-Z0-9_-]"), "_").take(50)
+                    val file = File(debugDir, "text_emb_${safeName}.bin")
+                    val buf = ByteBuffer.allocate(EMBEDDING_DIM * 4).order(ByteOrder.LITTLE_ENDIAN)
+                    for (v in embedding) buf.putFloat(v)
+                    file.writeBytes(buf.array())
+                    Log.i(TAG, "Saved embedding to ${file.absolutePath} (${file.length()} bytes)")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to save debug embedding: ${e.message}")
+                }
+            }
+
+            embedding
         } catch (e: Exception) {
             Log.e(TAG, "Text inference failed: ${e.message}", e)
             null

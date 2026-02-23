@@ -401,8 +401,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     MuLanTextInference(modelFile, vocabFile, Accelerator.GPU).also { textInference = it }
                 }
 
-                // Generate text embedding
-                val embedding = inference.generateEmbedding(query)
+                // Generate text embedding (save to debug dir for quality comparison)
+                val debugDir = File(filesDir, "debug_embeddings")
+                val embedding = inference.generateEmbedding(query, debugDir)
                 if (embedding == null) {
                     _textSearchResult.value = TextSearchResult(query = query, error = "Text inference failed")
                     return@launch
