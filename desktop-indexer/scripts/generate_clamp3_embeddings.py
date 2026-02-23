@@ -266,7 +266,7 @@ def make_cache_key(file_path, music_dir):
 
 # ─── Phase 1: MERT feature extraction ────────────────────────────────────────
 
-def phase1_mert(music_dir, cache_dir, max_duration, batch_size):
+def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False):
     """Extract MERT features from all audio files, cached as .npy.
 
     Pipeline (matches official CLaMP3 exactly):
@@ -408,11 +408,15 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size):
 
             np.save(str(npy_path), all_features.numpy())
             success += 1
+            if verbose:
+                dur_s = waveform.shape[-1] / MERT_SR
+                print(f"  OK [{i+1}/{len(to_process)}] {fpath.name[:60]} "
+                      f"({dur_s:.0f}s, {len(chunks)} chunks)")
 
         except Exception as e:
             fail += 1
-            if fail <= 20:
-                print(f"  FAIL: {fpath.name[:60]}: {e}")
+            if fail <= 20 or verbose:
+                print(f"  FAIL [{i+1}/{len(to_process)}] {fpath.name[:60]}: {e}")
 
     elapsed = time.time() - t0
     print(f"\nPhase 1 complete: {success} ok, {fail} fail in {elapsed:.0f}s "
@@ -426,7 +430,7 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size):
 
 # ─── Phase 2: CLaMP3 encoding + DB storage ───────────────────────────────────
 
-def phase2_clamp3(music_dir, cache_dir, db_path):
+def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False):
     """Encode cached MERT features with CLaMP3 and store in SQLite.
 
     Pipeline (matches official CLaMP3 exactly):
@@ -598,11 +602,14 @@ def phase2_clamp3(music_dir, cache_dir, db_path):
                 (track_id, float_list_to_blob(emb_list))
             )
             success += 1
+            if verbose:
+                label = f"{artist} - {title}" if artist else title
+                print(f"  OK [{i+1}/{len(to_process)}] {label[:60]}")
 
         except Exception as e:
             fail += 1
-            if fail <= 20:
-                print(f"  FAIL: {cache_key[:60]}: {e}")
+            if fail <= 20 or verbose:
+                print(f"  FAIL [{i+1}/{len(to_process)}] {cache_key[:60]}: {e}")
 
     conn.commit()
     elapsed = time.time() - t0
@@ -658,6 +665,9 @@ Examples:
     parser.add_argument(
         "--batch-size", type=int, default=8,
         help="MERT chunk batch size for GPU throughput (default: 8)")
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Print per-track progress")
 
     args = parser.parse_args()
 
@@ -679,10 +689,11 @@ Examples:
     print()
 
     if args.phase in ("1", "both"):
-        phase1_mert(music_dir, cache_dir, args.max_duration, args.batch_size)
+        phase1_mert(music_dir, cache_dir, args.max_duration, args.batch_size,
+                    verbose=args.verbose)
 
     if args.phase in ("2", "both"):
-        phase2_clamp3(music_dir, cache_dir, db_path)
+        phase2_clamp3(music_dir, cache_dir, db_path, verbose=args.verbose)
 
     return 0
 
