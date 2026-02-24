@@ -14,6 +14,7 @@ Usage:
   python generate_clamp3_embeddings.py /path/to/music -o embeddings_clamp3.db --phase 1
   python generate_clamp3_embeddings.py /path/to/music -o embeddings_clamp3.db --phase 2
   python generate_clamp3_embeddings.py /path/to/music -o embeddings_clamp3.db --max-duration 600 --batch-size 8
+  python generate_clamp3_embeddings.py /path/to/music -o embeddings_clamp3.db --fp16
 """
 
 import argparse
@@ -305,7 +306,8 @@ def _load_audio_chunks(fpath, processor, max_duration):
     return chunks, waveform.shape[-1]
 
 
-def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False):
+def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False,
+                fp16=False):
     """Extract MERT features from all audio files, cached as .npy.
 
     Pipeline (matches official CLaMP3 exactly):
@@ -315,6 +317,8 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False):
         → Mean over layers → [1, chunks, 768] → save .npy
 
     CPU audio decoding runs in a background thread, overlapping with GPU inference.
+    When fp16=True, MERT runs in half precision (halves VRAM, ~2x faster).
+    Output is cast back to float32 before saving for Phase 2 compatibility.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -373,7 +377,11 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False):
     mert_model.to(device).eval()
     for param in mert_model.parameters():
         param.requires_grad = False
-    print("MERT loaded")
+    if fp16:
+        mert_model.half()
+        print("MERT loaded (FP16)")
+    else:
+        print("MERT loaded")
 
     t0 = time.time()
     success = 0
@@ -429,13 +437,15 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False):
                 batch = torch.stack(
                     chunks[b_start:b_start + batch_size]
                 ).to(device)
+                if fp16:
+                    batch = batch.half()
                 with torch.no_grad():
                     out = mert_model(
                         batch, output_hidden_states=True
                     ).hidden_states
                     out = torch.stack(out)   # [L, B, T_hidden, H]
                     out = out.mean(-2)       # [L, B, H] — mean over time
-                features_list.append(out.cpu())
+                features_list.append(out.float().cpu())
 
             # Concatenate batches → [L, total_chunks, H]
             all_features = torch.cat(features_list, dim=1)
@@ -468,7 +478,7 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False):
 
 # ─── Phase 2: CLaMP3 encoding + DB storage ───────────────────────────────────
 
-def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False):
+def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False, fp16=False):
     """Encode cached MERT features with CLaMP3 and store in SQLite.
 
     Pipeline (matches official CLaMP3 exactly):
@@ -477,6 +487,8 @@ def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False):
         → BertModel → avg_pooling → audio_proj
         → weighted average of segments → L2 normalize → 768d
         → store in SQLite with track metadata
+
+    When fp16=True, new embeddings are tagged with precision='fp16'.
     """
     print("\n" + "=" * 70)
     print("PHASE 2: CLaMP3 Encoding → SQLite")
@@ -504,6 +516,18 @@ def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False):
 
     # Init DB and check existing embeddings
     conn = init_db(db_path)
+
+    # Migrate: add precision column if it doesn't exist yet
+    try:
+        conn.execute(
+            "ALTER TABLE embeddings_clamp3 ADD COLUMN precision TEXT DEFAULT 'fp32'"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    precision_tag = 'fp16' if fp16 else 'fp32'
+
     existing = get_existing_paths_with_embeddings(conn)
 
     # Build lookup for orphan tracks (exist in DB without embeddings)
@@ -636,8 +660,8 @@ def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False):
 
             conn.execute(
                 "INSERT OR REPLACE INTO embeddings_clamp3 "
-                "(track_id, embedding) VALUES (?, ?)",
-                (track_id, float_list_to_blob(emb_list))
+                "(track_id, embedding, precision) VALUES (?, ?, ?)",
+                (track_id, float_list_to_blob(emb_list), precision_tag)
             )
             success += 1
             if verbose:
@@ -706,6 +730,10 @@ Examples:
     parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="Print per-track progress")
+    parser.add_argument(
+        "--fp16", action="store_true",
+        help="Run MERT in FP16 (halves VRAM, ~2x faster). "
+             "Embeddings are cast back to float32 for cache/DB compatibility.")
 
     args = parser.parse_args()
 
@@ -728,10 +756,11 @@ Examples:
 
     if args.phase in ("1", "both"):
         phase1_mert(music_dir, cache_dir, args.max_duration, args.batch_size,
-                    verbose=args.verbose)
+                    verbose=args.verbose, fp16=args.fp16)
 
     if args.phase in ("2", "both"):
-        phase2_clamp3(music_dir, cache_dir, db_path, verbose=args.verbose)
+        phase2_clamp3(music_dir, cache_dir, db_path, verbose=args.verbose,
+                      fp16=args.fp16)
 
     return 0
 

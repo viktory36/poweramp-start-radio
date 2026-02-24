@@ -47,10 +47,22 @@ def load_all_embeddings(db_path):
     """Load all CLaMP3 embeddings and track metadata from the DB."""
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT t.id, t.artist, t.album, t.title, t.file_path, e.embedding "
-        "FROM tracks t INNER JOIN embeddings_clamp3 e ON t.id = e.track_id"
-    ).fetchall()
+
+    # Check if precision column exists
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(embeddings_clamp3)")}
+    has_precision = 'precision' in cols
+
+    if has_precision:
+        rows = conn.execute(
+            "SELECT t.id, t.artist, t.album, t.title, t.file_path, "
+            "e.embedding, e.precision "
+            "FROM tracks t INNER JOIN embeddings_clamp3 e ON t.id = e.track_id"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT t.id, t.artist, t.album, t.title, t.file_path, e.embedding "
+            "FROM tracks t INNER JOIN embeddings_clamp3 e ON t.id = e.track_id"
+        ).fetchall()
     conn.close()
 
     tracks = []
@@ -63,6 +75,7 @@ def load_all_embeddings(db_path):
             'album': row['album'] or '',
             'title': row['title'] or '',
             'file_path': row['file_path'],
+            'precision': row['precision'] if has_precision else 'fp32',
         })
         embeddings.append(emb)
 
@@ -104,7 +117,7 @@ def cmd_similar(db_path, query, top_k=20):
 
     seed_idx = scored[0][0]
     seed = tracks[seed_idx]
-    print(f"Seed track: {seed['artist']} - {seed['title']}")
+    print(f"Seed track: {seed['artist']} - {seed['title']} [{seed['precision']}]")
 
     # Cosine similarity
     seed_emb = emb_matrix[seed_idx].unsqueeze(0)  # [1, 768]
@@ -120,7 +133,7 @@ def cmd_similar(db_path, query, top_k=20):
             continue
         t = tracks[idx]
         sim = sims[idx].item()
-        print(f"  {sim:.4f}  {t['artist']} - {t['title']}")
+        print(f"  {sim:.4f}  [{t['precision']}] {t['artist']} - {t['title']}")
         shown += 1
         if shown >= top_k:
             break
@@ -262,7 +275,7 @@ def cmd_search(db_path, query, top_k=20):
         idx = ranked[i].item()
         t = tracks[idx]
         sim = sims[idx].item()
-        print(f"  {sim:.4f}  {t['artist']} - {t['title']}")
+        print(f"  {sim:.4f}  [{t['precision']}] {t['artist']} - {t['title']}")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
