@@ -379,8 +379,7 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False,
         param.requires_grad = False
     if fp16:
         mert_model.half()
-    mert_model = torch.compile(mert_model)
-    print(f"MERT loaded{' (FP16)' if fp16 else ''}, compiling graph...")
+    print(f"MERT loaded{' (FP16)' if fp16 else ''}")
 
     t0 = time.time()
     success = 0
