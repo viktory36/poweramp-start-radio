@@ -399,9 +399,6 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False,
             print(f"  [{i}/{len(to_process)}] {success} ok, {fail} fail, "
                   f"{rate:.1f}s/track, ETA {eta:.0f}min")
 
-        if i > 0 and i % 200 == 0:
-            torch.cuda.empty_cache()
-
         cache_key = make_cache_key(fpath, music_dir)
         npy_path = cache_dir / (cache_key + ".npy")
 
