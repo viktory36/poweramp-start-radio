@@ -379,9 +379,8 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False,
         param.requires_grad = False
     if fp16:
         mert_model.half()
-        print("MERT loaded (FP16)")
-    else:
-        print("MERT loaded")
+    mert_model = torch.compile(mert_model)
+    print(f"MERT loaded{' (FP16)' if fp16 else ''}, compiling graph...")
 
     t0 = time.time()
     success = 0
@@ -399,10 +398,6 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False,
             eta = rate * (len(to_process) - i) / 60
             print(f"  [{i}/{len(to_process)}] {success} ok, {fail} fail, "
                   f"{rate:.1f}s/track, ETA {eta:.0f}min")
-
-        if i > 0 and i % 100 == 0:
-            torch.cuda.empty_cache()
-            gc.collect()
 
         cache_key = make_cache_key(fpath, music_dir)
         npy_path = cache_dir / (cache_key + ".npy")
@@ -439,7 +434,7 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False,
                 ).to(device)
                 if fp16:
                     batch = batch.half()
-                with torch.no_grad():
+                with torch.inference_mode():
                     out = mert_model(
                         batch, output_hidden_states=True
                     ).hidden_states
