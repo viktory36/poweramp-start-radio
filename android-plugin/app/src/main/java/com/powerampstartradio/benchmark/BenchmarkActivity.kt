@@ -88,7 +88,7 @@ class BenchmarkActivity : ComponentActivity() {
             scope.launch(Dispatchers.IO) {
                 try {
                     runBenchmark(selectedAccelerator) { msg -> status = msg }
-                } catch (e: Exception) {
+                } catch (e: Throwable) {
                     Log.e(TAG, "Benchmark failed", e)
                     status = "ERROR: ${e.message}\n\n${e.stackTraceToString()}"
                 } finally {
@@ -449,6 +449,7 @@ class BenchmarkActivity : ComponentActivity() {
 
         clamp3Inference.close()
         log("\nCLaMP3 session closed.")
+        Log.i(TAG, "Building output JSON...")
 
         // ── Save results as JSON ──
         val output = BenchmarkOutput(
@@ -465,15 +466,13 @@ class BenchmarkActivity : ComponentActivity() {
             tracks = results,
         )
 
+        Log.i(TAG, "BenchmarkOutput built, ${results.size} tracks, serializing...")
         val gson = GsonBuilder().setPrettyPrinting().create()
-        val json = try {
-            gson.toJson(output)
-        } catch (e: Exception) {
-            Log.e(TAG, "Gson serialization failed", e)
-            throw e
-        }
+        val json = gson.toJson(output)
+        Log.i(TAG, "JSON serialized: ${json.length} chars")
         val outputFile = File(filesDir, "benchmark_results.json")
         outputFile.writeText(json)
+        Log.i(TAG, "Written to ${outputFile.absolutePath}")
 
         log("\n=== Results saved ===")
         log("File: ${outputFile.absolutePath}")
