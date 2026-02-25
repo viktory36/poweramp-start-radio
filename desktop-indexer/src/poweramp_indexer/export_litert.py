@@ -168,8 +168,15 @@ class CLaMP3AudioWrapper(nn.Module):
     """Wraps CLaMP3 audio encoder for TFLite export.
 
     Input:  audio_inputs [1, 128, 768] (MERT features, zero-padded)
-            audio_masks  [1, 128] (attention mask, 1=real, 0=pad)
+            audio_masks  [1, 128, 128] (attention mask, pre-expanded on host)
     Output: [1, 768] projected features (not L2-normalized)
+
+    The mask is 3D [B, S, S] so BERT only unsqueezes to 4D (no expand
+    or broadcast). The GPU delegate doesn't support BROADCAST_TO, and the
+    TFLite converter optimizes repeat/tile into BROADCAST_TO, so the only
+    clean solution is to pass the mask pre-expanded from the host.
+
+    Host constructs: mask_3d[i, j] = mask_1d[j] for all i (key-only masking).
 
     This is a single 128-frame window. The segmentation and weighted averaging
     of multi-segment tracks is done on the host (Kotlin/Python) side.
@@ -183,11 +190,12 @@ class CLaMP3AudioWrapper(nn.Module):
     def forward(self, audio_inputs: torch.Tensor, audio_masks: torch.Tensor) -> torch.Tensor:
         features = self.audio_model(
             inputs_embeds=audio_inputs,
-            attention_mask=audio_masks,
+            attention_mask=audio_masks,  # [1, 128, 128] — BERT unsqueezes to [1, 1, 128, 128]
         )['last_hidden_state']
-        masks = audio_masks.unsqueeze(-1)
-        features = features * masks
-        pooled = features.sum(dim=1) / masks.sum(dim=1)
+        # Extract 1D mask from 3D for pooling (all rows are identical)
+        masks_1d = audio_masks[:, 0, :].unsqueeze(-1)  # [1, 128, 1]
+        features = features * masks_1d
+        pooled = features.sum(dim=1) / masks_1d.sum(dim=1)
         return self.audio_proj(pooled)
 
 
@@ -209,9 +217,9 @@ def convert_clamp3_audio(output_dir: Path):
     wrapper = CLaMP3AudioWrapper(encoder)
     wrapper.eval()
 
-    # Sample inputs
+    # Sample inputs — mask is 3D [B, S, S] (pre-expanded on host)
     sample_inputs = torch.randn(1, MAX_AUDIO_LENGTH, AUDIO_HIDDEN_SIZE)
-    sample_masks = torch.ones(1, MAX_AUDIO_LENGTH)
+    sample_masks = torch.ones(1, MAX_AUDIO_LENGTH, MAX_AUDIO_LENGTH)
 
     # Validate
     logger.info("Validating wrapper...")
