@@ -466,6 +466,22 @@ class BenchmarkActivity : ComponentActivity() {
             tracks = results,
         )
 
+        // Check for NaN embeddings (GPU numerical issues)
+        for (r in results) {
+            val emb = r.clamp3?.embedding
+            if (emb != null && emb.any { it.isNaN() || it.isInfinite() }) {
+                val nanCount = emb.count { it.isNaN() }
+                val infCount = emb.count { it.isInfinite() }
+                Log.w(TAG, "NaN/Inf in embedding for ${r.artist} - ${r.title}: " +
+                    "$nanCount NaN, $infCount Inf out of ${emb.size}")
+                // Replace NaN/Inf with 0 so JSON serialization doesn't fail
+                r.clamp3 = EmbeddingResult(
+                    dim = emb.size,
+                    embedding = emb.map { if (it.isNaN() || it.isInfinite()) 0f else it },
+                )
+            }
+        }
+
         Log.i(TAG, "BenchmarkOutput built, ${results.size} tracks, serializing...")
         val gson = GsonBuilder().setPrettyPrinting().create()
         val json = gson.toJson(output)
