@@ -369,9 +369,21 @@ class BenchmarkActivity : ComponentActivity() {
                 var lastWindowEndNs = 0L
                 val inferStart = System.nanoTime()
                 lastWindowEndNs = inferStart
+                var mertNanWindows = 0
                 val numWindows = mertInference.extractFeaturesStreaming(
                     audio,
-                    onFeatureExtracted = { features.add(it.copyOf()) },
+                    onFeatureExtracted = { feat ->
+                        features.add(feat.copyOf())
+                        // Check for NaN/Inf in MERT output
+                        val nanCount = feat.count { it.isNaN() }
+                        val infCount = feat.count { it.isInfinite() }
+                        if (nanCount > 0 || infCount > 0) {
+                            mertNanWindows++
+                            if (mertNanWindows <= 3) {
+                                Log.w(TAG, "MERT window ${features.size}: $nanCount NaN, $infCount Inf")
+                            }
+                        }
+                    },
                     onWindowDone = {
                         val now = System.nanoTime()
                         perWindowMs.add((now - lastWindowEndNs) / 1_000_000)
@@ -384,6 +396,16 @@ class BenchmarkActivity : ComponentActivity() {
                 log("  $numWindows windows: total=${mertMs}ms, avg=${avgMs}ms/win")
                 if (perWindowMs.isNotEmpty()) {
                     log("  per-window: min=${perWindowMs.min()}ms, max=${perWindowMs.max()}ms")
+                }
+                if (mertNanWindows > 0) {
+                    log("  WARNING: $mertNanWindows/$numWindows MERT windows contain NaN!")
+                } else if (features.isNotEmpty()) {
+                    // Log MERT feature stats for first window
+                    val f0 = features[0]
+                    val fMin = f0.min()
+                    val fMax = f0.max()
+                    val fAbsMax = f0.maxOf { kotlin.math.abs(it) }
+                    log("  MERT features OK: min=${"%.4f".format(fMin)}, max=${"%.4f".format(fMax)}, absmax=${"%.4f".format(fAbsMax)}")
                 }
                 allFeatures[i] = TrackFeatures(features, decodeMs, mertMs, perWindowMs.toList(), audio.durationS)
                 results[i].durationS = audio.durationS
@@ -422,6 +444,14 @@ class BenchmarkActivity : ComponentActivity() {
                 val realtimeFactor = if (tf.audioDurationS > 0) totalMs / (tf.audioDurationS * 1000f) else 0f
 
                 if (embedding != null) {
+                    val embNanCount = embedding.count { it.isNaN() }
+                    val embInfCount = embedding.count { it.isInfinite() }
+                    if (embNanCount > 0 || embInfCount > 0) {
+                        log("  CLaMP3 output: $embNanCount NaN, $embInfCount Inf out of ${embedding.size}")
+                    } else {
+                        val norm = kotlin.math.sqrt(embedding.sumOf { (it * it).toDouble() }).toFloat()
+                        log("  CLaMP3 output OK: norm=${"%.4f".format(norm)}, absmax=${"%.4f".format(embedding.maxOf { kotlin.math.abs(it) })}")
+                    }
                     log("  ${embedding.size}d, $numSegments seg (decode=${tf.decodeMs}ms, mert=${tf.mertMs}ms, clamp3=${encMs}ms, total=${totalMs}ms)")
                     log("  Realtime factor: ${"%.2f".format(realtimeFactor)}x (${tf.audioDurationS}s audio in ${totalMs / 1000f}s)")
                     results[i].timing = TrackTiming(
