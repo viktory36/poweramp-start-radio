@@ -76,7 +76,7 @@ class RecommendationEngine(
         val dbModified = dbFile.lastModified()
 
         // Embedding index
-        val embFile = File(filesDir, "fused.emb")
+        val embFile = File(filesDir, "clamp3.emb")
         if (!embFile.exists() || embFile.lastModified() < dbModified) {
             Log.i(TAG, "Extracting embedding index (one-time)...")
             onProgress?.invoke("Extracting embedding index...")

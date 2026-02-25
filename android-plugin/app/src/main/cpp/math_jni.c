@@ -1,11 +1,12 @@
 /*
- * NEON-accelerated math operations for embedding fusion.
+ * NEON-accelerated math operations for embedding indexing.
  *
- * Hot loops that dominate FusionEngine runtime:
- * - k-means assignment: n × K dot products per iteration (~15s → ~2s)
+ * Hot loops:
+ * - k-means assignment: n × K dot products per iteration
  * - kNN candidate scoring: query vs N candidates
  * - Covariance accumulation: streaming outer products
- * - Matrix-vector multiply: projection (1024d → 512d per track)
+ * - Matrix-vector multiply: projection per track
+ * - int16 → mono float conversion: bulk audio decoding
  *
  * ARM NEON does 4 float multiply-adds per instruction, giving ~4x
  * speedup over scalar Kotlin loops. Combined with C loop efficiency

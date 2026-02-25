@@ -40,7 +40,7 @@ class AudioDecoder {
      * Decode an audio file to mono PCM at the given target sample rate.
      *
      * @param file Audio file to decode
-     * @param targetSampleRate Desired output sample rate (e.g., 24000 for MuQ-MuLan, 16000 for Flamingo)
+     * @param targetSampleRate Desired output sample rate (e.g., 24000 for MERT/CLaMP3)
      * @param maxDurationS Maximum duration to decode in seconds (0 = unlimited).
      *   Caps at native sample rate before resampling.
      * @return Decoded audio, or null on failure
@@ -244,11 +244,6 @@ class AudioDecoder {
 
     /**
      * Resample audio using libsoxr (native) for high-quality anti-aliased conversion.
-     *
-     * Flamingo/Whisper is extremely sensitive to resampling quality — a 0.001 mel
-     * cosine difference from aliasing causes 0.40 embedding cosine degradation.
-     * Only soxr-quality resampling produces correct embeddings (0.95+ cosine vs DB).
-     * All other approaches (linear, sinc, Kaiser FIR, scipy polyphase) give ~0.55.
      */
     fun resample(
         samples: FloatArray,

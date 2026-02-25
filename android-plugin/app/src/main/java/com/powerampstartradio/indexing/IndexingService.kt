@@ -16,11 +16,9 @@ import com.powerampstartradio.R
 import com.powerampstartradio.data.EmbeddingDatabase
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -30,18 +28,15 @@ import kotlinx.coroutines.launch
 import java.io.File
 
 /**
- * Foreground service for on-device embedding indexing.
+ * Foreground service for on-device CLaMP3 embedding indexing.
  *
- * Runs MuQ-MuLan + Flamingo TFLite inference on new tracks detected in the Poweramp
- * library, writes embeddings to the database, and rebuilds indices.
+ * Two-phase GPU pipeline (Adreno can't run two OpenCL contexts simultaneously):
+ * - Phase 1 (MERT): Decode audio → extract 768d features per 5s window → spill to disk
+ * - Phase 2 (CLaMP3): Read MERT features → encode into 768d embedding → write to DB
  *
- * Follows the same foreground service pattern as RadioService.
+ * After indexing, optionally rebuilds the kNN graph for recommendation algorithms.
  */
 class IndexingService : Service() {
-
-    enum class FusionTier { QUICK_UPDATE, RECLUSTER, FULL_REFUSION }
-
-    data class FusionOptions(val tier: FusionTier, val buildKnnGraph: Boolean = false)
 
     companion object {
         private const val TAG = "IndexingService"
@@ -65,18 +60,18 @@ class IndexingService : Service() {
         @Volatile
         var pendingTracks: List<NewTrackDetector.UnindexedTrack>? = null
 
-        /** Post-indexing fusion options. Null = extract indices only (no fusion). */
+        /** Whether to rebuild kNN graph after indexing. */
         @Volatile
-        var pendingFusionOptions: FusionOptions? = null
+        var pendingBuildGraph: Boolean = false
 
         fun startIndexing(
             context: Context,
             selectedTracks: List<NewTrackDetector.UnindexedTrack>? = null,
-            fusionOptions: FusionOptions? = null,
+            buildGraph: Boolean = false,
         ) {
             if (isActive) return
             pendingTracks = selectedTracks
-            pendingFusionOptions = fusionOptions
+            pendingBuildGraph = buildGraph
             _state.value = IndexingState.Starting
             val intent = Intent(context, IndexingService::class.java).apply {
                 action = ACTION_START_INDEXING
@@ -98,9 +93,6 @@ class IndexingService : Service() {
         }
     }
 
-    /**
-     * State of the indexing operation.
-     */
     sealed class IndexingState {
         data object Idle : IndexingState()
         data object Starting : IndexingState()
@@ -157,7 +149,6 @@ class IndexingService : Service() {
                     return@launch
                 }
 
-                // Open database in read-write mode
                 val db = EmbeddingDatabase.openReadWrite(dbFile)
 
                 // Use pre-selected tracks if provided, otherwise detect
@@ -189,74 +180,47 @@ class IndexingService : Service() {
                 updateNotification("Loading models for ${unindexed.size} tracks...")
                 val batchStartTime = System.currentTimeMillis()
 
-                val mulanFile = resolveModelFile(filesDir, "mulan_audio")
-                val flamingoFile = resolveModelFile(filesDir, "flamingo_encoder")
-                val projectorFile = resolveModelFile(filesDir, "flamingo_projector")
+                val mertFile = resolveModelFile(filesDir, "mert")
+                val clamp3AudioFile = resolveModelFile(filesDir, "clamp3_audio")
 
-                val hasMulan = mulanFile.exists()
-                val hasFlamingo = flamingoFile.exists()
-
-                if (!hasMulan && !hasFlamingo) {
+                if (!mertFile.exists() || !clamp3AudioFile.exists()) {
                     _state.value = IndexingState.Error(
-                        "No TFLite models found. Transfer mulan_audio.tflite and/or " +
-                        "flamingo_encoder.tflite to ${filesDir.absolutePath}"
+                        "CLaMP3 models not found. Transfer mert.tflite and " +
+                        "clamp3_audio.tflite to ${filesDir.absolutePath}"
                     )
                     db.close()
                     stopSelf()
                     return@launch
                 }
 
-                // Load projection matrices from DB metadata
-                val rawDb = db.getRawDatabase()
-                // flamingo_projection is stored as V_k [3584, 512] (row-major) from
-                // the Python `reduce` command. On-device we need V_k^T [512, 3584]
-                // so that multiplyVector(flamingoRaw_3584d) → reduced_512d.
-                val flamingoProjection = EmbeddingProcessor.loadProjectionMatrix(
-                    rawDb, "flamingo_projection", 3584, 512
-                )?.transpose()
-                val fusedProjection = EmbeddingProcessor.loadProjectionMatrix(
-                    rawDb, "fused_projection", 512, 1024
-                )
-                val centroids = db.loadCentroids()
-                val writer = EmbeddingWriter(db, centroids)
+                val writer = EmbeddingWriter(db)
+                val audioDecoder = AudioDecoder()
 
                 var indexed = 0
                 var failed = 0
 
                 // Pre-compute total work steps for ETA.
-                // Step weights calibrated from Snapdragon 8 Gen 3 benchmarks (14 tracks):
-                // - MuLan clip inference: ~0.27s (base unit, weight=1)
-                // - Audio decode: ~12.2s/track (weight=45 clip-equivalents)
-                // - Resample 24→16kHz: ~4.4s/track (weight=16)
-                // - Flamingo chunk inference: ~1.9s/chunk (weight=7)
-                // - Flamingo project+fuse+write: ~2ms/track (weight=1, minimal but provides UI feedback)
+                // Step weights calibrated for CLaMP3 pipeline:
+                // - Audio decode: ~12s/track (weight=45)
+                // - MERT window inference: ~0.3s/window (weight=1)
+                // - CLaMP3 segment inference: ~0.5s/segment (weight=2)
+                // - DB write: negligible (weight=1)
                 val DECODE_WEIGHT = 45
-                val RESAMPLE_WEIGHT = 16
-                val FLAMINGO_CHUNK_WEIGHT = 7
-                val FLAMINGO_PROJECT_WEIGHT = 1
+                val CLAMP3_SEGMENT_WEIGHT = 2
+                val WRITE_WEIGHT = 1
                 var totalSteps = 0
                 for (t in unindexed) {
                     val durS = t.durationMs / 1000f
-                    if (hasMulan && durS >= 30f) {
-                        totalSteps += DECODE_WEIGHT
-                        if (hasFlamingo) totalSteps += RESAMPLE_WEIGHT
-                        val mulanChunks = maxOf(1, minOf((durS / 60f).toInt(), 30))
-                        totalSteps += mulanChunks * 3  // MuLan clips, weight=1 each
-                    }
-                    if (hasFlamingo && durS >= 3f) {
-                        if (!hasMulan) totalSteps += DECODE_WEIGHT
-                        val flamingoChunks = maxOf(1, minOf(kotlin.math.ceil(durS / 30.0).toInt(), 60))
-                        totalSteps += flamingoChunks * FLAMINGO_CHUNK_WEIGHT
-                        totalSteps += FLAMINGO_PROJECT_WEIGHT  // project+fuse+write per track
-                    }
+                    if (durS < MertInference.WINDOW_SEC) continue
+                    totalSteps += DECODE_WEIGHT
+                    val windows = (durS * MertInference.SAMPLE_RATE).toInt() / MertInference.WINDOW_SAMPLES
+                    totalSteps += windows  // MERT windows, weight=1 each
+                    val segments = maxOf(1, kotlin.math.ceil(windows.toFloat() / Clamp3AudioInference.MAX_WINDOWS).toInt())
+                    totalSteps += segments * CLAMP3_SEGMENT_WEIGHT
+                    totalSteps += WRITE_WEIGHT
                 }
                 var completedSteps = 0
-                // Floor prevents progress bar regression when cache misses
-                // dynamically increase totalSteps (line ~540).
                 var fractionFloor = 0f
-                // ETA clock starts after model loading (not batchStartTime which
-                // includes model load). Prevents inflated early ETAs from 4-7s
-                // GPU JIT compilation being amortized across the first few steps.
                 var etaStartTime = 0L
                 var lastEta = 0L
 
@@ -270,555 +234,261 @@ class IndexingService : Service() {
                     if (completedSteps == 0 || etaStartTime == 0L) return 0L
                     val elapsed = System.currentTimeMillis() - etaStartTime
                     val rawEta = elapsed * (totalSteps - completedSteps) / completedSteps
-                    // Smooth: ETA can drop freely but only increase by 20% per update
-                    // to prevent jarring jumps when a slow track inflates the average.
                     lastEta = if (rawEta > lastEta && lastEta > 0L) {
                         minOf(rawEta, (lastEta * 1.2).toLong())
                     } else rawEta
                     return lastEta
                 }
 
-                // MuLan results held in memory until Flamingo pass completes.
-                // Avoids writing partial entries to DB that would be invisible
-                // to search (no fused embedding) but considered "indexed" by detector.
-                // Each embedding is 512 floats = 2KB, negligible memory.
-                val mulanResults = mutableMapOf<NewTrackDetector.UnindexedTrack, EmbeddingProcessor.EmbeddingResult>()
+                // ── Phase 1: MERT Feature Extraction (GPU) ────────────────
+                // Extract 768d MERT features per 5-second window. Features are
+                // spilled to disk because the Adreno GPU can't have MERT and
+                // CLaMP3 audio TFLite models loaded simultaneously.
 
-                // Decode-once optimization: cache 16kHz audio during MuLan pass
-                // for Flamingo pass. Avoids redundant decode+resample (~50s/track).
-                // Disk-backed: write temp files instead of an in-memory LRU cache.
-                // No size limit — even a 30-min opus file is only 115MB at 16kHz,
-                // and disk I/O is <0.5s on UFS 4.0. Guarantees cache hits for all
-                // tracks, preventing OOM from re-decoding long files at native rate.
-                val audioCacheDir = if (hasMulan && hasFlamingo) {
-                    File(cacheDir, "audio_cache_16k").also {
-                        it.mkdirs()
-                    }
-                } else null
-                val audioDecoder = AudioDecoder()
+                _state.value = IndexingState.Processing(
+                    current = 0, total = unindexed.size,
+                    trackName = "", passName = "MERT features",
+                    detail = "Loading MERT model (GPU)...",
+                    progressFraction = 0f,
+                    estimatedRemainingMs = 0,
+                )
+                updateNotification("Loading MERT model...")
+                val mertLoadStart = System.nanoTime()
+                val mertInference = try { MertInference(mertFile) }
+                catch (e: Exception) {
+                    Log.e(TAG, "Failed to load MERT", e)
+                    _state.value = IndexingState.Error("Failed to load MERT model: ${e.message}")
+                    db.close()
+                    stopSelf()
+                    return@launch
+                }
+                Log.i(TAG, "TIMING: mert_model_load = ${(System.nanoTime() - mertLoadStart) / 1_000_000}ms")
 
-                // ── Pass 1: MuLan ──────────────────────────────────────
-                // Sequential loading: load MuLan first, process all tracks,
-                // close it before loading Flamingo. This avoids having multiple
-                // large models in memory simultaneously.
+                // Disk-spill: write all MERT features to a single temp file.
+                // Each window is 768 floats = 3072 bytes. For 100 tracks × 48 windows
+                // = ~14 MB disk — trivial.
+                val featuresFile = File(cacheDir, "mert_features.tmp")
+                val windowCounts = IntArray(unindexed.size)
+                val windowBytes = MertInference.FEATURE_DIM * 4  // 768 × 4 = 3072
 
-                if (hasMulan) {
-                    _state.value = IndexingState.Processing(
-                        current = 0, total = unindexed.size,
-                        trackName = "", passName = "MuQ-MuLan pass",
-                        detail = "Loading MuQ-MuLan model (GPU)...",
-                        progressFraction = 0f,
-                        estimatedRemainingMs = 0,
-                    )
-                    updateNotification("Loading MuQ-MuLan model...")
-                    val mulanLoadStart = System.nanoTime()
-                    val mulanInference = try { MuLanInference(mulanFile) }
-                    catch (e: Exception) {
-                        Log.e(TAG, "Failed to load MuQ-MuLan", e)
-                        null
-                    }
-                    Log.i(TAG, "TIMING: mulan_model_load = ${(System.nanoTime() - mulanLoadStart) / 1_000_000}ms")
+                etaStartTime = System.currentTimeMillis()
 
-                    if (mulanInference != null) {
-                        val processor = EmbeddingProcessor(
-                            mulanModel = mulanInference,
-                            flamingoProjection = null,
-                            fusedProjection = null,
+                try {  // ensures featuresFile is cleaned up
+                val writeBuf = java.nio.ByteBuffer.allocate(windowBytes)
+                    .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                val writeChannel = java.io.FileOutputStream(featuresFile).channel
+
+                try {
+                for ((i, track) in unindexed.withIndex()) {
+                    ensureActive()
+                    val trackProgress = "${i + 1}/${unindexed.size}"
+                    var windowsDone = 0
+                    fun emitProgress(detail: String, etaMs: Long = eta()) {
+                        val msg = "MERT $trackProgress ${track.title} \u2013 $detail${formatEta(etaMs)}"
+                        _state.value = IndexingState.Processing(
+                            current = i + 1,
+                            total = unindexed.size,
+                            trackName = "${track.artist} - ${track.title}",
+                            passName = "MERT features",
+                            detail = detail,
+                            progressFraction = fraction(),
+                            estimatedRemainingMs = etaMs,
                         )
-                        etaStartTime = System.currentTimeMillis()
+                        updateNotification(msg, completedSteps, totalSteps)
+                    }
+                    emitProgress("decoding")
+                    val trackStart = System.nanoTime()
 
-                        for ((i, track) in unindexed.withIndex()) {
-                            ensureActive()
-                            val trackProgress = "${i + 1}/${unindexed.size}"
-                            var clipsDone = 0
-                            fun emitProgress(detail: String, etaMs: Long = eta()) {
-                                val msg = "MuQ-MuLan $trackProgress ${track.title} \u2013 $detail${formatEta(etaMs)}"
-                                _state.value = IndexingState.Processing(
-                                    current = i + 1,
-                                    total = unindexed.size,
-                                    trackName = "${track.artist} - ${track.title}",
-                                    passName = "MuQ-MuLan pass",
-                                    detail = detail,
-                                    progressFraction = fraction(),
-                                    estimatedRemainingMs = etaMs,
-                                )
-                                updateNotification(msg, completedSteps, totalSteps)
-                            }
-                            emitProgress("decoding")
-                            val trackStart = System.nanoTime()
+                    val audioFile = resolveAudioFile(track)
+                    if (audioFile == null) {
+                        Log.w(TAG, "Cannot resolve audio file for: ${track.title}")
+                        failed++
+                        continue
+                    }
 
-                            val audioFile = resolveAudioFile(track)
-                            if (audioFile == null) {
-                                Log.w(TAG, "Cannot resolve audio file for: ${track.title}")
-                                if (!hasFlamingo) failed++
-                                continue
-                            }
+                    // Decode at 24kHz for MERT. Cap duration to prevent OOM.
+                    val maxDur = minOf((track.durationMs / 1000).toInt() + 10, 900)
+                    val audio24k = audioDecoder.decode(audioFile, MertInference.SAMPLE_RATE, maxDurationS = maxDur)
+                    if (audio24k == null) {
+                        Log.w(TAG, "Decode failed for: ${track.title}")
+                        failed++
+                        continue
+                    }
+                    completedSteps += DECODE_WEIGHT
 
-                            // Tighter pre-alloc: use actual duration instead of 900s cap.
-                            // A 3-min track at 48kHz: 35MB vs 165MB with the blanket 900s cap.
-                            val maxDurMulan = minOf((track.durationMs / 1000).toInt() + 10, 900)
-                            val audio24k = audioDecoder.decode(
-                                audioFile, 24000,
-                                maxDurationS = maxDurMulan,
-                            )
-                            if (audio24k == null) {
-                                Log.w(TAG, "Decode failed for: ${track.title}")
-                                if (!hasFlamingo) failed++
-                                continue
-                            }
-                            completedSteps += DECODE_WEIGHT
+                    val expectedWindows = audio24k.samples.size / MertInference.WINDOW_SAMPLES
+                    if (expectedWindows == 0) {
+                        Log.w(TAG, "Audio too short for MERT: ${track.title} (${audio24k.durationS}s)")
+                        failed++
+                        continue
+                    }
 
-                            // Launch 16kHz resample on CPU in background while MuLan runs on GPU.
-                            // Writes result to a temp file (disk-backed cache) so Flamingo
-                            // never needs to re-decode, even for long tracks.
-                            var resampleDeferred: Deferred<Boolean>? = null
-                            if (audioCacheDir != null) {
-                                emitProgress("resampling")
-                                val cacheFile = File(audioCacheDir, "${i}.pcm")
-                                resampleDeferred = async(Dispatchers.Default) {
-                                    try {
-                                        val samples16k = audioDecoder.resample(audio24k.samples, 24000, 16000)
-                                        java.io.FileOutputStream(cacheFile).channel.use { ch ->
-                                            val buf = java.nio.ByteBuffer.allocate(65536)
-                                                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                                            var pos = 0
-                                            while (pos < samples16k.size) {
-                                                buf.clear()
-                                                val count = minOf(buf.capacity() / 4, samples16k.size - pos)
-                                                buf.asFloatBuffer().put(samples16k, pos, count)
-                                                buf.limit(count * 4)
-                                                ch.write(buf)
-                                                pos += count
-                                            }
-                                        }
-                                        true
-                                    } catch (e: OutOfMemoryError) {
-                                        Log.w(TAG, "OOM resampling for ${track.title} — skipping cache", e)
-                                        System.gc()
-                                        false
-                                    } catch (e: Exception) {
-                                        Log.w(TAG, "16kHz cache failed for ${track.title}: ${e.message}")
-                                        false
-                                    }
-                                }
-                            }
+                    windowsDone = 0
+                    emitProgress("window 0/$expectedWindows")
 
-                            // Compute total clips from actual decoded duration (not metadata,
-                            // which may exceed the 900s decode cap)
-                            val durS = audio24k.durationS
-                            val mulanChunks = maxOf(1, minOf((durS / 60f).toInt(), 30))
-                            val totalClips = mulanChunks * 3
-                            clipsDone = 0
+                    // Stream MERT features to disk
+                    val mertStart = System.nanoTime()
+                    val numExtracted = mertInference.extractFeaturesStreaming(
+                        audio24k,
+                        onFeatureExtracted = { feature ->
+                            writeBuf.clear()
+                            writeBuf.asFloatBuffer().put(feature)
+                            writeBuf.rewind()
+                            writeChannel.write(writeBuf)
+                        },
+                        onWindowDone = {
+                            completedSteps++
+                            windowsDone++
+                            emitProgress("window $windowsDone/$expectedWindows")
+                        },
+                    )
+                    val mertMs = (System.nanoTime() - mertStart) / 1_000_000
 
-                            // MuLan inference (GPU) — runs concurrently with CPU resample
-                            val mulanInferStart = System.nanoTime()
-                            emitProgress("clip 0/$totalClips")
-                            val embeddings = processor.processTrack(
-                                audioFile, preDecodedAudio = audio24k,
-                                onProgress = { /* ignore internal progress */ },
-                                onChunkDone = {
-                                    completedSteps++
-                                    clipsDone++
-                                    emitProgress("clip $clipsDone/$totalClips")
-                                },
-                            )
-                            val mulanInferMs = (System.nanoTime() - mulanInferStart) / 1_000_000
+                    val trackMs = (System.nanoTime() - trackStart) / 1_000_000
+                    Log.i(TAG, "TIMING: mert_track ${i+1}/${unindexed.size} " +
+                        "\"${track.artist} - ${track.title}\" = ${trackMs}ms " +
+                        "(mert=${mertMs}ms, windows=$numExtracted)")
 
-                            // Wait for background resample + disk write to complete
-                            if (resampleDeferred != null) {
-                                resampleDeferred.await()
-                                completedSteps += RESAMPLE_WEIGHT
-                            }
-
-                            val trackMs = (System.nanoTime() - trackStart) / 1_000_000
-                            Log.i(TAG, "TIMING: mulan_track ${i+1}/${unindexed.size} " +
-                                "\"${track.artist} - ${track.title}\" = ${trackMs}ms " +
-                                "(inference=${mulanInferMs}ms)")
-
-                            if (embeddings == null) {
-                                if (!hasFlamingo) failed++
-                                continue
-                            }
-
-                            if (hasFlamingo) {
-                                // Hold in memory — will write after Flamingo pass completes
-                                mulanResults[track] = embeddings
-                            } else {
-                                // MuLan-only mode — write immediately
-                                val trackId = writer.writeTrack(
-                                    metadataKey = track.metadataKey,
-                                    filenameKey = track.filenameKey,
-                                    artist = track.artist.ifEmpty { null },
-                                    album = track.album.ifEmpty { null },
-                                    title = track.title.ifEmpty { null },
-                                    durationMs = track.durationMs,
-                                    filePath = track.path ?: audioFile.absolutePath,
-                                    embeddings = embeddings,
-                                    source = "phone",
-                                )
-                                if (trackId > 0) {
-                                    indexed++
-                                    Log.i(TAG, "Track ${i + 1}/${unindexed.size} indexed: ${track.artist} - ${track.title}")
-                                } else {
-                                    failed++
-                                }
-                            }
-                        }
-
-                        processor.close()
-                        val mulanPassMs = (System.currentTimeMillis() - batchStartTime)
-                        Log.i(TAG, "TIMING: mulan_pass_total = ${mulanPassMs}ms " +
-                            "(${mulanResults.size} tracks, ${mulanPassMs / maxOf(mulanResults.size, 1)}ms/track avg)")
+                    if (numExtracted > 0) {
+                        windowCounts[i] = numExtracted
+                    } else {
+                        failed++
                     }
                 }
+                } finally {
+                    writeChannel.close()
+                }
 
-                // ── Pass 2: Flamingo + Fusion (two-phase GPU) ────────
-                // Phase 2a: Encoder — encode all tracks on GPU, spill hidden
-                //           states to disk (each chunk = 3.84MB, 14 tracks ≈ 490MB
-                //           which exceeds the ~368MB heap limit).
-                // Phase 2b: Projector — close encoder, load projector on GPU,
-                //           read hidden states back from disk, project, fuse, write.
-                // Two CL environments can't coexist on Adreno GPUs, so we
-                // must close the encoder before loading the projector.
-                val flamingoPassStart = System.currentTimeMillis()
-                if (hasFlamingo) {
-                    // Use Processing state (not Detecting) to preserve progress bar during model load.
-                    // The fraction stays at its current value while the detail shows loading status.
+                val totalWindows = windowCounts.sum()
+                val spillMB = totalWindows.toLong() * windowBytes / (1024 * 1024)
+                Log.i(TAG, "MERT phase done: $totalWindows windows spilled to disk (${spillMB}MB)")
+
+                // ── Phase transition: MERT → CLaMP3 audio encoder ────────
+                mertInference.close()
+
+                _state.value = IndexingState.Processing(
+                    current = 0, total = unindexed.size,
+                    trackName = "", passName = "CLaMP3 encode",
+                    detail = "Loading CLaMP3 audio encoder (GPU)...",
+                    progressFraction = fraction(),
+                    estimatedRemainingMs = eta(),
+                )
+                updateNotification("Loading CLaMP3 audio encoder...")
+                val clamp3LoadStart = System.nanoTime()
+                val clamp3Inference = try { Clamp3AudioInference(clamp3AudioFile) }
+                catch (e: Exception) {
+                    Log.e(TAG, "Failed to load CLaMP3 audio encoder", e)
+                    _state.value = IndexingState.Error("Failed to load CLaMP3 model: ${e.message}")
+                    db.close()
+                    stopSelf()
+                    return@launch
+                }
+                Log.i(TAG, "TIMING: clamp3_audio_load = ${(System.nanoTime() - clamp3LoadStart) / 1_000_000}ms")
+
+                // ── Phase 2: CLaMP3 Audio Encoding ───────────────────────
+                // Read MERT features from disk, encode into 768d embeddings,
+                // write to database.
+                val readBuf = java.nio.ByteBuffer.allocate(windowBytes)
+                    .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                val readChannel = java.io.FileInputStream(featuresFile).channel
+
+                try {
+                val encodableCount = windowCounts.count { it > 0 }
+                var encoded = 0
+                for ((i, track) in unindexed.withIndex()) {
+                    val numWindows = windowCounts[i]
+                    if (numWindows == 0) continue
+
+                    ensureActive()
+                    encoded++
+                    val numSegments = clamp3Inference.segmentCount(numWindows)
+                    val encMsg = "CLaMP3 $encoded/$encodableCount ${track.title}"
                     _state.value = IndexingState.Processing(
-                        current = 0, total = unindexed.size,
-                        trackName = "", passName = "Flamingo encode",
-                        detail = "Loading Flamingo encoder (GPU)...",
+                        current = encoded,
+                        total = encodableCount,
+                        trackName = "${track.artist} - ${track.title}",
+                        passName = "CLaMP3 encode",
+                        detail = "encoding ($numWindows windows, $numSegments segments)",
                         progressFraction = fraction(),
                         estimatedRemainingMs = eta(),
                     )
-                    updateNotification("Loading Flamingo encoder...")
-                    val flamingoLoadStart = System.nanoTime()
-                    val flamingoInference = try {
-                        FlamingoInference(flamingoFile, projectorFile)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Failed to load Flamingo", e)
-                        null
+                    updateNotification(encMsg, completedSteps, totalSteps)
+                    val encStart = System.nanoTime()
+
+                    // Stream MERT features from disk one window at a time
+                    val embedding = clamp3Inference.encodeStreaming(
+                        numWindows = numWindows,
+                        readNextWindow = {
+                            readBuf.clear()
+                            readChannel.read(readBuf)
+                            readBuf.flip()
+                            FloatArray(MertInference.FEATURE_DIM).also { arr ->
+                                readBuf.asFloatBuffer().get(arr)
+                            }
+                        },
+                        onSegmentDone = {
+                            completedSteps += CLAMP3_SEGMENT_WEIGHT
+                        },
+                    )
+
+                    if (embedding == null) {
+                        failed++
+                        continue
                     }
-                    Log.i(TAG, "TIMING: flamingo_encoder_load = ${(System.nanoTime() - flamingoLoadStart) / 1_000_000}ms")
 
-                    if (flamingoInference != null) {
-                        if (etaStartTime == 0L) etaStartTime = System.currentTimeMillis()
+                    // Write to database
+                    val trackId = writer.writeTrack(
+                        metadataKey = track.metadataKey,
+                        filenameKey = track.filenameKey,
+                        artist = track.artist.ifEmpty { null },
+                        album = track.album.ifEmpty { null },
+                        title = track.title.ifEmpty { null },
+                        durationMs = track.durationMs,
+                        filePath = track.path ?: "",
+                        embedding = embedding,
+                        source = "phone",
+                    )
+                    completedSteps += WRITE_WEIGHT
+                    val encMs = (System.nanoTime() - encStart) / 1_000_000
 
-                        // Adjust projection matrix dims if projector is absent
-                        val actualFlamingoProjection = if (flamingoInference.outputDim != 3584) {
-                            EmbeddingProcessor.loadProjectionMatrix(
-                                rawDb, "flamingo_projection",
-                                flamingoInference.outputDim, 512
-                            )?.transpose()
-                        } else flamingoProjection
-
-                        // ── Phase 2a: Encode all tracks, spill to disk ──
-                        // Hidden states are written to a temp file instead of accumulating
-                        // in memory. Each chunk is 750×1280 floats = 3.84MB. For 14 tracks
-                        // × ~9 chunks = ~490MB which would OOM the 368MB heap.
-                        // Disk I/O is <0.5s total on UFS 4.0 — negligible overhead.
-                        val hiddenFile = File(cacheDir, "flamingo_hiddens.tmp")
-                        val chunkCounts = IntArray(unindexed.size)
-                        val chunkBytes = FlamingoInference.HIDDEN_STATE_BYTES
-
-                        try {  // outer try ensures hiddenFile is always cleaned up
-                        val writeBuf = java.nio.ByteBuffer.allocate(chunkBytes)
-                            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                        val writeChannel = java.io.FileOutputStream(hiddenFile).channel
-
-                        try {
-                        for ((i, track) in unindexed.withIndex()) {
-                            ensureActive()
-                            val trackProgress = "${i + 1}/${unindexed.size}"
-                            var chunksDone = 0
-                            fun emitProgress(detail: String, etaMs: Long = eta()) {
-                                val msg = "Flamingo $trackProgress ${track.title} \u2013 $detail${formatEta(etaMs)}"
-                                _state.value = IndexingState.Processing(
-                                    current = i + 1,
-                                    total = unindexed.size,
-                                    trackName = "${track.artist} - ${track.title}",
-                                    passName = "Flamingo encode",
-                                    detail = detail,
-                                    progressFraction = fraction(),
-                                    estimatedRemainingMs = etaMs,
-                                )
-                                updateNotification(msg, completedSteps, totalSteps)
-                            }
-
-                            val flTrackStart = System.nanoTime()
-
-                            val audioFile = resolveAudioFile(track)
-                            if (audioFile == null) {
-                                Log.w(TAG, "Cannot resolve audio file for: ${track.title}")
-                                failed++
-                                continue
-                            }
-
-                            // Read cached 16kHz audio from disk (written during MuLan pass)
-                            var audio16k: AudioDecoder.DecodedAudio? = null
-                            val cacheFile = audioCacheDir?.let { File(it, "${i}.pcm") }
-                            if (cacheFile != null && cacheFile.exists()) {
-                                try {
-                                    val totalSamples = (cacheFile.length() / 4).toInt()
-                                    val samples = FloatArray(totalSamples)
-                                    java.io.FileInputStream(cacheFile).channel.use { ch ->
-                                        val buf = java.nio.ByteBuffer.allocate(65536)
-                                            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                                        var pos = 0
-                                        while (ch.read(buf) > 0) {
-                                            buf.flip()
-                                            val count = buf.remaining() / 4
-                                            buf.asFloatBuffer().get(samples, pos, count)
-                                            pos += count
-                                            buf.clear()
-                                        }
-                                    }
-                                    audio16k = AudioDecoder.DecodedAudio(
-                                        samples, 16000, totalSamples.toFloat() / 16000
-                                    )
-                                } catch (e: Exception) {
-                                    Log.w(TAG, "Failed to read cached audio for ${track.title}: ${e.message}")
-                                }
-                            }
-
-                            // Cache miss or no MuLan pass — decode from source file
-                            if (audio16k == null) {
-                                if (hasMulan) totalSteps += DECODE_WEIGHT
-                                emitProgress("decoding")
-                                // Cap at 900s (same as MuLan) to prevent OOM on long files.
-                                // At 48kHz native, 1800s pre-alloc = 345MB > heap limit.
-                                val maxDurFlamingo = minOf((track.durationMs / 1000).toInt() + 10, 900)
-                                audio16k = audioDecoder.decode(audioFile, 16000, maxDurationS = maxDurFlamingo)
-                                if (audio16k == null) {
-                                    Log.w(TAG, "Decode failed for: ${track.title}")
-                                    failed++
-                                    continue
-                                }
-                                completedSteps += DECODE_WEIGHT
-                            }
-
-                            // Compute total Flamingo chunks from actual audio duration
-                            // (may be shorter than metadata if resampled from MuLan's 900s cap)
-                            val flDurS = audio16k.durationS
-                            val totalFChunks = maxOf(1, minOf(kotlin.math.ceil(flDurS.toDouble() / 30.0).toInt(), 60))
-                            chunksDone = 0
-                            emitProgress("chunk 0/$totalFChunks")
-
-                            // Stream each encoded chunk directly to disk instead of
-                            // accumulating all chunks in memory. This keeps per-track
-                            // peak memory at ~3.84MB (one chunk) vs up to 230MB for
-                            // a 30-min track (60 chunks × 3.84MB).
-                            val encInferStart = System.nanoTime()
-                            val numEncoded = flamingoInference.encodeTrackStreaming(
-                                audio16k,
-                                onChunkEncoded = { hidden ->
-                                    writeBuf.clear()
-                                    writeBuf.asFloatBuffer().put(hidden)
-                                    writeBuf.rewind()
-                                    writeChannel.write(writeBuf)
-                                },
-                                onChunkDone = {
-                                    completedSteps += FLAMINGO_CHUNK_WEIGHT
-                                    chunksDone++
-                                    emitProgress("chunk $chunksDone/$totalFChunks")
-                                },
-                            )
-                            val encInferMs = (System.nanoTime() - encInferStart) / 1_000_000
-
-                            val trackMs = (System.nanoTime() - flTrackStart) / 1_000_000
-                            Log.i(TAG, "TIMING: flamingo_encode ${i+1}/${unindexed.size} " +
-                                "\"${track.artist} - ${track.title}\" = ${trackMs}ms " +
-                                "(encode=${encInferMs}ms)")
-
-                            if (numEncoded > 0) {
-                                chunkCounts[i] = numEncoded
-                            } else {
-                                failed++
-                            }
-                        }
-                        } finally {
-                            writeChannel.close()
-                        }
-
-                        val totalChunks = chunkCounts.sum()
-                        val spillMB = totalChunks.toLong() * chunkBytes / (1024 * 1024)
-                        Log.i(TAG, "Flamingo encoder done: $totalChunks chunks spilled to disk (${spillMB}MB)")
-
-                        // Clean up disk-backed audio cache — no longer needed
-                        audioCacheDir?.deleteRecursively()
-
-                        // ── Phase transition: encoder → projector ──
-                        flamingoInference.closeEncoder()
-                        val projLoadStart = System.nanoTime()
-                        _state.value = IndexingState.Processing(
-                            current = 0, total = unindexed.size,
-                            trackName = "", passName = "Flamingo project + fuse",
-                            detail = "Loading Flamingo projector (GPU)...",
-                            progressFraction = fraction(),
-                            estimatedRemainingMs = eta(),
-                        )
-                        updateNotification("Loading Flamingo projector...")
-                        flamingoInference.loadProjector()
-                        Log.i(TAG, "TIMING: flamingo_projector_load = ${(System.nanoTime() - projLoadStart) / 1_000_000}ms")
-
-                        // ── Phase 2b: Stream hidden states from disk, project + fuse + write ──
-                        // Each chunk is read lazily via callback — only one 3.84MB
-                        // chunk in memory at a time, vs 230MB for a 30-min track.
-                        val readBuf = java.nio.ByteBuffer.allocate(chunkBytes)
-                            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                        val readChannel = java.io.FileInputStream(hiddenFile).channel
-
-                        try {
-                        val projectableCount = chunkCounts.count { it > 0 }
-                        var projected = 0
-                        for ((i, track) in unindexed.withIndex()) {
-                            val numChunks = chunkCounts[i]
-                            if (numChunks == 0) continue  // failed during encode
-
-                            ensureActive()
-                            projected++
-                            val projMsg = "Flamingo project $projected/$projectableCount ${track.title}"
-                            _state.value = IndexingState.Processing(
-                                current = projected,
-                                total = projectableCount,
-                                trackName = "${track.artist} - ${track.title}",
-                                passName = "Flamingo project + fuse",
-                                detail = "projecting + writing to DB",
-                                progressFraction = fraction(),
-                                estimatedRemainingMs = eta(),
-                            )
-                            updateNotification(projMsg, completedSteps, totalSteps)
-                            val projStart = System.nanoTime()
-
-                            // Stream hidden states from disk one chunk at a time
-                            val flamingoRaw = flamingoInference.projectAndAverageStreaming(
-                                numChunks = numChunks,
-                                readNextChunk = {
-                                    readBuf.clear()
-                                    readChannel.read(readBuf)
-                                    readBuf.flip()
-                                    FloatArray(FlamingoInference.HIDDEN_STATE_FLOATS).also { arr ->
-                                        readBuf.asFloatBuffer().get(arr)
-                                    }
-                                },
-                            )
-                            if (flamingoRaw == null) {
-                                failed++
-                                continue
-                            }
-
-                            // Apply flamingo_projection: 3584d → 512d
-                            var flamingoReduced: FloatArray? = null
-                            if (actualFlamingoProjection != null) {
-                                flamingoReduced = actualFlamingoProjection.multiplyVector(flamingoRaw)
-                                l2Normalize(flamingoReduced)
-                            }
-
-                            // Fuse with MuLan
-                            val mulanEmbedding = mulanResults[track]?.mulanEmbedding
-                            var fusedEmbedding: FloatArray? = null
-                            if (mulanEmbedding != null && flamingoReduced != null && fusedProjection != null) {
-                                val concat = FloatArray(1024)
-                                mulanEmbedding.copyInto(concat, 0)
-                                flamingoReduced.copyInto(concat, 512)
-                                fusedEmbedding = fusedProjection.multiplyVector(concat)
-                                l2Normalize(fusedEmbedding)
-                            }
-
-                            val merged = EmbeddingProcessor.EmbeddingResult(
-                                mulanEmbedding = mulanEmbedding,
-                                flamingoEmbedding = flamingoRaw,
-                                flamingoReduced = flamingoReduced,
-                                fusedEmbedding = fusedEmbedding,
-                            )
-                            val trackId = writer.writeTrack(
-                                metadataKey = track.metadataKey,
-                                filenameKey = track.filenameKey,
-                                artist = track.artist.ifEmpty { null },
-                                album = track.album.ifEmpty { null },
-                                title = track.title.ifEmpty { null },
-                                durationMs = track.durationMs,
-                                filePath = track.path ?: "",
-                                embeddings = merged,
-                                source = "phone",
-                            )
-                            completedSteps += FLAMINGO_PROJECT_WEIGHT
-                            val projMs = (System.nanoTime() - projStart) / 1_000_000
-                            if (trackId > 0) {
-                                indexed++
-                                mulanResults.remove(track)  // Free memory
-                            } else {
-                                failed++
-                            }
-                            Log.i(TAG, "TIMING: flamingo_project " +
-                                "\"${track.artist} - ${track.title}\" = ${projMs}ms")
-                        }
-                        } finally {
-                            readChannel.close()
-                        }
-
-                        } finally {
-                            hiddenFile.delete()
-                        }
-
-                        flamingoInference.close()
-                        val flamingoPassMs = System.currentTimeMillis() - flamingoPassStart
-                        Log.i(TAG, "TIMING: flamingo_pass_total = ${flamingoPassMs}ms " +
-                            "($indexed tracks, ${flamingoPassMs / maxOf(indexed, 1)}ms/track avg)")
+                    if (trackId > 0) {
+                        indexed++
+                    } else {
+                        failed++
                     }
+                    Log.i(TAG, "TIMING: clamp3_encode " +
+                        "\"${track.artist} - ${track.title}\" = ${encMs}ms")
                 }
+                } finally {
+                    readChannel.close()
+                }
+
+                clamp3Inference.close()
+
+                } finally {
+                    featuresFile.delete()
+                }
+
+                val clamp3PassMs = System.currentTimeMillis() - batchStartTime
+                Log.i(TAG, "TIMING: clamp3_pass_total = ${clamp3PassMs}ms " +
+                    "($indexed indexed, $failed failed, " +
+                    "${clamp3PassMs / maxOf(indexed, 1)}ms/track avg)")
 
                 // Rebuild indices after indexing new tracks
                 if (indexed > 0) {
-                    val options = pendingFusionOptions.also { pendingFusionOptions = null }
+                    val buildGraph = pendingBuildGraph.also { pendingBuildGraph = false }
                     val rebuildStart = System.currentTimeMillis()
 
-                    if (options != null) {
-                        val tierName = when (options.tier) {
-                            FusionTier.QUICK_UPDATE -> "Quick update"
-                            FusionTier.RECLUSTER -> "Re-cluster"
-                            FusionTier.FULL_REFUSION -> "Full re-fusion"
-                        }
-                        _state.value = IndexingState.RebuildingIndices(
-                            message = "Starting...", phaseName = tierName)
-                        updateNotification("$tierName...")
+                    _state.value = IndexingState.RebuildingIndices(
+                        message = "Rebuilding search indices...")
+                    updateNotification("Rebuilding indices...")
 
-                        val fusionEngine = FusionEngine(db, filesDir)
-                        val fusionStart = System.currentTimeMillis()
-                        val progressCb: (String, String, Float) -> Unit =
-                            { phase, detail, fraction ->
-                                val elapsed = System.currentTimeMillis() - fusionStart
-                                val eta = if (fraction > 0.02f) {
-                                    ((elapsed / fraction) * (1f - fraction)).toLong()
-                                } else 0L
-                                _state.value = IndexingState.RebuildingIndices(
-                                    message = detail,
-                                    phaseName = phase,
-                                    progressFraction = fraction,
-                                    estimatedRemainingMs = eta,
-                                )
-                                updateNotification("$phase: $detail")
-                            }
-                        when (options.tier) {
-                            FusionTier.QUICK_UPDATE -> fusionEngine.quickUpdate(options.buildKnnGraph, progressCb)
-                            FusionTier.RECLUSTER -> fusionEngine.recluster(options.buildKnnGraph, progressCb)
-                            FusionTier.FULL_REFUSION -> fusionEngine.fullRefusion(options.buildKnnGraph, progressCb)
-                        }
-                        Log.i(TAG, "TIMING: fusion_${options.tier.name.lowercase()} = ${System.currentTimeMillis() - rebuildStart}ms")
-                    } else {
-                        // No fusion — just extract indices (indeterminate progress)
-                        _state.value = IndexingState.RebuildingIndices(
-                            message = "Rebuilding search indices...")
-                        updateNotification("Rebuilding indices...")
-
-                        val graphUpdater = GraphUpdater(db, filesDir)
-                        graphUpdater.rebuildIndices { status ->
-                            _state.value = IndexingState.RebuildingIndices(
-                                message = status)
-                            updateNotification(status)
-                        }
-                        Log.i(TAG, "TIMING: rebuild_indices = ${System.currentTimeMillis() - rebuildStart}ms")
+                    val graphUpdater = GraphUpdater(db, filesDir)
+                    graphUpdater.rebuildIndices { status ->
+                        _state.value = IndexingState.RebuildingIndices(message = status)
+                        updateNotification(status)
                     }
+                    Log.i(TAG, "TIMING: rebuild_indices = ${System.currentTimeMillis() - rebuildStart}ms")
                 }
 
                 db.close()
@@ -859,7 +529,7 @@ class IndexingService : Service() {
 
     /**
      * Find the best available model variant.
-     * Prefers weight-only INT8 (smaller, same quality), then FP32.
+     * Prefers FP16 (GPU-native, half the size, lossless), then FP32.
      */
     private fun resolveModelFile(dir: File, baseName: String): File {
         for (suffix in MODEL_VARIANTS) {
@@ -874,18 +544,13 @@ class IndexingService : Service() {
 
     /**
      * Resolve a Poweramp track to an actual audio file on the filesystem.
-     *
-     * Poweramp stores paths relative to its music folders. We try the path directly,
-     * then common mount points.
      */
     private fun resolveAudioFile(track: NewTrackDetector.UnindexedTrack): File? {
         val path = track.path ?: return null
 
-        // Try direct path
         val direct = File(path)
         if (direct.exists() && direct.canRead()) return direct
 
-        // Try common Android storage prefixes
         val prefixes = listOf(
             "/storage/emulated/0/",
             "/sdcard/",
@@ -937,7 +602,7 @@ class IndexingService : Service() {
     ): Notification {
         val pendingIntent = PendingIntent.getActivity(
             this, 0,
-            Intent(this, com.powerampstartradio.indexing.IndexingActivity::class.java),
+            Intent(this, IndexingActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE,
         )
         val cancelIntent = PendingIntent.getService(
@@ -945,9 +610,8 @@ class IndexingService : Service() {
             Intent(this, IndexingService::class.java).apply { action = ACTION_CANCEL },
             PendingIntent.FLAG_IMMUTABLE,
         )
-        val title = "Indexing Tracks"
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(title)
+            .setContentTitle("Indexing Tracks")
             .setContentText(message)
             .setSmallIcon(R.drawable.ic_radio)
             .setContentIntent(pendingIntent)

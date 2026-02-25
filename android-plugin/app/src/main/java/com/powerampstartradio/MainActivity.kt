@@ -1225,9 +1225,7 @@ fun SettingsScreen(
                     if (databaseInfo != null) {
                         val trackCountFmt = "%,d".format(databaseInfo.trackCount)
                         val dimLabel = if (databaseInfo.embeddingDim != null) "${databaseInfo.embeddingDim}-dim" else ""
-                        val modelNames = databaseInfo.availableModels.map { it.first }
-                        val embType = if (databaseInfo.hasFused) "fused" else modelNames.firstOrNull()?.replaceFirstChar { it.uppercase() } ?: "unknown"
-                        Text("$trackCountFmt tracks \u00b7 $dimLabel $embType embeddings",
+                        Text("$trackCountFmt tracks \u00b7 $dimLabel CLaMP3 embeddings",
                             style = MaterialTheme.typography.bodyMedium)
                     } else {
                         Text("No database imported", color = MaterialTheme.colorScheme.error)
@@ -1283,7 +1281,7 @@ fun SettingsScreen(
                             Text("TFLite models not found",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Text("Transfer mulan_audio.tflite and flamingo_encoder.tflite to app data",
+                            Text("Transfer mert.tflite and clamp3_audio.tflite to app data",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
                         } else {

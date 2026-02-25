@@ -11,7 +11,7 @@ import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.data.EmbeddingIndex
 import com.powerampstartradio.indexing.IndexingService
 import com.powerampstartradio.indexing.IndexingViewModel
-import com.powerampstartradio.indexing.MuLanTextInference
+import com.powerampstartradio.indexing.Clamp3TextInference
 import com.powerampstartradio.indexing.NewTrackDetector
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
@@ -295,7 +295,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun getOrOpenRankIndex(): EmbeddingIndex? {
         rankIndex?.let { return it }
-        val embFile = File(getApplication<Application>().filesDir, "fused.emb")
+        val embFile = File(getApplication<Application>().filesDir, "clamp3.emb")
         if (!embFile.exists()) return null
         return try {
             EmbeddingIndex.mmap(embFile).also { rankIndex = it }
@@ -367,11 +367,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
     val recentSearches: StateFlow<List<String>> = _recentSearches.asStateFlow()
 
-    private var textInference: MuLanTextInference? = null
-    private var mulanIndex: EmbeddingIndex? = null
+    private var textInference: Clamp3TextInference? = null
+    private var textIndex: EmbeddingIndex? = null
 
     /**
-     * Search for the best matching track by text query using MuQ-MuLan text embeddings.
+     * Search for the best matching track by text query using CLaMP3 text embeddings.
      */
     fun performTextSearch(query: String) {
         if (_textSearchLoading.value) return
@@ -397,8 +397,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
                     // Try: FP16+GPU → FP16+CPU → FP32+GPU → FP32+CPU
                     val candidates = buildList {
-                        val fp16 = File(filesDir, "mulan_text_fp16.tflite")
-                        val fp32 = File(filesDir, "mulan_text.tflite")
+                        val fp16 = File(filesDir, "clamp3_text_fp16.tflite")
+                        val fp32 = File(filesDir, "clamp3_text.tflite")
                         if (fp16.exists()) {
                             add(fp16 to Accelerator.GPU)
                             add(fp16 to Accelerator.CPU)
@@ -409,15 +409,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                     if (candidates.isEmpty()) {
-                        _textSearchResult.value = TextSearchResult(query = query, error = "MuQ-MuLan text model not found")
+                        _textSearchResult.value = TextSearchResult(query = query, error = "CLaMP3 text model not found")
                         return@launch
                     }
 
                     var lastError: Exception? = null
-                    var result: MuLanTextInference? = null
+                    var result: Clamp3TextInference? = null
                     for ((modelFile, accel) in candidates) {
                         try {
-                            result = MuLanTextInference(modelFile, vocabFile, accel)
+                            result = Clamp3TextInference(modelFile, vocabFile, accel)
                             Log.i("MainViewModel", "Text model loaded: ${modelFile.name} on $accel")
                             break
                         } catch (e: Exception) {
@@ -440,26 +440,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     return@launch
                 }
 
-                // Lazy init MuLan-specific embedding index
-                val index = mulanIndex ?: run {
-                    val embFile = File(filesDir, "mulan.emb")
+                // Lazy init CLaMP3 embedding index for text search
+                // Text and audio embeddings share the same 768d space in CLaMP3
+                val index = textIndex ?: run {
+                    val embFile = File(filesDir, "clamp3.emb")
                     if (!embFile.exists()) {
-                        // Extract MuLan embeddings from DB
                         val db = EmbeddingDatabase.open(dbFile)
-                        val mulanCount = db.getEmbeddingCountForTable("embeddings_mulan")
-                        if (mulanCount == 0) {
+                        val clamp3Count = db.getEmbeddingCountForTable("embeddings_clamp3")
+                        if (clamp3Count == 0) {
                             db.close()
-                            _textSearchResult.value = TextSearchResult(query = query, error = "No MuLan embeddings in database")
+                            _textSearchResult.value = TextSearchResult(query = query, error = "No CLaMP3 embeddings in database")
                             return@launch
                         }
-                        EmbeddingIndex.extractFromDatabase(db, embFile, table = "embeddings_mulan")
+                        EmbeddingIndex.extractFromDatabase(db, embFile, table = "embeddings_clamp3")
                         db.close()
                     }
                     if (!embFile.exists()) {
-                        _textSearchResult.value = TextSearchResult(query = query, error = "Failed to extract MuLan index")
+                        _textSearchResult.value = TextSearchResult(query = query, error = "Failed to extract CLaMP3 index")
                         return@launch
                     }
-                    EmbeddingIndex.mmap(embFile).also { mulanIndex = it }
+                    EmbeddingIndex.mmap(embFile).also { textIndex = it }
                 }
 
                 // Find top matches
@@ -595,11 +595,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return null
         }
 
-        val mulanFile = findModel("mulan_audio")
-        val mulanTextFile = findModel("mulan_text")
-        val flamingoFile = findModel("flamingo_encoder")
-        val projectorFile = findModel("flamingo_projector")
-        _hasModels.value = mulanFile != null || flamingoFile != null
+        val mertFile = findModel("mert")
+        val clamp3AudioFile = findModel("clamp3_audio")
+        val clamp3TextFile = findModel("clamp3_text")
+        _hasModels.value = mertFile != null && clamp3AudioFile != null
 
         fun fileSizeMb(f: File?): String? {
             if (f == null) return null
@@ -608,27 +607,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val dbFile = File(filesDir, "embeddings.db")
-        val embFile = File(filesDir, "fused.emb")
+        val embFile = File(filesDir, "clamp3.emb")
         val graphFile = File(filesDir, "graph.bin")
         val vocabFile = File(filesDir, "xlm_roberta_vocab.json")
 
         _fileStatuses.value = listOf(
             AppFileStatus("embeddings.db", dbFile.exists(), fileSizeMb(dbFile),
                 "Embedding database (required)"),
-            AppFileStatus("fused.emb", embFile.exists(), fileSizeMb(embFile),
+            AppFileStatus("clamp3.emb", embFile.exists(), fileSizeMb(embFile),
                 "Auto-generated from database"),
             AppFileStatus("graph.bin", graphFile.exists(), fileSizeMb(graphFile),
                 "kNN graph for Random Walk"),
-            AppFileStatus("mulan_audio", mulanFile != null, fileSizeMb(mulanFile),
-                if (mulanFile != null) mulanFile.name else "MuQ-MuLan audio model"),
-            AppFileStatus("mulan_text", mulanTextFile != null, fileSizeMb(mulanTextFile),
-                if (mulanTextFile != null) mulanTextFile.name else "MuQ-MuLan text model (for text search)"),
+            AppFileStatus("mert", mertFile != null, fileSizeMb(mertFile),
+                if (mertFile != null) mertFile.name else "MERT audio feature model"),
+            AppFileStatus("clamp3_audio", clamp3AudioFile != null, fileSizeMb(clamp3AudioFile),
+                if (clamp3AudioFile != null) clamp3AudioFile.name else "CLaMP3 audio encoder"),
+            AppFileStatus("clamp3_text", clamp3TextFile != null, fileSizeMb(clamp3TextFile),
+                if (clamp3TextFile != null) clamp3TextFile.name else "CLaMP3 text encoder (for text search)"),
             AppFileStatus("vocab", vocabFile.exists(), fileSizeMb(vocabFile),
                 "xlm_roberta_vocab.json (for text search)"),
-            AppFileStatus("flamingo_encoder", flamingoFile != null, fileSizeMb(flamingoFile),
-                if (flamingoFile != null) flamingoFile.name else "Flamingo encoder model"),
-            AppFileStatus("flamingo_projector", projectorFile != null, fileSizeMb(projectorFile),
-                if (projectorFile != null) projectorFile.name else "Flamingo projector"),
         )
     }
 
@@ -707,7 +704,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 } ?: throw IllegalArgumentException("Cannot open URI: $uri")
 
                 // Delete stale derived files so they're re-extracted from the new DB
-                File(app.filesDir, "fused.emb").delete()
+                File(app.filesDir, "clamp3.emb").delete()
                 File(app.filesDir, "graph.bin").delete()
 
                 // Atomic replace: delete old, rename temp to final
@@ -727,7 +724,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     embeddingDim = db.getEmbeddingDim(),
                     version = db.getMetadata("version"),
                     sizeKb = destFile.length() / 1024,
-                    hasFused = db.hasFusedEmbeddings,
                     hasGraph = db.hasBinaryData("knn_graph"),
                     embeddingTable = db.embeddingTable,
                     availableModels = db.getAvailableModels(),
@@ -769,7 +765,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         embeddingDim = db.getEmbeddingDim(),
                         version = db.getMetadata("version"),
                         sizeKb = dbFile.length() / 1024,
-                        hasFused = db.hasFusedEmbeddings,
                         hasGraph = db.hasBinaryData("knn_graph"),
                         embeddingTable = db.embeddingTable,
                         availableModels = db.getAvailableModels(),
@@ -797,9 +792,8 @@ data class DatabaseInfo(
     val embeddingDim: Int?,
     val version: String?,
     val sizeKb: Long,
-    val hasFused: Boolean = false,
     val hasGraph: Boolean = false,
-    val embeddingTable: String = "embeddings_fused",
+    val embeddingTable: String = "embeddings_clamp3",
     val availableModels: List<Pair<String, Int>> = emptyList(),
 )
 

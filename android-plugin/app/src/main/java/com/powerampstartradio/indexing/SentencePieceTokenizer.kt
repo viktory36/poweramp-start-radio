@@ -17,7 +17,7 @@ import java.io.File
  * - Word boundaries are marked with ▁ (U+2581, "LOWER ONE EIGHTH BLOCK")
  * - BOS = 0 (<s>), PAD = 1 (<pad>), EOS = 2 (</s>), UNK = 3 (<unk>)
  */
-class SentencePieceTokenizer(vocabFile: File) {
+class SentencePieceTokenizer(vocabFile: File, private val seqLen: Int = 128) {
 
     companion object {
         private const val TAG = "SPTokenizer"
@@ -27,9 +27,6 @@ class SentencePieceTokenizer(vocabFile: File) {
         const val PAD_ID = 1   // <pad>
         const val EOS_ID = 2   // </s>
         const val UNK_ID = 3   // <unk>
-
-        // Static output sequence length for TFLite
-        const val SEQ_LEN = 64
 
         // SentencePiece word boundary marker
         private const val SP_SPACE = "\u2581"
@@ -119,13 +116,13 @@ class SentencePieceTokenizer(vocabFile: File) {
         // Map pieces to token IDs
         val tokenIds = pieces.map { vocab[it] ?: UNK_ID }
 
-        // Build input_ids: BOS + tokens + EOS, padded to SEQ_LEN
-        val maxTokens = SEQ_LEN - 2  // reserve BOS and EOS
+        // Build input_ids: BOS + tokens + EOS, padded to seqLen
+        val maxTokens = seqLen - 2  // reserve BOS and EOS
         val truncated = if (tokenIds.size > maxTokens) tokenIds.subList(0, maxTokens) else tokenIds
-        val seqLen = truncated.size + 2  // BOS + tokens + EOS
+        val actualLen = truncated.size + 2  // BOS + tokens + EOS
 
-        val inputIds = IntArray(SEQ_LEN) { PAD_ID }
-        val attentionMask = IntArray(SEQ_LEN) { 0 }
+        val inputIds = IntArray(seqLen) { PAD_ID }
+        val attentionMask = IntArray(seqLen) { 0 }
 
         inputIds[0] = BOS_ID
         attentionMask[0] = 1
@@ -133,10 +130,10 @@ class SentencePieceTokenizer(vocabFile: File) {
             inputIds[i + 1] = truncated[i]
             attentionMask[i + 1] = 1
         }
-        inputIds[seqLen - 1] = EOS_ID
-        attentionMask[seqLen - 1] = 1
+        inputIds[actualLen - 1] = EOS_ID
+        attentionMask[actualLen - 1] = 1
 
-        Log.d(TAG, "Encoded '$text': ${seqLen} tokens (${truncated.size} pieces)")
+        Log.d(TAG, "Encoded '$text': $actualLen tokens (${truncated.size} pieces)")
 
         return inputIds to attentionMask
     }

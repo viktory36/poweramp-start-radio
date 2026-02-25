@@ -68,8 +68,8 @@ class EmbeddingIndex private constructor(
          *
          * Streams rows one at a time — never holds more than one embedding in memory.
          *
-         * @param table Override the embedding table to extract from (e.g., "embeddings_mulan").
-         *              When null, uses the database's auto-detected best table.
+         * @param table Override the embedding table to extract from.
+         *              When null, uses the database's default table (embeddings_clamp3).
          * @param onProgress called periodically with (current, total) track counts
          */
         fun extractFromDatabase(

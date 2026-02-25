@@ -37,7 +37,7 @@ class GraphUpdater(
     fun rebuildIndices(onProgress: ((String) -> Unit)? = null) {
         // Step 1: Regenerate .emb file from database
         onProgress?.invoke("Rebuilding embedding index...")
-        val embFile = File(filesDir, "fused.emb")
+        val embFile = File(filesDir, "clamp3.emb")
         EmbeddingIndex.extractFromDatabase(db, embFile) { current, total ->
             onProgress?.invoke("Extracting embeddings: $current/$total")
         }

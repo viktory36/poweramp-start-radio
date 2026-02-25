@@ -1,4 +1,4 @@
-"""SQLite database management for embeddings storage."""
+"""SQLite database management for CLaMP3 embeddings storage."""
 
 from __future__ import annotations
 
@@ -26,10 +26,14 @@ def blob_to_float_list(blob: bytes) -> list[float]:
 
 class EmbeddingDatabase:
     """
-    SQLite database for storing track metadata and embeddings.
+    SQLite database for storing track metadata and CLaMP3 embeddings.
 
-    Supports multiple embedding models via per-model tables (embeddings_mulan,
-    embeddings_flamingo, embeddings_fused, etc.).
+    Schema:
+      - tracks: track metadata (artist, album, title, duration, file_path, cluster_id)
+      - embeddings_clamp3: 768d CLaMP3 audio embeddings
+      - clusters: k-means centroids for cluster-based navigation
+      - binary_data: kNN graph and other binary blobs
+      - metadata: key-value store (model, embedding_dim, etc.)
     """
 
     BASE_SCHEMA = """
@@ -65,25 +69,28 @@ class EmbeddingDatabase:
         key TEXT PRIMARY KEY,
         data BLOB NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS embeddings_clamp3 (
+        track_id INTEGER PRIMARY KEY,
+        embedding BLOB NOT NULL,
+        FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
+    );
     """
 
-    def __init__(self, db_path: Path, models: list[str] | None = None):
+    def __init__(self, db_path: Path):
         """
         Initialize or open an embedding database.
 
         Args:
             db_path: Path to the SQLite database file
-            models: List of model names to create embedding tables for
-                    (e.g. ["mulan"] or ["mulan", "flamingo"]). If None, only base
-                    tables are created and existing embedding tables are used.
         """
         self.db_path = db_path
         self.conn = sqlite3.connect(str(db_path))
         self.conn.row_factory = sqlite3.Row
-        self._init_schema(models)
+        self._init_schema()
 
-    def _init_schema(self, models: list[str] | None):
-        """Create base tables and per-model embedding tables."""
+    def _init_schema(self):
+        """Create all tables."""
         self.conn.executescript(self.BASE_SCHEMA)
         # Migration: add source column to existing databases
         try:
@@ -91,54 +98,13 @@ class EmbeddingDatabase:
             self.conn.commit()
         except sqlite3.OperationalError:
             pass  # Column already exists
-        if models:
-            for model in models:
-                table = f"embeddings_{model}"
-                self.conn.execute(f"""
-                    CREATE TABLE IF NOT EXISTS [{table}] (
-                        track_id INTEGER PRIMARY KEY,
-                        embedding BLOB NOT NULL,
-                        FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
-                    )
-                """)
         self.conn.commit()
 
-    def _table_name(self, model: str) -> str:
-        """Get the embedding table name for a model."""
-        return f"embeddings_{model}"
-
-    def get_available_models(self) -> list[str]:
-        """Return list of model names that have embedding tables with rows."""
-        models = []
-
-        # Check for embeddings_* tables
-        rows = self.conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'embeddings_%'"
-        ).fetchall()
-        for row in rows:
-            table_name = row["name"]
-            # Check it has rows
-            count = self.conn.execute(f"SELECT COUNT(*) as c FROM [{table_name}]").fetchone()["c"]
-            if count > 0:
-                # Strip 'embeddings_' prefix to get model name
-                model = table_name[len("embeddings_"):]
-                models.append(model)
-
-        return models
-
-    def get_track_id_by_path(self, file_path: str) -> Optional[int]:
-        """Look up a track ID by its file path."""
-        row = self.conn.execute(
-            "SELECT id FROM tracks WHERE file_path = ?", (file_path,)
-        ).fetchone()
-        return row["id"] if row else None
-
     def add_embedding(self, track_id: int, model: str, embedding: list[float]):
-        """Insert an embedding into the model-specific table."""
-        table = f"embeddings_{model}"
+        """Insert an embedding into the embeddings table."""
         blob = float_list_to_blob(embedding)
         self.conn.execute(
-            f"INSERT OR REPLACE INTO [{table}] (track_id, embedding) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO embeddings_clamp3 (track_id, embedding) VALUES (?, ?)",
             (track_id, blob)
         )
 
@@ -176,17 +142,11 @@ class EmbeddingDatabase:
         self,
         metadata: TrackMetadata,
         embedding: list[float],
-        model: str = "mulan",
+        model: str = "clamp3",
         source: str = "desktop",
     ) -> int:
         """
         Add a track and its embedding to the database.
-
-        Args:
-            metadata: Track metadata
-            embedding: Embedding vector (dimension depends on model)
-            model: Model name for embedding table (default: "mulan")
-            source: Origin of the embedding ("desktop" or "phone")
 
         Returns:
             The track ID
@@ -211,19 +171,12 @@ class EmbeddingDatabase:
         self.add_embedding(track_id, model, embedding)
         return track_id
 
-    def get_existing_paths(self, model: str | None = None) -> set[str]:
-        """Get file paths in the database.
-
-        When model is specified, only returns paths that have an embedding
-        for that model (via JOIN). Otherwise returns all track paths.
-        """
-        if model is None:
-            rows = self.conn.execute("SELECT file_path FROM tracks").fetchall()
-        else:
-            table = self._table_name(model)
-            rows = self.conn.execute(
-                f"SELECT t.file_path FROM tracks t INNER JOIN [{table}] e ON t.id = e.track_id"
-            ).fetchall()
+    def get_existing_paths(self, model: str = "clamp3") -> set[str]:
+        """Get file paths that have embeddings."""
+        rows = self.conn.execute(
+            "SELECT t.file_path FROM tracks t "
+            "INNER JOIN embeddings_clamp3 e ON t.id = e.track_id"
+        ).fetchall()
         return {row["file_path"] for row in rows}
 
     def remove_missing_tracks(self, existing_paths: set[str]):
@@ -245,11 +198,12 @@ class EmbeddingDatabase:
         row = self.conn.execute("SELECT COUNT(*) as count FROM tracks").fetchone()
         return row["count"]
 
-    def count_embeddings(self, model: str) -> int:
-        """Return the number of embeddings for a given model."""
-        table = self._table_name(model)
+    def count_embeddings(self, model: str = "clamp3") -> int:
+        """Return the number of embeddings."""
         try:
-            row = self.conn.execute(f"SELECT COUNT(*) as count FROM [{table}]").fetchone()
+            row = self.conn.execute(
+                "SELECT COUNT(*) as count FROM embeddings_clamp3"
+            ).fetchone()
             return row["count"]
         except sqlite3.OperationalError:
             return 0
@@ -266,24 +220,21 @@ class EmbeddingDatabase:
         """Reclaim unused space in the database."""
         self.conn.execute("VACUUM")
 
-    def get_all_embeddings(self, model: str = "mulan") -> dict[int, list[float]]:
-        """
-        Load all embeddings from the database for a given model.
+    def get_all_embeddings(self, model: str = "clamp3") -> dict[int, list[float]]:
+        """Load all embeddings from the database.
 
         Returns:
             Dictionary mapping track_id to embedding vector
         """
-        table = self._table_name(model)
         rows = self.conn.execute(
-            f"SELECT track_id, embedding FROM [{table}]"
+            "SELECT track_id, embedding FROM embeddings_clamp3"
         ).fetchall()
         return {row["track_id"]: blob_to_float_list(row["embedding"]) for row in rows}
 
-    def get_embedding_by_id(self, track_id: int, model: str = "mulan") -> Optional[list[float]]:
+    def get_embedding_by_id(self, track_id: int, model: str = "clamp3") -> Optional[list[float]]:
         """Get the embedding for a specific track."""
-        table = self._table_name(model)
         row = self.conn.execute(
-            f"SELECT embedding FROM [{table}] WHERE track_id = ?", (track_id,)
+            "SELECT embedding FROM embeddings_clamp3 WHERE track_id = ?", (track_id,)
         ).fetchone()
         return blob_to_float_list(row["embedding"]) if row else None
 
@@ -299,18 +250,11 @@ class EmbeddingDatabase:
         """
         Search tracks by artist, album, or title (case-insensitive).
         All words in the query must appear somewhere in the combined metadata.
-
-        Args:
-            query: Search string (space-separated words)
-
-        Returns:
-            List of matching track dictionaries
         """
         words = query.lower().split()
         if not words:
             return []
 
-        # Build query: all words must appear in the concatenated fields
         conditions = []
         params = []
         for word in words:
@@ -336,6 +280,13 @@ class EmbeddingDatabase:
             "SELECT id, artist, album, title, file_path FROM tracks ORDER BY RANDOM() LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
+
+    def get_track_id_by_path(self, file_path: str) -> Optional[int]:
+        """Look up a track ID by its file path."""
+        row = self.conn.execute(
+            "SELECT id FROM tracks WHERE file_path = ?", (file_path,)
+        ).fetchone()
+        return row["id"] if row else None
 
     def __enter__(self):
         return self

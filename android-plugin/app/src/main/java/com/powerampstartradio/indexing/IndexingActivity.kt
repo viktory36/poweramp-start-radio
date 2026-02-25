@@ -71,7 +71,6 @@ fun IndexingScreen(
     val isDetecting by viewModel.isDetecting.collectAsState()
     val detectingStatus by viewModel.detectingStatus.collectAsState()
     val indexingState by viewModel.indexingState.collectAsState()
-    val hasSvdMatrix by viewModel.hasSvdMatrix.collectAsState()
 
     // Re-detect when activity resumes (e.g. user replaced DB while app was backgrounded).
     // detectUnindexed() has its own cache check so this is cheap when nothing changed.
@@ -89,8 +88,6 @@ fun IndexingScreen(
 
     var showMenu by remember { mutableStateOf(false) }
     var showHiddenTracks by remember { mutableStateOf(false) }
-
-    var recluster by remember { mutableStateOf(false) }
 
     // When all dismissed tracks are restored, auto-navigate back
     LaunchedEffect(showHiddenTracks, hasDismissed) {
@@ -156,18 +153,8 @@ fun IndexingScreen(
                 && visibleTracks.isNotEmpty() && !isDetecting) {
                 BottomBar(
                     selectedCount = selectedCount,
-                    hasSvdMatrix = hasSvdMatrix,
-                    recluster = recluster,
-                    onReclusterChanged = { recluster = it },
                     onStartIndexing = {
-                        val tier = when {
-                            !hasSvdMatrix -> IndexingService.FusionTier.FULL_REFUSION
-                            recluster -> IndexingService.FusionTier.RECLUSTER
-                            else -> IndexingService.FusionTier.QUICK_UPDATE
-                        }
-                        viewModel.startIndexing(
-                            fusionOptions = IndexingService.FusionOptions(tier, buildKnnGraph = true)
-                        )
+                        viewModel.startIndexing(buildGraph = true)
                     },
                 )
             }
@@ -598,80 +585,27 @@ private fun HiddenTracksScreen(
 @Composable
 private fun BottomBar(
     selectedCount: Int,
-    hasSvdMatrix: Boolean,
-    recluster: Boolean,
-    onReclusterChanged: (Boolean) -> Unit,
     onStartIndexing: () -> Unit,
 ) {
-    var expanded by remember { mutableStateOf(false) }
-
     Surface(tonalElevation = 3.dp) {
         Column(modifier = Modifier.fillMaxWidth()) {
-            // Collapsed header — always visible
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .then(
-                        if (hasSvdMatrix) Modifier.clickable { expanded = !expanded }
-                        else Modifier
-                    )
                     .padding(horizontal = 16.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        if (hasSvdMatrix) "Incremental update" else "Full fusion",
+                        "CLaMP3 indexing",
                         style = MaterialTheme.typography.bodyMedium,
                     )
-                }
-                if (hasSvdMatrix) {
-                    Icon(
-                        if (expanded) Icons.Default.KeyboardArrowDown
-                        else Icons.Default.KeyboardArrowUp,
-                        contentDescription = if (expanded) "Collapse" else "Expand",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
                 }
                 Button(
                     onClick = onStartIndexing,
                     enabled = selectedCount > 0,
                 ) {
                     Text("Start ($selectedCount)")
-                }
-            }
-
-            // Expanded options — only when SVD exists
-            if (hasSvdMatrix) {
-                AnimatedVisibility(visible = expanded) {
-                    Column {
-                        HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
-
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onReclusterChanged(!recluster) }
-                                .padding(horizontal = 16.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Checkbox(
-                                checked = recluster,
-                                onCheckedChange = onReclusterChanged,
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    "Re-cluster all tracks",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                )
-                                Text(
-                                    "Rebuilds track clusters from scratch. Useful after adding many tracks over several sessions. If the Explorer (Random Walk) mode stops surfacing good connections, re-clustering helps.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        }
-                    }
                 }
             }
         }

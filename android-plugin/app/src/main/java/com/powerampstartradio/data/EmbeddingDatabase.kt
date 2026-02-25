@@ -27,12 +27,7 @@ data class EmbeddedTrack(
 /**
  * Wrapper for reading the embeddings SQLite database created by the desktop indexer.
  *
- * Expects a fused embedding database with:
- * - embeddings_fused table (primary, for similarity search)
- * - clusters table (centroids)
- * - cluster_id column on tracks
- *
- * Falls back to single-model tables if fused is not available.
+ * Primary table: embeddings_clamp3 (768d CLaMP3 audio embeddings).
  */
 class EmbeddingDatabase private constructor(
     private val db: SQLiteDatabase
@@ -67,6 +62,17 @@ class EmbeddingDatabase private constructor(
                 db.execSQL("ALTER TABLE tracks ADD COLUMN source TEXT DEFAULT 'desktop'")
             } catch (_: Exception) {
                 // Column already exists
+            }
+            // Migration: create embeddings_clamp3 table if not present
+            try {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS embeddings_clamp3 (
+                        track_id INTEGER PRIMARY KEY REFERENCES tracks(id),
+                        embedding BLOB NOT NULL
+                    )
+                """)
+            } catch (_: Exception) {
+                // Table already exists
             }
             return EmbeddingDatabase(db)
         }
@@ -107,22 +113,12 @@ class EmbeddingDatabase private constructor(
     }
 
     /**
-     * Whether this database has fused embeddings.
-     * Computed each time to avoid stale caches after on-device fusion.
-     */
-    val hasFusedEmbeddings: Boolean
-        get() = tableHasRows("embeddings_fused")
-
-    /**
      * The embedding table to use for similarity search.
-     * Prefers fused, falls back to mulan, then flamingo.
-     * Computed each time to avoid stale caches after on-device fusion.
+     * Uses embeddings_clamp3 (768d CLaMP3 audio embeddings).
+     * Computed each time to avoid stale caches after on-device indexing.
      */
     val embeddingTable: String
-        get() {
-            val candidates = listOf("embeddings_fused", "embeddings_mulan", "embeddings_flamingo")
-            return candidates.firstOrNull { tableHasRows(it) } ?: "embeddings_fused"
-        }
+        get() = "embeddings_clamp3"
 
     private fun getTableNames(): Set<String> {
         val names = mutableSetOf<String>()
@@ -134,14 +130,6 @@ class EmbeddingDatabase private constructor(
             }
         }
         return names
-    }
-
-    private fun tableHasRows(tableName: String): Boolean {
-        return try {
-            db.rawQuery("SELECT 1 FROM [$tableName] LIMIT 1", null).use { it.moveToFirst() }
-        } catch (e: Exception) {
-            false
-        }
     }
 
     /**
@@ -560,8 +548,7 @@ class EmbeddingDatabase private constructor(
     }
 
     /**
-     * Get an embedding for a track from a specific named table (e.g., "embeddings_mulan").
-     * Used for two-pass sequential indexing where pass 2 needs pass 1's embeddings.
+     * Get an embedding for a track from a specific named table.
      */
     fun getEmbeddingFromTable(tableName: String, trackId: Long): FloatArray? {
         return try {
