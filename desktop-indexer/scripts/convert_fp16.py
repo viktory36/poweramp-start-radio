@@ -79,6 +79,20 @@ def convert_fp32_to_fp16(input_path: str, output_path: str | None = None):
         dequant_opcode_idx = len(model.operatorCodes) - 1
         print(f"  Added DEQUANTIZE opcode at index {dequant_opcode_idx}")
 
+    # Pre-pass: identify buffers shared with non-FLOAT32 tensors (must NOT convert)
+    from collections import defaultdict
+    buf_types = defaultdict(set)
+    for t in subgraph.tensors:
+        buf = model.buffers[t.buffer]
+        if buf.data is not None and len(buf.data) > 0:
+            buf_types[t.buffer].add(t.type)
+    mixed_buffers = set()
+    for buf_idx, types in buf_types.items():
+        if schema_fb.TensorType.FLOAT32 in types and len(types) > 1:
+            mixed_buffers.add(buf_idx)
+    if mixed_buffers:
+        print(f"  Skipping {len(mixed_buffers)} mixed-type shared buffer(s)")
+
     converted = 0
     total_saved = 0
     new_tensors = []
@@ -91,6 +105,9 @@ def convert_fp32_to_fp16(input_path: str, output_path: str | None = None):
         if tensor.type != schema_fb.TensorType.FLOAT32:
             continue
         if tensor_idx in graph_inputs or tensor_idx in graph_outputs:
+            continue
+        # Skip buffers shared with non-FLOAT32 tensors (converting would corrupt them)
+        if tensor.buffer in mixed_buffers:
             continue
         buf = model.buffers[tensor.buffer]
         if buf.data is None or len(buf.data) == 0:
