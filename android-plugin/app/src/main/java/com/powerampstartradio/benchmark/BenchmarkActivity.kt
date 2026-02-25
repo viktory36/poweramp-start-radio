@@ -337,11 +337,19 @@ class BenchmarkActivity : ComponentActivity() {
             return
         }
         val mertLoadMs = (System.nanoTime() - mertLoadStart) / 1_000_000
-        log("  MERT loaded in ${mertLoadMs}ms")
+        val mertAccel = mertInference.activeAccelerator.name
+        log("  MERT loaded in ${mertLoadMs}ms (accelerator: $mertAccel)")
+        log("  Model: ${mertFile.name} (${mertFile.length() / 1024 / 1024}MB)")
         log("")
 
         // Extract features for all tracks
-        data class TrackFeatures(val features: List<FloatArray>, val decodeMsMs: Long, val mertMs: Long)
+        data class TrackFeatures(
+            val features: List<FloatArray>,
+            val decodeMs: Long,
+            val mertMs: Long,
+            val perWindowMs: List<Long>,
+            val audioDurationS: Float,
+        )
         val allFeatures = arrayOfNulls<TrackFeatures>(testTracks.size)
 
         for ((i, track) in testTracks.withIndex()) {
@@ -355,17 +363,29 @@ class BenchmarkActivity : ComponentActivity() {
                 if (audio == null) { log("  Decode failed"); continue }
                 log("  Audio: ${audio.durationS}s @ ${audio.sampleRate}Hz (decode: ${decodeMs}ms)")
 
-                val inferStart = System.nanoTime()
                 val features = mutableListOf<FloatArray>()
+                val perWindowMs = mutableListOf<Long>()
+                var lastWindowEndNs = 0L
+                val inferStart = System.nanoTime()
+                lastWindowEndNs = inferStart
                 val numWindows = mertInference.extractFeaturesStreaming(
                     audio,
                     onFeatureExtracted = { features.add(it.copyOf()) },
-                    onWindowDone = {},
+                    onWindowDone = {
+                        val now = System.nanoTime()
+                        perWindowMs.add((now - lastWindowEndNs) / 1_000_000)
+                        lastWindowEndNs = now
+                    },
                 )
                 val mertMs = (System.nanoTime() - inferStart) / 1_000_000
+                val avgMs = if (numWindows > 0) mertMs / numWindows else 0
 
-                log("  Extracted $numWindows windows in ${mertMs}ms")
-                allFeatures[i] = TrackFeatures(features, decodeMs, mertMs)
+                log("  $numWindows windows: total=${mertMs}ms, avg=${avgMs}ms/win")
+                if (perWindowMs.isNotEmpty()) {
+                    log("  per-window: min=${perWindowMs.min()}ms, max=${perWindowMs.max()}ms")
+                }
+                allFeatures[i] = TrackFeatures(features, decodeMs, mertMs, perWindowMs.toList(), audio.durationS)
+                results[i].durationS = audio.durationS
             } catch (e: Throwable) {
                 log("  ERROR: ${e.javaClass.simpleName}: ${e.message}")
             }
@@ -383,28 +403,38 @@ class BenchmarkActivity : ComponentActivity() {
             return
         }
         val clamp3LoadMs = (System.nanoTime() - clamp3LoadStart) / 1_000_000
-        log("  CLaMP3 audio encoder loaded in ${clamp3LoadMs}ms")
+        val clamp3Accel = clamp3Inference.activeAccelerator.name
+        log("  CLaMP3 audio loaded in ${clamp3LoadMs}ms (accelerator: $clamp3Accel)")
+        log("  Model: ${clamp3AudioFile.name} (${clamp3AudioFile.length() / 1024 / 1024}MB)")
         log("")
-
-        var ep: String? = null
 
         for ((i, track) in testTracks.withIndex()) {
             val tf = allFeatures[i] ?: continue
             log("CLaMP3 [${i + 1}/${testTracks.size}] ${track.artist} - ${track.title}")
 
             try {
+                val numSegments = clamp3Inference.segmentCount(tf.features.size)
                 val encStart = System.nanoTime()
                 val embedding = clamp3Inference.encode(tf.features, tf.features.size)
                 val encMs = (System.nanoTime() - encStart) / 1_000_000
-                val totalMs = tf.decodeMsMs + tf.mertMs + encMs
+                val totalMs = tf.decodeMs + tf.mertMs + encMs
+                val realtimeFactor = if (tf.audioDurationS > 0) totalMs / (tf.audioDurationS * 1000f) else 0f
 
                 if (embedding != null) {
-                    ep = "LiteRT GPU"
-                    log("  Embedding: ${embedding.size}d (decode=${tf.decodeMsMs}ms, mert=${tf.mertMs}ms, clamp3=${encMs}ms, total=${totalMs}ms)")
-                    log("  First 5: ${embedding.take(5).map { "%.4f".format(it) }}")
+                    log("  ${embedding.size}d, $numSegments seg (decode=${tf.decodeMs}ms, mert=${tf.mertMs}ms, clamp3=${encMs}ms, total=${totalMs}ms)")
+                    log("  Realtime factor: ${"%.2f".format(realtimeFactor)}x (${tf.audioDurationS}s audio in ${totalMs / 1000f}s)")
+                    results[i].timing = TrackTiming(
+                        decodeMs = tf.decodeMs,
+                        mertTotalMs = tf.mertMs,
+                        mertWindows = tf.features.size,
+                        mertPerWindowMs = tf.perWindowMs,
+                        mertAvgWindowMs = if (tf.features.isNotEmpty()) tf.mertMs / tf.features.size else 0,
+                        clamp3Segments = numSegments,
+                        clamp3TotalMs = encMs,
+                        totalMs = totalMs,
+                        realtimeFactor = realtimeFactor,
+                    )
                     results[i].clamp3 = EmbeddingResult(
-                        ep = ep,
-                        timingMs = totalMs,
                         dim = embedding.size,
                         embedding = embedding.toList(),
                     )
@@ -425,7 +455,12 @@ class BenchmarkActivity : ComponentActivity() {
             soc = Build.SOC_MODEL,
             androidVersion = "${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})",
             runtime = "LiteRT",
-            clamp3Ep = ep,
+            mertModel = mertFile.name,
+            mertAccelerator = mertAccel,
+            mertLoadMs = mertLoadMs,
+            clamp3Model = clamp3AudioFile.name,
+            clamp3Accelerator = clamp3Accel,
+            clamp3LoadMs = clamp3LoadMs,
             tracks = results,
         )
 
@@ -437,12 +472,42 @@ class BenchmarkActivity : ComponentActivity() {
         log("\n=== Results saved ===")
         log("File: ${outputFile.absolutePath}")
         log("Pull via: adb pull ${outputFile.absolutePath}")
-        log("CLaMP3 EP: ${ep ?: "not loaded"}")
 
-        log("\n=== Summary ===")
+        // ── Timing Summary ──
+        log("\n=== Timing Summary ===")
+        log("Models: MERT=${mertFile.name} ($mertAccel, load=${mertLoadMs}ms)")
+        log("        CLaMP3=${clamp3AudioFile.name} ($clamp3Accel, load=${clamp3LoadMs}ms)")
+        log("")
+        log(String.format("%-30s %6s %6s %6s %5s %7s %6s",
+            "Track", "Dec", "MERT", "CL3", "Win", "Total", "RT-x"))
+        log("-".repeat(95))
+
+        val allTimings = results.mapNotNull { it.timing }
         for (r in results) {
-            log("${r.artist} - ${r.title} [${r.album}] (${r.durationMs}ms)")
-            r.clamp3?.let { log("  CLaMP3: ${it.dim}d, ${it.timingMs}ms, EP=${it.ep}") }
+            val t = r.timing ?: continue
+            log(String.format("%-30s %5dms %5dms %5dms %4dw %6dms %5.2fx",
+                "${r.artist} - ${r.title}".take(30),
+                t.decodeMs, t.mertTotalMs, t.clamp3TotalMs, t.mertWindows, t.totalMs, t.realtimeFactor))
+        }
+
+        if (allTimings.isNotEmpty()) {
+            log("-".repeat(95))
+            val avgDecode = allTimings.map { it.decodeMs }.average().toLong()
+            val avgMert = allTimings.map { it.mertTotalMs }.average().toLong()
+            val avgClamp3 = allTimings.map { it.clamp3TotalMs }.average().toLong()
+            val avgWindows = allTimings.map { it.mertWindows }.average().toInt()
+            val avgTotal = allTimings.map { it.totalMs }.average().toLong()
+            val avgRt = allTimings.map { it.realtimeFactor.toDouble() }.average().toFloat()
+            val avgPerWindow = allTimings.flatMap { it.mertPerWindowMs }.let { if (it.isNotEmpty()) it.average().toLong() else 0 }
+            log(String.format("%-30s %5dms %5dms %5dms %4dw %6dms %5.2fx",
+                "AVERAGE", avgDecode, avgMert, avgClamp3, avgWindows, avgTotal, avgRt))
+            log("")
+            log("MERT per-window: avg=${avgPerWindow}ms")
+            val allWindowMs = allTimings.flatMap { it.mertPerWindowMs }
+            if (allWindowMs.isNotEmpty()) {
+                log("  min=${allWindowMs.min()}ms, max=${allWindowMs.max()}ms, " +
+                    "p50=${allWindowMs.sorted()[allWindowMs.size / 2]}ms")
+            }
         }
         log("\nBenchmark complete.")
     }
@@ -558,7 +623,12 @@ class BenchmarkActivity : ComponentActivity() {
         val soc: String,
         val androidVersion: String,
         val runtime: String,
-        val clamp3Ep: String? = null,
+        val mertModel: String? = null,
+        val mertAccelerator: String? = null,
+        val mertLoadMs: Long = 0,
+        val clamp3Model: String? = null,
+        val clamp3Accelerator: String? = null,
+        val clamp3LoadMs: Long = 0,
         val tracks: List<TrackResult>,
     )
 
@@ -568,12 +638,24 @@ class BenchmarkActivity : ComponentActivity() {
         val album: String,
         val title: String,
         val durationMs: Long,
+        var durationS: Float = 0f,
+        var timing: TrackTiming? = null,
         var clamp3: EmbeddingResult? = null,
     )
 
+    data class TrackTiming(
+        val decodeMs: Long,
+        val mertTotalMs: Long,
+        val mertWindows: Int,
+        val mertPerWindowMs: List<Long>,
+        val mertAvgWindowMs: Long,
+        val clamp3Segments: Int,
+        val clamp3TotalMs: Long,
+        val totalMs: Long,
+        val realtimeFactor: Float,
+    )
+
     data class EmbeddingResult(
-        val ep: String,
-        val timingMs: Long,
         val dim: Int,
         val embedding: List<Float>,
     )
