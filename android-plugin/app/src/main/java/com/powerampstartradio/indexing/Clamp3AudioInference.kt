@@ -71,16 +71,24 @@ class Clamp3AudioInference(
 
     /**
      * Compute the number of CLaMP3 segments needed for this many MERT windows.
+     * Accounts for the prepended + appended zero vectors (CLaMP3 training convention).
      * Used for pre-computing total work steps for ETA.
      */
     fun segmentCount(numWindows: Int): Int {
-        return maxOf(1, ceil(numWindows.toFloat() / MAX_WINDOWS).toInt())
+        val totalFrames = numWindows + 2  // +2 for zero-vector bookends
+        return maxOf(1, ceil(totalFrames.toFloat() / MAX_WINDOWS).toInt())
     }
 
     /**
      * Encode MERT features into a CLaMP3 embedding, streaming features
      * from a callback. Designed for disk-spilled MERT features to avoid
      * loading all windows into memory at once.
+     *
+     * Matches the desktop CLaMP3 pipeline:
+     * 1. Prepend + append zero vector (CLaMP3 training convention)
+     * 2. Segment into 128-frame windows
+     * 3. Last segment uses the final 128 frames (may overlap with previous)
+     * 4. Weight-average segments by valid frame count
      *
      * @param numWindows Total number of MERT feature windows for this track
      * @param readNextWindow Callback that returns the next 768d MERT feature vector
@@ -94,24 +102,50 @@ class Clamp3AudioInference(
     ): FloatArray? {
         if (numWindows == 0) return null
 
-        val numSegments = segmentCount(numWindows)
+        // Read all MERT windows into memory for prepend/append + overlapping last segment.
+        // Memory: numWindows * 768 * 4 bytes (~180 windows for 15min track = ~540KB).
+        val allWindows = Array(numWindows) { readNextWindow() }
+
+        // Prepend + append zero vector (matching CLaMP3 training pipeline)
+        val totalFrames = numWindows + 2
+        val zeroVec = FloatArray(FEATURE_DIM)
+
+        // Build segment list matching desktop: segment into 128-frame windows,
+        // then replace last segment with the final 128 frames (may overlap).
+        val segStarts = mutableListOf<Int>()
+        var pos = 0
+        while (pos < totalFrames) {
+            segStarts.add(pos)
+            pos += MAX_WINDOWS
+        }
+        // Last segment: use last MAX_WINDOWS frames (may overlap with previous)
+        if (segStarts.size > 1 || totalFrames > MAX_WINDOWS) {
+            segStarts[segStarts.lastIndex] = maxOf(0, totalFrames - MAX_WINDOWS)
+        }
+
+        val numSegments = segStarts.size
         val sumEmbedding = FloatArray(EMBEDDING_DIM)
         var totalWeight = 0f
         var count = 0
         var totalInferMs = 0L
-        var windowsRead = 0
 
         for (s in 0 until numSegments) {
-            val segWindows = min(MAX_WINDOWS, numWindows - windowsRead)
-            if (segWindows <= 0) break
+            val segStart = segStarts[s]
+            val segEnd = minOf(segStart + MAX_WINDOWS, totalFrames)
+            val segWindows = segEnd - segStart
 
-            // Fill input: copy MERT features into pre-allocated buffer
+            // Fill input buffer with features from the virtual array
+            // (zero at index 0, allWindows at 1..numWindows, zero at numWindows+1)
             audioMaskFlat.fill(0f)
             for (w in 0 until segWindows) {
-                val feature = readNextWindow()
+                val virtualIdx = segStart + w
+                val feature = when (virtualIdx) {
+                    0 -> zeroVec                         // prepended zero
+                    totalFrames - 1 -> zeroVec           // appended zero
+                    else -> allWindows[virtualIdx - 1]   // actual MERT feature
+                }
                 System.arraycopy(feature, 0, audioInputFlat, w * FEATURE_DIM, FEATURE_DIM)
                 audioMaskFlat[w] = 1f
-                windowsRead++
             }
             // Zero-pad remainder of features
             for (w in segWindows until MAX_WINDOWS) {
@@ -123,8 +157,14 @@ class Clamp3AudioInference(
                 totalInferMs += inferMs
             }
             if (embedding != null) {
-                // Weight by number of valid windows in this segment
-                val weight = segWindows.toFloat()
+                // Weight by valid frame count (matches desktop weighting)
+                val weight = if (s < numSegments - 1) {
+                    MAX_WINDOWS.toFloat()
+                } else {
+                    // Last segment weight = remainder (or MAX_WINDOWS if evenly divisible)
+                    val remain = totalFrames % MAX_WINDOWS
+                    if (remain == 0) MAX_WINDOWS.toFloat() else remain.toFloat()
+                }
                 for (i in 0 until EMBEDDING_DIM) {
                     sumEmbedding[i] += embedding[i] * weight
                 }

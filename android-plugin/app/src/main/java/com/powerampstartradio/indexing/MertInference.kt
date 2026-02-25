@@ -3,6 +3,7 @@ package com.powerampstartradio.indexing
 import android.util.Log
 import com.google.ai.edge.litert.Accelerator
 import java.io.File
+import kotlin.math.sqrt
 
 /**
  * MERT-v1-95M LiteRT inference for on-device audio feature extraction.
@@ -31,6 +32,27 @@ class MertInference(
         const val WINDOW_SEC = 5
         const val WINDOW_SAMPLES = SAMPLE_RATE * WINDOW_SEC  // 120000
         const val FEATURE_DIM = 768
+
+        /**
+         * Per-track zero-mean unit-variance normalization (in-place).
+         * Matches Wav2Vec2FeatureExtractor(do_normalize=True) on desktop.
+         */
+        fun normalizeAudio(samples: FloatArray) {
+            var sum = 0.0
+            for (s in samples) sum += s
+            val mean = (sum / samples.size).toFloat()
+
+            var sumSq = 0.0
+            for (s in samples) {
+                val d = s - mean
+                sumSq += d * d
+            }
+            val std = sqrt((sumSq / samples.size).toFloat() + 1e-7f)
+
+            for (i in samples.indices) {
+                samples[i] = (samples[i] - mean) / std
+            }
+        }
     }
 
     private val model: com.google.ai.edge.litert.CompiledModel
@@ -90,6 +112,10 @@ class MertInference(
             Log.w(TAG, "Audio too short (${audio.durationS}s < ${WINDOW_SEC}s)")
             return 0
         }
+
+        // Per-track zero-mean unit-variance normalization
+        // (matches Wav2Vec2FeatureExtractor(do_normalize=True) on desktop)
+        normalizeAudio(audio.samples)
 
         var count = 0
         var totalInferMs = 0L

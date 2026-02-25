@@ -92,7 +92,7 @@ class Clamp3TextInference(
                     "total=${tokenMs + inferMs}ms, query='$query'")
 
             val embedding = if (output.size >= EMBEDDING_DIM) {
-                output.copyOf(EMBEDDING_DIM)
+                output.copyOf(EMBEDDING_DIM).also { l2Normalize(it) }
             } else {
                 Log.w(TAG, "Unexpected output size: ${output.size}")
                 null

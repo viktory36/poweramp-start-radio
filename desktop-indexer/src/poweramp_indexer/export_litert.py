@@ -32,6 +32,24 @@ MERT_SR = 24000
 MERT_WINDOW_SAMPLES = 5 * MERT_SR  # 120,000 samples = 5 seconds
 
 
+FP16_SAFE_EPS = 7e-5  # Must exceed FP16 smallest normal (6.1e-5) to survive GPU FTZ
+
+
+def fix_norm_eps_for_gpu(module: nn.Module, eps: float = FP16_SAFE_EPS):
+    """Set eps on all LayerNorm/GroupNorm modules to a FP16-safe value.
+
+    Mobile GPUs operate in Flush-To-Zero mode: FP16 subnormals (< 6.1e-5)
+    are rounded to 0. Standard eps values (1e-5, 1e-12) become 0, causing
+    RSQRT(variance + 0) = inf when variance is small → NaN cascade.
+    """
+    count = 0
+    for m in module.modules():
+        if isinstance(m, (nn.LayerNorm, nn.GroupNorm, ChannelNorm, ClampLayerNorm)):
+            m.eps = eps
+            count += 1
+    logger.info(f"Fixed eps={eps} on {count} normalization modules (FP16 GPU-safe)")
+
+
 class ChannelNorm(nn.Module):
     """GPU-friendly replacement for GroupNorm(C, C) where num_groups == num_channels.
 
@@ -39,6 +57,14 @@ class ChannelNorm(nn.Module):
     (for indexing the affine params per-group). Since MERT uses
     GroupNorm(512, 512) — one channel per group — we replace it with
     simple per-channel mean/var that exports as GPU-native arithmetic.
+
+    GPU FP16 safety:
+    - Mean uses explicit sum/T division (not .mean()) — the reciprocal 1/T
+      is subnormal in FP16 when T > 16384 (e.g. T=23999 after MERT's first
+      conv), flushed to 0 by GPU FTZ.
+    - Uses clamp-based normalization: rsqrt(clamp(var, min=eps)) instead of
+      rsqrt(var + eps). This preserves exact behavior for the ~92% of
+      positions where variance > eps, only clamping the rare near-zero cases.
     """
 
     def __init__(self, group_norm: nn.GroupNorm):
@@ -49,10 +75,41 @@ class ChannelNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [batch, C, T]
-        mean = x.mean(dim=2, keepdim=True)
-        var = x.var(dim=2, keepdim=True, correction=0)
-        x = (x - mean) / torch.sqrt(var + self.eps)
+        T = x.shape[2]
+        sum_x = x.sum(dim=2, keepdim=True)
+        mean = sum_x / T
+        diff = x - mean
+        var = (diff * diff).sum(dim=2, keepdim=True) / T
+        x = diff * torch.rsqrt(var.clamp(min=self.eps))
         return x * self.weight.unsqueeze(0).unsqueeze(2) + self.bias.unsqueeze(0).unsqueeze(2)
+
+
+class ClampLayerNorm(nn.Module):
+    """LayerNorm replacement using clamp-based variance floor for GPU FP16 safety.
+
+    Standard nn.LayerNorm uses rsqrt(var + eps). When eps is subnormal in FP16
+    (< 6.1e-5), GPU FTZ flushes it to 0, causing NaN when variance is small.
+    This replacement uses rsqrt(clamp(var, min=eps)) which:
+    - Preserves exact behavior when var > eps (the common case)
+    - Only intervenes for near-zero variance (rare edge case)
+
+    Only needed for MERT's feature_projection.layer_norm where variance
+    occasionally dips near the FP16 threshold. All transformer LayerNorms
+    have variance >> 0.04, making eps irrelevant.
+    """
+
+    def __init__(self, layer_norm: nn.LayerNorm):
+        super().__init__()
+        self.weight = layer_norm.weight
+        self.bias = layer_norm.bias
+        self.eps = layer_norm.eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mean = x.mean(dim=-1, keepdim=True)
+        diff = x - mean
+        var = (diff * diff).mean(dim=-1, keepdim=True)
+        x = diff * torch.rsqrt(var.clamp(min=self.eps))
+        return x * self.weight + self.bias
 
 
 class MertWrapper(nn.Module):
@@ -88,6 +145,18 @@ class MertWrapper(nn.Module):
         layer0 = self.mert.feature_extractor.conv_layers[0]
         layer0.layer_norm = ChannelNorm(layer0.layer_norm)
         logger.info("Replaced GroupNorm with ChannelNorm for GPU compatibility")
+
+        # Replace feature_projection LayerNorm with clamp-based version
+        # (variance occasionally dips near FP16 threshold at 7e-5)
+        self.mert.feature_projection.layer_norm = ClampLayerNorm(
+            self.mert.feature_projection.layer_norm
+        )
+        logger.info("Replaced feature_projection LayerNorm with ClampLayerNorm")
+
+        # Fix eps on all normalization modules for GPU FP16 FTZ safety.
+        # For transformer LayerNorms, eps is irrelevant (variance > 0.04),
+        # but we set it anyway for correctness.
+        fix_norm_eps_for_gpu(self)
 
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
         """
@@ -188,6 +257,7 @@ class CLaMP3AudioWrapper(nn.Module):
         self.bert_embeddings = encoder.audio_model.embeddings
         self.bert_encoder = encoder.audio_model.encoder
         self.audio_proj = encoder.audio_proj
+        fix_norm_eps_for_gpu(self)
 
     def forward(self, audio_inputs: torch.Tensor, audio_masks: torch.Tensor) -> torch.Tensor:
         # Run BERT embeddings (adds position + token_type + LayerNorm)
@@ -287,6 +357,7 @@ class CLaMP3TextWrapper(nn.Module):
         self.roberta_embeddings = text_encoder.text_model.embeddings
         self.roberta_encoder = text_encoder.text_model.encoder
         self.text_proj = text_encoder.text_proj
+        fix_norm_eps_for_gpu(self)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         # Run RoBERTa embeddings (word + position + token_type + LayerNorm)

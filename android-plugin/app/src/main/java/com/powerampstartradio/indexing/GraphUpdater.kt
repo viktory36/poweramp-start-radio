@@ -72,6 +72,12 @@ class GraphUpdater(
         val neighbors = Array(n) { IntArray(k) }
         val weights = Array(n) { FloatArray(k) }
 
+        // Build trackId → index lookup to avoid O(N) linear scan per neighbor
+        val idToIndex = HashMap<Long, Int>(n * 2)
+        for (i in 0 until n) {
+            idToIndex[index.getTrackId(i)] = i
+        }
+
         for (i in 0 until n) {
             if (i % 1000 == 0) {
                 onProgress?.invoke("kNN: $i/$n")
@@ -85,18 +91,9 @@ class GraphUpdater(
             val topK = index.findTopK(embedding, k, excludeIds = setOf(trackId))
 
             for (j in topK.indices) {
-                // Convert track ID to index
                 val neighborTrackId = topK[j].first
                 val similarity = topK[j].second
-
-                // Find the index for this neighbor track ID
-                var neighborIdx = 0
-                for (idx in 0 until n) {
-                    if (index.getTrackId(idx) == neighborTrackId) {
-                        neighborIdx = idx
-                        break
-                    }
-                }
+                val neighborIdx = idToIndex[neighborTrackId] ?: 0
 
                 neighbors[i][j] = neighborIdx
                 weights[i][j] = maxOf(similarity, 0f)

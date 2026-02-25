@@ -135,7 +135,14 @@ def extract_mert_features_tflite(interp, fpath, max_duration=600):
 
 
 def encode_clamp3_audio_tflite(interp, features):
-    """Run CLaMP3 audio encoder TFLite, returning [768] embedding."""
+    """Run CLaMP3 audio encoder TFLite, returning [768] embedding.
+
+    Matches the desktop CLaMP3 pipeline:
+    1. Prepend + append zero vector (CLaMP3 training convention)
+    2. Segment into 128-frame windows
+    3. Last segment uses the final 128 frames (may overlap with previous)
+    4. Weight-average segments by valid frame count
+    """
     MAX_WINDOWS = 128
     FEATURE_DIM = 768
 
@@ -143,29 +150,43 @@ def encode_clamp3_audio_tflite(interp, features):
     if num_windows == 0:
         return None
 
-    num_segments = max(1, (num_windows + MAX_WINDOWS - 1) // MAX_WINDOWS)
+    # Prepend + append zero vector (matching CLaMP3 training pipeline)
+    zero_vec = np.zeros((1, FEATURE_DIM), dtype=np.float32)
+    input_data = np.concatenate([zero_vec, features, zero_vec], axis=0)
+    total_frames = len(input_data)
+
+    # Build segment list (matching desktop: last segment = last 128 frames)
+    seg_starts = list(range(0, total_frames, MAX_WINDOWS))
+    if len(seg_starts) > 1 or total_frames > MAX_WINDOWS:
+        seg_starts[-1] = max(0, total_frames - MAX_WINDOWS)
+
+    # Compute weights matching desktop logic
+    full_cnt = total_frames // MAX_WINDOWS
+    remain = total_frames % MAX_WINDOWS
+    if remain == 0:
+        weights = [MAX_WINDOWS] * full_cnt
+    else:
+        weights = [MAX_WINDOWS] * full_cnt + [remain]
+
     sum_emb = np.zeros(FEATURE_DIM, dtype=np.float32)
     total_weight = 0
-    idx = 0
 
-    for s in range(num_segments):
-        seg_windows = min(MAX_WINDOWS, num_windows - idx)
-        if seg_windows <= 0:
-            break
+    for s, seg_start in enumerate(seg_starts):
+        seg_end = min(seg_start + MAX_WINDOWS, total_frames)
+        seg_data = input_data[seg_start:seg_end]
+        seg_len = len(seg_data)
 
         # Build padded input
         audio_inputs = np.zeros((1, MAX_WINDOWS, FEATURE_DIM), dtype=np.float32)
         audio_masks = np.zeros((1, MAX_WINDOWS), dtype=np.float32)
-
-        for w in range(seg_windows):
-            audio_inputs[0, w] = features[idx]
-            audio_masks[0, w] = 1.0
-            idx += 1
+        audio_inputs[0, :seg_len] = seg_data
+        audio_masks[0, :seg_len] = 1.0
 
         # Run CLaMP3 audio: [1, 128, 768] + [1, 128] → [1, 768]
         out = run_tflite(interp, audio_inputs, audio_masks)
-        sum_emb += out[0] * seg_windows
-        total_weight += seg_windows
+        w = weights[s]
+        sum_emb += out[0] * w
+        total_weight += w
 
     if total_weight == 0:
         return None
