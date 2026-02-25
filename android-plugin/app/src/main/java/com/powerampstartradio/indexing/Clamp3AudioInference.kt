@@ -11,11 +11,12 @@ import kotlin.math.min
  *
  * Uses a TFLite model (converted from PyTorch via litert-torch):
  * - Input 0: audio_inputs [1, 128, 768] (MERT features, zero-padded)
- * - Input 1: audio_masks  [1, 128, 128] (3D attention mask, pre-expanded)
+ * - Input 1: audio_masks  [1, 128] float32 (1=real, 0=pad)
  * - Output:  [1, 768] projected features (not L2-normalized)
  *
- * The mask is 3D because the GPU delegate doesn't support BROADCAST_TO.
- * Each row of the mask is the same 1D mask (key-only masking).
+ * The model computes a GPU-safe additive attention mask internally using -1e4
+ * (fits in FP16) instead of BERT's default finfo.min (-3.4e38 → -inf → NaN).
+ * ADD broadcasts [B,1,1,S] natively on GPU — no BROADCAST_TO ops needed.
  *
  * Handles segmentation: tracks with >128 MERT windows are split into
  * segments, each encoded separately, then weight-averaged by valid frame count.
@@ -53,9 +54,9 @@ class Clamp3AudioInference(
     /** Which accelerator is actually in use. */
     val activeAccelerator: Accelerator
 
-    // Pre-allocated flat arrays for model input [1, 128, 768] and [1, 128, 128]
+    // Pre-allocated flat arrays for model input [1, 128, 768] and [1, 128]
     private val audioInputFlat = FloatArray(MAX_WINDOWS * FEATURE_DIM)
-    private val audioMaskFlat = FloatArray(MAX_WINDOWS * MAX_WINDOWS)
+    private val audioMaskFlat = FloatArray(MAX_WINDOWS)
 
     init {
         val result = createReadyModel(modelFile.absolutePath, accelerator)
@@ -105,21 +106,16 @@ class Clamp3AudioInference(
             if (segWindows <= 0) break
 
             // Fill input: copy MERT features into pre-allocated buffer
-            // Build 1D mask first, then expand to 3D [128, 128]
-            val mask1d = FloatArray(MAX_WINDOWS)
+            audioMaskFlat.fill(0f)
             for (w in 0 until segWindows) {
                 val feature = readNextWindow()
                 System.arraycopy(feature, 0, audioInputFlat, w * FEATURE_DIM, FEATURE_DIM)
-                mask1d[w] = 1f
+                audioMaskFlat[w] = 1f
                 windowsRead++
             }
             // Zero-pad remainder of features
             for (w in segWindows until MAX_WINDOWS) {
                 audioInputFlat.fill(0f, w * FEATURE_DIM, (w + 1) * FEATURE_DIM)
-            }
-            // Expand 1D mask to 3D: each row is the same 1D mask (key-only masking)
-            for (row in 0 until MAX_WINDOWS) {
-                System.arraycopy(mask1d, 0, audioMaskFlat, row * MAX_WINDOWS, MAX_WINDOWS)
             }
 
             // Run inference

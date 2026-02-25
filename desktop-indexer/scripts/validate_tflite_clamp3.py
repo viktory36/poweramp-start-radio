@@ -155,19 +155,14 @@ def encode_clamp3_audio_tflite(interp, features):
 
         # Build padded input
         audio_inputs = np.zeros((1, MAX_WINDOWS, FEATURE_DIM), dtype=np.float32)
-        # 3D mask [1, 128, 128] — each row is the 1D mask (key-only masking)
-        audio_masks = np.zeros((1, MAX_WINDOWS, MAX_WINDOWS), dtype=np.float32)
+        audio_masks = np.zeros((1, MAX_WINDOWS), dtype=np.float32)
 
-        mask_1d = np.zeros(MAX_WINDOWS, dtype=np.float32)
         for w in range(seg_windows):
             audio_inputs[0, w] = features[idx]
-            mask_1d[w] = 1.0
+            audio_masks[0, w] = 1.0
             idx += 1
-        # Broadcast 1D mask to all rows
-        for w in range(MAX_WINDOWS):
-            audio_masks[0, w] = mask_1d
 
-        # Run CLaMP3 audio: [1, 128, 768] + [1, 128, 128] → [1, 768]
+        # Run CLaMP3 audio: [1, 128, 768] + [1, 128] → [1, 768]
         out = run_tflite(interp, audio_inputs, audio_masks)
         sum_emb += out[0] * seg_windows
         total_weight += seg_windows

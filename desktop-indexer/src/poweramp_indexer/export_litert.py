@@ -168,15 +168,16 @@ class CLaMP3AudioWrapper(nn.Module):
     """Wraps CLaMP3 audio encoder for TFLite export.
 
     Input:  audio_inputs [1, 128, 768] (MERT features, zero-padded)
-            audio_masks  [1, 128, 128] (attention mask, pre-expanded on host)
+            audio_masks  [1, 128] float32 (1=real, 0=pad)
     Output: [1, 768] projected features (not L2-normalized)
 
-    The mask is 3D [B, S, S] so BERT only unsqueezes to 4D (no expand
-    or broadcast). The GPU delegate doesn't support BROADCAST_TO, and the
-    TFLite converter optimizes repeat/tile into BROADCAST_TO, so the only
-    clean solution is to pass the mask pre-expanded from the host.
+    GPU-safe mask handling: BERT's get_extended_attention_mask uses
+    torch.finfo(float32).min (-3.4e38) which overflows to -inf in the GPU
+    delegate's FP16 compute. For valid tokens: 0.0 * (-inf) = NaN (IEEE 754).
+    We bypass BertModel.forward() and call embeddings + encoder directly,
+    computing the additive mask ourselves with -1e4 (fits in FP16 safely).
 
-    Host constructs: mask_3d[i, j] = mask_1d[j] for all i (key-only masking).
+    ADD with [B, 1, 1, S] broadcasts natively on GPU — no BROADCAST_TO needed.
 
     This is a single 128-frame window. The segmentation and weighted averaging
     of multi-segment tracks is done on the host (Kotlin/Python) side.
@@ -184,18 +185,24 @@ class CLaMP3AudioWrapper(nn.Module):
 
     def __init__(self, encoder):
         super().__init__()
-        self.audio_model = encoder.audio_model
+        self.bert_embeddings = encoder.audio_model.embeddings
+        self.bert_encoder = encoder.audio_model.encoder
         self.audio_proj = encoder.audio_proj
 
     def forward(self, audio_inputs: torch.Tensor, audio_masks: torch.Tensor) -> torch.Tensor:
-        features = self.audio_model(
-            inputs_embeds=audio_inputs,
-            attention_mask=audio_masks,  # [1, 128, 128] — BERT unsqueezes to [1, 1, 128, 128]
-        )['last_hidden_state']
-        # Extract 1D mask from 3D for pooling (all rows are identical)
-        masks_1d = audio_masks[:, 0, :].unsqueeze(-1)  # [1, 128, 1]
-        features = features * masks_1d
-        pooled = features.sum(dim=1) / masks_1d.sum(dim=1)
+        # Run BERT embeddings (adds position + token_type + LayerNorm)
+        hidden_states = self.bert_embeddings(inputs_embeds=audio_inputs)
+        # Compute additive attention mask: 0 for valid, -1e4 for padded
+        # -1e4 is safely within FP16 range (max ±65504), unlike finfo.min (-3.4e38 → -inf)
+        additive_mask = (1.0 - audio_masks.float()) * (-1e4)  # [B, S]
+        extended_mask = additive_mask[:, None, None, :]  # [B, 1, 1, S]
+        # Run BERT encoder directly (bypassing get_extended_attention_mask)
+        encoder_out = self.bert_encoder(hidden_states, attention_mask=extended_mask)
+        features = encoder_out['last_hidden_state']
+        # Masked mean pooling
+        masks = audio_masks.unsqueeze(-1)  # [B, S, 1]
+        features = features * masks
+        pooled = features.sum(dim=1) / masks.sum(dim=1)
         return self.audio_proj(pooled)
 
 
@@ -217,9 +224,9 @@ def convert_clamp3_audio(output_dir: Path):
     wrapper = CLaMP3AudioWrapper(encoder)
     wrapper.eval()
 
-    # Sample inputs — mask is 3D [B, S, S] (pre-expanded on host)
+    # Sample inputs — mask is 2D [B, S] (1=real, 0=pad)
     sample_inputs = torch.randn(1, MAX_AUDIO_LENGTH, AUDIO_HIDDEN_SIZE)
-    sample_masks = torch.ones(1, MAX_AUDIO_LENGTH, MAX_AUDIO_LENGTH)
+    sample_masks = torch.ones(1, MAX_AUDIO_LENGTH)
 
     # Validate
     logger.info("Validating wrapper...")
@@ -266,6 +273,10 @@ class CLaMP3TextWrapper(nn.Module):
             attention_mask [1, 128] INT64 (1=real, 0=pad)
     Output: [1, 768] projected features (not L2-normalized)
 
+    GPU-safe mask handling: same as CLaMP3AudioWrapper — bypasses the model's
+    get_extended_attention_mask (which uses finfo.min → NaN in FP16) and
+    computes a -1e4 additive mask directly.
+
     Segmentation and weighted averaging for long texts is done on the host side.
     """
 
@@ -273,14 +284,20 @@ class CLaMP3TextWrapper(nn.Module):
 
     def __init__(self, text_encoder):
         super().__init__()
-        self.text_model = text_encoder.text_model
+        self.roberta_embeddings = text_encoder.text_model.embeddings
+        self.roberta_encoder = text_encoder.text_model.encoder
         self.text_proj = text_encoder.text_proj
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        features = self.text_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )['last_hidden_state']
+        # Run RoBERTa embeddings (word + position + token_type + LayerNorm)
+        hidden_states = self.roberta_embeddings(input_ids=input_ids)
+        # Compute GPU-safe additive mask (bypasses finfo.min)
+        additive_mask = (1.0 - attention_mask.float()) * (-1e4)  # [B, S]
+        extended_mask = additive_mask[:, None, None, :]  # [B, 1, 1, S]
+        # Run encoder directly
+        encoder_out = self.roberta_encoder(hidden_states, attention_mask=extended_mask)
+        features = encoder_out['last_hidden_state']
+        # Masked mean pooling
         masks = attention_mask.unsqueeze(-1).float()
         features = features * masks
         pooled = features.sum(dim=1) / masks.sum(dim=1).clamp(min=1e-10)
