@@ -89,6 +89,7 @@ class BenchmarkActivity : ComponentActivity() {
                 try {
                     runBenchmark(selectedAccelerator) { msg -> status = msg }
                 } catch (e: Exception) {
+                    Log.e(TAG, "Benchmark failed", e)
                     status = "ERROR: ${e.message}\n\n${e.stackTraceToString()}"
                 } finally {
                     running = false
@@ -465,7 +466,12 @@ class BenchmarkActivity : ComponentActivity() {
         )
 
         val gson = GsonBuilder().setPrettyPrinting().create()
-        val json = gson.toJson(output)
+        val json = try {
+            gson.toJson(output)
+        } catch (e: Exception) {
+            Log.e(TAG, "Gson serialization failed", e)
+            throw e
+        }
         val outputFile = File(filesDir, "benchmark_results.json")
         outputFile.writeText(json)
 
