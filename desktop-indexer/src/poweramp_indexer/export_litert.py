@@ -32,6 +32,29 @@ MERT_SR = 24000
 MERT_WINDOW_SAMPLES = 5 * MERT_SR  # 120,000 samples = 5 seconds
 
 
+class ChannelNorm(nn.Module):
+    """GPU-friendly replacement for GroupNorm(C, C) where num_groups == num_channels.
+
+    PyTorch's GroupNorm generates GATHER_ND ops during TFLite export
+    (for indexing the affine params per-group). Since MERT uses
+    GroupNorm(512, 512) — one channel per group — we replace it with
+    simple per-channel mean/var that exports as GPU-native arithmetic.
+    """
+
+    def __init__(self, group_norm: nn.GroupNorm):
+        super().__init__()
+        self.weight = group_norm.weight  # [C]
+        self.bias = group_norm.bias      # [C]
+        self.eps = group_norm.eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, C, T]
+        mean = x.mean(dim=2, keepdim=True)
+        var = x.var(dim=2, keepdim=True, correction=0)
+        x = (x - mean) / torch.sqrt(var + self.eps)
+        return x * self.weight.unsqueeze(0).unsqueeze(2) + self.bias.unsqueeze(0).unsqueeze(2)
+
+
 class MertWrapper(nn.Module):
     """Wraps MERT-v1-95M for TFLite export.
 
@@ -60,6 +83,12 @@ class MertWrapper(nn.Module):
             except Exception:
                 logger.warning("Could not remove weight_norm — may fail during export")
 
+        # Replace GroupNorm(512,512) with GPU-friendly ChannelNorm
+        # (GroupNorm generates GATHER_ND ops that the GPU delegate rejects)
+        layer0 = self.mert.feature_extractor.conv_layers[0]
+        layer0.layer_norm = ChannelNorm(layer0.layer_norm)
+        logger.info("Replaced GroupNorm with ChannelNorm for GPU compatibility")
+
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -68,12 +97,14 @@ class MertWrapper(nn.Module):
             [batch, 768] mean-pooled features
         """
         out = self.mert(waveform, output_hidden_states=True)
-        # Stack all hidden states: [num_layers, batch, time, 768]
-        hidden = torch.stack(out.hidden_states)
-        # Mean over time: [num_layers, batch, 768]
-        hidden = hidden.mean(dim=2)
-        # Mean over layers: [batch, 768]
-        return hidden.mean(dim=0)
+        # Accumulate mean over layers without torch.stack.
+        # torch.stack generates GATHER_ND which the GPU delegate can't run.
+        # Unrolled sum is traced as 13 static additions — all GPU-native.
+        num_layers = len(out.hidden_states)
+        acc = out.hidden_states[0].mean(dim=1)  # [batch, 768]
+        for h in out.hidden_states[1:]:
+            acc = acc + h.mean(dim=1)
+        return acc / num_layers
 
 
 def convert_mert(output_dir: Path):

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Convert TFLite FP32 models to FP16 weights with DEQUANTIZE ops.
+"""Convert TFLite FP32 models to GPU-native FP16.
 
-The LiteRT GPU delegate natively handles FP16 data, so FP16 weights with
-DEQUANTIZE ops run efficiently on GPU without the crashes seen with INT8
-weight-only quantization.
+Converts all FP32 weight tensors to FP16 in-place (no DEQUANTIZE ops).
+The LiteRT GPU delegate reads FP16 tensors natively — no CPU fallback needed.
 
-This halves model size with essentially zero quality loss (cosine ~0.999999).
+This halves model size with essentially zero quality loss on GPU.
+Note: these models are GPU-only; CPU inference would need the FP32 originals.
 
 Usage:
     python convert_fp16.py <input.tflite> [output.tflite]
@@ -14,8 +14,8 @@ If no output path is given, writes to <input>_fp16.tflite.
 """
 
 import sys
-import struct
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -37,13 +37,12 @@ def convert_fp32_to_fp16(input_path: str, output_path: str | None = None):
     file_data = bytearray(input_path.read_bytes())
     print(f"  Read in {time.time() - t0:.1f}s")
 
-    # Parse into mutable object tree
     t0 = time.time()
     model_obj = schema_fb.Model.GetRootAs(file_data)
     model = schema_fb.ModelT.InitFromObj(model_obj)
     print(f"  Parsed in {time.time() - t0:.1f}s")
 
-    # Phase 1: Inline all offset-based buffers (large models store data externally)
+    # Inline all offset-based buffers (large models store data externally)
     inlined = 0
     for buf_idx, buf in enumerate(model.buffers):
         if buf.data is None and buf.offset and buf.size:
@@ -56,31 +55,13 @@ def convert_fp32_to_fp16(input_path: str, output_path: str | None = None):
     if inlined:
         print(f"  Inlined {inlined} offset-based buffers")
 
-    # Free original file data to reduce peak memory
     del file_data
 
-    # Phase 2: Find all FP32 weight tensors and convert to FP16
     subgraph = model.subgraphs[0]
     graph_inputs = set(subgraph.inputs.tolist()) if subgraph.inputs is not None else set()
     graph_outputs = set(subgraph.outputs.tolist()) if subgraph.outputs is not None else set()
 
-    # Ensure DEQUANTIZE opcode exists
-    dequant_opcode_idx = None
-    for i, code in enumerate(model.operatorCodes):
-        if code.builtinCode == 6:  # DEQUANTIZE
-            dequant_opcode_idx = i
-            break
-    if dequant_opcode_idx is None:
-        opcode = schema_fb.OperatorCodeT()
-        opcode.builtinCode = 6
-        opcode.deprecatedBuiltinCode = 6
-        opcode.version = 1
-        model.operatorCodes.append(opcode)
-        dequant_opcode_idx = len(model.operatorCodes) - 1
-        print(f"  Added DEQUANTIZE opcode at index {dequant_opcode_idx}")
-
     # Pre-pass: identify buffers shared with non-FLOAT32 tensors (must NOT convert)
-    from collections import defaultdict
     buf_types = defaultdict(set)
     for t in subgraph.tensors:
         buf = model.buffers[t.buffer]
@@ -95,60 +76,29 @@ def convert_fp32_to_fp16(input_path: str, output_path: str | None = None):
 
     converted = 0
     total_saved = 0
-    new_tensors = []
-    new_ops = []
-    tensor_remap = {}  # old_idx -> new_fp32_idx (output of DEQUANTIZE)
-    converted_buffers = set()  # track buffers already converted
+    converted_buffers = set()
 
     for tensor_idx, tensor in enumerate(subgraph.tensors):
-        # Skip non-FP32, activation tensors (empty buffer), graph I/O
         if tensor.type != schema_fb.TensorType.FLOAT32:
             continue
         if tensor_idx in graph_inputs or tensor_idx in graph_outputs:
             continue
-        # Skip buffers shared with non-FLOAT32 tensors (converting would corrupt them)
         if tensor.buffer in mixed_buffers:
             continue
         buf = model.buffers[tensor.buffer]
         if buf.data is None or len(buf.data) == 0:
             continue
-        # Handle buffers already converted by a previous tensor sharing the same buffer:
-        # mark as FP16 and create DEQUANTIZE op (must check BEFORE alignment check,
-        # since the buffer has already been halved from 4→2 bytes)
+
+        # Shared buffer already converted — just update tensor type
         if tensor.buffer in converted_buffers:
             tensor.type = schema_fb.TensorType.FLOAT16
-
-            new_buf = schema_fb.BufferT()
-            model.buffers.append(new_buf)
-            new_buf_idx = len(model.buffers) - 1
-
-            new_tensor = schema_fb.TensorT()
-            new_tensor.shape = tensor.shape.copy() if tensor.shape is not None else None
-            new_tensor.type = schema_fb.TensorType.FLOAT32
-            new_tensor.buffer = new_buf_idx
-            new_tensor.name = (tensor.name or b"") + b"_dequantized"
-            new_tensor.shapeSignature = (
-                tensor.shapeSignature.copy() if tensor.shapeSignature is not None else None
-            )
-            new_tensors.append(new_tensor)
-            new_fp32_idx = len(subgraph.tensors) + len(new_tensors) - 1
-
-            dq_op = schema_fb.OperatorT()
-            dq_op.opcodeIndex = dequant_opcode_idx
-            dq_op.inputs = np.array([tensor_idx], dtype=np.int32)
-            dq_op.outputs = np.array([new_fp32_idx], dtype=np.int32)
-            dq_op.builtinOptionsType = schema_fb.BuiltinOptions.DequantizeOptions
-            dq_op.builtinOptions = schema_fb.DequantizeOptionsT()
-            new_ops.append(dq_op)
-
-            tensor_remap[tensor_idx] = new_fp32_idx
             converted += 1
             continue
-        # Skip buffers not aligned to 4 bytes (e.g. mixed-type)
+
         if len(buf.data) % 4 != 0:
             continue
 
-        # Convert buffer from FP32 to FP16
+        # Convert buffer from FP32 to FP16 in-place
         fp32_data = np.frombuffer(buf.data, dtype=np.float32)
         fp16_data = fp32_data.astype(np.float16)
         saved = len(buf.data) - len(fp16_data.tobytes())
@@ -157,52 +107,9 @@ def convert_fp32_to_fp16(input_path: str, output_path: str | None = None):
         buf.data = np.frombuffer(fp16_data.tobytes(), dtype=np.uint8)
         tensor.type = schema_fb.TensorType.FLOAT16
         converted_buffers.add(tensor.buffer)
-
-        # Create new FP32 tensor (DEQUANTIZE output, empty buffer — computed at runtime)
-        new_buf = schema_fb.BufferT()
-        model.buffers.append(new_buf)
-        new_buf_idx = len(model.buffers) - 1
-
-        new_tensor = schema_fb.TensorT()
-        new_tensor.shape = tensor.shape.copy() if tensor.shape is not None else None
-        new_tensor.type = schema_fb.TensorType.FLOAT32
-        new_tensor.buffer = new_buf_idx
-        new_tensor.name = (tensor.name or b"") + b"_dequantized"
-        new_tensor.shapeSignature = (
-            tensor.shapeSignature.copy() if tensor.shapeSignature is not None else None
-        )
-        new_tensors.append(new_tensor)
-        new_fp32_idx = len(subgraph.tensors) + len(new_tensors) - 1
-
-        # Create DEQUANTIZE op: FP16 tensor -> new FP32 tensor
-        dq_op = schema_fb.OperatorT()
-        dq_op.opcodeIndex = dequant_opcode_idx
-        dq_op.inputs = np.array([tensor_idx], dtype=np.int32)
-        dq_op.outputs = np.array([new_fp32_idx], dtype=np.int32)
-        dq_op.builtinOptionsType = schema_fb.BuiltinOptions.DequantizeOptions
-        dq_op.builtinOptions = schema_fb.DequantizeOptionsT()
-        new_ops.append(dq_op)
-
-        tensor_remap[tensor_idx] = new_fp32_idx
         converted += 1
 
-    print(f"  Converted {converted} tensors, saved {total_saved / 1e6:.0f} MB")
-
-    # Append new tensors to subgraph
-    subgraph.tensors.extend(new_tensors)
-
-    # Rewrite operator inputs to use dequantized FP32 tensors
-    rewrites = 0
-    for op in subgraph.operators:
-        if op.inputs is not None:
-            for i in range(len(op.inputs)):
-                if op.inputs[i] in tensor_remap:
-                    op.inputs[i] = tensor_remap[op.inputs[i]]
-                    rewrites += 1
-    print(f"  Rewired {rewrites} operator inputs")
-
-    # Prepend DEQUANTIZE ops (must run before any op that uses their outputs)
-    subgraph.operators = new_ops + list(subgraph.operators)
+    print(f"  Converted {converted} tensors in-place, saved {total_saved / 1e6:.0f} MB")
 
     # Pack and write
     print(f"  Packing...")
