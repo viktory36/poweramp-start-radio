@@ -92,10 +92,14 @@ class MertWrapper(nn.Module):
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            waveform: [batch, 120000] float32 raw audio at 24kHz
+            waveform: [batch, 1, 120000, 1] float32 raw audio at 24kHz
+                      (4D for GPU delegate buffer compatibility — GPU delegates
+                       require [B,H,W,C] tensor layout for buffer allocation)
         Returns:
             [batch, 768] mean-pooled features
         """
+        # Reshape 4D GPU-compatible input to 2D for MERT
+        waveform = waveform.reshape(waveform.shape[0], -1)  # [B,1,T,1] → [B,T]
         out = self.mert(waveform, output_hidden_states=True)
         # Accumulate mean over layers without torch.stack.
         # torch.stack generates GATHER_ND which the GPU delegate can't run.
@@ -122,8 +126,9 @@ def convert_mert(output_dir: Path):
     wrapper.eval()
 
     # Validate wrapper produces reasonable output
+    # 4D input: [B, 1, T, 1] — GPU delegate requires [B,H,W,C] for buffer allocation
     logger.info("Validating wrapper...")
-    sample_wav = torch.randn(1, MERT_WINDOW_SAMPLES)
+    sample_wav = torch.randn(1, 1, MERT_WINDOW_SAMPLES, 1)
     with torch.no_grad():
         ref_out = wrapper(sample_wav)
     logger.info(f"Wrapper output shape: {ref_out.shape}, norm: {ref_out.norm().item():.4f}")
