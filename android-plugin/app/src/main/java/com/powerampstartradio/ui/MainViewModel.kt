@@ -395,14 +395,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         return@launch
                     }
 
-                    // Try: FP16+GPU → FP16+CPU → FP32+GPU → FP32+CPU
+                    // Text model has INT64 ops → GPU always fails → CPU via XNNPACK.
+                    // Try GPU first for future-proofing, fall back to CPU.
                     val candidates = buildList {
-                        val fp16 = File(filesDir, "clamp3_text_fp16.tflite")
                         val fp32 = File(filesDir, "clamp3_text.tflite")
-                        if (fp16.exists()) {
-                            add(fp16 to Accelerator.GPU)
-                            add(fp16 to Accelerator.CPU)
-                        }
                         if (fp32.exists()) {
                             add(fp32 to Accelerator.GPU)
                             add(fp32 to Accelerator.CPU)

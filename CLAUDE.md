@@ -149,7 +149,6 @@ Poweramp API uses:
 | CLaMP3 evaluation (similar/search) | `desktop-indexer/scripts/evaluate_clamp3.py` |
 | SQLite database schema | `desktop-indexer/src/poweramp_indexer/database.py` |
 | PyTorch → TFLite export | `desktop-indexer/src/poweramp_indexer/export_litert.py` |
-| FP32 → FP16 conversion | `desktop-indexer/scripts/convert_fp16.py` |
 | Poweramp API wrapper | `android-plugin/.../poweramp/PowerampHelper.kt` |
 | Recommendation engine | `android-plugin/.../similarity/RecommendationEngine.kt` |
 | Algorithm modules | `android-plugin/.../similarity/algorithms/*.kt` |
@@ -214,6 +213,6 @@ On Android, `EmbeddingDatabase.kt` reads from `embeddings_clamp3`. `EmbeddingInd
 - All embeddings are L2-normalized at generation time (cosine similarity = dot product)
 - `PowerampHelper.replaceQueue()` preserves the currently playing queue entry when re-running Start Radio, so Poweramp's position pointer stays valid
 - The `references/` directory contains Poweramp API examples (not part of build)
-- TFLite model files go in the app's `filesDir` (pushed via adb). Auto-detection prefers `_fp16` variants over FP32.
+- TFLite model files go in the app's `filesDir` (pushed via adb). FP32 model files only (FP16 files incompatible with required FP32 GPU precision).
 - Native libraries: `libsoxr-jni.so` (resampler, ~700KB with NEON), `libmath-jni.so` (NEON linear algebra). All arm64-v8a only, built via CMake/NDK 27.
 - `useLegacyPackaging = true` is required in build.gradle.kts (native .so files must be uncompressed for JNI loading)

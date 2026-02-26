@@ -14,7 +14,7 @@ Usage:
   python generate_clamp3_embeddings.py /path/to/music -o embeddings_clamp3.db --phase 1
   python generate_clamp3_embeddings.py /path/to/music -o embeddings_clamp3.db --phase 2
   python generate_clamp3_embeddings.py /path/to/music -o embeddings_clamp3.db --max-duration 600 --batch-size 8
-  python generate_clamp3_embeddings.py /path/to/music -o embeddings_clamp3.db --fp16
+  python generate_clamp3_embeddings.py /path/to/music -o embeddings_clamp3.db --fp32  # (FP16 is default)
 """
 
 import argparse
@@ -875,9 +875,9 @@ Examples:
         "-v", "--verbose", action="store_true",
         help="Print per-track progress")
     parser.add_argument(
-        "--fp16", action="store_true",
-        help="Run MERT in FP16 (halves VRAM, ~2x faster). "
-             "Embeddings are cast back to float32 for cache/DB compatibility.")
+        "--fp32", action="store_true",
+        help="Run MERT in FP32 instead of FP16. Slower and uses more VRAM. "
+             "FP16 is the default (lossless, cosine ≥ 0.999993 vs FP32).")
 
     args = parser.parse_args()
 
@@ -910,13 +910,15 @@ Examples:
     print(f"Max duration: {args.max_duration}s, Batch size: {args.batch_size}")
     print()
 
+    use_fp16 = not args.fp32
+
     if args.phase in ("1", "both"):
         phase1_mert(music_dir, cache_dir, args.max_duration, args.batch_size,
-                    verbose=args.verbose, fp16=args.fp16)
+                    verbose=args.verbose, fp16=use_fp16)
 
     if args.phase in ("2", "both"):
         phase2_clamp3(music_dir, cache_dir, db_path, verbose=args.verbose,
-                      fp16=args.fp16)
+                      fp16=use_fp16)
 
     if args.phase == "both":
         build_knn_graph(db_path)

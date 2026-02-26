@@ -44,8 +44,8 @@ class IndexingService : Service() {
         private const val NOTIFICATION_ID = 2
         private const val CHANNEL_ID = "indexing_service"
 
-        /** Model variant suffixes in preference order: FP16 (GPU-native), then FP32. */
-        private val MODEL_VARIANTS = listOf("_fp16", "")
+        /** FP32 model files required — FP16 files fail with FP32 GPU precision. */
+        private val MODEL_VARIANTS = listOf("")
 
         const val ACTION_START_INDEXING = "com.powerampstartradio.START_INDEXING"
         const val ACTION_CANCEL = "com.powerampstartradio.CANCEL_INDEXING"
@@ -569,8 +569,8 @@ class IndexingService : Service() {
     }
 
     /**
-     * Find the best available model variant.
-     * Prefers FP16 (GPU-native, half the size, lossless), then FP32.
+     * Find the model file for a given base name.
+     * FP32 model files required (FP16 files incompatible with FP32 GPU precision).
      */
     private fun resolveModelFile(dir: File, baseName: String): File {
         for (suffix in MODEL_VARIANTS) {
