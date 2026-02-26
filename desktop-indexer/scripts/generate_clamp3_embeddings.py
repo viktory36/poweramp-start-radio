@@ -767,27 +767,32 @@ def build_knn_graph(db_path, k=20):
     print(f"Loaded {n} embeddings, building kNN graph (K={k})...")
     t0 = time.time()
 
-    # Brute-force: compute all pairwise similarities via matrix multiply
-    # For 75K × 768, this is ~4.3B ops — numpy does it in <2s
-    sims = embeddings @ embeddings.T  # [N, N] cosine similarities
-
-    # For each track, find K nearest (exclude self)
+    # Chunked brute-force: compute similarities in blocks to avoid N×N matrix
+    # (74K × 74K × 4 bytes = ~20GB — won't fit in RAM)
+    CHUNK = 1024
     neighbors = np.zeros((n, k), dtype=np.int32)
     weights = np.zeros((n, k), dtype=np.float32)
 
-    for i in range(n):
-        if i % 10000 == 0 and i > 0:
-            print(f"  kNN: {i}/{n}")
-        sims[i, i] = -1.0  # exclude self
-        top_k_idx = np.argpartition(sims[i], -k)[-k:]
-        top_k_idx = top_k_idx[np.argsort(sims[i, top_k_idx])[::-1]]  # sort desc
-        for j_idx, ni in enumerate(top_k_idx):
-            neighbors[i, j_idx] = ni
-            weights[i, j_idx] = max(sims[i, ni], 0.0)
-        # Row-normalize
-        total = weights[i].sum()
-        if total > 0:
-            weights[i] /= total
+    for start in range(0, n, CHUNK):
+        end = min(start + CHUNK, n)
+        if start % (CHUNK * 10) == 0:
+            elapsed = time.time() - t0
+            print(f"  kNN: {start}/{n} ({elapsed:.1f}s)")
+
+        # [chunk, 768] @ [768, N] → [chunk, N]
+        chunk_sims = embeddings[start:end] @ embeddings.T
+
+        for ci, i in enumerate(range(start, end)):
+            chunk_sims[ci, i] = -1.0  # exclude self
+            top_k_idx = np.argpartition(chunk_sims[ci], -k)[-k:]
+            top_k_idx = top_k_idx[np.argsort(chunk_sims[ci, top_k_idx])[::-1]]
+            for j_idx, ni in enumerate(top_k_idx):
+                neighbors[i, j_idx] = ni
+                weights[i, j_idx] = max(chunk_sims[ci, ni], 0.0)
+            # Row-normalize
+            total = weights[i].sum()
+            if total > 0:
+                weights[i] /= total
 
     elapsed = time.time() - t0
     print(f"Graph computed in {elapsed:.1f}s")
@@ -796,12 +801,13 @@ def build_knn_graph(db_path, k=20):
     header = struct.pack('<II', n, k)
     id_map = track_ids.tobytes()  # already int64 little-endian on x86
 
-    graph_data = bytearray()
-    for i in range(n):
-        for j in range(k):
-            graph_data += struct.pack('<If', neighbors[i, j], weights[i, j])
+    # Interleave neighbors (uint32) and weights (float32) into [N, K, 2] array
+    graph_array = np.empty((n, k, 2), dtype=np.float32)
+    graph_array[:, :, 0] = neighbors.view(np.float32)  # reinterpret int32 bits as float32
+    graph_array[:, :, 1] = weights
+    graph_data = graph_array.tobytes()
 
-    blob = header + id_map + bytes(graph_data)
+    blob = header + id_map + graph_data
 
     # Store in binary_data table
     conn.execute(
