@@ -142,6 +142,11 @@ class IndexingService : Service() {
 
     private fun performIndexing() {
         activeJob = serviceScope.launch {
+            // Hoisted so the finally block can release GPU resources on cancellation.
+            // Without this, CancellationException skips .close() and the OpenCL context
+            // leaks, causing "Failed to create input buffers" on the next attempt.
+            var mertInference: MertInference? = null
+            var clamp3Inference: Clamp3AudioInference? = null
             try {
                 val dbFile = File(filesDir, "embeddings.db")
                 if (!dbFile.exists()) {
@@ -277,7 +282,7 @@ class IndexingService : Service() {
                 )
                 updateNotification("Loading MERT model...")
                 val mertLoadStart = System.nanoTime()
-                val mertInference = try { MertInference(mertFile) }
+                mertInference = try { MertInference(mertFile) }
                 catch (e: Exception) {
                     Log.e(TAG, "Failed to load MERT", e)
                     _state.value = IndexingState.Error("Failed to load MERT model: ${e.message}")
@@ -285,6 +290,7 @@ class IndexingService : Service() {
                     stopSelf()
                     return@launch
                 }
+                val mert = mertInference!!  // safe: assigned above, exception returns early
                 Log.i(TAG, "TIMING: mert_model_load = ${(System.nanoTime() - mertLoadStart) / 1_000_000}ms")
 
                 // Disk-spill: write all MERT features to a single temp file.
@@ -397,7 +403,7 @@ class IndexingService : Service() {
                         totalResampleMs += audio24k.resampleMs
                         numChunks++
 
-                        val chunkWindows = mertInference.windowCount(audio24k.durationS)
+                        val chunkWindows = mert.windowCount(audio24k.durationS)
                         if (chunkWindows == 0) { chunkStart += chunkS; continue }
 
                         // Prefetch next track's first chunk during last chunk of this track
@@ -409,7 +415,7 @@ class IndexingService : Service() {
                         // Stream MERT features to disk
                         val mertStart = System.nanoTime()
                         if (windowsDone == 0) currentTrackMertStart = mertStart
-                        val numExtracted = mertInference.extractFeaturesStreaming(
+                        val numExtracted = mert.extractFeaturesStreaming(
                             audio24k,
                             onFeatureExtracted = { feature ->
                                 writeBuf.clear()
@@ -463,7 +469,8 @@ class IndexingService : Service() {
                 Log.i(TAG, "MERT phase done: $actualTotalWindows windows spilled to disk (${spillMB}MB)")
 
                 // ── Phase transition: MERT → CLaMP3 audio encoder ────────
-                mertInference.close()
+                mert.close()
+                mertInference = null
 
                 _state.value = IndexingState.Processing(
                     current = 0, total = unindexed.size,
@@ -474,7 +481,7 @@ class IndexingService : Service() {
                 )
                 updateNotification("Loading CLaMP3 audio encoder...")
                 val clamp3LoadStart = System.nanoTime()
-                val clamp3Inference = try { Clamp3AudioInference(clamp3AudioFile) }
+                clamp3Inference = try { Clamp3AudioInference(clamp3AudioFile) }
                 catch (e: Exception) {
                     Log.e(TAG, "Failed to load CLaMP3 audio encoder", e)
                     _state.value = IndexingState.Error("Failed to load CLaMP3 model: ${e.message}")
@@ -482,6 +489,7 @@ class IndexingService : Service() {
                     stopSelf()
                     return@launch
                 }
+                val clamp3 = clamp3Inference!!
                 Log.i(TAG, "TIMING: clamp3_audio_load = ${(System.nanoTime() - clamp3LoadStart) / 1_000_000}ms")
 
                 // ── Phase 2: CLaMP3 Audio Encoding ───────────────────────
@@ -500,7 +508,7 @@ class IndexingService : Service() {
 
                     ensureActive()
                     encoded++
-                    val numSegments = clamp3Inference.segmentCount(numWindows)
+                    val numSegments = clamp3.segmentCount(numWindows)
                     val encMsg = "CLaMP3 $encoded/$encodableCount ${track.title}"
                     // CLaMP3 phase fills the 0.95→1.0 range
                     val clamp3Frac = 0.95f + 0.05f * (encoded - 1).toFloat() / maxOf(encodableCount, 1)
@@ -517,7 +525,7 @@ class IndexingService : Service() {
                     val encStart = System.nanoTime()
 
                     // Stream MERT features from disk one window at a time
-                    val embedding = clamp3Inference.encodeStreaming(
+                    val embedding = clamp3.encodeStreaming(
                         numWindows = numWindows,
                         readNextWindow = {
                             readBuf.clear()
@@ -563,7 +571,8 @@ class IndexingService : Service() {
                     readChannel.close()
                 }
 
-                clamp3Inference.close()
+                clamp3.close()
+                clamp3Inference = null
 
                 } finally {
                     featuresFile.delete()
@@ -621,6 +630,9 @@ class IndexingService : Service() {
                 updateNotification("Error: ${e.message}")
                 stopSelfDelayed()
             } finally {
+                // Release GPU resources if cancelled before normal .close() path
+                try { mertInference?.close() } catch (_: Exception) {}
+                try { clamp3Inference?.close() } catch (_: Exception) {}
                 activeJob = null
                 releaseWakeLock()
             }
