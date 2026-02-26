@@ -36,8 +36,11 @@ import java.io.File
  * Launch via:
  *   adb shell am start -n com.powerampstartradio/.benchmark.BenchmarkActivity
  *
+ * Auto-start via adb (no UI interaction needed):
+ *   adb shell am start -n com.powerampstartradio/.benchmark.BenchmarkActivity --ez auto_start true
+ *
  * Pull results via:
- *   adb pull /data/data/com.powerampstartradio/files/benchmark_results.json
+ *   adb shell run-as com.powerampstartradio cat files/benchmark_results.json
  */
 class BenchmarkActivity : ComponentActivity() {
 
@@ -94,6 +97,13 @@ class BenchmarkActivity : ComponentActivity() {
                 } finally {
                     running = false
                 }
+            }
+        }
+
+        // Auto-start via intent extra: --ez auto_start true
+        LaunchedEffect(Unit) {
+            if (intent.getBooleanExtra("auto_start", false) && hasAudioPermission()) {
+                startBenchmark()
             }
         }
 

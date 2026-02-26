@@ -84,7 +84,9 @@ class MertInference(
      */
     fun windowCount(durationS: Float): Int {
         val totalSamples = (durationS * SAMPLE_RATE).toInt()
-        return totalSamples / WINDOW_SAMPLES
+        val full = totalSamples / WINDOW_SAMPLES
+        val remain = totalSamples % WINDOW_SAMPLES
+        return full + if (remain >= SAMPLE_RATE) 1 else 0
     }
 
     /**
@@ -109,9 +111,14 @@ class MertInference(
             "MERT requires ${SAMPLE_RATE}Hz audio, got ${audio.sampleRate}Hz"
         }
 
-        val numWindows = audio.samples.size / WINDOW_SAMPLES
+        val fullWindows = audio.samples.size / WINDOW_SAMPLES
+        val remainingSamples = audio.samples.size % WINDOW_SAMPLES
+        // Match desktop: zero-pad partial tail windows >= 1 second, discard < 1 second
+        val hasPartial = remainingSamples >= SAMPLE_RATE
+        val numWindows = fullWindows + if (hasPartial) 1 else 0
+
         if (numWindows == 0) {
-            Log.w(TAG, "Audio too short (${audio.durationS}s < ${WINDOW_SEC}s)")
+            Log.w(TAG, "Audio too short (${audio.durationS}s < 1s)")
             return 0
         }
 
@@ -124,7 +131,13 @@ class MertInference(
 
         for (w in 0 until numWindows) {
             val startSample = w * WINDOW_SAMPLES
-            System.arraycopy(audio.samples, startSample, windowBuffer, 0, WINDOW_SAMPLES)
+            if (w == fullWindows && hasPartial) {
+                // Partial last window: zero-pad to WINDOW_SAMPLES (matches desktop)
+                windowBuffer.fill(0f)
+                System.arraycopy(audio.samples, startSample, windowBuffer, 0, remainingSamples)
+            } else {
+                System.arraycopy(audio.samples, startSample, windowBuffer, 0, WINDOW_SAMPLES)
+            }
 
             val feature = runInference(windowBuffer) { inferMs ->
                 totalInferMs += inferMs
@@ -136,8 +149,8 @@ class MertInference(
             onWindowDone?.invoke()
         }
 
-        Log.i(TAG, "TIMING: mert $numWindows windows: inference=${totalInferMs}ms, " +
-            "${if (numWindows > 0) totalInferMs / numWindows else 0}ms/window")
+        Log.i(TAG, "TIMING: mert $numWindows windows${if (hasPartial) " (last zero-padded)" else ""}: " +
+            "inference=${totalInferMs}ms, ${if (numWindows > 0) totalInferMs / numWindows else 0}ms/window")
 
         return count
     }
