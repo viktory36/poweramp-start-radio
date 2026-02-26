@@ -207,6 +207,14 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         _selectedIds.value = emptySet()
     }
 
+    fun selectIds(ids: Set<Long>) {
+        _selectedIds.value = _selectedIds.value + ids
+    }
+
+    fun deselectIds(ids: Set<Long>) {
+        _selectedIds.value = _selectedIds.value - ids
+    }
+
     fun dismissSelected() {
         val toDismiss = _selectedIds.value
         if (toDismiss.isEmpty()) return
@@ -239,7 +247,13 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         _selectedIds.value = _selectedIds.value + ids
     }
 
-    fun startIndexing(buildGraph: Boolean = false) {
+    /**
+     * @param autoDismissUnselected When true, unselected visible tracks are auto-dismissed.
+     *   Should be true when the user sees the full list (no search filter) — their choice
+     *   to not select something is an intentional "don't index". Should be false when a
+     *   search filter is active — the user is only focused on the search results.
+     */
+    fun startIndexing(buildGraph: Boolean = false, autoDismissUnselected: Boolean = true) {
         val selected = _selectedIds.value
         if (selected.isEmpty()) return
         val dismissed = _dismissedIds.value
@@ -248,14 +262,15 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         }
         if (tracks.isEmpty()) return
 
-        // Auto-dismiss unselected visible tracks — user has seen the list and acknowledged it
-        val unselectedVisible = _unindexedTracks.value.filter {
-            it.powerampFileId !in selected && it.powerampFileId !in dismissed
-        }.map { it.powerampFileId }.toSet()
-        if (unselectedVisible.isNotEmpty()) {
-            val newDismissed = dismissed + unselectedVisible
-            _dismissedIds.value = newDismissed
-            saveDismissedIds(newDismissed)
+        if (autoDismissUnselected) {
+            val unselectedVisible = _unindexedTracks.value.filter {
+                it.powerampFileId !in selected && it.powerampFileId !in dismissed
+            }.map { it.powerampFileId }.toSet()
+            if (unselectedVisible.isNotEmpty()) {
+                val newDismissed = dismissed + unselectedVisible
+                _dismissedIds.value = newDismissed
+                saveDismissedIds(newDismissed)
+            }
         }
 
         // Invalidate cache so the next detectUnindexed() re-scans from the DB.

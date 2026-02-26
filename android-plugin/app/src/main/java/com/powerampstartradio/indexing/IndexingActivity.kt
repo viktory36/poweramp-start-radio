@@ -17,7 +17,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -88,6 +90,7 @@ fun IndexingScreen(
 
     var showMenu by remember { mutableStateOf(false) }
     var showHiddenTracks by remember { mutableStateOf(false) }
+    var isSearchActive by remember { mutableStateOf(false) }
 
     // When all dismissed tracks are restored, auto-navigate back
     LaunchedEffect(showHiddenTracks, hasDismissed) {
@@ -154,7 +157,10 @@ fun IndexingScreen(
                 BottomBar(
                     selectedCount = selectedCount,
                     onStartIndexing = {
-                        viewModel.startIndexing(buildGraph = true)
+                        viewModel.startIndexing(
+                            buildGraph = true,
+                            autoDismissUnselected = !isSearchActive,
+                        )
                     },
                 )
             }
@@ -180,6 +186,16 @@ fun IndexingScreen(
                                     viewModel.selectAll()
                                 }
                             },
+                            onToggleFiltered = { filtered ->
+                                val filteredIds = filtered.map { it.powerampFileId }.toSet()
+                                val allFilteredSelected = filteredIds.all { it in selectedIds }
+                                if (allFilteredSelected) {
+                                    viewModel.deselectIds(filteredIds)
+                                } else {
+                                    viewModel.selectIds(filteredIds)
+                                }
+                            },
+                            onSearchActiveChanged = { isSearchActive = it },
                         )
                     }
                 }
@@ -261,28 +277,88 @@ private fun TrackSelectionContent(
     selectedCount: Int,
     onToggle: (Long) -> Unit,
     onToggleAll: () -> Unit,
+    onToggleFiltered: (List<NewTrackDetector.UnindexedTrack>) -> Unit,
+    onSearchActiveChanged: (Boolean) -> Unit,
 ) {
+    var searchQuery by remember { mutableStateOf("") }
+
+    // Report search state changes up
+    LaunchedEffect(searchQuery) {
+        onSearchActiveChanged(searchQuery.isNotBlank())
+    }
+
+    val filteredTracks = remember(tracks, searchQuery) {
+        if (searchQuery.isBlank()) tracks
+        else {
+            val q = searchQuery.lowercase()
+            tracks.filter { t ->
+                t.title.lowercase().contains(q) ||
+                    t.artist.lowercase().contains(q) ||
+                    t.album.lowercase().contains(q)
+            }
+        }
+    }
+
+    val isFiltered = searchQuery.isNotBlank()
+    val filteredSelectedCount = remember(filteredTracks, selectedIds) {
+        filteredTracks.count { it.powerampFileId in selectedIds }
+    }
+
     Column(modifier = Modifier.fillMaxSize()) {
+        // Search bar
+        OutlinedTextField(
+            value = searchQuery,
+            onValueChange = { searchQuery = it },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            placeholder = { Text("Search tracks...") },
+            leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+            trailingIcon = {
+                if (searchQuery.isNotEmpty()) {
+                    IconButton(onClick = { searchQuery = "" }) {
+                        Icon(Icons.Default.Clear, contentDescription = "Clear")
+                    }
+                }
+            },
+            singleLine = true,
+        )
+
         // Header row with parent checkbox and count
+        val headerToggle = {
+            if (isFiltered) {
+                onToggleFiltered(filteredTracks)
+            } else {
+                onToggleAll()
+            }
+        }
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable(onClick = onToggleAll)
+                .clickable(onClick = headerToggle)
                 .padding(horizontal = 16.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            val displayCount = if (isFiltered) filteredSelectedCount else selectedCount
+            val displayTotal = if (isFiltered) filteredTracks.size else tracks.size
             TriStateCheckbox(
                 state = when {
-                    selectedCount == tracks.size -> ToggleableState.On
-                    selectedCount == 0 -> ToggleableState.Off
+                    displayTotal == 0 -> ToggleableState.Off
+                    displayCount == displayTotal -> ToggleableState.On
+                    displayCount == 0 -> ToggleableState.Off
                     else -> ToggleableState.Indeterminate
                 },
-                onClick = onToggleAll,
+                onClick = headerToggle,
             )
             Spacer(modifier = Modifier.width(12.dp))
             Text(
-                "${tracks.size} unindexed tracks" +
-                    if (selectedCount > 0) " ($selectedCount selected)" else "",
+                if (isFiltered) {
+                    "${filteredTracks.size} of ${tracks.size} tracks" +
+                        if (filteredSelectedCount > 0) " ($filteredSelectedCount selected)" else ""
+                } else {
+                    "${tracks.size} unindexed tracks" +
+                        if (selectedCount > 0) " ($selectedCount selected)" else ""
+                },
                 style = MaterialTheme.typography.titleSmall,
             )
         }
@@ -293,7 +369,7 @@ private fun TrackSelectionContent(
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(vertical = 4.dp),
         ) {
-            items(tracks, key = { it.powerampFileId }) { track ->
+            items(filteredTracks, key = { it.powerampFileId }) { track ->
                 TrackRow(
                     track = track,
                     isSelected = track.powerampFileId in selectedIds,
