@@ -92,7 +92,7 @@ Poweramp library → NewTrackDetector → IndexingActivity (track selection UI)
 - Single model pipeline: MERT-v1-95M → CLaMP3 audio encoder → 768d embeddings
 - Audio: 24kHz raw waveform → 5-second windows → 768d features → aggregate → 768d embedding
 - Text: XLM-RoBERTa tokenizer → CLaMP3 text encoder → 768d embedding (shared space with audio)
-- Total model size: ~919 MB FP16 (vs 2,574 MB for old MuLan+Flamingo = 2.8x smaller)
+- Total model size: ~722 MB FP32 on device (MERT 378MB + CLaMP3 audio 344MB; FP16 models incompatible with required FP32 GPU precision)
 - No mel spectrogram needed (MERT takes raw waveform)
 - No fusion/SVD needed (single 768d space for both audio and text)
 
@@ -107,9 +107,10 @@ Poweramp library → NewTrackDetector → IndexingActivity (track selection UI)
 ### On-Device Indexing Details
 
 **LiteRT (TFLite) GPU inference:**
-- Models converted from PyTorch via `export_litert.py` (torch.export + StableHLO) then FP16-converted via `convert_fp16.py`
-- GPU delegate (OpenCL/OpenGL) — works on virtually all modern Android devices
-- FP16 models are GPU-native, half the size of FP32, lossless (cosine ≥ 0.999993)
+- Models converted from PyTorch via `export_litert.py` (torch.export + StableHLO)
+- **GPU delegate MUST use `GpuOptions.Precision.FP32`** — default FP16 causes embedding collapse (pairwise cosine 0.97+, same syndrome as NPU). FP32 GPU gives cosine 0.990 vs desktop (15 tracks validated).
+- **FP16 model files are incompatible with FP32 GPU precision** (DEPTHWISE_CONV_2D fails to prepare). Must use FP32 model files (378MB MERT, 344MB CLaMP3 audio).
+- MERT: ~200ms/window on FP32 GPU (Adreno 740). ~15s for 3-min FLAC, ~30s for 3-min MP3.
 - Requires Kotlin 2.2.21, compileSdk 35, Compose compiler plugin (mandated by LiteRT 2.1.0+)
 
 **Two-phase GPU pipeline:** Adreno GPUs can't have two OpenCL contexts simultaneously. IndexingService:
@@ -121,7 +122,10 @@ Poweramp library → NewTrackDetector → IndexingActivity (track selection UI)
 - **NEON stereo→mono conversion must widen to int32 before adding channels.** `vaddq_s16(L, R)` wraps on loud masters (5–17% of samples), corrupting embeddings. Use `vaddl_s16` to widen first.
 
 **NPU (Hexagon HTP) — dead end for audio transformers:**
-Qualcomm's HTP forces FP16 precision on ALL non-quantized float ops at the hardware level. Deep transformer encoders (12+ layers of LayerNorm) accumulate FP16 overflow, producing degenerate embeddings. GPU with FP32 compute is the correct path.
+Qualcomm's HTP forces FP16 precision on ALL non-quantized float ops at the hardware level. Deep transformer encoders (12+ layers of LayerNorm) accumulate FP16 overflow, producing degenerate embeddings. GPU with explicit FP32 precision is the correct path.
+
+**GPU FP16 — also a dead end for deep transformers:**
+The LiteRT GPU delegate defaults to FP16 internal computation, which causes the same accumulation/collapse as NPU (though subtler: pairwise cosine ~0.97 instead of ~1.0). The fix is `GpuOptions(precision = Precision.FP32)` which forces FP32 compute on the Adreno GPU. This is 2x slower than FP16 but produces correct embeddings (cosine 0.990 vs desktop).
 
 ### Android Integration Points
 
