@@ -192,6 +192,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         super.onCleared()
         PowerampReceiver.removeTrackChangeListener(trackChangeListener)
+        try { textInference?.close() } catch (_: Exception) {}
+        textInference = null
     }
 
     /**
@@ -439,9 +441,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     result.also { textInference = it }
                 }
 
-                // Generate text embedding (save to debug dir for quality comparison)
+                // Generate text embedding. If inference fails on a cached model
+                // (stale GPU context from cancelled indexing), destroy and retry once.
                 val debugDir = File(filesDir, "debug_embeddings")
-                val embedding = inference.generateEmbedding(query, debugDir)
+                var embedding = try {
+                    inference.generateEmbedding(query, debugDir)
+                } catch (e: Exception) {
+                    Log.w("MainViewModel", "Text inference failed, will retry with fresh model", e)
+                    null
+                }
+                if (embedding == null && textInference != null) {
+                    Log.i("MainViewModel", "Destroying stale text model and retrying")
+                    try { textInference?.close() } catch (_: Exception) {}
+                    textInference = null
+                    _textSearchResult.value = TextSearchResult(query = query, error = "Model error — retrying...")
+                    // Retry: re-run performTextSearch which will lazy-init a fresh model
+                    _textSearchLoading.value = false
+                    performTextSearch(query)
+                    return@launch
+                }
                 if (embedding == null) {
                     _textSearchResult.value = TextSearchResult(query = query, error = "Text inference failed")
                     return@launch
