@@ -469,9 +469,12 @@ data class PowerampTrack(
      */
     val metadataKey: String
         get() {
-            val a = (artist ?: "").lowercase().trim()
-            val al = (album ?: "").lowercase().trim()
-            val t = title.lowercase().trim()
+            // Replace | with / to match desktop indexer key format.
+            // Pipe is the metadata key delimiter; titles like "d|lp 1.1" would
+            // corrupt key parsing without this replacement.
+            val a = (artist ?: "").lowercase().trim().replace('|', '/')
+            val al = (album ?: "").lowercase().trim().replace('|', '/')
+            val t = title.lowercase().trim().replace('|', '/')
             val d = (durationMs / 100) * 100
             return "$a|$al|$t|$d"
         }

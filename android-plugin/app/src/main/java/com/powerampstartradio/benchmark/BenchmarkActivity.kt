@@ -136,12 +136,13 @@ class BenchmarkActivity : ComponentActivity() {
             }
         }
 
-        // Auto-start via intent extra: --ez auto_start true [--es benchmark_type text|audio]
+        // Auto-start via intent extra: --ez auto_start true [--es benchmark_type text|audio|diagnose]
         LaunchedEffect(Unit) {
             if (intent.getBooleanExtra("auto_start", false)) {
                 val type = intent.getStringExtra("benchmark_type") ?: "audio"
                 when (type) {
                     "text" -> startTextBenchmark()
+                    "diagnose" -> startDiagnostics()
                     else -> if (hasAudioPermission()) startBenchmark()
                 }
             }
