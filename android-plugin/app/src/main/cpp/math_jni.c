@@ -377,6 +377,191 @@ Java_com_powerampstartradio_indexing_NativeMath_nativeJacobiEigen(
     return jResult;
 }
 
+/* ── Top-K search on mmap'd embedding index ─────────────── */
+/*
+ * Find top-K most similar tracks by scanning a mmap'd .emb file directly.
+ * Replaces the scalar Kotlin dotProduct loop in EmbeddingIndex.findTopK.
+ *
+ * The .emb format has track IDs at trackIdsOffset (int64[N]) and embeddings
+ * at embeddingsOffset (float32[N × dim]), both little-endian.
+ *
+ * Uses NEON dot products + C min-heap for ~30x speedup over Kotlin/mmap.
+ *
+ * @param byteBuffer     mmap'd .emb file (direct ByteBuffer)
+ * @param trackIdsOffset byte offset to int64 track ID array
+ * @param embOffset      byte offset to float32 embedding array
+ * @param jQuery         query vector [dim]
+ * @param numTracks      total tracks in the index
+ * @param dim            embedding dimension (e.g. 768)
+ * @param topK           how many results to return
+ * @param jExcludeIds    track IDs to skip (nullable)
+ * @param outTrackIds    pre-allocated long[topK] for result track IDs
+ * @param outScores      pre-allocated float[topK] for result scores
+ * @return               actual number of results (≤ topK)
+ */
+
+typedef struct {
+    int idx;
+    float score;
+} TopKEntry;
+
+static void topk_sift_down(TopKEntry *heap, int size, int i) {
+    while (1) {
+        int smallest = i;
+        int left = 2 * i + 1;
+        int right = 2 * i + 2;
+        if (left < size && heap[left].score < heap[smallest].score) smallest = left;
+        if (right < size && heap[right].score < heap[smallest].score) smallest = right;
+        if (smallest == i) break;
+        TopKEntry tmp = heap[i];
+        heap[i] = heap[smallest];
+        heap[smallest] = tmp;
+        i = smallest;
+    }
+}
+
+JNIEXPORT jint JNICALL
+Java_com_powerampstartradio_indexing_NativeMath_nativeFindTopK(
+    JNIEnv *env, jclass cls,
+    jobject byteBuffer,
+    jlong trackIdsOffset,
+    jlong embOffset,
+    jfloatArray jQuery,
+    jint numTracks,
+    jint dim,
+    jint topK,
+    jlongArray jExcludeIds,
+    jlongArray outTrackIds,
+    jfloatArray outScores)
+{
+    uint8_t *base = (uint8_t *)(*env)->GetDirectBufferAddress(env, byteBuffer);
+    if (!base) {
+        LOGE("nativeFindTopK: not a direct ByteBuffer");
+        return 0;
+    }
+
+    const int64_t *trackIds = (const int64_t *)(base + trackIdsOffset);
+    const float *embeddings = (const float *)(base + embOffset);
+
+    float *query = (*env)->GetFloatArrayElements(env, jQuery, NULL);
+    if (!query) return 0;
+
+    /* Exclude set (usually 1 element = seed track) */
+    int excludeCount = jExcludeIds ? (*env)->GetArrayLength(env, jExcludeIds) : 0;
+    int64_t *excludeIds = NULL;
+    if (excludeCount > 0) {
+        excludeIds = (*env)->GetLongArrayElements(env, jExcludeIds, NULL);
+    }
+
+    /* Allocate min-heap */
+    TopKEntry *heap = (TopKEntry *)malloc(topK * sizeof(TopKEntry));
+    if (!heap) {
+        (*env)->ReleaseFloatArrayElements(env, jQuery, query, JNI_ABORT);
+        if (excludeIds) (*env)->ReleaseLongArrayElements(env, jExcludeIds, excludeIds, JNI_ABORT);
+        return 0;
+    }
+    int heapSize = 0;
+
+    for (int i = 0; i < numTracks; i++) {
+        /* Check exclude list (linear scan — typically 1 element) */
+        if (excludeCount > 0) {
+            int64_t tid = trackIds[i];
+            int skip = 0;
+            for (int e = 0; e < excludeCount; e++) {
+                if (excludeIds[e] == tid) { skip = 1; break; }
+            }
+            if (skip) continue;
+        }
+
+        float score = dot_product(query, embeddings + (long)i * dim, dim);
+
+        if (heapSize < topK) {
+            heap[heapSize].idx = i;
+            heap[heapSize].score = score;
+            heapSize++;
+            /* Heapify once full */
+            if (heapSize == topK) {
+                for (int j = topK / 2 - 1; j >= 0; j--)
+                    topk_sift_down(heap, heapSize, j);
+            }
+        } else if (score > heap[0].score) {
+            heap[0].idx = i;
+            heap[0].score = score;
+            topk_sift_down(heap, heapSize, 0);
+        }
+    }
+
+    /* Sort by score descending (insertion sort, heapSize ≤ topK ≤ ~1500) */
+    for (int i = 1; i < heapSize; i++) {
+        TopKEntry key = heap[i];
+        int j = i - 1;
+        while (j >= 0 && heap[j].score < key.score) {
+            heap[j + 1] = heap[j];
+            j--;
+        }
+        heap[j + 1] = key;
+    }
+
+    /* Write results to output arrays */
+    int64_t *outIds = (*env)->GetLongArrayElements(env, outTrackIds, NULL);
+    float *outScr = (*env)->GetFloatArrayElements(env, outScores, NULL);
+    for (int i = 0; i < heapSize; i++) {
+        outIds[i] = trackIds[heap[i].idx];
+        outScr[i] = heap[i].score;
+    }
+    (*env)->ReleaseLongArrayElements(env, outTrackIds, outIds, 0);
+    (*env)->ReleaseFloatArrayElements(env, outScores, outScr, 0);
+
+    /* Cleanup */
+    free(heap);
+    (*env)->ReleaseFloatArrayElements(env, jQuery, query, JNI_ABORT);
+    if (excludeIds) (*env)->ReleaseLongArrayElements(env, jExcludeIds, excludeIds, JNI_ABORT);
+
+    return heapSize;
+}
+
+/* ── All-pairs similarity on mmap'd embedding index ─────── */
+/*
+ * Compute dot product of one query against all N embeddings in a mmap'd
+ * .emb file. Returns float[N] of similarities.
+ *
+ * Same NEON acceleration as nativeFindTopK but returns all scores instead
+ * of top-K. Used for precomputing seed similarities for rank lookups.
+ */
+JNIEXPORT void JNICALL
+Java_com_powerampstartradio_indexing_NativeMath_nativeAllSimilarities(
+    JNIEnv *env, jclass cls,
+    jobject byteBuffer,
+    jlong embOffset,
+    jfloatArray jQuery,
+    jint numTracks,
+    jint dim,
+    jfloatArray outScores)
+{
+    uint8_t *base = (uint8_t *)(*env)->GetDirectBufferAddress(env, byteBuffer);
+    if (!base) {
+        LOGE("nativeAllSimilarities: not a direct ByteBuffer");
+        return;
+    }
+
+    const float *embeddings = (const float *)(base + embOffset);
+    float *query = (*env)->GetFloatArrayElements(env, jQuery, NULL);
+    if (!query) return;
+
+    float *scores = (*env)->GetFloatArrayElements(env, outScores, NULL);
+    if (!scores) {
+        (*env)->ReleaseFloatArrayElements(env, jQuery, query, JNI_ABORT);
+        return;
+    }
+
+    for (int i = 0; i < numTracks; i++) {
+        scores[i] = dot_product(query, embeddings + (long)i * dim, dim);
+    }
+
+    (*env)->ReleaseFloatArrayElements(env, jQuery, query, JNI_ABORT);
+    (*env)->ReleaseFloatArrayElements(env, outScores, scores, 0);
+}
+
 /* ── int16 PCM → mono float conversion ──────────────────── */
 /*
  * Convert interleaved int16 PCM from a direct ByteBuffer to mono float.

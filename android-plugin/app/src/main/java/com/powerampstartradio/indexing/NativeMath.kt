@@ -75,18 +75,37 @@ object NativeMath {
     ): FloatArray? = nativeMatVecMul(matrix, rows, cols, vector)
 
     /**
-     * Convert interleaved int16 PCM from a direct ByteBuffer to mono float.
-     * Replaces per-sample ByteBuffer.getShort() with bulk NEON processing.
+     * Top-K search on a mmap'd .emb file using NEON dot products + C min-heap.
+     * ~30x faster than scalar Kotlin dotProduct loop over mmap.
      *
-     * @param buffer Direct ByteBuffer from MediaCodec.getOutputBuffer()
-     * @param offsetBytes bufferInfo.offset
-     * @param sizeBytes bufferInfo.size
-     * @param channels Audio channel count (1=mono, 2=stereo)
-     * @param output Pre-allocated float array for mono samples
-     * @param dstOffset Write position in output
-     * @param maxFrames Maximum frames to convert (duration cap)
-     * @return Number of mono frames written
+     * @param buffer mmap'd .emb file (direct ByteBuffer)
+     * @param trackIdsOffset byte offset to int64 track ID array
+     * @param embeddingsOffset byte offset to float32 embedding array
+     * @param query query vector [dim]
+     * @param numTracks total tracks in the index
+     * @param dim embedding dimension
+     * @param topK how many results to return
+     * @param excludeIds track IDs to skip (null for none)
+     * @param outTrackIds pre-allocated LongArray[topK] for result track IDs
+     * @param outScores pre-allocated FloatArray[topK] for result scores
+     * @return actual number of results (≤ topK)
      */
+    fun findTopK(
+        buffer: java.nio.ByteBuffer,
+        trackIdsOffset: Long,
+        embeddingsOffset: Long,
+        query: FloatArray,
+        numTracks: Int,
+        dim: Int,
+        topK: Int,
+        excludeIds: LongArray?,
+        outTrackIds: LongArray,
+        outScores: FloatArray,
+    ): Int = nativeFindTopK(
+        buffer, trackIdsOffset, embeddingsOffset, query,
+        numTracks, dim, topK, excludeIds, outTrackIds, outScores
+    )
+
     /**
      * Jacobi eigendecomposition for a symmetric matrix, fully in native code.
      *
@@ -117,6 +136,26 @@ object NativeMath {
         covariance: DoubleArray, vectors: FloatArray, batch: Int, dim: Int)
     @JvmStatic private external fun nativeMatVecMul(
         matrix: FloatArray, rows: Int, cols: Int, vector: FloatArray): FloatArray?
+    /**
+     * Compute dot product of one query against all embeddings in a mmap'd .emb file.
+     * Returns all scores via outScores[numTracks].
+     */
+    fun allSimilarities(
+        buffer: java.nio.ByteBuffer,
+        embeddingsOffset: Long,
+        query: FloatArray,
+        numTracks: Int,
+        dim: Int,
+        outScores: FloatArray,
+    ) = nativeAllSimilarities(buffer, embeddingsOffset, query, numTracks, dim, outScores)
+
+    @JvmStatic private external fun nativeAllSimilarities(
+        buffer: java.nio.ByteBuffer, embOffset: Long,
+        query: FloatArray, numTracks: Int, dim: Int, outScores: FloatArray)
+    @JvmStatic private external fun nativeFindTopK(
+        buffer: java.nio.ByteBuffer, trackIdsOffset: Long, embeddingsOffset: Long,
+        query: FloatArray, numTracks: Int, dim: Int, topK: Int,
+        excludeIds: LongArray?, outTrackIds: LongArray, outScores: FloatArray): Int
     @JvmStatic private external fun nativeJacobiEigen(
         matrix: DoubleArray, n: Int, maxSweeps: Int, eps: Double): DoubleArray?
     @JvmStatic private external fun nativeInt16ToMonoFloat(
