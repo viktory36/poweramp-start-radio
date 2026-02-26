@@ -15,9 +15,8 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.MarqueeSpacing
 import androidx.compose.foundation.basicMarquee
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -314,11 +313,10 @@ fun HomeScreen(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 IconButton(onClick = onOpenTextSearch) {
                     Icon(Icons.Default.Search, contentDescription = "Text Search",
-                        modifier = Modifier.size(28.dp),
                         tint = MaterialTheme.colorScheme.onSurface)
                 }
                 val dividerColor = MaterialTheme.colorScheme.outlineVariant
-                Canvas(modifier = Modifier.height(32.dp).width(2.dp)) {
+                Canvas(modifier = Modifier.height(28.dp).width(2.dp)) {
                     val path = Path().apply {
                         moveTo(center.x, 0f)
                         quadraticTo(size.width, center.y, center.x, size.height)
@@ -329,14 +327,12 @@ fun HomeScreen(
                 if (radioState.isActiveSearch()) {
                     IconButton(onClick = onCancelSearch) {
                         Icon(Icons.Default.Clear, contentDescription = "Cancel",
-                            modifier = Modifier.size(28.dp),
                             tint = MaterialTheme.colorScheme.error)
                     }
                 } else {
                     IconButton(onClick = onStartRadio) {
                         Icon(painterResource(R.drawable.ic_radio_waves),
                             contentDescription = "Start Radio",
-                            modifier = Modifier.size(28.dp),
                             tint = MaterialTheme.colorScheme.primary)
                     }
                 }
@@ -448,7 +444,7 @@ fun CompactNowPlayingHeader(
         Column(modifier = clickModifier) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("NOW PLAYING", style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.secondary)
+                    color = MaterialTheme.colorScheme.primary)
                 if (matchType != null) {
                     Text(" \u00b7 ${humanMatchType(matchType)}",
                         style = MaterialTheme.typography.labelSmall,
@@ -462,10 +458,10 @@ fun CompactNowPlayingHeader(
             }
             Text(text = currentTrack.title, style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                color = MaterialTheme.colorScheme.secondary)
+                color = MaterialTheme.colorScheme.primary)
             Text(text = listOfNotNull(currentTrack.artist, currentTrack.album).joinToString(" \u00b7 "),
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.tertiary,
+                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     } else {
@@ -527,12 +523,7 @@ private fun SessionSeedHeader(session: RadioResult, modifier: Modifier = Modifie
         text = summary,
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.padding(vertical = 4.dp).fillMaxWidth().basicMarquee(
-            iterations = Int.MAX_VALUE,
-            initialDelayMillis = 3000,
-            repeatDelayMillis = 3000,
-            spacing = MarqueeSpacing(0.dp),
-        ),
+        modifier = Modifier.padding(vertical = 4.dp).fillMaxWidth().basicMarquee(iterations = 1, initialDelayMillis = 1500),
         maxLines = 1
     )
 }
@@ -780,7 +771,6 @@ fun TextSearchScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .padding(horizontal = 16.dp)
         ) {
             // Search input
             val placeholderHint = remember {
@@ -798,12 +788,7 @@ fun TextSearchScreen(
                 placeholder = {
                     Text(
                         placeholderHint,
-                        modifier = Modifier.basicMarquee(
-                            iterations = Int.MAX_VALUE,
-                            initialDelayMillis = 3000,
-                            repeatDelayMillis = 3000,
-                            spacing = MarqueeSpacing(0.dp),
-                        ),
+                        modifier = Modifier.basicMarquee(iterations = 1, initialDelayMillis = 1500),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
                         maxLines = 1,
@@ -812,6 +797,7 @@ fun TextSearchScreen(
                 singleLine = true,
                 modifier = Modifier
                     .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
                     .focusRequester(focusRequester),
                 trailingIcon = {
                     if (isLoading) {
@@ -851,7 +837,7 @@ fun TextSearchScreen(
                         colors = CardDefaults.cardColors(
                             containerColor = MaterialTheme.colorScheme.errorContainer
                         ),
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
                     ) {
                         Text(
                             result.error,
@@ -864,6 +850,7 @@ fun TextSearchScreen(
                         "\"${result.query}\" \u00b7 showing ${result.matches.size} results",
                         style = MaterialTheme.typography.titleSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 16.dp),
                     )
                     Spacer(modifier = Modifier.height(8.dp))
 
@@ -880,7 +867,7 @@ fun TextSearchScreen(
                                             onBack()
                                             viewModel.startRadioFromTextSearch(match.track.id)
                                         }
-                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                        .padding(horizontal = 16.dp, vertical = 10.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
                                     Text(
@@ -892,12 +879,7 @@ fun TextSearchScreen(
                                     Column(modifier = Modifier.weight(1f)) {
                                         Text(
                                             match.track.title ?: "Unknown",
-                                            modifier = Modifier.basicMarquee(
-                                                iterations = Int.MAX_VALUE,
-                                                initialDelayMillis = 3000,
-                                                repeatDelayMillis = 3000,
-                                                spacing = MarqueeSpacing(0.dp),
-                                            ),
+                                            modifier = Modifier.basicMarquee(iterations = 1, initialDelayMillis = 1500),
                                             style = MaterialTheme.typography.bodyMedium,
                                             fontWeight = FontWeight.Bold,
                                             maxLines = 1,
@@ -908,12 +890,7 @@ fun TextSearchScreen(
                                                 match.track.artist,
                                                 match.track.album
                                             ).joinToString(" \u00b7 "),
-                                            modifier = Modifier.basicMarquee(
-                                                iterations = Int.MAX_VALUE,
-                                                initialDelayMillis = 3000,
-                                                repeatDelayMillis = 3000,
-                                                spacing = MarqueeSpacing(0.dp),
-                                            ),
+                                            modifier = Modifier.basicMarquee(iterations = 1, initialDelayMillis = 1500),
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                                             maxLines = 1,
@@ -935,37 +912,38 @@ fun TextSearchScreen(
                         }
                     }
             } else if (!isLoading) {
-                Text(
-                    "Recent searches",
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                if (recentSearches.isNotEmpty()) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "Recent searches",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    TextButton(
+                        onClick = { viewModel.clearRecentSearches() },
+                        modifier = Modifier.alpha(if (recentSearches.isNotEmpty()) 1f else 0f),
+                        enabled = recentSearches.isNotEmpty(),
                     ) {
-                        Spacer(modifier = Modifier.weight(1f))
-                        TextButton(onClick = { viewModel.clearRecentSearches() }) {
-                            Text("Clear")
-                        }
+                        Text("Clear")
                     }
-                    recentSearches.forEach { recent ->
-                        TextButton(
-                            onClick = {
-                                query = TextFieldValue(recent, selection = TextRange(recent.length))
-                                doSearch(recent)
-                            },
+                }
+                recentSearches.forEach { recent ->
+                    TextButton(
+                        onClick = {
+                            query = TextFieldValue(recent, selection = TextRange(recent.length))
+                            doSearch(recent)
+                        },
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                    ) {
+                        Text(
+                            recent,
                             modifier = Modifier.fillMaxWidth(),
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                        ) {
-                            Text(
-                                recent,
-                                modifier = Modifier.fillMaxWidth(),
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
-                        }
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
                     }
                 }
             }

@@ -8,6 +8,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -155,8 +157,13 @@ fun IndexingScreen(
             // Only show bottom bar when idle with tracks to index
             if (indexingState is IndexingService.IndexingState.Idle
                 && visibleTracks.isNotEmpty() && !isDetecting) {
+                val buttonCount = if (isSearchActive && filteredTrackIds != null) {
+                    selectedIds.count { it in filteredTrackIds!! }
+                } else {
+                    selectedCount
+                }
                 BottomBar(
-                    selectedCount = selectedCount,
+                    selectedCount = buttonCount,
                     onStartIndexing = {
                         viewModel.startIndexing(
                             buildGraph = true,
@@ -220,7 +227,6 @@ fun IndexingScreen(
                         failed = state.failed,
                         onDone = {
                             IndexingService.resetState()
-                            viewModel.detectUnindexed(forceRefresh = true)
                             onBack()
                         },
                     )
@@ -261,8 +267,15 @@ private fun DetectingContent(status: String = "") {
 @Composable
 private fun AllIndexedContent() {
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("All tracks indexed", style = MaterialTheme.typography.headlineSmall)
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.padding(32.dp),
+        ) {
+            Text(
+                "All tracks indexed",
+                style = MaterialTheme.typography.headlineSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
                 "Every track in your Poweramp library has embeddings.",
@@ -392,6 +405,7 @@ private fun TrackSelectionContent(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun TrackRow(
     track: NewTrackDetector.UnindexedTrack,
@@ -414,8 +428,8 @@ private fun TrackRow(
             Text(
                 text = track.title.ifEmpty { "Unknown" },
                 style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.basicMarquee(iterations = 1, initialDelayMillis = 1500),
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
             )
             val subtitle = buildString {
                 if (track.artist.isNotEmpty()) append(track.artist)
@@ -428,13 +442,14 @@ private fun TrackRow(
                 text = subtitle,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.basicMarquee(iterations = 1, initialDelayMillis = 1500),
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
             )
         }
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ProcessingContent(
     state: IndexingService.IndexingState.Processing,
@@ -456,6 +471,7 @@ private fun ProcessingContent(
         Text(
             "${state.current} / ${state.total}",
             style = MaterialTheme.typography.headlineMedium,
+            color = MaterialTheme.colorScheme.primary,
         )
         Spacer(modifier = Modifier.height(16.dp))
         LinearProgressIndicator(
@@ -466,8 +482,8 @@ private fun ProcessingContent(
         Text(
             text = state.trackName,
             style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.basicMarquee(iterations = 1, initialDelayMillis = 1500),
             maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
         )
         if (state.detail.isNotEmpty()) {
             Spacer(modifier = Modifier.height(2.dp))
@@ -557,9 +573,13 @@ private fun ErrorContent(message: String, onBack: () -> Unit) {
 
 @Composable
 private fun CompleteContent(indexed: Int, failed: Int, onDone: () -> Unit) {
-    Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+    Box(modifier = Modifier.fillMaxSize().padding(32.dp), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("Indexing complete", style = MaterialTheme.typography.headlineSmall)
+            Text(
+                "Indexing complete",
+                style = MaterialTheme.typography.headlineSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
             Spacer(modifier = Modifier.height(8.dp))
             val message = if (failed > 0) {
                 "$indexed tracks indexed, $failed failed"
@@ -572,7 +592,7 @@ private fun CompleteContent(indexed: Int, failed: Int, onDone: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(modifier = Modifier.height(24.dp))
-            Button(onClick = onDone) {
+            FilledTonalButton(onClick = onDone) {
                 Text("Done")
             }
         }
@@ -641,11 +661,36 @@ private fun HiddenTracksScreen(
             }
         } else {
             Column(modifier = Modifier.fillMaxSize().padding(padding)) {
-                Text(
-                    "${dismissedTracks.size} hidden tracks",
-                    style = MaterialTheme.typography.titleSmall,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                )
+                val allIds = remember(dismissedTracks) {
+                    dismissedTracks.map { it.powerampFileId }.toSet()
+                }
+                val allSelected = localSelected.size == dismissedTracks.size && dismissedTracks.isNotEmpty()
+                val toggleAll = {
+                    localSelected = if (allSelected) emptySet() else allIds
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(onClick = toggleAll)
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TriStateCheckbox(
+                        state = when {
+                            dismissedTracks.isEmpty() -> ToggleableState.Off
+                            allSelected -> ToggleableState.On
+                            localSelected.isEmpty() -> ToggleableState.Off
+                            else -> ToggleableState.Indeterminate
+                        },
+                        onClick = toggleAll,
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Text(
+                        "${dismissedTracks.size} hidden tracks" +
+                            if (localSelected.isNotEmpty()) " (${localSelected.size} selected)" else "",
+                        style = MaterialTheme.typography.titleSmall,
+                    )
+                }
                 HorizontalDivider()
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
@@ -676,25 +721,23 @@ private fun BottomBar(
     onStartIndexing: () -> Unit,
 ) {
     Surface(tonalElevation = 3.dp) {
-        Column(modifier = Modifier.fillMaxWidth()) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "CLaMP3 indexing",
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+            FilledTonalButton(
+                onClick = onStartIndexing,
+                enabled = selectedCount > 0,
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        "CLaMP3 indexing",
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                }
-                Button(
-                    onClick = onStartIndexing,
-                    enabled = selectedCount > 0,
-                ) {
-                    Text("Start ($selectedCount)")
-                }
+                Text("Start ($selectedCount)")
             }
         }
     }
