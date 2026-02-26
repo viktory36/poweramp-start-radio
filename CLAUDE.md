@@ -119,6 +119,8 @@ Poweramp library → NewTrackDetector → IndexingActivity (track selection UI)
 
 **Audio pipeline:**
 - **soxr resampler** for high-quality anti-aliased conversion. libsoxr is vendored via NDK/JNI (LGPL 2.1).
+- **soxr NEON SIMD**: `cpu_has_simd32()` in soxr.c needs `#elif defined __aarch64__` to detect ARM64 — without it, falls back to scalar path (2x slower). cr32s+PFFFT is the SIMD path.
+- **CPU prefetch**: IndexingService decodes track N+1 on CPU while GPU runs MERT on track N. AudioDecoder.decode() is stateless and thread-safe for concurrent calls.
 - **NEON stereo→mono conversion must widen to int32 before adding channels.** `vaddq_s16(L, R)` wraps on loud masters (5–17% of samples), corrupting embeddings. Use `vaddl_s16` to widen first.
 
 **NPU (Hexagon HTP) — dead end for audio transformers:**
