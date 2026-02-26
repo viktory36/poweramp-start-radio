@@ -27,6 +27,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * ViewModel for the main screen.
@@ -85,6 +86,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _minArtistSpacing = MutableStateFlow(prefs.getInt("min_artist_spacing", 3))
     val minArtistSpacing: StateFlow<Int> = _minArtistSpacing.asStateFlow()
+
+    private val _textSearchTopK = MutableStateFlow(prefs.getInt("text_search_top_k", 20))
+    val textSearchTopK: StateFlow<Int> = _textSearchTopK.asStateFlow()
 
     // --- Database & permission state ---
 
@@ -161,6 +165,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
+
+    private val indicesPreparing = AtomicBoolean(false)
 
     init {
         RadioService.initHistory(application.filesDir)
@@ -261,6 +267,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setMinArtistSpacing(value: Int) {
         _minArtistSpacing.value = value
         prefs.edit().putInt("min_artist_spacing", value).apply()
+    }
+
+    fun setTextSearchTopK(value: Int) {
+        _textSearchTopK.value = value
+        prefs.edit().putInt("text_search_top_k", value).apply()
     }
 
     // --- Actions ---
@@ -459,7 +470,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 // Find top matches
-                val topMatches = index.findTopK(embedding, topK = 5)
+                val topMatches = index.findTopK(embedding, topK = _textSearchTopK.value)
                 if (topMatches.isEmpty()) {
                     _textSearchResult.value = TextSearchResult(query = query, error = "No matches found")
                     return@launch
@@ -501,6 +512,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val updated = (listOf(query) + _recentSearches.value.filter { it != query }).take(10)
         _recentSearches.value = updated
         prefs.edit().putString("recent_searches", updated.joinToString("\u0000")).apply()
+    }
+
+    fun clearRecentSearches() {
+        _recentSearches.value = emptyList()
+        prefs.edit().remove("recent_searches").apply()
     }
 
     // --- Indexing actions ---
@@ -638,12 +654,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         setDiversityLambda(defaults.diversityLambda)
         setMaxPerArtist(defaults.maxPerArtist)
         setMinArtistSpacing(defaults.minArtistSpacing)
+        setTextSearchTopK(20)
     }
 
     fun prepareIndices() {
+        if (!indicesPreparing.compareAndSet(false, true)) return
         viewModelScope.launch(Dispatchers.IO) {
-            prepareIndicesWithProgress { message ->
-                _indexStatus.value = message
+            try {
+                prepareIndicesWithProgress { message ->
+                    _indexStatus.value = message
+                }
+            } finally {
+                indicesPreparing.set(false)
             }
         }
     }
