@@ -85,12 +85,18 @@ class BenchmarkActivity : ComponentActivity() {
         var selectedAccelerator by remember { mutableStateOf(Accelerator.GPU) }
         val scope = rememberCoroutineScope()
 
+        val resampleQuality = when (intent.getStringExtra("resample_quality")) {
+            "mq" -> NativeResampler.QUALITY_MQ
+            "vhq" -> NativeResampler.QUALITY_VHQ
+            else -> NativeResampler.QUALITY_HQ
+        }
+
         fun startBenchmark() {
             running = true
             status = "Starting benchmark with $selectedAccelerator..."
             scope.launch(Dispatchers.IO) {
                 try {
-                    runBenchmark(selectedAccelerator) { msg -> status = msg }
+                    runBenchmark(selectedAccelerator, resampleQuality) { msg -> status = msg }
                 } catch (e: Throwable) {
                     Log.e(TAG, "Benchmark failed", e)
                     status = "ERROR: ${e.message}\n\n${e.stackTraceToString()}"
@@ -275,7 +281,16 @@ class BenchmarkActivity : ComponentActivity() {
         return result
     }
 
-    private suspend fun runBenchmark(accelerator: Accelerator, onStatus: (String) -> Unit) {
+    private suspend fun runBenchmark(
+        accelerator: Accelerator,
+        resampleQuality: Int = NativeResampler.QUALITY_HQ,
+        onStatus: (String) -> Unit,
+    ) {
+        val qualityName = when (resampleQuality) {
+            NativeResampler.QUALITY_MQ -> "mq"
+            NativeResampler.QUALITY_VHQ -> "vhq"
+            else -> "hq"
+        }
         val sb = StringBuilder()
         fun log(msg: String) {
             sb.appendLine(msg)
@@ -287,6 +302,7 @@ class BenchmarkActivity : ComponentActivity() {
         log("Device: ${Build.MANUFACTURER} ${Build.MODEL}")
         log("SOC: ${Build.SOC_MODEL}")
         log("Requested accelerator: $accelerator")
+        log("Resample quality: $qualityName")
         log("")
 
         // Discover tracks from Poweramp
@@ -357,6 +373,7 @@ class BenchmarkActivity : ComponentActivity() {
         data class TrackFeatures(
             val features: List<FloatArray>,
             val decodeMs: Long,
+            val resampleMs: Long,
             val mertMs: Long,
             val perWindowMs: List<Long>,
             val audioDurationS: Float,
@@ -369,10 +386,14 @@ class BenchmarkActivity : ComponentActivity() {
             val audioFile = resolveFile(track.path)!!
             try {
                 val decodeStart = System.nanoTime()
-                val audio = decoder.decode(audioFile, MertInference.SAMPLE_RATE, maxDurationS = MertInference.MAX_DURATION_S)
-                val decodeMs = (System.nanoTime() - decodeStart) / 1_000_000
+                val audio = decoder.decode(
+                    audioFile, MertInference.SAMPLE_RATE,
+                    maxDurationS = MertInference.MAX_DURATION_S,
+                    resampleQuality = resampleQuality,
+                )
+                val totalDecodeMs = (System.nanoTime() - decodeStart) / 1_000_000
                 if (audio == null) { log("  Decode failed"); continue }
-                log("  Audio: ${audio.durationS}s @ ${audio.sampleRate}Hz (decode: ${decodeMs}ms)")
+                log("  Audio: ${audio.durationS}s @ ${audio.sampleRate}Hz (decode: ${audio.decodeMs}ms, resample: ${audio.resampleMs}ms)")
 
                 val features = mutableListOf<FloatArray>()
                 val perWindowMs = mutableListOf<Long>()
@@ -417,7 +438,7 @@ class BenchmarkActivity : ComponentActivity() {
                     val fAbsMax = f0.maxOf { kotlin.math.abs(it) }
                     log("  MERT features OK: min=${"%.4f".format(fMin)}, max=${"%.4f".format(fMax)}, absmax=${"%.4f".format(fAbsMax)}")
                 }
-                allFeatures[i] = TrackFeatures(features, decodeMs, mertMs, perWindowMs.toList(), audio.durationS)
+                allFeatures[i] = TrackFeatures(features, audio.decodeMs, audio.resampleMs, mertMs, perWindowMs.toList(), audio.durationS)
                 results[i].durationS = audio.durationS
             } catch (e: Throwable) {
                 log("  ERROR: ${e.javaClass.simpleName}: ${e.message}")
@@ -450,7 +471,7 @@ class BenchmarkActivity : ComponentActivity() {
                 val encStart = System.nanoTime()
                 val embedding = clamp3Inference.encode(tf.features, tf.features.size)
                 val encMs = (System.nanoTime() - encStart) / 1_000_000
-                val totalMs = tf.decodeMs + tf.mertMs + encMs
+                val totalMs = tf.decodeMs + tf.resampleMs + tf.mertMs + encMs
                 val realtimeFactor = if (tf.audioDurationS > 0) totalMs / (tf.audioDurationS * 1000f) else 0f
 
                 if (embedding != null) {
@@ -462,10 +483,12 @@ class BenchmarkActivity : ComponentActivity() {
                         val norm = kotlin.math.sqrt(embedding.sumOf { (it * it).toDouble() }).toFloat()
                         log("  CLaMP3 output OK: norm=${"%.4f".format(norm)}, absmax=${"%.4f".format(embedding.maxOf { kotlin.math.abs(it) })}")
                     }
-                    log("  ${embedding.size}d, $numSegments seg (decode=${tf.decodeMs}ms, mert=${tf.mertMs}ms, clamp3=${encMs}ms, total=${totalMs}ms)")
+                    log("  ${embedding.size}d, $numSegments seg (decode=${tf.decodeMs}ms, resample=${tf.resampleMs}ms, mert=${tf.mertMs}ms, clamp3=${encMs}ms, total=${totalMs}ms)")
                     log("  Realtime factor: ${"%.2f".format(realtimeFactor)}x (${tf.audioDurationS}s audio in ${totalMs / 1000f}s)")
                     results[i].timing = TrackTiming(
                         decodeMs = tf.decodeMs,
+                        resampleMs = tf.resampleMs,
+                        resampleQuality = qualityName,
                         mertTotalMs = tf.mertMs,
                         mertWindows = tf.features.size,
                         mertPerWindowMs = tf.perWindowMs,
@@ -539,29 +562,30 @@ class BenchmarkActivity : ComponentActivity() {
         log("Models: MERT=${mertFile.name} ($mertAccel, load=${mertLoadMs}ms)")
         log("        CLaMP3=${clamp3AudioFile.name} ($clamp3Accel, load=${clamp3LoadMs}ms)")
         log("")
-        log(String.format("%-30s %6s %6s %6s %5s %7s %6s",
-            "Track", "Dec", "MERT", "CL3", "Win", "Total", "RT-x"))
-        log("-".repeat(95))
+        log(String.format("%-30s %7s %7s %6s %6s %5s %7s %6s",
+            "Track", "Dec", "Resamp", "MERT", "CL3", "Win", "Total", "RT-x"))
+        log("-".repeat(105))
 
         val allTimings = results.mapNotNull { it.timing }
         for (r in results) {
             val t = r.timing ?: continue
-            log(String.format("%-30s %5dms %5dms %5dms %4dw %6dms %5.2fx",
+            log(String.format("%-30s %6dms %6dms %5dms %5dms %4dw %6dms %5.2fx",
                 "${r.artist} - ${r.title}".take(30),
-                t.decodeMs, t.mertTotalMs, t.clamp3TotalMs, t.mertWindows, t.totalMs, t.realtimeFactor))
+                t.decodeMs, t.resampleMs, t.mertTotalMs, t.clamp3TotalMs, t.mertWindows, t.totalMs, t.realtimeFactor))
         }
 
         if (allTimings.isNotEmpty()) {
-            log("-".repeat(95))
+            log("-".repeat(105))
             val avgDecode = allTimings.map { it.decodeMs }.average().toLong()
+            val avgResample = allTimings.map { it.resampleMs }.average().toLong()
             val avgMert = allTimings.map { it.mertTotalMs }.average().toLong()
             val avgClamp3 = allTimings.map { it.clamp3TotalMs }.average().toLong()
             val avgWindows = allTimings.map { it.mertWindows }.average().toInt()
             val avgTotal = allTimings.map { it.totalMs }.average().toLong()
             val avgRt = allTimings.map { it.realtimeFactor.toDouble() }.average().toFloat()
             val avgPerWindow = allTimings.flatMap { it.mertPerWindowMs }.let { if (it.isNotEmpty()) it.average().toLong() else 0 }
-            log(String.format("%-30s %5dms %5dms %5dms %4dw %6dms %5.2fx",
-                "AVERAGE", avgDecode, avgMert, avgClamp3, avgWindows, avgTotal, avgRt))
+            log(String.format("%-30s %6dms %6dms %5dms %5dms %4dw %6dms %5.2fx",
+                "AVERAGE", avgDecode, avgResample, avgMert, avgClamp3, avgWindows, avgTotal, avgRt))
             log("")
             log("MERT per-window: avg=${avgPerWindow}ms")
             val allWindowMs = allTimings.flatMap { it.mertPerWindowMs }
@@ -706,6 +730,8 @@ class BenchmarkActivity : ComponentActivity() {
 
     data class TrackTiming(
         val decodeMs: Long,
+        val resampleMs: Long = 0,
+        val resampleQuality: String = "hq",
         val mertTotalMs: Long,
         val mertWindows: Int,
         val mertPerWindowMs: List<Long>,

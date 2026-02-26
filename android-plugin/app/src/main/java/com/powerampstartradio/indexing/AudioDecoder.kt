@@ -29,11 +29,15 @@ class AudioDecoder {
      * @param samples Mono PCM samples in [-1, 1] range at [sampleRate] Hz
      * @param sampleRate Target sample rate the audio was resampled to
      * @param durationS Duration in seconds
+     * @param decodeMs Wall-clock time for MediaCodec PCM decode (ms)
+     * @param resampleMs Wall-clock time for soxr resample (ms)
      */
     data class DecodedAudio(
         val samples: FloatArray,
         val sampleRate: Int,
-        val durationS: Float
+        val durationS: Float,
+        val decodeMs: Long = 0,
+        val resampleMs: Long = 0,
     )
 
     /**
@@ -103,7 +107,7 @@ class AudioDecoder {
             Log.i(TAG, "TIMING: resample ${file.name} ${nativeSampleRate}->${targetSampleRate}Hz = ${resampleMs}ms")
             Log.i(TAG, "TIMING: decode_total ${file.name} = ${decodeMs + resampleMs}ms (${durationS}s audio)")
 
-            return DecodedAudio(resampled, targetSampleRate, durationS)
+            return DecodedAudio(resampled, targetSampleRate, durationS, decodeMs, resampleMs)
 
         } catch (e: OutOfMemoryError) {
             Log.e(TAG, "OOM decoding ${file.name} — skipping", e)
