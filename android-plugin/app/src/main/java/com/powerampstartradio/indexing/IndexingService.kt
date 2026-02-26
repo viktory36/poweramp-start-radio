@@ -200,41 +200,63 @@ class IndexingService : Service() {
                 var indexed = 0
                 var failed = 0
 
-                // Pre-compute total work steps for ETA.
-                // Step weights calibrated for CLaMP3 pipeline:
-                // - Audio decode: ~12s/track (weight=45)
-                // - MERT window inference: ~0.3s/window (weight=1)
-                // - CLaMP3 segment inference: ~0.5s/segment (weight=2)
-                // - DB write: negligible (weight=1)
-                val DECODE_WEIGHT = 45
-                val CLAMP3_SEGMENT_WEIGHT = 2
-                val WRITE_WEIGHT = 1
-                var totalSteps = 0
-                for (t in unindexed) {
+                // ── ETA: measured wall-clock extrapolation ──────────────
+                // Instead of guessing step weights, we measure actual ms/window
+                // from completed MERT inference (which dominates ~95% of time)
+                // and extrapolate for remaining windows. This naturally adapts
+                // to any device, resampler, or model speed.
+                //
+                // Per-track cost breakdown (Snapdragon 8 Gen 3, 2026-02):
+                //   MERT window: ~250ms  |  Decode+resample: ~3.5s (hidden by prefetch)
+                //   CLaMP3: ~50ms/track   |  Graph rebuild: ~10s (separate phase)
+                //
+                // Since decode is hidden by CPU prefetch after track 1, the
+                // wall-clock per-track ≈ MERT windows × ms/window. We measure
+                // this directly.
+
+                // Pre-compute expected window counts per track (full duration, no cap)
+                val windowsPerTrack = IntArray(unindexed.size)
+                var totalWindows = 0
+                for ((i, t) in unindexed.withIndex()) {
                     val durS = t.durationMs / 1000f
                     if (durS < MertInference.WINDOW_SEC) continue
-                    totalSteps += DECODE_WEIGHT
-                    val windows = (durS * MertInference.SAMPLE_RATE).toInt() / MertInference.WINDOW_SAMPLES
-                    totalSteps += windows  // MERT windows, weight=1 each
-                    val segments = maxOf(1, kotlin.math.ceil(windows.toFloat() / Clamp3AudioInference.MAX_WINDOWS).toInt())
-                    totalSteps += segments * CLAMP3_SEGMENT_WEIGHT
-                    totalSteps += WRITE_WEIGHT
+                    val totalSamples = (durS * MertInference.SAMPLE_RATE).toInt()
+                    val full = totalSamples / MertInference.WINDOW_SAMPLES
+                    val remain = totalSamples % MertInference.WINDOW_SAMPLES
+                    val w = full + if (remain >= MertInference.SAMPLE_RATE) 1 else 0
+                    windowsPerTrack[i] = w
+                    totalWindows += w
                 }
-                var completedSteps = 0
+
+                var windowsCompleted = 0
+                var tracksCompleted = 0
                 var fractionFloor = 0f
-                var etaStartTime = 0L
+                // EMA of ms/window, updated both within-track (from MERT windows)
+                // and at track boundaries (from full wall-clock). This gives an
+                // ETA even during the first track — crucial for single-track indexing.
+                var msPerWindowEma = 0.0
+                val EMA_ALPHA = 0.3  // weight for newest measurement
+                var mertPhaseStartTime = 0L
+                var currentTrackMertStart = 0L  // set when MERT begins for current track
                 var lastEta = 0L
 
                 fun fraction(): Float {
-                    val raw = if (totalSteps > 0) completedSteps.toFloat() / totalSteps else 0f
-                    fractionFloor = maxOf(fractionFloor, raw)
+                    val raw = if (totalWindows > 0) windowsCompleted.toFloat() / totalWindows else 0f
+                    // CLaMP3 phase is fast (~1% of total) — reserve last 5% for it + graph
+                    val scaled = raw * 0.95f
+                    fractionFloor = maxOf(fractionFloor, scaled)
                     return fractionFloor
                 }
 
                 fun eta(): Long {
-                    if (completedSteps == 0 || etaStartTime == 0L) return 0L
-                    val elapsed = System.currentTimeMillis() - etaStartTime
-                    val rawEta = elapsed * (totalSteps - completedSteps) / completedSteps
+                    if (msPerWindowEma <= 0) return 0L
+                    val remainingWindows = totalWindows - windowsCompleted
+                    // Add flat budget for CLaMP3 phase (~50ms/track) + graph rebuild
+                    val remainingTracks = unindexed.size - tracksCompleted
+                    val clamp3Budget = remainingTracks * 50L
+                    val graphBudget = if (remainingWindows > 0) 10_000L else 0L
+                    val rawEta = (remainingWindows * msPerWindowEma).toLong() + clamp3Budget + graphBudget
+                    // Dampen upward jumps (max +20% per update) for smoother display
                     lastEta = if (rawEta > lastEta && lastEta > 0L) {
                         minOf(rawEta, (lastEta * 1.2).toLong())
                     } else rawEta
@@ -272,20 +294,19 @@ class IndexingService : Service() {
                 val windowCounts = IntArray(unindexed.size)
                 val windowBytes = MertInference.FEATURE_DIM * 4  // 768 × 4 = 3072
 
-                etaStartTime = System.currentTimeMillis()
+                mertPhaseStartTime = System.currentTimeMillis()
 
                 try {  // ensures featuresFile is cleaned up
                 val writeBuf = java.nio.ByteBuffer.allocate(windowBytes)
                     .order(java.nio.ByteOrder.LITTLE_ENDIAN)
                 val writeChannel = java.io.FileOutputStream(featuresFile).channel
 
-                // CPU prefetch: decode track N+1 while GPU runs MERT on track N.
-                // Decode+resample is CPU-bound; MERT is GPU-bound. Overlapping them
-                // hides decode latency for all but the first track.
+                // CPU prefetch: decode first chunk of track N+1 while GPU runs
+                // MERT on track N. Decode+resample is CPU-bound; MERT is GPU-bound.
                 var prefetchJob: kotlinx.coroutines.Deferred<AudioDecoder.DecodedAudio?>? = null
                 var prefetchIndex = -1
 
-                fun startPrefetch(idx: Int) {
+                fun startPrefetch(idx: Int, chunkS: Int) {
                     if (idx >= unindexed.size) return
                     val nextTrack = unindexed[idx]
                     val nextFile = resolveAudioFile(nextTrack) ?: return
@@ -293,7 +314,7 @@ class IndexingService : Service() {
                     prefetchJob = async(Dispatchers.Default) {
                         try {
                             audioDecoder.decode(nextFile, MertInference.SAMPLE_RATE,
-                                maxDurationS = MertInference.MAX_DURATION_S)
+                                maxDurationS = chunkS)
                         } catch (e: Exception) {
                             Log.e(TAG, "Prefetch decode failed for: ${nextTrack.title}", e)
                             null
@@ -306,6 +327,7 @@ class IndexingService : Service() {
                     ensureActive()
                     val trackProgress = "${i + 1}/${unindexed.size}"
                     var windowsDone = 0
+                    val expectedWindows = windowsPerTrack[i]
                     fun emitProgress(detail: String, etaMs: Long = eta()) {
                         val msg = "MERT $trackProgress ${track.title} \u2013 $detail${formatEta(etaMs)}"
                         _state.value = IndexingState.Processing(
@@ -317,7 +339,7 @@ class IndexingService : Service() {
                             progressFraction = fraction(),
                             estimatedRemainingMs = etaMs,
                         )
-                        updateNotification(msg, completedSteps, totalSteps)
+                        updateNotification(msg, windowsCompleted, totalWindows)
                     }
 
                     val trackStart = System.nanoTime()
@@ -329,66 +351,104 @@ class IndexingService : Service() {
                         continue
                     }
 
-                    // Use prefetched decode if available, otherwise decode now
-                    val audio24k = if (i == prefetchIndex && prefetchJob != null) {
-                        emitProgress("awaiting prefetch")
-                        val result = prefetchJob!!.await()
-                        prefetchJob = null
-                        prefetchIndex = -1
-                        result
-                    } else {
-                        emitProgress("decoding")
-                        audioDecoder.decode(audioFile, MertInference.SAMPLE_RATE,
-                            maxDurationS = MertInference.MAX_DURATION_S)
-                    }
-
-                    if (audio24k == null) {
-                        Log.w(TAG, "Decode failed for: ${track.title}")
-                        failed++
-                        continue
-                    }
-                    completedSteps += DECODE_WEIGHT
-
-                    val expectedWindows = mertInference.windowCount(audio24k.durationS)
                     if (expectedWindows == 0) {
-                        Log.w(TAG, "Audio too short for MERT: ${track.title} (${audio24k.durationS}s)")
+                        Log.w(TAG, "Audio too short for MERT: ${track.title}")
                         failed++
                         continue
                     }
 
-                    // Start prefetching next track BEFORE MERT inference.
-                    // While GPU runs MERT (~10s), CPU decodes next track in parallel.
-                    startPrefetch(i + 1)
+                    // Chunked decode+MERT: process the full track in memory-adaptive
+                    // chunks. Chunk size is recomputed per-track from available heap,
+                    // so it adapts if memory pressure changes mid-run. Each chunk is
+                    // decoded, resampled, fed to MERT, then freed.
+                    val trackDurationS = track.durationMs / 1000
+                    var trackWindowsExtracted = 0
+                    var totalDecodeMs = 0L
+                    var totalResampleMs = 0L
+                    var totalMertMs = 0L
+                    var numChunks = 0
 
                     windowsDone = 0
                     emitProgress("window 0/$expectedWindows")
 
-                    // Stream MERT features to disk
-                    val mertStart = System.nanoTime()
-                    val numExtracted = mertInference.extractFeaturesStreaming(
-                        audio24k,
-                        onFeatureExtracted = { feature ->
-                            writeBuf.clear()
-                            writeBuf.asFloatBuffer().put(feature)
-                            writeBuf.rewind()
-                            writeChannel.write(writeBuf)
-                        },
-                        onWindowDone = {
-                            completedSteps++
-                            windowsDone++
-                            emitProgress("window $windowsDone/$expectedWindows")
-                        },
-                    )
-                    val mertMs = (System.nanoTime() - mertStart) / 1_000_000
+                    var prefetchStarted = false
+                    var chunkStart = 0  // position cursor in seconds
+
+                    while (chunkStart < trackDurationS || chunkStart == 0) {
+                        ensureActive()
+                        val chunkS = computeChunkDurationS()
+                        val isLastChunk = chunkStart + chunkS >= trackDurationS
+
+                        // First chunk: use prefetch if available
+                        val audio24k = if (chunkStart == 0 && i == prefetchIndex && prefetchJob != null) {
+                            emitProgress("awaiting prefetch")
+                            val result = prefetchJob!!.await()
+                            prefetchJob = null
+                            prefetchIndex = -1
+                            result
+                        } else {
+                            if (chunkStart == 0) emitProgress("decoding")
+                            audioDecoder.decode(audioFile, MertInference.SAMPLE_RATE,
+                                maxDurationS = chunkS, startTimeS = chunkStart)
+                        }
+
+                        if (audio24k == null || audio24k.samples.isEmpty()) break
+                        totalDecodeMs += audio24k.decodeMs
+                        totalResampleMs += audio24k.resampleMs
+                        numChunks++
+
+                        val chunkWindows = mertInference.windowCount(audio24k.durationS)
+                        if (chunkWindows == 0) { chunkStart += chunkS; continue }
+
+                        // Prefetch next track's first chunk during last chunk of this track
+                        if (isLastChunk && !prefetchStarted) {
+                            startPrefetch(i + 1, chunkS)
+                            prefetchStarted = true
+                        }
+
+                        // Stream MERT features to disk
+                        val mertStart = System.nanoTime()
+                        if (windowsDone == 0) currentTrackMertStart = mertStart
+                        val numExtracted = mertInference.extractFeaturesStreaming(
+                            audio24k,
+                            onFeatureExtracted = { feature ->
+                                writeBuf.clear()
+                                writeBuf.asFloatBuffer().put(feature)
+                                writeBuf.rewind()
+                                writeChannel.write(writeBuf)
+                            },
+                            onWindowDone = {
+                                windowsCompleted++
+                                windowsDone++
+                                // Update EMA from within-track MERT windows. This gives
+                                // an ETA even during the first track (after ~3 windows).
+                                if (windowsDone >= 3) {
+                                    val mertElapsed = (System.nanoTime() - currentTrackMertStart) / 1_000_000.0
+                                    val measured = mertElapsed / windowsDone
+                                    msPerWindowEma = if (msPerWindowEma <= 0) measured
+                                                     else msPerWindowEma * (1 - EMA_ALPHA) + measured * EMA_ALPHA
+                                }
+                                emitProgress("window $windowsDone/$expectedWindows")
+                            },
+                        )
+                        totalMertMs += (System.nanoTime() - mertStart) / 1_000_000
+                        trackWindowsExtracted += numExtracted
+                        chunkStart += chunkS
+                    }
 
                     val trackMs = (System.nanoTime() - trackStart) / 1_000_000
                     Log.i(TAG, "TIMING: mert_track ${i+1}/${unindexed.size} " +
                         "\"${track.artist} - ${track.title}\" = ${trackMs}ms " +
-                        "(decode=${audio24k.decodeMs}ms, resample=${audio24k.resampleMs}ms, " +
-                        "mert=${mertMs}ms, windows=$numExtracted)")
+                        "(decode=${totalDecodeMs}ms, resample=${totalResampleMs}ms, " +
+                        "mert=${totalMertMs}ms, windows=$trackWindowsExtracted, chunks=$numChunks)")
 
-                    if (numExtracted > 0) {
-                        windowCounts[i] = numExtracted
+                    if (trackWindowsExtracted > 0) {
+                        windowCounts[i] = trackWindowsExtracted
+                        tracksCompleted++
+                        // Update EMA from full track wall-clock for cross-track accuracy
+                        val measuredMsPerWindow = trackMs.toDouble() / trackWindowsExtracted
+                        msPerWindowEma = if (tracksCompleted == 1) measuredMsPerWindow
+                                         else msPerWindowEma * (1 - EMA_ALPHA) + measuredMsPerWindow * EMA_ALPHA
                     } else {
                         failed++
                     }
@@ -398,9 +458,9 @@ class IndexingService : Service() {
                     writeChannel.close()
                 }
 
-                val totalWindows = windowCounts.sum()
-                val spillMB = totalWindows.toLong() * windowBytes / (1024 * 1024)
-                Log.i(TAG, "MERT phase done: $totalWindows windows spilled to disk (${spillMB}MB)")
+                val actualTotalWindows = windowCounts.sum()
+                val spillMB = actualTotalWindows.toLong() * windowBytes / (1024 * 1024)
+                Log.i(TAG, "MERT phase done: $actualTotalWindows windows spilled to disk (${spillMB}MB)")
 
                 // ── Phase transition: MERT → CLaMP3 audio encoder ────────
                 mertInference.close()
@@ -442,16 +502,18 @@ class IndexingService : Service() {
                     encoded++
                     val numSegments = clamp3Inference.segmentCount(numWindows)
                     val encMsg = "CLaMP3 $encoded/$encodableCount ${track.title}"
+                    // CLaMP3 phase fills the 0.95→1.0 range
+                    val clamp3Frac = 0.95f + 0.05f * (encoded - 1).toFloat() / maxOf(encodableCount, 1)
                     _state.value = IndexingState.Processing(
                         current = encoded,
                         total = encodableCount,
                         trackName = "${track.artist} - ${track.title}",
                         passName = "CLaMP3 encode",
                         detail = "encoding ($numWindows windows, $numSegments segments)",
-                        progressFraction = fraction(),
-                        estimatedRemainingMs = eta(),
+                        progressFraction = clamp3Frac,
+                        estimatedRemainingMs = 0,  // CLaMP3 is too fast for meaningful ETA
                     )
-                    updateNotification(encMsg, completedSteps, totalSteps)
+                    updateNotification(encMsg, windowsCompleted, totalWindows)
                     val encStart = System.nanoTime()
 
                     // Stream MERT features from disk one window at a time
@@ -465,9 +527,7 @@ class IndexingService : Service() {
                                 readBuf.asFloatBuffer().get(arr)
                             }
                         },
-                        onSegmentDone = {
-                            completedSteps += CLAMP3_SEGMENT_WEIGHT
-                        },
+                        onSegmentDone = { },
                     )
 
                     if (embedding == null) {
@@ -488,7 +548,6 @@ class IndexingService : Service() {
                         embedding = embedding,
                         source = "phone",
                     )
-                    completedSteps += WRITE_WEIGHT
                     val encMs = (System.nanoTime() - encStart) / 1_000_000
 
                     if (trackId > 0) {
@@ -566,6 +625,32 @@ class IndexingService : Service() {
                 releaseWakeLock()
             }
         }
+    }
+
+    /**
+     * Compute optimal decode chunk duration based on available heap memory.
+     * Larger chunks = fewer codec setups + better CPU prefetch overlap.
+     *
+     * Peak memory per second of audio during decode+resample (48kHz→24kHz):
+     *   native mono float (48000×4) + resampled float (24000×4) coexist
+     *   = 288,000 bytes/second of audio
+     *
+     * Uses 50% of available heap for the chunk, rest as headroom for
+     * TFLite GPU buffers, GC pressure, notification bitmaps, etc.
+     */
+    private fun computeChunkDurationS(): Int {
+        val runtime = Runtime.getRuntime()
+        val usedBytes = runtime.totalMemory() - runtime.freeMemory()
+        val availableBytes = runtime.maxMemory() - usedBytes
+        val budgetBytes = availableBytes / 2
+        // Assume 48kHz source (worst common case: Opus, high-bitrate FLAC)
+        val peakBytesPerSec = (48000 + 24000) * 4L  // 288,000
+        val chunkS = (budgetBytes / peakBytesPerSec).toInt()
+            .coerceIn(30, 600)  // 30s min (6 windows), 10min max
+        Log.i(TAG, "Chunk sizing: heap_max=${runtime.maxMemory()/1024/1024}MB, " +
+            "available=${availableBytes/1024/1024}MB, budget=${budgetBytes/1024/1024}MB, " +
+            "chunk=${chunkS}s")
+        return chunkS
     }
 
     /**

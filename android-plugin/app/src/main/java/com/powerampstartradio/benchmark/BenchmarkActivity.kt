@@ -419,7 +419,7 @@ class BenchmarkActivity : ComponentActivity() {
                 val decodeStart = System.nanoTime()
                 val audio = decoder.decode(
                     audioFile, MertInference.SAMPLE_RATE,
-                    maxDurationS = MertInference.MAX_DURATION_S,
+                    maxDurationS = MertInference.CHUNK_DURATION_S,
                     resampleQuality = resampleQuality,
                 )
                 val totalDecodeMs = (System.nanoTime() - decodeStart) / 1_000_000

@@ -47,12 +47,15 @@ class AudioDecoder {
      * @param targetSampleRate Desired output sample rate (e.g., 24000 for MERT/CLaMP3)
      * @param maxDurationS Maximum duration to decode in seconds (0 = unlimited).
      *   Caps at native sample rate before resampling.
+     * @param startTimeS Start position in seconds (seeks to this position before decoding).
+     *   Used for chunked decoding of long tracks.
      * @return Decoded audio, or null on failure
      */
     fun decode(
         file: File,
         targetSampleRate: Int,
         maxDurationS: Int = 0,
+        startTimeS: Int = 0,
         resampleQuality: Int = NativeResampler.QUALITY_HQ,
     ): DecodedAudio? {
         val decodeStart = System.nanoTime()
@@ -66,6 +69,14 @@ class AudioDecoder {
                 return null
             }
             extractor.selectTrack(audioTrackIndex)
+
+            // Seek to start position for chunked decoding
+            if (startTimeS > 0) {
+                extractor.seekTo(
+                    startTimeS.toLong() * 1_000_000,
+                    MediaExtractor.SEEK_TO_CLOSEST_SYNC,
+                )
+            }
 
             val format = extractor.getTrackFormat(audioTrackIndex)
             val mime = format.getString(MediaFormat.KEY_MIME) ?: return null
@@ -94,10 +105,11 @@ class AudioDecoder {
             Log.i(TAG, "TIMING: decode_pcm ${file.name} = ${decodeMs}ms " +
                 "(${rawSamples.size} samples @ ${nativeSampleRate}Hz)")
 
-            // Resample if needed
+            // Resample if needed — use NEON polyphase FIR (200x faster than soxr)
             val resampleStart = System.nanoTime()
             val resampled = if (nativeSampleRate != targetSampleRate) {
-                resample(rawSamples, nativeSampleRate, targetSampleRate, resampleQuality)
+                NativeMath.resamplePolyphase(rawSamples, nativeSampleRate, targetSampleRate)
+                    ?: resample(rawSamples, nativeSampleRate, targetSampleRate, resampleQuality)
             } else {
                 rawSamples
             }

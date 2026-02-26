@@ -253,8 +253,13 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
      *   to not select something is an intentional "don't index". Should be false when a
      *   search filter is active — the user is only focused on the search results.
      */
-    fun startIndexing(buildGraph: Boolean = false, autoDismissUnselected: Boolean = true) {
-        val selected = _selectedIds.value
+    /**
+     * @param onlyIds When non-null, restrict indexing to these track IDs (intersection
+     *   with selected). Used when a search filter is active — only index visible tracks.
+     */
+    fun startIndexing(buildGraph: Boolean = false, autoDismissUnselected: Boolean = true,
+                      onlyIds: Set<Long>? = null) {
+        val selected = if (onlyIds != null) _selectedIds.value.intersect(onlyIds) else _selectedIds.value
         if (selected.isEmpty()) return
         val dismissed = _dismissedIds.value
         val tracks = _unindexedTracks.value.filter {

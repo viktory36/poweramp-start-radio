@@ -91,6 +91,7 @@ fun IndexingScreen(
     var showMenu by remember { mutableStateOf(false) }
     var showHiddenTracks by remember { mutableStateOf(false) }
     var isSearchActive by remember { mutableStateOf(false) }
+    var filteredTrackIds by remember { mutableStateOf<Set<Long>?>(null) }
 
     // When all dismissed tracks are restored, auto-navigate back
     LaunchedEffect(showHiddenTracks, hasDismissed) {
@@ -160,6 +161,7 @@ fun IndexingScreen(
                         viewModel.startIndexing(
                             buildGraph = true,
                             autoDismissUnselected = !isSearchActive,
+                            onlyIds = if (isSearchActive) filteredTrackIds else null,
                         )
                     },
                 )
@@ -196,6 +198,7 @@ fun IndexingScreen(
                                 }
                             },
                             onSearchActiveChanged = { isSearchActive = it },
+                            onFilteredIdsChanged = { filteredTrackIds = it },
                         )
                     }
                 }
@@ -279,6 +282,7 @@ private fun TrackSelectionContent(
     onToggleAll: () -> Unit,
     onToggleFiltered: (List<NewTrackDetector.UnindexedTrack>) -> Unit,
     onSearchActiveChanged: (Boolean) -> Unit,
+    onFilteredIdsChanged: (Set<Long>?) -> Unit,
 ) {
     var searchQuery by remember { mutableStateOf("") }
 
@@ -297,6 +301,14 @@ private fun TrackSelectionContent(
                     t.album.lowercase().contains(q)
             }
         }
+    }
+
+    // Report filtered IDs so startIndexing can scope to visible tracks
+    LaunchedEffect(filteredTracks) {
+        onFilteredIdsChanged(
+            if (searchQuery.isNotBlank()) filteredTracks.map { it.powerampFileId }.toSet()
+            else null
+        )
     }
 
     val isFiltered = searchQuery.isNotBlank()

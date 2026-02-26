@@ -305,9 +305,10 @@ def _load_audio_chunks(fpath, processor, max_duration):
     if sr != MERT_SR:
         waveform = torchaudio.transforms.Resample(sr, MERT_SR)(waveform)
 
-    max_samples = max_duration * MERT_SR
-    if waveform.shape[-1] > max_samples:
-        waveform = waveform[:, :max_samples]
+    if max_duration > 0:
+        max_samples = max_duration * MERT_SR
+        if waveform.shape[-1] > max_samples:
+            waveform = waveform[:, :max_samples]
 
     wav_np = waveform.squeeze(0).numpy()
     wav = processor(
@@ -866,8 +867,8 @@ Examples:
         "--phase", choices=["1", "2", "3", "both"], default="both",
         help="Which phase to run: 1=MERT, 2=CLaMP3, 3=kNN graph (default: both=all)")
     parser.add_argument(
-        "--max-duration", type=int, default=600,
-        help="Max audio duration in seconds (default: 600 = 10 min)")
+        "--max-duration", type=int, default=0,
+        help="Max audio duration in seconds (0 = no limit, processes full track)")
     parser.add_argument(
         "--batch-size", type=int, default=8,
         help="MERT chunk batch size for GPU throughput (default: 8)")

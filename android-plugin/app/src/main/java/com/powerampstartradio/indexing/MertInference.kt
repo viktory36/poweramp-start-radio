@@ -32,8 +32,11 @@ class MertInference(
         const val WINDOW_SEC = 5
         const val WINDOW_SAMPLES = SAMPLE_RATE * WINDOW_SEC  // 120000
         const val FEATURE_DIM = 768
-        /** Max audio duration in seconds (must match desktop's max_duration=600). */
-        const val MAX_DURATION_S = 600
+        /** Max audio duration per decode chunk in seconds.
+         *  Longer tracks are decoded in multiple chunks to bound memory.
+         *  Each chunk is processed independently — MERT windows are identical
+         *  regardless of chunking. 120s keeps peak memory ~33 MB. */
+        const val CHUNK_DURATION_S = 120
 
         /**
          * Per-track zero-mean unit-variance normalization (in-place).

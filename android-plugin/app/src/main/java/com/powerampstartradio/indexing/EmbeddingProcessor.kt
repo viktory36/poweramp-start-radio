@@ -32,7 +32,7 @@ class EmbeddingProcessor(
      */
     fun decodeForMert(
         audioFile: File,
-        maxDurationS: Int = MertInference.MAX_DURATION_S,
+        maxDurationS: Int = MertInference.CHUNK_DURATION_S,
     ): AudioDecoder.DecodedAudio? {
         return audioDecoder.decode(audioFile, MertInference.SAMPLE_RATE, maxDurationS = maxDurationS)
     }
