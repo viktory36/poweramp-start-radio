@@ -27,10 +27,22 @@ internal fun createReadyModel(
 ): ReadyModel {
     var model: CompiledModel? = null
     try {
-        model = CompiledModel.create(path, CompiledModel.Options(accelerator))
+        val options = CompiledModel.Options(accelerator).apply {
+            if (accelerator == Accelerator.GPU) {
+                // Force FP32 computation on GPU. The default (FP16) causes embedding
+                // collapse in deep transformers (12+ layers): FP16 accumulation with
+                // Flush-To-Zero on mobile GPUs loses discriminative signal, producing
+                // near-identical embeddings regardless of input content.
+                gpuOptions = CompiledModel.GpuOptions(
+                    precision = CompiledModel.GpuOptions.Precision.FP32,
+                )
+            }
+        }
+        model = CompiledModel.create(path, options)
         val inputBuffers = model.createInputBuffers()
         val outputBuffers = model.createOutputBuffers()
-        Log.i("LiteRT", "Model ready with $accelerator accelerator")
+        Log.i("LiteRT", "Model ready with $accelerator accelerator (precision: " +
+            "${if (accelerator == Accelerator.GPU) "FP32" else "default"})")
         return ReadyModel(model, inputBuffers, outputBuffers, accelerator)
     } catch (e: Exception) {
         model?.close()
