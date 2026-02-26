@@ -152,7 +152,10 @@ class BenchmarkActivity : ComponentActivity() {
                 .fillMaxSize()
                 .padding(16.dp)
         ) {
-            Text("CLaMP3 Embedding Benchmark", style = MaterialTheme.typography.headlineSmall)
+            Text(
+                "CLaMP3 Embedding Benchmark — ${if (running) "RUNNING" else "idle"}",
+                style = MaterialTheme.typography.headlineSmall,
+            )
             Spacer(Modifier.height(8.dp))
 
             Text(

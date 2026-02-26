@@ -2,6 +2,7 @@ package com.powerampstartradio.indexing
 
 import android.util.Log
 import com.google.ai.edge.litert.Accelerator
+import com.google.ai.edge.litert.CompiledModel
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -46,7 +47,11 @@ class Clamp3TextInference(
     init {
         tokenizer = SentencePieceTokenizer(vocabFile, seqLen = SEQ_LEN)
 
-        val result = createReadyModel(modelFile.absolutePath, accelerator)
+        // Text model fallback chain:
+        // 1. GPU with FP32 precision (best quality, may fail on FP16-converted models)
+        // 2. GPU with default/FP16 precision (single forward pass, FP16 acceptable)
+        // 3. CPU (always works)
+        val result = loadWithFallback(modelFile.absolutePath, accelerator)
         model = result.model
         activeAccelerator = result.accelerator
         inputBuffers = result.inputBuffers
@@ -54,6 +59,48 @@ class Clamp3TextInference(
 
         Log.i(TAG, "CLaMP3 text encoder loaded: ${modelFile.name} " +
                 "(${modelFile.length() / 1024 / 1024}MB), accelerator=$activeAccelerator")
+    }
+
+    private fun loadWithFallback(path: String, preferred: Accelerator): ReadyModel {
+        if (preferred == Accelerator.GPU) {
+            // Try GPU with FP32 first
+            try {
+                return createReadyModel(path, Accelerator.GPU)
+            } catch (e: Exception) {
+                Log.w(TAG, "GPU+FP32 failed: ${e.message}")
+            }
+
+            // Try GPU with default (FP16) precision — acceptable for single-pass text
+            try {
+                val options = CompiledModel.Options(Accelerator.GPU)
+                val model = CompiledModel.create(path, options)
+                try {
+                    val inputs = model.createInputBuffers()
+                    val outputs = model.createOutputBuffers()
+                    Log.i(TAG, "GPU+FP16 succeeded")
+                    return ReadyModel(model, inputs, outputs, Accelerator.GPU)
+                } catch (e2: Exception) {
+                    model.close()
+                    Log.w(TAG, "GPU+FP16 buffer alloc failed: ${e2.message}")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "GPU+FP16 compilation failed: ${e.message}")
+            }
+        }
+
+        // CPU fallback
+        try {
+            return createReadyModel(path, Accelerator.CPU)
+        } catch (e: Exception) {
+            Log.w(TAG, "CPU with default options failed: ${e.message}")
+        }
+
+        // Last resort: CPU with no options at all
+        val model = CompiledModel.create(path)
+        val inputs = model.createInputBuffers()
+        val outputs = model.createOutputBuffers()
+        Log.i(TAG, "CPU (bare) succeeded")
+        return ReadyModel(model, inputs, outputs, Accelerator.CPU)
     }
 
     /**
