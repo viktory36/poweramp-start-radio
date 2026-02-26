@@ -42,11 +42,16 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.Canvas
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.powerampstartradio.poweramp.PowerampHelper
@@ -298,9 +303,6 @@ fun HomeScreen(
                             Icon(Icons.Default.Clear, contentDescription = "Clear")
                         }
                     }
-                    IconButton(onClick = onOpenTextSearch) {
-                        Icon(Icons.Default.Search, contentDescription = "Text Search")
-                    }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Default.Settings, contentDescription = "Settings")
                     }
@@ -308,22 +310,32 @@ fun HomeScreen(
             )
         },
         floatingActionButton = {
-            if (radioState.isActiveSearch()) {
-                ExtendedFloatingActionButton(
-                    onClick = onCancelSearch,
-                    icon = { Icon(Icons.Default.Clear, contentDescription = null) },
-                    text = { Text("Cancel") },
-                    containerColor = MaterialTheme.colorScheme.errorContainer,
-                    contentColor = MaterialTheme.colorScheme.onErrorContainer,
-                    expanded = true
-                )
-            } else {
-                ExtendedFloatingActionButton(
-                    onClick = onStartRadio,
-                    icon = { Icon(Icons.Default.PlayArrow, contentDescription = null) },
-                    text = { Text("Start Radio") },
-                    expanded = true
-                )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onOpenTextSearch) {
+                    Icon(Icons.Default.Search, contentDescription = "Text Search",
+                        tint = MaterialTheme.colorScheme.onSurface)
+                }
+                val dividerColor = MaterialTheme.colorScheme.outlineVariant
+                Canvas(modifier = Modifier.height(28.dp).width(2.dp)) {
+                    val path = Path().apply {
+                        moveTo(center.x, 0f)
+                        quadraticTo(size.width, center.y, center.x, size.height)
+                        quadraticTo(0f, center.y, center.x, 0f)
+                    }
+                    drawPath(path, dividerColor)
+                }
+                if (radioState.isActiveSearch()) {
+                    IconButton(onClick = onCancelSearch) {
+                        Icon(Icons.Default.Clear, contentDescription = "Cancel",
+                            tint = MaterialTheme.colorScheme.error)
+                    }
+                } else {
+                    IconButton(onClick = onStartRadio) {
+                        Icon(painterResource(R.drawable.ic_radio_waves),
+                            contentDescription = "Start Radio",
+                            tint = MaterialTheme.colorScheme.primary)
+                    }
+                }
             }
         }
     ) { padding ->
@@ -445,10 +457,11 @@ fun CompactNowPlayingHeader(
                 }
             }
             Text(text = currentTrack.title, style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.primary)
             Text(text = listOfNotNull(currentTrack.artist, currentTrack.album).joinToString(" \u00b7 "),
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     } else {
@@ -691,6 +704,7 @@ fun IdleContent(
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         if (indexStatus != null && indexStatus != "Index ready") {
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             Text(indexStatus, style = MaterialTheme.typography.bodySmall,
                 fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
@@ -707,7 +721,7 @@ fun IdleContent(
 
 // ---- Text Search Screen ----
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun TextSearchScreen(
     viewModel: MainViewModel = viewModel(),
@@ -716,7 +730,7 @@ fun TextSearchScreen(
     val textSearchResult by viewModel.textSearchResult.collectAsState()
     val isLoading by viewModel.textSearchLoading.collectAsState()
     val recentSearches by viewModel.recentSearches.collectAsState()
-    var query by remember { mutableStateOf("") }
+    var query by remember { mutableStateOf(TextFieldValue("")) }
     val focusRequester = remember { FocusRequester() }
 
     LaunchedEffect(Unit) {
@@ -725,16 +739,28 @@ fun TextSearchScreen(
 
     fun doSearch(q: String) {
         if (q.isBlank()) return
-        query = q
+        query = TextFieldValue(q, selection = TextRange(q.length))
         viewModel.performTextSearch(q.trim())
     }
+
+    BackHandler(enabled = textSearchResult != null) {
+        viewModel.clearTextSearchResult()
+    }
+
+    val dynamicTitle = if (textSearchResult != null) "Results" else "Vibe Search"
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Text Search") },
+                title = { Text(dynamicTitle) },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
+                    IconButton(onClick = {
+                        if (textSearchResult != null) {
+                            viewModel.clearTextSearchResult()
+                        } else {
+                            onBack()
+                        }
+                    }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 }
@@ -748,47 +774,58 @@ fun TextSearchScreen(
                 .padding(horizontal = 16.dp)
         ) {
             // Search input
+            val placeholderHint = remember {
+                listOf(
+                    "classic rock, British, 1960s, upbeat",
+                    "Heartfelt and nostalgic, with a bittersweet, melancholic feel",
+                    "A Latin jazz piece with rhythmic percussion and brass",
+                    "big band, major key, swing, brass-heavy, syncopation, baritone vocal",
+                ).random()
+            }
             OutlinedTextField(
                 value = query,
                 onValueChange = { query = it },
                 label = { Text("Describe what you want to hear...") },
+                placeholder = {
+                    Text(
+                        placeholderHint,
+                        modifier = Modifier.basicMarquee(),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                        maxLines = 1,
+                    )
+                },
                 singleLine = true,
                 modifier = Modifier
                     .fillMaxWidth()
                     .focusRequester(focusRequester),
                 trailingIcon = {
-                    if (query.isNotEmpty()) {
-                        IconButton(onClick = { query = "" }) {
-                            Icon(Icons.Default.Clear, contentDescription = "Clear")
+                    if (isLoading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                        )
+                    } else if (query.text.isNotEmpty()) {
+                        Row {
+                            IconButton(onClick = { doSearch(query.text) }) {
+                                Icon(Icons.Default.Search, contentDescription = "Search")
+                            }
+                            IconButton(onClick = {
+                                query = TextFieldValue("")
+                                viewModel.clearTextSearchResult()
+                            }) {
+                                Icon(Icons.Default.Clear, contentDescription = "Clear")
+                            }
                         }
                     }
                 },
                 keyboardActions = androidx.compose.foundation.text.KeyboardActions(
-                    onDone = { doSearch(query) }
+                    onSearch = { doSearch(query.text) }
                 ),
                 keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
                     imeAction = androidx.compose.ui.text.input.ImeAction.Search
                 ),
             )
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Button(
-                onClick = { doSearch(query) },
-                enabled = query.isNotBlank() && !isLoading,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                if (isLoading) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(18.dp),
-                        strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.onPrimary,
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Searching...")
-                } else {
-                    Text("Search")
-                }
-            }
 
             Spacer(modifier = Modifier.height(16.dp))
 
@@ -810,61 +847,69 @@ fun TextSearchScreen(
                     }
                 } else if (result.matches.isNotEmpty()) {
                     Text(
-                        "Results for \"${result.query}\"",
+                        "\"${result.query}\" \u00b7 ${result.matches.size} results",
                         style = MaterialTheme.typography.titleSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Spacer(modifier = Modifier.height(8.dp))
 
-                    LazyColumn(
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                        modifier = Modifier.weight(1f),
+                    Surface(
+                        shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp),
+                        tonalElevation = 1.dp,
+                        modifier = Modifier.weight(1f).fillMaxWidth(),
                     ) {
-                        items(result.matches.size) { i ->
-                            val match = result.matches[i]
-                            val simPct = (match.similarity * 100).roundToInt()
-                            Card(
-                                modifier = Modifier.fillMaxWidth().clickable {
-                                    viewModel.startRadioFromTextSearch(match.track.id)
-                                    onBack()
-                                },
-                            ) {
-                                Column(modifier = Modifier.padding(12.dp)) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically,
-                                    ) {
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Text(
-                                                match.track.title ?: "Unknown",
-                                                style = MaterialTheme.typography.bodyMedium,
-                                                fontWeight = FontWeight.Bold,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis,
-                                            )
-                                            Text(
-                                                listOfNotNull(
-                                                    match.track.artist,
-                                                    match.track.album
-                                                ).joinToString(" \u00b7 "),
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis,
-                                            )
+                        LazyColumn(
+                            modifier = Modifier.fillMaxSize(),
+                        ) {
+                            items(result.matches.size) { i ->
+                                val match = result.matches[i]
+                                val simPct = (match.similarity * 100).roundToInt()
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            viewModel.startRadioFromTextSearch(match.track.id)
+                                            onBack()
                                         }
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        "\u25B6",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
                                         Text(
-                                            "$simPct%",
-                                            style = MaterialTheme.typography.labelMedium,
-                                            color = MaterialTheme.colorScheme.primary,
+                                            match.track.title ?: "Unknown",
+                                            modifier = Modifier.basicMarquee(),
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                        )
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        Text(
+                                            listOfNotNull(
+                                                match.track.artist,
+                                                match.track.album
+                                            ).joinToString(" \u00b7 "),
+                                            modifier = Modifier.basicMarquee(),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
                                         )
                                     }
-                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Spacer(modifier = Modifier.width(8.dp))
                                     Text(
-                                        "Tap to start radio from this track",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                                        "$simPct%",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                if (i < result.matches.lastIndex) {
+                                    HorizontalDivider(
+                                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.2f),
                                     )
                                 }
                             }
@@ -872,16 +917,25 @@ fun TextSearchScreen(
                     }
                 }
             } else if (!isLoading && recentSearches.isNotEmpty()) {
-                Text(
-                    "Recent searches",
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "Recent searches",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    TextButton(onClick = { viewModel.clearRecentSearches() }) {
+                        Text("Clear")
+                    }
+                }
                 Spacer(modifier = Modifier.height(4.dp))
                 recentSearches.forEach { recent ->
                     TextButton(
                         onClick = {
-                            query = recent
+                            query = TextFieldValue(recent, selection = TextRange(recent.length))
                             doSearch(recent)
                         },
                         modifier = Modifier.fillMaxWidth(),
