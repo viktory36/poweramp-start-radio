@@ -5,6 +5,7 @@ import com.powerampstartradio.data.EmbeddedTrack
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.data.EmbeddingIndex
 import com.powerampstartradio.data.GraphIndex
+import com.powerampstartradio.indexing.GraphUpdater
 import com.powerampstartradio.similarity.algorithms.DppSelector
 import com.powerampstartradio.similarity.algorithms.DriftEngine
 import com.powerampstartradio.similarity.algorithms.MmrSelector
@@ -93,7 +94,13 @@ class RecommendationEngine(
         val graphFile = File(filesDir, "graph.bin")
         if (!graphFile.exists() || graphFile.lastModified() < dbModified) {
             onProgress?.invoke("Extracting kNN graph...")
-            GraphIndex.extractFromDatabase(database, graphFile)
+            val extracted = GraphIndex.extractFromDatabase(database, graphFile)
+            if (!extracted && embFile.exists()) {
+                Log.i(TAG, "No graph in database, building from scratch...")
+                onProgress?.invoke("Building kNN graph (one-time)...")
+                val graphUpdater = GraphUpdater(database, filesDir)
+                graphUpdater.rebuildIndices(onProgress)
+            }
         }
         if (graphFile.exists() && graphIndex == null) {
             try {

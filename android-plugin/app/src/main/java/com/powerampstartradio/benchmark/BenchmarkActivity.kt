@@ -22,6 +22,7 @@ import androidx.core.content.ContextCompat
 import com.google.gson.GsonBuilder
 import com.google.ai.edge.litert.Accelerator
 import com.powerampstartradio.data.EmbeddingDatabase
+import com.powerampstartradio.data.EmbeddingIndex
 import com.powerampstartradio.indexing.*
 import com.powerampstartradio.poweramp.PowerampHelper
 import kotlinx.coroutines.*
@@ -106,10 +107,18 @@ class BenchmarkActivity : ComponentActivity() {
             }
         }
 
-        // Auto-start via intent extra: --ez auto_start true
-        LaunchedEffect(Unit) {
-            if (intent.getBooleanExtra("auto_start", false) && hasAudioPermission()) {
-                startBenchmark()
+        fun startTextBenchmark() {
+            running = true
+            status = "Starting text search benchmark..."
+            scope.launch(Dispatchers.IO) {
+                try {
+                    runTextBenchmark { msg -> status = msg }
+                } catch (e: Throwable) {
+                    Log.e(TAG, "Text benchmark failed", e)
+                    status = "ERROR: ${e.message}\n\n${e.stackTraceToString()}"
+                } finally {
+                    running = false
+                }
             }
         }
 
@@ -123,6 +132,17 @@ class BenchmarkActivity : ComponentActivity() {
                     status = "ERROR: ${e.message}\n\n${e.stackTraceToString()}"
                 } finally {
                     running = false
+                }
+            }
+        }
+
+        // Auto-start via intent extra: --ez auto_start true [--es benchmark_type text|audio]
+        LaunchedEffect(Unit) {
+            if (intent.getBooleanExtra("auto_start", false)) {
+                val type = intent.getStringExtra("benchmark_type") ?: "audio"
+                when (type) {
+                    "text" -> startTextBenchmark()
+                    else -> if (hasAudioPermission()) startBenchmark()
                 }
             }
         }
@@ -176,6 +196,13 @@ class BenchmarkActivity : ComponentActivity() {
                     enabled = !running,
                 ) {
                     Text(if (running) "Running..." else "Benchmark ($selectedAccelerator)")
+                }
+
+                OutlinedButton(
+                    onClick = { startTextBenchmark() },
+                    enabled = !running,
+                ) {
+                    Text("Text Search")
                 }
 
                 OutlinedButton(
@@ -674,6 +701,217 @@ class BenchmarkActivity : ComponentActivity() {
         log("\nDiagnostics complete.")
     }
 
+    // ── Text Search Benchmark ─────────────────────────────────────────────────
+
+    private val textTestQueries = listOf(
+        "ethereal ambient",
+        "heavy metal guitar",
+        "jazz piano trio",
+        "electronic dance music",
+        "sufi devotional music",
+        "lo-fi hip hop beats",
+        "orchestral film score",
+        "acoustic folk guitar",
+    )
+
+    private suspend fun runTextBenchmark(onStatus: (String) -> Unit) {
+        val sb = StringBuilder()
+        fun log(msg: String) {
+            sb.appendLine(msg)
+            Log.i(TAG, msg)
+            onStatus(sb.toString())
+        }
+
+        log("=== CLaMP3 Text Search Benchmark ===")
+        log("Device: ${Build.MANUFACTURER} ${Build.MODEL}")
+        log("SOC: ${Build.SOC_MODEL}")
+        log("")
+
+        // Resolve text model + vocab
+        val textModelFile = resolveModelFile(filesDir, "clamp3_text")
+        val vocabFile = File(filesDir, "xlm_roberta_vocab.json")
+
+        if (!textModelFile.exists()) {
+            log("ERROR: CLaMP3 text model not found at ${textModelFile.absolutePath}")
+            log("Push clamp3_text.tflite or clamp3_text_fp16.tflite to ${filesDir.absolutePath}")
+            return
+        }
+        if (!vocabFile.exists()) {
+            log("ERROR: Vocab file not found at ${vocabFile.absolutePath}")
+            log("Push xlm_roberta_vocab.json to ${filesDir.absolutePath}")
+            return
+        }
+
+        // Load text model
+        log("Loading CLaMP3 text model...")
+        val loadStart = System.nanoTime()
+        val textInference = try {
+            Clamp3TextInference(textModelFile, vocabFile)
+        } catch (e: Exception) {
+            log("Text model load FAILED: ${e.message}")
+            log(e.stackTraceToString())
+            return
+        }
+        val loadMs = (System.nanoTime() - loadStart) / 1_000_000
+        val textAccel = textInference.activeAccelerator.name
+        log("  Loaded in ${loadMs}ms (accelerator: $textAccel)")
+        log("  Model: ${textModelFile.name} (${textModelFile.length() / 1024 / 1024}MB)")
+        log("  Vocab: ${vocabFile.name} (${vocabFile.length() / 1024}KB)")
+        log("")
+
+        // Load audio embedding index for search comparison
+        val embFile = File(filesDir, "clamp3.emb")
+        val dbFile = File(filesDir, "embeddings.db")
+        var embIndex: EmbeddingIndex? = null
+
+        if (embFile.exists()) {
+            log("Loading embedding index: ${embFile.name} (${embFile.length() / 1024 / 1024}MB)")
+            try {
+                embIndex = EmbeddingIndex.mmap(embFile)
+                log("  ${embIndex.numTracks} tracks, ${embIndex.dim}d")
+            } catch (e: Exception) {
+                log("  WARNING: Failed to load embedding index: ${e.message}")
+            }
+        } else if (dbFile.exists()) {
+            log("Extracting embedding index from DB...")
+            try {
+                val db = EmbeddingDatabase.open(dbFile)
+                EmbeddingIndex.extractFromDatabase(db, embFile)
+                db.close()
+                embIndex = EmbeddingIndex.mmap(embFile)
+                log("  Extracted ${embIndex.numTracks} tracks, ${embIndex.dim}d")
+            } catch (e: Exception) {
+                log("  WARNING: Failed to extract embeddings: ${e.message}")
+            }
+        } else {
+            log("No embedding index or DB found — search results unavailable")
+        }
+
+        // Open DB for track metadata lookups (getTrackById for each search hit)
+        var metaDb: EmbeddingDatabase? = null
+        if (embIndex != null && dbFile.exists()) {
+            try {
+                metaDb = EmbeddingDatabase.open(dbFile)
+                log("  DB opened for metadata (${metaDb.getTrackCount()} tracks)")
+            } catch (e: Exception) {
+                log("  WARNING: Failed to open DB for metadata: ${e.message}")
+            }
+        }
+        log("")
+
+        // Run test queries
+        val queryResults = mutableListOf<TextQueryResult>()
+        val debugDir = File(filesDir, "text_benchmark")
+
+        for ((qi, query) in textTestQueries.withIndex()) {
+            log("Query [${qi + 1}/${textTestQueries.size}]: \"$query\"")
+
+            val t0 = System.nanoTime()
+            val embedding = textInference.generateEmbedding(query, debugDir = debugDir)
+            val totalMs = (System.nanoTime() - t0) / 1_000_000
+
+            if (embedding == null) {
+                log("  FAILED: null embedding")
+                queryResults.add(TextQueryResult(query = query, error = "null embedding"))
+                continue
+            }
+
+            // Check embedding quality
+            val nanCount = embedding.count { it.isNaN() }
+            val infCount = embedding.count { it.isInfinite() }
+            val norm = kotlin.math.sqrt(embedding.sumOf { (it * it).toDouble() }).toFloat()
+            val absMax = embedding.maxOf { kotlin.math.abs(it) }
+
+            if (nanCount > 0 || infCount > 0) {
+                log("  WARNING: $nanCount NaN, $infCount Inf in ${embedding.size}d embedding")
+            }
+            log("  ${embedding.size}d, norm=${"%.4f".format(norm)}, absmax=${"%.4f".format(absMax)}, time=${totalMs}ms")
+
+            // Search against audio embeddings
+            var searchResults: List<TextSearchHit>? = null
+            if (embIndex != null) {
+                val searchStart = System.nanoTime()
+                val topK = embIndex.findTopK(embedding, 10)
+                val searchMs = (System.nanoTime() - searchStart) / 1_000_000
+                log("  Search: ${embIndex.numTracks} tracks in ${searchMs}ms")
+
+                searchResults = topK.map { (trackId, sim) ->
+                    val track = metaDb?.getTrackById(trackId)
+                    val label = if (track != null) {
+                        "${track.artist} - ${track.title}"
+                    } else "trackId=$trackId"
+                    TextSearchHit(trackId = trackId, similarity = sim, label = label)
+                }
+
+                for ((rank, hit) in searchResults.withIndex()) {
+                    log("    ${rank + 1}. ${"%.4f".format(hit.similarity)}  ${hit.label}")
+                }
+            }
+
+            queryResults.add(TextQueryResult(
+                query = query,
+                dim = embedding.size,
+                norm = norm,
+                absMax = absMax,
+                totalMs = totalMs,
+                embedding = embedding.toList(),
+                topMatches = searchResults,
+            ))
+            log("")
+        }
+
+        textInference.close()
+        metaDb?.close()
+        log("Text model closed.")
+
+        // Save results JSON
+        val output = TextBenchmarkOutput(
+            device = "${Build.MANUFACTURER} ${Build.MODEL}",
+            soc = Build.SOC_MODEL,
+            androidVersion = "${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})",
+            textModel = textModelFile.name,
+            textAccelerator = textAccel,
+            textLoadMs = loadMs,
+            numAudioTracks = embIndex?.numTracks ?: 0,
+            queries = queryResults,
+        )
+
+        val gson = GsonBuilder().setPrettyPrinting().create()
+        val json = gson.toJson(output)
+        val outputFile = File(filesDir, "text_benchmark_results.json")
+        outputFile.writeText(json)
+
+        log("\n=== Results saved ===")
+        log("File: ${outputFile.absolutePath}")
+        log("Pull: adb shell run-as com.powerampstartradio cat files/text_benchmark_results.json")
+
+        // Timing summary
+        log("\n=== Timing Summary ===")
+        log("Model load: ${loadMs}ms ($textAccel)")
+        log("")
+        log(String.format("%-30s %8s %8s %8s", "Query", "Total", "Norm", "AbsMax"))
+        log("-".repeat(60))
+        for (r in queryResults) {
+            if (r.error != null) {
+                log(String.format("%-30s %8s", r.query.take(30), "FAILED"))
+            } else {
+                log(String.format("%-30s %7dms %7.4f %7.4f",
+                    r.query.take(30), r.totalMs, r.norm, r.absMax))
+            }
+        }
+
+        val successfulQueries = queryResults.filter { it.error == null }
+        if (successfulQueries.isNotEmpty()) {
+            val avgMs = successfulQueries.map { it.totalMs }.average().toLong()
+            val avgNorm = successfulQueries.map { it.norm.toDouble() }.average()
+            log("-".repeat(60))
+            log(String.format("%-30s %7dms %7.4f",
+                "AVERAGE (${successfulQueries.size})", avgMs, avgNorm))
+        }
+
+        log("\nText benchmark complete.")
+    }
+
     /** Prefer FP16 models (GPU-native, half size) over FP32 originals. */
     private fun resolveModelFile(dir: File, baseName: String): File {
         val variants = listOf("_fp16", "")
@@ -745,5 +983,34 @@ class BenchmarkActivity : ComponentActivity() {
     data class EmbeddingResult(
         val dim: Int,
         val embedding: List<Float>,
+    )
+
+    // Text benchmark data classes
+    data class TextBenchmarkOutput(
+        val device: String,
+        val soc: String,
+        val androidVersion: String,
+        val textModel: String,
+        val textAccelerator: String,
+        val textLoadMs: Long,
+        val numAudioTracks: Int,
+        val queries: List<TextQueryResult>,
+    )
+
+    data class TextQueryResult(
+        val query: String,
+        val dim: Int = 0,
+        val norm: Float = 0f,
+        val absMax: Float = 0f,
+        val totalMs: Long = 0,
+        val embedding: List<Float>? = null,
+        val topMatches: List<TextSearchHit>? = null,
+        val error: String? = null,
+    )
+
+    data class TextSearchHit(
+        val trackId: Long,
+        val similarity: Float,
+        val label: String,
     )
 }

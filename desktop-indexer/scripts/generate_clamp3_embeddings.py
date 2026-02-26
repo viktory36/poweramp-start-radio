@@ -728,6 +728,94 @@ def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False, fp16=False):
     gc.collect()
 
 
+# ─── Phase 3: kNN graph construction ──────────────────────────────────────────
+
+def build_knn_graph(db_path, k=20):
+    """Build a kNN graph from CLaMP3 embeddings and store in binary_data.
+
+    For each track, brute-force find K nearest neighbors via cosine similarity
+    (= dot product since embeddings are L2-normalized). Row-normalize weights
+    to transition probabilities.
+
+    Binary format (matching Android GraphIndex):
+      Header: N (uint32) + K (uint32)
+      ID map: N × int64 (track IDs in embedding order)
+      Graph:  N × K × (uint32 neighbor_index + float32 weight)
+    """
+    print("\n" + "=" * 70)
+    print("PHASE 3: kNN Graph Construction")
+    print("=" * 70)
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+
+    # Load all embeddings
+    rows = conn.execute(
+        "SELECT e.track_id, e.embedding FROM embeddings_clamp3 e"
+    ).fetchall()
+    n = len(rows)
+    if n == 0:
+        print("No embeddings found. Skipping graph build.")
+        conn.close()
+        return
+
+    track_ids = np.array([r['track_id'] for r in rows], dtype=np.int64)
+    embeddings = np.zeros((n, 768), dtype=np.float32)
+    for i, r in enumerate(rows):
+        embeddings[i] = np.frombuffer(r['embedding'], dtype=np.float32)
+
+    print(f"Loaded {n} embeddings, building kNN graph (K={k})...")
+    t0 = time.time()
+
+    # Brute-force: compute all pairwise similarities via matrix multiply
+    # For 75K × 768, this is ~4.3B ops — numpy does it in <2s
+    sims = embeddings @ embeddings.T  # [N, N] cosine similarities
+
+    # For each track, find K nearest (exclude self)
+    neighbors = np.zeros((n, k), dtype=np.int32)
+    weights = np.zeros((n, k), dtype=np.float32)
+
+    for i in range(n):
+        if i % 10000 == 0 and i > 0:
+            print(f"  kNN: {i}/{n}")
+        sims[i, i] = -1.0  # exclude self
+        top_k_idx = np.argpartition(sims[i], -k)[-k:]
+        top_k_idx = top_k_idx[np.argsort(sims[i, top_k_idx])[::-1]]  # sort desc
+        for j_idx, ni in enumerate(top_k_idx):
+            neighbors[i, j_idx] = ni
+            weights[i, j_idx] = max(sims[i, ni], 0.0)
+        # Row-normalize
+        total = weights[i].sum()
+        if total > 0:
+            weights[i] /= total
+
+    elapsed = time.time() - t0
+    print(f"Graph computed in {elapsed:.1f}s")
+
+    # Build binary blob
+    header = struct.pack('<II', n, k)
+    id_map = track_ids.tobytes()  # already int64 little-endian on x86
+
+    graph_data = bytearray()
+    for i in range(n):
+        for j in range(k):
+            graph_data += struct.pack('<If', neighbors[i, j], weights[i, j])
+
+    blob = header + id_map + bytes(graph_data)
+
+    # Store in binary_data table
+    conn.execute(
+        "INSERT OR REPLACE INTO binary_data (key, data) VALUES (?, ?)",
+        ("knn_graph", blob)
+    )
+    conn.commit()
+    conn.close()
+
+    size_mb = len(blob) / (1024 * 1024)
+    print(f"Graph stored: {n} nodes, K={k}, {size_mb:.1f} MB")
+    print(f"Saved to binary_data table in {db_path}")
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -743,8 +831,8 @@ Examples:
         """
     )
     parser.add_argument(
-        "music_dir",
-        help="Root directory of the music library")
+        "music_dir", nargs="?", default=None,
+        help="Root directory of the music library (not needed for --phase 3)")
     parser.add_argument(
         "-o", "--output", default="embeddings_clamp3.db",
         help="Output SQLite database path (default: embeddings_clamp3.db)")
@@ -753,8 +841,8 @@ Examples:
         help="Directory for MERT feature cache "
              "(default: mert_cache/ next to output DB)")
     parser.add_argument(
-        "--phase", choices=["1", "2", "both"], default="both",
-        help="Which phase to run (default: both)")
+        "--phase", choices=["1", "2", "3", "both"], default="both",
+        help="Which phase to run: 1=MERT, 2=CLaMP3, 3=kNN graph (default: both=all)")
     parser.add_argument(
         "--max-duration", type=int, default=600,
         help="Max audio duration in seconds (default: 600 = 10 min)")
@@ -771,12 +859,24 @@ Examples:
 
     args = parser.parse_args()
 
+    db_path = Path(args.output).resolve()
+
+    if args.phase == "3":
+        # Phase 3 only — just build graph on existing DB, no music_dir needed
+        if not db_path.exists():
+            print(f"ERROR: Database not found: {db_path}")
+            return 1
+        build_knn_graph(db_path)
+        return 0
+
+    if not args.music_dir:
+        print("ERROR: music_dir is required for phase 1/2/both")
+        return 1
+
     music_dir = Path(args.music_dir).resolve()
     if not music_dir.is_dir():
         print(f"ERROR: Music directory not found: {music_dir}")
         return 1
-
-    db_path = Path(args.output).resolve()
     if args.cache_dir:
         cache_dir = Path(args.cache_dir).resolve()
     else:
@@ -795,6 +895,9 @@ Examples:
     if args.phase in ("2", "both"):
         phase2_clamp3(music_dir, cache_dir, db_path, verbose=args.verbose,
                       fp16=args.fp16)
+
+    if args.phase == "both":
+        build_knn_graph(db_path)
 
     return 0
 

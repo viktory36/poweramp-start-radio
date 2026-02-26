@@ -129,8 +129,12 @@ class GraphUpdater(
         onProgress?.invoke("Writing graph binary...")
         val graphBlob = buildGraphBinary(index, neighbors, weights, k)
 
-        // Store in DB binary_data table
-        db.setBinaryData("knn_graph", graphBlob)
+        // Store in DB binary_data table (only if DB is writable)
+        if (db.isReadWrite) {
+            db.setBinaryData("knn_graph", graphBlob)
+        } else {
+            Log.d(TAG, "DB is read-only, skipping binary_data write (graph.bin file only)")
+        }
 
         // Also extract to file
         val graphFile = File(filesDir, "graph.bin")
