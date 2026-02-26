@@ -79,6 +79,7 @@ class EmbeddingIndex private constructor(
             onProgress: ((current: Int, total: Int) -> Unit)? = null
         ) {
             val tableName = table ?: db.embeddingTable
+            val t0 = System.nanoTime()
             Log.d(TAG, "Extracting embeddings from $tableName to ${outFile.name}")
 
             val numTracks = db.getEmbeddingCountForTable(tableName)
@@ -149,7 +150,8 @@ class EmbeddingIndex private constructor(
                 buf.force()
             }
 
-            Log.i(TAG, "Wrote ${outFile.length() / 1024 / 1024} MB to ${outFile.name}")
+            val extractMs = (System.nanoTime() - t0) / 1_000_000
+            Log.i(TAG, "Wrote ${outFile.length() / 1024 / 1024} MB to ${outFile.name} in ${extractMs}ms")
         }
     }
 

@@ -687,6 +687,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun importDatabase(uri: Uri) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                val t0 = System.nanoTime()
+                Log.i("MainViewModel", "importDatabase: starting from URI $uri")
                 _importStatus.value = "Copying database..."
                 val app = getApplication<Application>()
                 val destFile = File(app.filesDir, "embeddings.db")
@@ -708,6 +710,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 File(app.filesDir, "graph.bin").delete()
 
                 // Atomic replace: delete old, rename temp to final
+                val copyMs = (System.nanoTime() - t0) / 1_000_000
+                val fileSizeMB = tempFile.length() / (1024 * 1024)
+                Log.i("MainViewModel", "TIMING: DB copy ${fileSizeMB}MB in ${copyMs}ms")
                 destFile.delete()
                 if (!tempFile.renameTo(destFile)) {
                     throw java.io.IOException("Failed to move imported database")
@@ -718,6 +723,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val db = EmbeddingDatabase.open(destFile)
 
                 _importStatus.value = "Reading database info..."
+                val tInfo = System.nanoTime()
                 val info = DatabaseInfo(
                     trackCount = db.getTrackCount(),
                     embeddingCount = db.getEmbeddingCount(),
@@ -729,6 +735,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     availableModels = db.getAvailableModels(),
                 )
                 db.close()
+                val infoMs = (System.nanoTime() - tInfo) / 1_000_000
+                Log.i("MainViewModel", "DB info: ${info.trackCount} tracks, " +
+                    "${info.embeddingCount} embeddings, dim=${info.embeddingDim}, " +
+                    "hasGraph=${info.hasGraph}, models=${info.availableModels} (${infoMs}ms)")
                 _databaseInfo.value = info
 
                 // Extract indices with progress updates
@@ -738,6 +748,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 checkModels()
+                val totalMs = (System.nanoTime() - t0) / 1_000_000
+                Log.i("MainViewModel", "TIMING: importDatabase total = ${totalMs}ms")
                 _importStatus.value = null
 
                 // Fire-and-forget: unindexed count updates independently

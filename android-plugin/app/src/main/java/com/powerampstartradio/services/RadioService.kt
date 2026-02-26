@@ -262,7 +262,11 @@ class RadioService : Service() {
     private fun performRadio(config: RadioConfig, overrideSeedTrackId: Long? = null) {
         activeJob = serviceScope.launch {
             try {
+                val radioStart = System.nanoTime()
                 toast("Starting radio...")
+                Log.i(TAG, "performRadio: mode=${config.selectionMode.name}, " +
+                    "drift=${config.driftEnabled}, numTracks=${config.numTracks}, " +
+                    "seedOverride=$overrideSeedTrackId")
 
                 val db = getOrCreateDatabase()
                 if (db == null) {
@@ -350,10 +354,13 @@ class RadioService : Service() {
                     " lambda=${config.diversityLambda}")
 
                 val eng = getOrCreateEngine(db)
+                val tIndices = System.nanoTime()
                 eng.ensureIndices { message ->
                     _uiState.value = RadioUiState.Loading(message)
                     updateNotification(message)
                 }
+                val indicesMs = (System.nanoTime() - tIndices) / 1_000_000
+                Log.d(TAG, "ensureIndices: ${indicesMs}ms")
 
                 // Resolve auto pool size so RadioResult carries the actual value
                 val resolvedConfig = if (config.candidatePoolSize <= 0) {
@@ -502,7 +509,9 @@ class RadioService : Service() {
                     val notFound = streamingTracks.count { it.status == QueueStatus.NOT_IN_LIBRARY }
                     val message = buildQueueResultMessage(finalResult.queuedCount, notFound)
                     updateNotification(message)
-                    Log.d(TAG, "Queue result: ${finalResult.queuedCount} queued / ${finalResult.failedCount} failed / $notFound not found")
+                    val totalMs = (System.nanoTime() - radioStart) / 1_000_000
+                    Log.i(TAG, "TIMING: radio_drift total=${totalMs}ms, " +
+                        "${finalResult.queuedCount} queued / ${finalResult.failedCount} failed / $notFound not found")
                     Toast.makeText(this@RadioService, message, Toast.LENGTH_SHORT).show()
 
                 } else {
@@ -526,8 +535,11 @@ class RadioService : Service() {
                         return@launch
                     }
 
+                    val tMap = System.nanoTime()
                     val mappedTracks = matcher.mapSimilarTracksToFileIds(this@RadioService, similarTracks)
                     val fileIds = mappedTracks.mapNotNull { it.fileId }
+                    val mapMs = (System.nanoTime() - tMap) / 1_000_000
+                    Log.d(TAG, "Track mapping: ${similarTracks.size} → ${fileIds.size} file IDs in ${mapMs}ms")
 
                     if (fileIds.isEmpty()) {
                         _uiState.value = RadioUiState.Error("Could not find tracks in Poweramp library")
@@ -547,7 +559,10 @@ class RadioService : Service() {
                     }
 
                     val queueCurrentId = textSearchQueueAnchorId ?: seedDisplayTrack.realId
+                    val tQueue = System.nanoTime()
                     val queuedCount = PowerampHelper.replaceQueue(this@RadioService, queueCurrentId, allFileIds)
+                    val queueMs = (System.nanoTime() - tQueue) / 1_000_000
+                    Log.d(TAG, "Poweramp queue: ${queuedCount}/${allFileIds.size} queued in ${queueMs}ms")
                     val queuedFileIds = allFileIds.take(queuedCount).toSet()
 
                     val trackResults = mappedTracks.map { mapped ->
@@ -592,7 +607,9 @@ class RadioService : Service() {
                     val notFound = trackResults.count { it.status == QueueStatus.NOT_IN_LIBRARY }
                     val message = buildQueueResultMessage(radioResult.queuedCount, notFound)
                     updateNotification(message)
-                    Log.d(TAG, "Queue result: ${radioResult.queuedCount} queued / ${radioResult.failedCount} failed / $notFound not found")
+                    val totalMs = (System.nanoTime() - radioStart) / 1_000_000
+                    Log.i(TAG, "TIMING: radio_batch total=${totalMs}ms, " +
+                        "${radioResult.queuedCount} queued / ${radioResult.failedCount} failed / $notFound not found")
                     Toast.makeText(this@RadioService, message, Toast.LENGTH_SHORT).show()
                 }
 

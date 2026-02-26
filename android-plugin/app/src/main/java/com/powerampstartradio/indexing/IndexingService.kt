@@ -291,8 +291,13 @@ class IndexingService : Service() {
                     val nextFile = resolveAudioFile(nextTrack) ?: return
                     prefetchIndex = idx
                     prefetchJob = async(Dispatchers.Default) {
-                        audioDecoder.decode(nextFile, MertInference.SAMPLE_RATE,
-                            maxDurationS = MertInference.MAX_DURATION_S)
+                        try {
+                            audioDecoder.decode(nextFile, MertInference.SAMPLE_RATE,
+                                maxDurationS = MertInference.MAX_DURATION_S)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Prefetch decode failed for: ${nextTrack.title}", e)
+                            null
+                        }
                     }
                 }
 
@@ -466,6 +471,7 @@ class IndexingService : Service() {
                     )
 
                     if (embedding == null) {
+                        Log.w(TAG, "CLaMP3 encode failed for: ${track.artist} - ${track.title}")
                         failed++
                         continue
                     }
@@ -488,6 +494,7 @@ class IndexingService : Service() {
                     if (trackId > 0) {
                         indexed++
                     } else {
+                        Log.e(TAG, "DB write failed for: ${track.artist} - ${track.title}")
                         failed++
                     }
                     Log.i(TAG, "TIMING: clamp3_encode " +

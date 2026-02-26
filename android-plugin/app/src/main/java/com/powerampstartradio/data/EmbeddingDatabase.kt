@@ -4,6 +4,7 @@ import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.net.Uri
+import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
@@ -36,6 +37,7 @@ class EmbeddingDatabase private constructor(
     val isReadWrite: Boolean get() = !db.isReadOnly
 
     companion object {
+        private const val TAG = "EmbeddingDatabase"
         /**
          * Open the database in read-only mode.
          */
@@ -60,6 +62,7 @@ class EmbeddingDatabase private constructor(
             // Migration: add source column if not present
             try {
                 db.execSQL("ALTER TABLE tracks ADD COLUMN source TEXT DEFAULT 'desktop'")
+                Log.d(TAG, "Migration: added 'source' column to tracks")
             } catch (_: Exception) {
                 // Column already exists
             }
@@ -81,12 +84,15 @@ class EmbeddingDatabase private constructor(
          * Import database from a content URI (e.g., from document picker).
          */
         fun importFrom(context: Context, uri: Uri, destFile: File): EmbeddingDatabase {
+            val t0 = System.nanoTime()
             context.contentResolver.openInputStream(uri)?.use { input ->
                 FileOutputStream(destFile).use { output ->
                     input.copyTo(output)
                 }
             } ?: throw IllegalArgumentException("Cannot open URI: $uri")
 
+            val copyMs = (System.nanoTime() - t0) / 1_000_000
+            Log.i(TAG, "Imported DB: ${destFile.length() / 1024}KB in ${copyMs}ms from $uri")
             return open(destFile)
         }
 
@@ -150,6 +156,7 @@ class EmbeddingDatabase private constructor(
             val cursor = db.rawQuery("SELECT COUNT(*) FROM [${embeddingTable}]", null)
             cursor.use { if (it.moveToFirst()) it.getInt(0) else 0 }
         } catch (e: Exception) {
+            Log.w(TAG, "getEmbeddingCount failed (table=$embeddingTable): ${e.message}")
             0
         }
     }
@@ -163,6 +170,7 @@ class EmbeddingDatabase private constructor(
                 if (it.moveToFirst()) it.getInt(0) / 4 else null
             }
         } catch (e: Exception) {
+            Log.w(TAG, "getEmbeddingDim failed (table=$embeddingTable): ${e.message}")
             null
         }
     }
@@ -184,7 +192,9 @@ class EmbeddingDatabase private constructor(
                         if (count > 0) models.add(model to count)
                     }
                 }
-            } catch (_: Exception) { }
+            } catch (e: Exception) {
+                Log.w(TAG, "getAvailableModels: failed to query $table: ${e.message}")
+            }
         }
         return models
     }
@@ -300,7 +310,10 @@ class EmbeddingDatabase private constructor(
             db.rawQuery("SELECT COUNT(*) FROM [$table]", null).use {
                 if (it.moveToFirst()) it.getInt(0) else 0
             }
-        } catch (e: Exception) { 0 }
+        } catch (e: Exception) {
+            Log.w(TAG, "getEmbeddingCountForTable($table) failed: ${e.message}")
+            0
+        }
     }
 
     /**
@@ -311,7 +324,10 @@ class EmbeddingDatabase private constructor(
             db.rawQuery("SELECT length(embedding) FROM [$table] LIMIT 1", null).use {
                 if (it.moveToFirst()) it.getInt(0) / 4 else null
             }
-        } catch (e: Exception) { null }
+        } catch (e: Exception) {
+            Log.w(TAG, "getEmbeddingDimForTable($table) failed: ${e.message}")
+            null
+        }
     }
 
     /**
@@ -326,7 +342,7 @@ class EmbeddingDatabase private constructor(
                 }
             }
         } catch (e: Exception) {
-            // cluster_id column may not exist in older databases
+            Log.d(TAG, "loadClusterAssignments: cluster_id column not available: ${e.message}")
         }
         return result
     }
@@ -343,7 +359,7 @@ class EmbeddingDatabase private constructor(
                 }
             }
         } catch (e: Exception) {
-            // clusters table may not exist in older databases
+            Log.d(TAG, "loadCentroids: clusters table not available: ${e.message}")
         }
         return result
     }
@@ -383,6 +399,7 @@ class EmbeddingDatabase private constructor(
                 arrayOf(key)
             ).use { it.moveToFirst() }
         } catch (e: Exception) {
+            Log.d(TAG, "hasBinaryData($key): table missing or error: ${e.message}")
             false
         }
     }
@@ -416,7 +433,26 @@ class EmbeddingDatabase private constructor(
             }
             true
         } catch (e: Exception) {
+            Log.e(TAG, "extractBinaryToFile($key) failed: ${e.message}")
             false
+        }
+    }
+
+    fun getEmbeddingFromTable(tableName: String, trackId: Long): FloatArray? {
+        return try {
+            val cursor = db.rawQuery(
+                "SELECT embedding FROM [$tableName] WHERE track_id = ?",
+                arrayOf(trackId.toString())
+            )
+            cursor.use {
+                if (it.moveToFirst()) {
+                    val blob = it.getBlob(0)
+                    blobToFloatArray(blob)
+                } else null
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "getEmbeddingFromTable($tableName, $trackId) failed: ${e.message}")
+            null
         }
     }
 
@@ -545,26 +581,6 @@ class EmbeddingDatabase private constructor(
             }
         }
         return paths
-    }
-
-    /**
-     * Get an embedding for a track from a specific named table.
-     */
-    fun getEmbeddingFromTable(tableName: String, trackId: Long): FloatArray? {
-        return try {
-            val cursor = db.rawQuery(
-                "SELECT embedding FROM [$tableName] WHERE track_id = ?",
-                arrayOf(trackId.toString())
-            )
-            cursor.use {
-                if (it.moveToFirst()) {
-                    val blob = it.getBlob(0)
-                    blobToFloatArray(blob)
-                } else null
-            }
-        } catch (e: Exception) {
-            null
-        }
     }
 
     /**

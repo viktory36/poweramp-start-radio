@@ -35,23 +35,33 @@ class GraphUpdater(
      * @param onProgress Status callback
      */
     fun rebuildIndices(onProgress: ((String) -> Unit)? = null) {
+        val t0 = System.nanoTime()
+
         // Step 1: Regenerate .emb file from database
         onProgress?.invoke("Rebuilding embedding index...")
         val embFile = File(filesDir, "clamp3.emb")
+        val tEmb = System.nanoTime()
         EmbeddingIndex.extractFromDatabase(db, embFile) { current, total ->
             onProgress?.invoke("Extracting embeddings: $current/$total")
         }
+        val embMs = (System.nanoTime() - tEmb) / 1_000_000
+        Log.i(TAG, "TIMING: extract embeddings = ${embMs}ms (${embFile.length() / 1024}KB)")
 
         // Step 2: Regenerate graph from database (if graph exists in DB)
         onProgress?.invoke("Extracting graph...")
         val graphFile = File(filesDir, "graph.bin")
+        val tGraph = System.nanoTime()
         val hasGraph = GraphIndex.extractFromDatabase(db, graphFile)
+        val graphExtractMs = (System.nanoTime() - tGraph) / 1_000_000
+        Log.d(TAG, "TIMING: extract graph = ${graphExtractMs}ms (hasGraph=$hasGraph)")
 
         if (!hasGraph) {
             onProgress?.invoke("No graph in database, building from scratch...")
             buildKnnGraph(embFile, onProgress)
         }
 
+        val totalMs = (System.nanoTime() - t0) / 1_000_000
+        Log.i(TAG, "TIMING: rebuildIndices total = ${totalMs}ms")
         onProgress?.invoke("Indices rebuilt")
     }
 
@@ -62,10 +72,12 @@ class GraphUpdater(
      * For 75K tracks × K=20, this takes ~5-10s on a flagship phone.
      */
     private fun buildKnnGraph(embFile: File, onProgress: ((String) -> Unit)? = null) {
+        val tBuild = System.nanoTime()
         val index = EmbeddingIndex.mmap(embFile)
         val n = index.numTracks
         val k = knnK
 
+        Log.i(TAG, "Building kNN graph: $n nodes, K=$k")
         onProgress?.invoke("Building kNN graph ($n nodes, K=$k)...")
 
         // For each track, find K nearest neighbors
@@ -124,9 +136,11 @@ class GraphUpdater(
         val graphFile = File(filesDir, "graph.bin")
         graphFile.writeBytes(graphBlob)
 
+        val buildMs = (System.nanoTime() - tBuild) / 1_000_000
         val sizeMB = graphBlob.size / 1024 / 1024
         onProgress?.invoke("Graph built: $n nodes, K=$k, ${sizeMB} MB")
-        Log.i(TAG, "Graph built: $n nodes, K=$k, ${sizeMB} MB")
+        Log.i(TAG, "TIMING: graph_build $n nodes, K=$k, ${sizeMB}MB in ${buildMs}ms " +
+            "(${buildMs / maxOf(n, 1)}ms/node)")
     }
 
     /**

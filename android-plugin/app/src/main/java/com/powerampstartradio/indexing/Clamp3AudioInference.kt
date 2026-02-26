@@ -100,7 +100,10 @@ class Clamp3AudioInference(
         readNextWindow: () -> FloatArray,
         onSegmentDone: (() -> Unit)? = null,
     ): FloatArray? {
-        if (numWindows == 0) return null
+        if (numWindows == 0) {
+            Log.w(TAG, "encodeStreaming: numWindows=0, returning null")
+            return null
+        }
 
         // Read all MERT windows into memory for prepend/append + overlapping last segment.
         // Memory: numWindows * 768 * 4 bytes (~180 windows for 15min track = ~540KB).
@@ -177,13 +180,23 @@ class Clamp3AudioInference(
         Log.i(TAG, "TIMING: clamp3_audio $numSegments segments ($numWindows windows): " +
             "inference=${totalInferMs}ms")
 
-        if (count == 0 || totalWeight == 0f) return null
+        if (count == 0 || totalWeight == 0f) {
+            Log.e(TAG, "encodeStreaming: no valid segments (count=$count, totalWeight=$totalWeight)")
+            return null
+        }
 
         // Weighted average and L2-normalize
         for (i in 0 until EMBEDDING_DIM) {
             sumEmbedding[i] /= totalWeight
         }
         l2Normalize(sumEmbedding)
+
+        // Sanity check: detect NaN/Inf in output
+        if (sumEmbedding.any { it.isNaN() || it.isInfinite() }) {
+            Log.e(TAG, "encodeStreaming: NaN/Inf in output embedding! " +
+                "(numWindows=$numWindows, segments=$numSegments, weight=$totalWeight)")
+            return null
+        }
 
         return sumEmbedding
     }
