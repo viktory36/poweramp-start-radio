@@ -307,7 +307,7 @@ class IndexingService : Service() {
                     }
 
                     // Decode at 24kHz for MERT. Cap duration to prevent OOM.
-                    val maxDur = minOf((track.durationMs / 1000).toInt() + 10, 900)
+                    val maxDur = minOf((track.durationMs / 1000).toInt() + 10, MertInference.MAX_DURATION_S)
                     val audio24k = audioDecoder.decode(audioFile, MertInference.SAMPLE_RATE, maxDurationS = maxDur)
                     if (audio24k == null) {
                         Log.w(TAG, "Decode failed for: ${track.title}")

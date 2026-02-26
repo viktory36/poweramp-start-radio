@@ -32,6 +32,8 @@ class MertInference(
         const val WINDOW_SEC = 5
         const val WINDOW_SAMPLES = SAMPLE_RATE * WINDOW_SEC  // 120000
         const val FEATURE_DIM = 768
+        /** Max audio duration in seconds (must match desktop's max_duration=600). */
+        const val MAX_DURATION_S = 600
 
         /**
          * Per-track zero-mean unit-variance normalization (in-place).

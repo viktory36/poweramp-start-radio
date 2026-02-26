@@ -359,7 +359,7 @@ class BenchmarkActivity : ComponentActivity() {
             val audioFile = resolveFile(track.path)!!
             try {
                 val decodeStart = System.nanoTime()
-                val audio = decoder.decode(audioFile, MertInference.SAMPLE_RATE, maxDurationS = 900)
+                val audio = decoder.decode(audioFile, MertInference.SAMPLE_RATE, maxDurationS = MertInference.MAX_DURATION_S)
                 val decodeMs = (System.nanoTime() - decodeStart) / 1_000_000
                 if (audio == null) { log("  Decode failed"); continue }
                 log("  Audio: ${audio.durationS}s @ ${audio.sampleRate}Hz (decode: ${decodeMs}ms)")
