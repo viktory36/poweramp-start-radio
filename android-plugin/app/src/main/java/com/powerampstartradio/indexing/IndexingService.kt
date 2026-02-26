@@ -24,6 +24,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import java.io.File
 
@@ -278,6 +279,23 @@ class IndexingService : Service() {
                     .order(java.nio.ByteOrder.LITTLE_ENDIAN)
                 val writeChannel = java.io.FileOutputStream(featuresFile).channel
 
+                // CPU prefetch: decode track N+1 while GPU runs MERT on track N.
+                // Decode+resample is CPU-bound; MERT is GPU-bound. Overlapping them
+                // hides decode latency for all but the first track.
+                var prefetchJob: kotlinx.coroutines.Deferred<AudioDecoder.DecodedAudio?>? = null
+                var prefetchIndex = -1
+
+                fun startPrefetch(idx: Int) {
+                    if (idx >= unindexed.size) return
+                    val nextTrack = unindexed[idx]
+                    val nextFile = resolveAudioFile(nextTrack) ?: return
+                    prefetchIndex = idx
+                    prefetchJob = async(Dispatchers.Default) {
+                        audioDecoder.decode(nextFile, MertInference.SAMPLE_RATE,
+                            maxDurationS = MertInference.MAX_DURATION_S)
+                    }
+                }
+
                 try {
                 for ((i, track) in unindexed.withIndex()) {
                     ensureActive()
@@ -296,7 +314,7 @@ class IndexingService : Service() {
                         )
                         updateNotification(msg, completedSteps, totalSteps)
                     }
-                    emitProgress("decoding")
+
                     val trackStart = System.nanoTime()
 
                     val audioFile = resolveAudioFile(track)
@@ -306,9 +324,19 @@ class IndexingService : Service() {
                         continue
                     }
 
-                    // Decode at 24kHz for MERT. Cap duration to prevent OOM.
-                    val maxDur = minOf((track.durationMs / 1000).toInt() + 10, MertInference.MAX_DURATION_S)
-                    val audio24k = audioDecoder.decode(audioFile, MertInference.SAMPLE_RATE, maxDurationS = maxDur)
+                    // Use prefetched decode if available, otherwise decode now
+                    val audio24k = if (i == prefetchIndex && prefetchJob != null) {
+                        emitProgress("awaiting prefetch")
+                        val result = prefetchJob!!.await()
+                        prefetchJob = null
+                        prefetchIndex = -1
+                        result
+                    } else {
+                        emitProgress("decoding")
+                        audioDecoder.decode(audioFile, MertInference.SAMPLE_RATE,
+                            maxDurationS = MertInference.MAX_DURATION_S)
+                    }
+
                     if (audio24k == null) {
                         Log.w(TAG, "Decode failed for: ${track.title}")
                         failed++
@@ -316,12 +344,16 @@ class IndexingService : Service() {
                     }
                     completedSteps += DECODE_WEIGHT
 
-                    val expectedWindows = audio24k.samples.size / MertInference.WINDOW_SAMPLES
+                    val expectedWindows = mertInference.windowCount(audio24k.durationS)
                     if (expectedWindows == 0) {
                         Log.w(TAG, "Audio too short for MERT: ${track.title} (${audio24k.durationS}s)")
                         failed++
                         continue
                     }
+
+                    // Start prefetching next track BEFORE MERT inference.
+                    // While GPU runs MERT (~10s), CPU decodes next track in parallel.
+                    startPrefetch(i + 1)
 
                     windowsDone = 0
                     emitProgress("window 0/$expectedWindows")
@@ -347,7 +379,8 @@ class IndexingService : Service() {
                     val trackMs = (System.nanoTime() - trackStart) / 1_000_000
                     Log.i(TAG, "TIMING: mert_track ${i+1}/${unindexed.size} " +
                         "\"${track.artist} - ${track.title}\" = ${trackMs}ms " +
-                        "(mert=${mertMs}ms, windows=$numExtracted)")
+                        "(decode=${audio24k.decodeMs}ms, resample=${audio24k.resampleMs}ms, " +
+                        "mert=${mertMs}ms, windows=$numExtracted)")
 
                     if (numExtracted > 0) {
                         windowCounts[i] = numExtracted
@@ -355,6 +388,7 @@ class IndexingService : Service() {
                         failed++
                     }
                 }
+                prefetchJob?.cancel()
                 } finally {
                     writeChannel.close()
                 }
