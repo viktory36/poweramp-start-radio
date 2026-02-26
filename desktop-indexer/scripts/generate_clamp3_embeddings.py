@@ -278,12 +278,28 @@ def _load_audio_chunks(fpath, processor, max_duration):
     """CPU-bound: load audio, resample, normalize, split into 5s chunks.
 
     Runs in a background thread to overlap with GPU inference.
+    Falls back to soundfile when torchaudio fails (common with MP3s that
+    have minor frame-level corruption — playable everywhere but rejected
+    by torchaudio's strict FFmpeg decoder).
 
     Returns:
         (chunks, num_samples) where chunks is a list of [WINDOW_SAMPLES] tensors,
         or raises on failure.
     """
-    waveform, sr = torchaudio.load(str(fpath))
+    try:
+        waveform, sr = torchaudio.load(str(fpath))
+    except Exception:
+        # Fallback: soundfile/mpg123 is more forgiving with corrupt frames
+        import soundfile as sf
+        import soxr
+        data, sr = sf.read(str(fpath), dtype='float32')
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        if sr != MERT_SR:
+            data = soxr.resample(data, sr, MERT_SR)
+        waveform = torch.from_numpy(data).unsqueeze(0)
+        sr = MERT_SR  # already resampled
+
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
     if sr != MERT_SR:
