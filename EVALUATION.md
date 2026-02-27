@@ -31,21 +31,22 @@ Lambda controls the relevance/diversity tradeoff. Higher lambda = more relevance
 - Better quality floor than MMR-0.3: pulls fewer low-similarity outliers
 - DPP selection takes ~263ms vs MMR's ~127ms (2x, due to Cholesky updates)
 
-### Random Walk (Personalized PageRank)
+### Random Walk (Monte Carlo)
 
-Alpha = restart probability. Higher alpha = stays closer to seed.
+10,000 random walks on a K=5 kNN graph with terminal-only counting and non-backtracking. Alpha = restart probability. Higher alpha = returns to seed more often (shorter walks).
 
-| Alpha | Tracks | Artists | Sim Range | Mean Sim | Hops |
-|-------|--------|---------|-----------|----------|------|
-| 0.3   | 30     | 22      | 78-88%    | 82.2%    | 1-2  |
-| 0.7   | 30     | 24      | 78-88%    | 82.0%    | 1-2  |
-| 0.9   | 30     | 25      | 78-88%    | 82.0%    | 1-2  |
+| Alpha | Tracks | Artists | Sim Range | Mean Sim | Hop Distribution |
+|-------|--------|---------|-----------|----------|-----------------|
+| 0.95  | 22     | 16      | 73-88%    | 81.2%    | 1:4, 2:11, 3:7  |
+| 0.50  | 30     | 21      | 69-88%    | 80.4%    | 1:4, 2:11, 3:15 |
+| 0.05  | 29     | 21      | 43-88%    | 78.3%    | 1:4, 2:8, 3:8, 4:6, 6:2, 9:1 |
 
-- Discovers tracks via transitive connections in the precomputed kNN graph (K=20)
-- All results within 2 hops — the graph neighborhood is semantically tight
-- High baseline similarity (~82%) because graph edges represent strong connections
-- Alpha has a subtle effect: lower alpha surfaces more 2-hop discoveries
-- PageRank computation: <1ms for 30 iterations on 74,753 nodes (sparse representation)
+- Replaced Personalized PageRank (power iteration), which produced near-identical results at all alpha values
+- K reduced from 20 to 5 to increase graph diameter and enable genuine exploration
+- Alpha now has clear effect: 0.05 reaches hop 9 with sim floor 43%, 0.95 stays within hop 3
+- Alpha 0.95 produces fewer tracks (22 vs 30) because short walks on K=5 have limited unique terminals
+- Stochastic: each run gives slightly different results
+- Walk computation: <10ms for 10,000 walks
 
 ### Drift Mode
 
@@ -145,7 +146,7 @@ On-device embeddings match desktop within cosine 0.990-0.997 across 25+ validate
 | Embedding retrieval (1500 candidates) | 9ms |
 | MMR selection (30 tracks) | 127ms |
 | DPP selection (30 tracks) | 263ms |
-| Random Walk PageRank (74K nodes) | <1ms |
+| Random Walk (10K walks, K=5 graph) | <10ms |
 | Drift playlist (30 steps) | 2,500ms |
 | Track mapping (first run) | 8,000ms |
 | Track mapping (cached) | 1ms |
