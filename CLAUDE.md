@@ -100,7 +100,6 @@ Poweramp library → NewTrackDetector → IndexingActivity (track selection UI)
 - **MMR** (Balanced): `lambda * relevance - (1-lambda) * max_sim_to_selected`. Penalizes redundancy.
 - **DPP** (Diverse): Greedy MAP with incremental Cholesky. Maximizes list-wise diversity.
 - **Random Walk** (Explorer): Personalized PageRank on precomputed kNN graph. Discovers transitive connections.
-- **Temperature** (Surprise Me): Gumbel-max trick for controlled randomness.
 - **Drift mode**: Optional modifier. Each result influences the next query via seed interpolation or EMA momentum.
 - **Post-filter**: Artist caps (max per artist, min spacing between same artist).
 

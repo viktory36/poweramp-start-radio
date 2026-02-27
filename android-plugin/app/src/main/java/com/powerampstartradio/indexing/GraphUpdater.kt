@@ -58,6 +58,17 @@ class GraphUpdater(
         if (!hasGraph) {
             onProgress?.invoke("No graph in database, building from scratch...")
             buildKnnGraph(embFile, onProgress)
+        } else {
+            // Check if the graph is stale (fewer nodes than the embedding index).
+            // This happens when new tracks were added via on-device indexing after
+            // the graph was built on desktop.
+            val embTrackCount = db.getEmbeddingCount()
+            val graphNodeCount = GraphIndex.readHeaderNodeCount(graphFile)
+            if (graphNodeCount in 1 until embTrackCount) {
+                Log.i(TAG, "Graph stale: $graphNodeCount nodes vs $embTrackCount embeddings, rebuilding")
+                onProgress?.invoke("Graph stale ($graphNodeCount/$embTrackCount), rebuilding...")
+                buildKnnGraph(embFile, onProgress)
+            }
         }
 
         val totalMs = (System.nanoTime() - t0) / 1_000_000

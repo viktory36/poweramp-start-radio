@@ -353,23 +353,6 @@ class EmbeddingDatabase private constructor(
     }
 
     /**
-     * Load cluster centroids: cluster_id -> embedding.
-     */
-    fun loadCentroids(): Map<Int, FloatArray> {
-        val result = mutableMapOf<Int, FloatArray>()
-        try {
-            db.rawQuery("SELECT cluster_id, embedding FROM clusters", null).use { cursor ->
-                while (cursor.moveToNext()) {
-                    result[cursor.getInt(0)] = blobToFloatArray(cursor.getBlob(1))
-                }
-            }
-        } catch (e: Exception) {
-            Log.d(TAG, "loadCentroids: clusters table not available: ${e.message}")
-        }
-        return result
-    }
-
-    /**
      * Get a track by its ID.
      */
     fun getTrackById(id: Long): EmbeddedTrack? {
@@ -440,24 +423,6 @@ class EmbeddingDatabase private constructor(
         } catch (e: Exception) {
             Log.e(TAG, "extractBinaryToFile($key) failed: ${e.message}")
             false
-        }
-    }
-
-    fun getEmbeddingFromTable(tableName: String, trackId: Long): FloatArray? {
-        return try {
-            val cursor = db.rawQuery(
-                "SELECT embedding FROM [$tableName] WHERE track_id = ?",
-                arrayOf(trackId.toString())
-            )
-            cursor.use {
-                if (it.moveToFirst()) {
-                    val blob = it.getBlob(0)
-                    blobToFloatArray(blob)
-                } else null
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "getEmbeddingFromTable($tableName, $trackId) failed: ${e.message}")
-            null
         }
     }
 
@@ -538,16 +503,6 @@ class EmbeddingDatabase private constructor(
         }
         db.insertWithOnConflict(tableName, null, values,
             android.database.sqlite.SQLiteDatabase.CONFLICT_REPLACE)
-    }
-
-    /**
-     * Update the cluster_id for a track.
-     */
-    fun updateClusterId(trackId: Long, clusterId: Int) {
-        val values = android.content.ContentValues().apply {
-            put("cluster_id", clusterId)
-        }
-        db.update("tracks", values, "id = ?", arrayOf(trackId.toString()))
     }
 
     /**

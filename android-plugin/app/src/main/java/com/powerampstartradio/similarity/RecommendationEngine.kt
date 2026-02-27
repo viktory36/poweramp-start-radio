@@ -48,10 +48,10 @@ data class SimilarTrack(
 )
 
 /**
- * Unified recommendation engine using fused embeddings.
+ * Unified recommendation engine using CLaMP3 embeddings.
  *
  * Two-stage architecture:
- * 1. RETRIEVE: brute-force top-N candidates from fused index
+ * 1. RETRIEVE: brute-force top-N candidates from embedding index
  * 2. SELECT: user-configured algorithm (MMR / DPP / Random Walk)
  * Optional: DRIFT modifies query per step (seed interpolation or EMA momentum)
  * Post-filter: artist/album caps

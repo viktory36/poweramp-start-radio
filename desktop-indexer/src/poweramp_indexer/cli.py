@@ -164,7 +164,7 @@ def update(music_path: Path, database: Path, remove_missing: bool, verbose: bool
     )
 
     def store_track(filepath, metadata, embedding):
-        db.add_track(metadata, embedding, model="clamp3")
+        db.add_track(metadata, embedding)
         if (store_track.count % 10) == 0:
             db.commit()
         store_track.count += 1

@@ -80,8 +80,6 @@ class RadioService : Service() {
         const val EXTRA_DIVERSITY_LAMBDA = "diversity_lambda"
         const val EXTRA_MAX_PER_ARTIST = "max_per_artist"
         const val EXTRA_MIN_ARTIST_SPACING = "min_artist_spacing"
-        @Deprecated("Pool size is now auto-computed") const val EXTRA_CANDIDATE_POOL_SIZE = "candidate_pool_size"
-
         const val DEFAULT_NUM_TRACKS = 50
 
         private var activeJob: Job? = null

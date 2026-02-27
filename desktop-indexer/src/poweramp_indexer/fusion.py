@@ -34,7 +34,7 @@ def build_index(db: EmbeddingDatabase, n_clusters: int = 200,
     # --- Step 1: Load embeddings ---
     progress("Loading CLaMP3 embeddings...")
 
-    embs = db.get_all_embeddings(model="clamp3")
+    embs = db.get_all_embeddings()
     if not embs:
         raise ValueError("Database has no CLaMP3 embeddings")
 
