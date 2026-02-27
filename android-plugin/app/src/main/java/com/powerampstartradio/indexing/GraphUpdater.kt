@@ -23,7 +23,7 @@ import java.nio.ByteOrder
 class GraphUpdater(
     private val db: EmbeddingDatabase,
     private val filesDir: File,
-    private val knnK: Int = 20,
+    private val knnK: Int = 5,
 ) {
     companion object {
         private const val TAG = "GraphUpdater"

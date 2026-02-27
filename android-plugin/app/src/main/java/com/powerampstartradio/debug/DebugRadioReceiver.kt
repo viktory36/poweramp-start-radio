@@ -30,13 +30,13 @@ class DebugRadioReceiver : BroadcastReceiver() {
             } catch (_: Exception) { DriftMode.SEED_INTERPOLATION },
             anchorStrength = intent.getFloatExtra("anchor_strength", 0.5f),
             momentumBeta = intent.getFloatExtra("momentum_beta", 0.7f),
-            pageRankAlpha = intent.getFloatExtra("pagerank_alpha", 0.5f),
+            walkRestartAlpha = intent.getFloatExtra("walk_restart_alpha", 0.5f),
             diversityLambda = intent.getFloatExtra("diversity_lambda", 0.4f),
             maxPerArtist = intent.getIntExtra("max_per_artist", 8),
             minArtistSpacing = intent.getIntExtra("min_artist_spacing", 3),
         )
         Log.i("DebugRadio", "Triggering: ${config.selectionMode} lambda=${config.diversityLambda} " +
-            "alpha=${config.pageRankAlpha} drift=${config.driftEnabled} anchor=${config.anchorStrength}")
+            "alpha=${config.walkRestartAlpha} drift=${config.driftEnabled} anchor=${config.anchorStrength}")
         RadioService.startRadio(context, config)
     }
 }

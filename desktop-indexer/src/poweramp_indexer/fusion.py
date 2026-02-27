@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 def build_index(db: EmbeddingDatabase, n_clusters: int = 200,
-                knn_k: int = 20, on_progress=None):
+                knn_k: int = 5, on_progress=None):
     """
     Build k-means clusters and kNN graph from CLaMP3 embeddings.
 

@@ -222,8 +222,8 @@ def _process_files(audio_files, generator, store_fn, desc):
 @click.argument("database", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--clusters", "-k", type=int, default=200,
               help="Number of k-means clusters (default: 200)")
-@click.option("--knn", type=int, default=20,
-              help="kNN graph neighbors (default: 20)")
+@click.option("--knn", type=int, default=5,
+              help="kNN graph neighbors (default: 5)")
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
 def index(database: Path, clusters: int, knn: int, verbose: bool):
     """Build k-means clusters and kNN graph for a CLaMP3 database.

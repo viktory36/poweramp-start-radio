@@ -441,7 +441,7 @@ class RecommendationEngine(
 
         onProgress?.invoke("Computing random walk...")
         val tWalk = System.nanoTime()
-        val alpha = config.pageRankAlpha
+        val alpha = config.walkRestartAlpha
         val ranking = RandomWalkSelector.computeRanking(graph, seedTrackId, alpha)
         val walkMs = (System.nanoTime() - tWalk) / 1_000_000
         Log.d(TAG, "Random walk: ${ranking.size} ranked nodes in ${walkMs}ms (alpha=$alpha)")
@@ -454,7 +454,7 @@ class RecommendationEngine(
         // Single scan serves both simToSeed and seedRank
         val seedSims = seedEmb?.let { index.computeAllSimilarities(it) }
 
-        // PageRank uses full ranking — its discovery power comes from transitive
+        // Random walk uses full ranking — its discovery power comes from transitive
         // connections, so don't limit to the embedding retrieval pool size.
         val ranked = ranking
         val tracks = ranked.indices.mapNotNull { i ->

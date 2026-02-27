@@ -99,7 +99,7 @@ Poweramp library → NewTrackDetector → IndexingActivity (track selection UI)
 **Recommendation Algorithms** (Android, user-selectable):
 - **MMR** (Balanced): `lambda * relevance - (1-lambda) * max_sim_to_selected`. Penalizes redundancy.
 - **DPP** (Diverse): Greedy MAP with incremental Cholesky. Maximizes list-wise diversity.
-- **Random Walk** (Explorer): Personalized PageRank on precomputed kNN graph. Discovers transitive connections.
+- **Random Walk** (Explorer): Monte Carlo random walks on precomputed K=5 kNN graph. 10,000 walks with terminal-only counting, non-backtracking. Alpha controls restart probability (exploration depth).
 - **Drift mode**: Optional modifier. Each result influences the next query via seed interpolation or EMA momentum.
 - **Post-filter**: Artist caps (max per artist, min spacing between same artist).
 
