@@ -8,6 +8,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -17,7 +19,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -71,7 +75,6 @@ fun IndexingScreen(
     val isDetecting by viewModel.isDetecting.collectAsState()
     val detectingStatus by viewModel.detectingStatus.collectAsState()
     val indexingState by viewModel.indexingState.collectAsState()
-    val hasSvdMatrix by viewModel.hasSvdMatrix.collectAsState()
 
     // Re-detect when activity resumes (e.g. user replaced DB while app was backgrounded).
     // detectUnindexed() has its own cache check so this is cheap when nothing changed.
@@ -89,8 +92,8 @@ fun IndexingScreen(
 
     var showMenu by remember { mutableStateOf(false) }
     var showHiddenTracks by remember { mutableStateOf(false) }
-
-    var recluster by remember { mutableStateOf(false) }
+    var isSearchActive by remember { mutableStateOf(false) }
+    var filteredTrackIds by remember { mutableStateOf<Set<Long>?>(null) }
 
     // When all dismissed tracks are restored, auto-navigate back
     LaunchedEffect(showHiddenTracks, hasDismissed) {
@@ -154,19 +157,18 @@ fun IndexingScreen(
             // Only show bottom bar when idle with tracks to index
             if (indexingState is IndexingService.IndexingState.Idle
                 && visibleTracks.isNotEmpty() && !isDetecting) {
+                val buttonCount = if (isSearchActive && filteredTrackIds != null) {
+                    selectedIds.count { it in filteredTrackIds!! }
+                } else {
+                    selectedCount
+                }
                 BottomBar(
-                    selectedCount = selectedCount,
-                    hasSvdMatrix = hasSvdMatrix,
-                    recluster = recluster,
-                    onReclusterChanged = { recluster = it },
+                    selectedCount = buttonCount,
                     onStartIndexing = {
-                        val tier = when {
-                            !hasSvdMatrix -> IndexingService.FusionTier.FULL_REFUSION
-                            recluster -> IndexingService.FusionTier.RECLUSTER
-                            else -> IndexingService.FusionTier.QUICK_UPDATE
-                        }
                         viewModel.startIndexing(
-                            fusionOptions = IndexingService.FusionOptions(tier, buildKnnGraph = true)
+                            buildGraph = true,
+                            autoDismissUnselected = !isSearchActive,
+                            onlyIds = if (isSearchActive) filteredTrackIds else null,
                         )
                     },
                 )
@@ -193,6 +195,17 @@ fun IndexingScreen(
                                     viewModel.selectAll()
                                 }
                             },
+                            onToggleFiltered = { filtered ->
+                                val filteredIds = filtered.map { it.powerampFileId }.toSet()
+                                val allFilteredSelected = filteredIds.all { it in selectedIds }
+                                if (allFilteredSelected) {
+                                    viewModel.deselectIds(filteredIds)
+                                } else {
+                                    viewModel.selectIds(filteredIds)
+                                }
+                            },
+                            onSearchActiveChanged = { isSearchActive = it },
+                            onFilteredIdsChanged = { filteredTrackIds = it },
                         )
                     }
                 }
@@ -214,7 +227,6 @@ fun IndexingScreen(
                         failed = state.failed,
                         onDone = {
                             IndexingService.resetState()
-                            viewModel.detectUnindexed(forceRefresh = true)
                             onBack()
                         },
                     )
@@ -255,8 +267,15 @@ private fun DetectingContent(status: String = "") {
 @Composable
 private fun AllIndexedContent() {
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("All tracks indexed", style = MaterialTheme.typography.headlineSmall)
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.padding(32.dp),
+        ) {
+            Text(
+                "All tracks indexed",
+                style = MaterialTheme.typography.headlineSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
                 "Every track in your Poweramp library has embeddings.",
@@ -274,28 +293,97 @@ private fun TrackSelectionContent(
     selectedCount: Int,
     onToggle: (Long) -> Unit,
     onToggleAll: () -> Unit,
+    onToggleFiltered: (List<NewTrackDetector.UnindexedTrack>) -> Unit,
+    onSearchActiveChanged: (Boolean) -> Unit,
+    onFilteredIdsChanged: (Set<Long>?) -> Unit,
 ) {
+    var searchQuery by remember { mutableStateOf("") }
+
+    // Report search state changes up
+    LaunchedEffect(searchQuery) {
+        onSearchActiveChanged(searchQuery.isNotBlank())
+    }
+
+    val filteredTracks = remember(tracks, searchQuery) {
+        if (searchQuery.isBlank()) tracks
+        else {
+            val q = searchQuery.lowercase()
+            tracks.filter { t ->
+                t.title.lowercase().contains(q) ||
+                    t.artist.lowercase().contains(q) ||
+                    t.album.lowercase().contains(q)
+            }
+        }
+    }
+
+    // Report filtered IDs so startIndexing can scope to visible tracks
+    LaunchedEffect(filteredTracks) {
+        onFilteredIdsChanged(
+            if (searchQuery.isNotBlank()) filteredTracks.map { it.powerampFileId }.toSet()
+            else null
+        )
+    }
+
+    val isFiltered = searchQuery.isNotBlank()
+    val filteredSelectedCount = remember(filteredTracks, selectedIds) {
+        filteredTracks.count { it.powerampFileId in selectedIds }
+    }
+
     Column(modifier = Modifier.fillMaxSize()) {
+        // Search bar
+        OutlinedTextField(
+            value = searchQuery,
+            onValueChange = { searchQuery = it },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            placeholder = { Text("Search tracks...") },
+            leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+            trailingIcon = {
+                if (searchQuery.isNotEmpty()) {
+                    IconButton(onClick = { searchQuery = "" }) {
+                        Icon(Icons.Default.Clear, contentDescription = "Clear")
+                    }
+                }
+            },
+            singleLine = true,
+        )
+
         // Header row with parent checkbox and count
+        val headerToggle = {
+            if (isFiltered) {
+                onToggleFiltered(filteredTracks)
+            } else {
+                onToggleAll()
+            }
+        }
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable(onClick = onToggleAll)
+                .clickable(onClick = headerToggle)
                 .padding(horizontal = 16.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            val displayCount = if (isFiltered) filteredSelectedCount else selectedCount
+            val displayTotal = if (isFiltered) filteredTracks.size else tracks.size
             TriStateCheckbox(
                 state = when {
-                    selectedCount == tracks.size -> ToggleableState.On
-                    selectedCount == 0 -> ToggleableState.Off
+                    displayTotal == 0 -> ToggleableState.Off
+                    displayCount == displayTotal -> ToggleableState.On
+                    displayCount == 0 -> ToggleableState.Off
                     else -> ToggleableState.Indeterminate
                 },
-                onClick = onToggleAll,
+                onClick = headerToggle,
             )
             Spacer(modifier = Modifier.width(12.dp))
             Text(
-                "${tracks.size} unindexed tracks" +
-                    if (selectedCount > 0) " ($selectedCount selected)" else "",
+                if (isFiltered) {
+                    "${filteredTracks.size} of ${tracks.size} tracks" +
+                        if (filteredSelectedCount > 0) " ($filteredSelectedCount selected)" else ""
+                } else {
+                    "${tracks.size} unindexed tracks" +
+                        if (selectedCount > 0) " ($selectedCount selected)" else ""
+                },
                 style = MaterialTheme.typography.titleSmall,
             )
         }
@@ -306,7 +394,7 @@ private fun TrackSelectionContent(
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(vertical = 4.dp),
         ) {
-            items(tracks, key = { it.powerampFileId }) { track ->
+            items(filteredTracks, key = { it.powerampFileId }) { track ->
                 TrackRow(
                     track = track,
                     isSelected = track.powerampFileId in selectedIds,
@@ -317,6 +405,7 @@ private fun TrackSelectionContent(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun TrackRow(
     track: NewTrackDetector.UnindexedTrack,
@@ -339,8 +428,8 @@ private fun TrackRow(
             Text(
                 text = track.title.ifEmpty { "Unknown" },
                 style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.basicMarquee(iterations = 1, initialDelayMillis = 1500),
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
             )
             val subtitle = buildString {
                 if (track.artist.isNotEmpty()) append(track.artist)
@@ -353,13 +442,14 @@ private fun TrackRow(
                 text = subtitle,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.basicMarquee(iterations = 1, initialDelayMillis = 1500),
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
             )
         }
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ProcessingContent(
     state: IndexingService.IndexingState.Processing,
@@ -381,6 +471,7 @@ private fun ProcessingContent(
         Text(
             "${state.current} / ${state.total}",
             style = MaterialTheme.typography.headlineMedium,
+            color = MaterialTheme.colorScheme.primary,
         )
         Spacer(modifier = Modifier.height(16.dp))
         LinearProgressIndicator(
@@ -391,8 +482,8 @@ private fun ProcessingContent(
         Text(
             text = state.trackName,
             style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.basicMarquee(iterations = 1, initialDelayMillis = 1500),
             maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
         )
         if (state.detail.isNotEmpty()) {
             Spacer(modifier = Modifier.height(2.dp))
@@ -482,9 +573,13 @@ private fun ErrorContent(message: String, onBack: () -> Unit) {
 
 @Composable
 private fun CompleteContent(indexed: Int, failed: Int, onDone: () -> Unit) {
-    Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+    Box(modifier = Modifier.fillMaxSize().padding(32.dp), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("Indexing complete", style = MaterialTheme.typography.headlineSmall)
+            Text(
+                "Indexing complete",
+                style = MaterialTheme.typography.headlineSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
             Spacer(modifier = Modifier.height(8.dp))
             val message = if (failed > 0) {
                 "$indexed tracks indexed, $failed failed"
@@ -497,7 +592,7 @@ private fun CompleteContent(indexed: Int, failed: Int, onDone: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(modifier = Modifier.height(24.dp))
-            Button(onClick = onDone) {
+            FilledTonalButton(onClick = onDone) {
                 Text("Done")
             }
         }
@@ -566,11 +661,36 @@ private fun HiddenTracksScreen(
             }
         } else {
             Column(modifier = Modifier.fillMaxSize().padding(padding)) {
-                Text(
-                    "${dismissedTracks.size} hidden tracks",
-                    style = MaterialTheme.typography.titleSmall,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                )
+                val allIds = remember(dismissedTracks) {
+                    dismissedTracks.map { it.powerampFileId }.toSet()
+                }
+                val allSelected = localSelected.size == dismissedTracks.size && dismissedTracks.isNotEmpty()
+                val toggleAll = {
+                    localSelected = if (allSelected) emptySet() else allIds
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(onClick = toggleAll)
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TriStateCheckbox(
+                        state = when {
+                            dismissedTracks.isEmpty() -> ToggleableState.Off
+                            allSelected -> ToggleableState.On
+                            localSelected.isEmpty() -> ToggleableState.Off
+                            else -> ToggleableState.Indeterminate
+                        },
+                        onClick = toggleAll,
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Text(
+                        "${dismissedTracks.size} hidden tracks" +
+                            if (localSelected.isNotEmpty()) " (${localSelected.size} selected)" else "",
+                        style = MaterialTheme.typography.titleSmall,
+                    )
+                }
                 HorizontalDivider()
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
@@ -598,81 +718,26 @@ private fun HiddenTracksScreen(
 @Composable
 private fun BottomBar(
     selectedCount: Int,
-    hasSvdMatrix: Boolean,
-    recluster: Boolean,
-    onReclusterChanged: (Boolean) -> Unit,
     onStartIndexing: () -> Unit,
 ) {
-    var expanded by remember { mutableStateOf(false) }
-
     Surface(tonalElevation = 3.dp) {
-        Column(modifier = Modifier.fillMaxWidth()) {
-            // Collapsed header — always visible
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .then(
-                        if (hasSvdMatrix) Modifier.clickable { expanded = !expanded }
-                        else Modifier
-                    )
-                    .padding(horizontal = 16.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "CLaMP3 indexing",
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+            FilledTonalButton(
+                onClick = onStartIndexing,
+                enabled = selectedCount > 0,
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        if (hasSvdMatrix) "Incremental update" else "Full fusion",
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                }
-                if (hasSvdMatrix) {
-                    Icon(
-                        if (expanded) Icons.Default.KeyboardArrowDown
-                        else Icons.Default.KeyboardArrowUp,
-                        contentDescription = if (expanded) "Collapse" else "Expand",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                }
-                Button(
-                    onClick = onStartIndexing,
-                    enabled = selectedCount > 0,
-                ) {
-                    Text("Start ($selectedCount)")
-                }
-            }
-
-            // Expanded options — only when SVD exists
-            if (hasSvdMatrix) {
-                AnimatedVisibility(visible = expanded) {
-                    Column {
-                        HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
-
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onReclusterChanged(!recluster) }
-                                .padding(horizontal = 16.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Checkbox(
-                                checked = recluster,
-                                onCheckedChange = onReclusterChanged,
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    "Re-cluster all tracks",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                )
-                                Text(
-                                    "Rebuilds track clusters from scratch. Useful after adding many tracks over several sessions. If the Explorer (Random Walk) mode stops surfacing good connections, re-clustering helps.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        }
-                    }
-                }
+                Text("Start ($selectedCount)")
             }
         }
     }

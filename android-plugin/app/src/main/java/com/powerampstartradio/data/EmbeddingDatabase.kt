@@ -4,6 +4,7 @@ import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.net.Uri
+import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
@@ -27,12 +28,7 @@ data class EmbeddedTrack(
 /**
  * Wrapper for reading the embeddings SQLite database created by the desktop indexer.
  *
- * Expects a fused embedding database with:
- * - embeddings_fused table (primary, for similarity search)
- * - clusters table (centroids)
- * - cluster_id column on tracks
- *
- * Falls back to single-model tables if fused is not available.
+ * Primary table: embeddings_clamp3 (768d CLaMP3 audio embeddings).
  */
 class EmbeddingDatabase private constructor(
     private val db: SQLiteDatabase
@@ -41,6 +37,7 @@ class EmbeddingDatabase private constructor(
     val isReadWrite: Boolean get() = !db.isReadOnly
 
     companion object {
+        private const val TAG = "EmbeddingDatabase"
         /**
          * Open the database in read-only mode.
          */
@@ -65,8 +62,20 @@ class EmbeddingDatabase private constructor(
             // Migration: add source column if not present
             try {
                 db.execSQL("ALTER TABLE tracks ADD COLUMN source TEXT DEFAULT 'desktop'")
+                Log.d(TAG, "Migration: added 'source' column to tracks")
             } catch (_: Exception) {
                 // Column already exists
+            }
+            // Migration: create embeddings_clamp3 table if not present
+            try {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS embeddings_clamp3 (
+                        track_id INTEGER PRIMARY KEY REFERENCES tracks(id),
+                        embedding BLOB NOT NULL
+                    )
+                """)
+            } catch (_: Exception) {
+                // Table already exists
             }
             return EmbeddingDatabase(db)
         }
@@ -75,12 +84,15 @@ class EmbeddingDatabase private constructor(
          * Import database from a content URI (e.g., from document picker).
          */
         fun importFrom(context: Context, uri: Uri, destFile: File): EmbeddingDatabase {
+            val t0 = System.nanoTime()
             context.contentResolver.openInputStream(uri)?.use { input ->
                 FileOutputStream(destFile).use { output ->
                     input.copyTo(output)
                 }
             } ?: throw IllegalArgumentException("Cannot open URI: $uri")
 
+            val copyMs = (System.nanoTime() - t0) / 1_000_000
+            Log.i(TAG, "Imported DB: ${destFile.length() / 1024}KB in ${copyMs}ms from $uri")
             return open(destFile)
         }
 
@@ -107,22 +119,12 @@ class EmbeddingDatabase private constructor(
     }
 
     /**
-     * Whether this database has fused embeddings.
-     * Computed each time to avoid stale caches after on-device fusion.
-     */
-    val hasFusedEmbeddings: Boolean
-        get() = tableHasRows("embeddings_fused")
-
-    /**
      * The embedding table to use for similarity search.
-     * Prefers fused, falls back to mulan, then flamingo.
-     * Computed each time to avoid stale caches after on-device fusion.
+     * Uses embeddings_clamp3 (768d CLaMP3 audio embeddings).
+     * Computed each time to avoid stale caches after on-device indexing.
      */
     val embeddingTable: String
-        get() {
-            val candidates = listOf("embeddings_fused", "embeddings_mulan", "embeddings_flamingo")
-            return candidates.firstOrNull { tableHasRows(it) } ?: "embeddings_fused"
-        }
+        get() = "embeddings_clamp3"
 
     private fun getTableNames(): Set<String> {
         val names = mutableSetOf<String>()
@@ -134,14 +136,6 @@ class EmbeddingDatabase private constructor(
             }
         }
         return names
-    }
-
-    private fun tableHasRows(tableName: String): Boolean {
-        return try {
-            db.rawQuery("SELECT 1 FROM [$tableName] LIMIT 1", null).use { it.moveToFirst() }
-        } catch (e: Exception) {
-            false
-        }
     }
 
     /**
@@ -162,6 +156,7 @@ class EmbeddingDatabase private constructor(
             val cursor = db.rawQuery("SELECT COUNT(*) FROM [${embeddingTable}]", null)
             cursor.use { if (it.moveToFirst()) it.getInt(0) else 0 }
         } catch (e: Exception) {
+            Log.w(TAG, "getEmbeddingCount failed (table=$embeddingTable): ${e.message}")
             0
         }
     }
@@ -175,6 +170,7 @@ class EmbeddingDatabase private constructor(
                 if (it.moveToFirst()) it.getInt(0) / 4 else null
             }
         } catch (e: Exception) {
+            Log.w(TAG, "getEmbeddingDim failed (table=$embeddingTable): ${e.message}")
             null
         }
     }
@@ -196,7 +192,9 @@ class EmbeddingDatabase private constructor(
                         if (count > 0) models.add(model to count)
                     }
                 }
-            } catch (_: Exception) { }
+            } catch (e: Exception) {
+                Log.w(TAG, "getAvailableModels: failed to query $table: ${e.message}")
+            }
         }
         return models
     }
@@ -209,31 +207,37 @@ class EmbeddingDatabase private constructor(
      * 3. Fuzzy artist match
      */
     fun findTrackByMetadataKey(key: String): EmbeddedTrack? {
+        // 1. Try exact metadata_key match (uses idx_tracks_metadata_key index)
+        db.rawQuery(
+            "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE metadata_key = ?",
+            arrayOf(key)
+        ).use { cursorToTrack(it)?.let { return it } }
+
+        // 2. Prefix match: same artist|album|title, any duration (index-friendly prefix scan)
+        val lastPipe = key.lastIndexOf('|')
+        if (lastPipe > 0) {
+            val prefix = key.substring(0, lastPipe + 1)  // "artist|album|title|"
+            db.rawQuery(
+                "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE metadata_key >= ? AND metadata_key < ?",
+                arrayOf(prefix, prefix + "\uffff")
+            ).use { cursorToTrack(it)?.let { return it } }
+        }
+
+        // 3. Individual column match: artist + title (any album/duration)
         val parts = key.split("|")
         if (parts.size >= 3) {
             val artist = parts[0]
-            val album = parts[1]
             val title = parts[2]
 
-            // 1. Try exact artist|album|title match
-            val exactPattern = "$artist|$album|$title|%"
             db.rawQuery(
-                "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE metadata_key LIKE ?",
-                arrayOf(exactPattern)
+                "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE LOWER(artist) = ? AND LOWER(title) = ?",
+                arrayOf(artist, title)
             ).use { cursorToTrack(it)?.let { return it } }
 
-            // 2. Try artist|title (any album)
-            val artistTitlePattern = "$artist|%|$title|%"
+            // 4. Fuzzy: find by title, check artist substring overlap
             db.rawQuery(
-                "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE metadata_key LIKE ?",
-                arrayOf(artistTitlePattern)
-            ).use { cursorToTrack(it)?.let { return it } }
-
-            // 3. Fuzzy: find by title, check artist substring overlap
-            val titlePattern = "%|%|$title|%"
-            db.rawQuery(
-                "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE metadata_key LIKE ?",
-                arrayOf(titlePattern)
+                "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE LOWER(title) = ?",
+                arrayOf(title)
             ).use {
                 val matches = cursorToTrackList(it)
                 return matches.find { track ->
@@ -262,10 +266,9 @@ class EmbeddingDatabase private constructor(
      * Find tracks by artist and title only (fuzzy fallback).
      */
     fun findTracksByArtistAndTitle(artist: String, title: String): List<EmbeddedTrack> {
-        val key = "${artist.lowercase()}|%|${title.lowercase()}|%"
         val cursor = db.rawQuery(
-            "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE metadata_key LIKE ?",
-            arrayOf(key)
+            "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE LOWER(artist) = ? AND LOWER(title) = ?",
+            arrayOf(artist.lowercase(), title.lowercase())
         )
         return cursor.use { cursorToTrackList(it) }
     }
@@ -288,14 +291,47 @@ class EmbeddingDatabase private constructor(
 
     /**
      * Stream embeddings one row at a time without holding them all in memory.
+     *
+     * @param table The embedding table to read from. Defaults to the auto-detected best table.
      */
-    fun forEachEmbeddingRaw(block: (trackId: Long, blob: ByteArray) -> Unit) {
-        db.rawQuery("SELECT track_id, embedding FROM [${embeddingTable}]", null).use { cursor ->
+    fun forEachEmbeddingRaw(
+        table: String = embeddingTable,
+        block: (trackId: Long, blob: ByteArray) -> Unit,
+    ) {
+        db.rawQuery("SELECT track_id, embedding FROM [$table]", null).use { cursor ->
             while (cursor.moveToNext()) {
                 val trackId = cursor.getLong(0)
                 val blob = cursor.getBlob(1)
                 block(trackId, blob)
             }
+        }
+    }
+
+    /**
+     * Get the count of embeddings in a specific table.
+     */
+    fun getEmbeddingCountForTable(table: String): Int {
+        return try {
+            db.rawQuery("SELECT COUNT(*) FROM [$table]", null).use {
+                if (it.moveToFirst()) it.getInt(0) else 0
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "getEmbeddingCountForTable($table) failed: ${e.message}")
+            0
+        }
+    }
+
+    /**
+     * Detect the embedding dimension for a specific table.
+     */
+    fun getEmbeddingDimForTable(table: String): Int? {
+        return try {
+            db.rawQuery("SELECT length(embedding) FROM [$table] LIMIT 1", null).use {
+                if (it.moveToFirst()) it.getInt(0) / 4 else null
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "getEmbeddingDimForTable($table) failed: ${e.message}")
+            null
         }
     }
 
@@ -311,7 +347,7 @@ class EmbeddingDatabase private constructor(
                 }
             }
         } catch (e: Exception) {
-            // cluster_id column may not exist in older databases
+            Log.d(TAG, "loadClusterAssignments: cluster_id column not available: ${e.message}")
         }
         return result
     }
@@ -328,7 +364,7 @@ class EmbeddingDatabase private constructor(
                 }
             }
         } catch (e: Exception) {
-            // clusters table may not exist in older databases
+            Log.d(TAG, "loadCentroids: clusters table not available: ${e.message}")
         }
         return result
     }
@@ -368,6 +404,7 @@ class EmbeddingDatabase private constructor(
                 arrayOf(key)
             ).use { it.moveToFirst() }
         } catch (e: Exception) {
+            Log.d(TAG, "hasBinaryData($key): table missing or error: ${e.message}")
             false
         }
     }
@@ -401,7 +438,26 @@ class EmbeddingDatabase private constructor(
             }
             true
         } catch (e: Exception) {
+            Log.e(TAG, "extractBinaryToFile($key) failed: ${e.message}")
             false
+        }
+    }
+
+    fun getEmbeddingFromTable(tableName: String, trackId: Long): FloatArray? {
+        return try {
+            val cursor = db.rawQuery(
+                "SELECT embedding FROM [$tableName] WHERE track_id = ?",
+                arrayOf(trackId.toString())
+            )
+            cursor.use {
+                if (it.moveToFirst()) {
+                    val blob = it.getBlob(0)
+                    blobToFloatArray(blob)
+                } else null
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "getEmbeddingFromTable($tableName, $trackId) failed: ${e.message}")
+            null
         }
     }
 
@@ -530,27 +586,6 @@ class EmbeddingDatabase private constructor(
             }
         }
         return paths
-    }
-
-    /**
-     * Get an embedding for a track from a specific named table (e.g., "embeddings_mulan").
-     * Used for two-pass sequential indexing where pass 2 needs pass 1's embeddings.
-     */
-    fun getEmbeddingFromTable(tableName: String, trackId: Long): FloatArray? {
-        return try {
-            val cursor = db.rawQuery(
-                "SELECT embedding FROM [$tableName] WHERE track_id = ?",
-                arrayOf(trackId.toString())
-            )
-            cursor.use {
-                if (it.moveToFirst()) {
-                    val blob = it.getBlob(0)
-                    blobToFloatArray(blob)
-                } else null
-            }
-        } catch (e: Exception) {
-            null
-        }
     }
 
     /**

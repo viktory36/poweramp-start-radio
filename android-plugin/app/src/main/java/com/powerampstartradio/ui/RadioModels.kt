@@ -118,6 +118,8 @@ data class RadioResult(
     val config: RadioConfig = RadioConfig(),
     val timestamp: Long = System.currentTimeMillis(),
     val queuedFileIds: Set<Long> = emptySet(),
+    /** Poweramp file ID anchored at queue pos 0 for text search (may differ from seed). */
+    val queueAnchorId: Long? = null,
     val isComplete: Boolean = true,
     val totalExpected: Int = 0,
     val metrics: QueueMetrics? = null

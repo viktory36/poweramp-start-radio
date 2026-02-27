@@ -18,12 +18,13 @@ class NewTrackDetector(
     companion object {
         private const val TAG = "NewTrackDetector"
         private val TRACK_NUMBER_PREFIX = Regex("^\\d+[.\\-\\s]+")
+        private val NON_ALPHANUM = Regex("[^a-z0-9 ()']")
+        private val MULTI_SPACE = Regex("\\s+")
     }
 
     /** Categorized reason why a track didn't match any embedded key. */
     enum class FailureReason {
         DURATION_ONLY,       // Same artist+album+title, duration differs
-        PIPE_IN_METADATA,    // Track has | in artist/album/title (desktop replaces with /)
         ARTIST_MISMATCH,     // Artist differs (after normalization)
         TITLE_MISMATCH,      // Same artist but title differs
         NO_SIMILAR_KEY,      // No embedded key shares artist prefix at all
@@ -297,11 +298,6 @@ class NewTrackDetector(
         entry: PowerampEntryWithPath,
         keysByArtist: Map<String, List<String>>,
     ): FailureReason {
-        // Check for pipe in raw metadata (desktop replaces | with /)
-        if ('|' in (entry.rawArtist ?: "") || '|' in (entry.rawAlbum ?: "") || '|' in (entry.rawTitle ?: "")) {
-            return FailureReason.PIPE_IN_METADATA
-        }
-
         // Find keys with same artist (also check semicolon-split and unknown artist)
         val sameArtist = resolveArtistKeys(entry.artist, keysByArtist)
         if (sameArtist.isEmpty()) {
@@ -360,7 +356,10 @@ class NewTrackDetector(
     /**
      * Resolve all DB keys that could belong to the same artist, accounting for:
      * - Exact artist match
-     * - Semicolon-split primary artist (Poweramp: "a; b", DB: "a")
+     * - Semicolon/comma/slash-split primary artist
+     *   (Poweramp: "a; b" or "a, b" or "a / b", DB: "a")
+     * - Period normalization (PA: "o.c", DB: "o.c." — common in hip-hop)
+     * - & ↔ and equivalence ("lq & the crew" ↔ "lq and the crew")
      * - Empty ↔ "unknown artist" equivalence
      * - ID3v1 30-char artist truncation (DB: "wanderwelle & bandhagens musik",
      *   phone: "wanderwelle & bandhagens musikförening")
@@ -370,25 +369,64 @@ class NewTrackDetector(
         keysByArtist: Map<String, List<String>>,
     ): List<String> {
         val result = mutableListOf<String>()
-        keysByArtist[artist]?.let { result.addAll(it) }
-        // Semicolon split
-        if (';' in artist) {
-            val primary = artist.substringBefore(';').trim()
-            if (primary != artist) keysByArtist[primary]?.let { result.addAll(it) }
+        val tried = mutableSetOf<String>()
+
+        fun tryArtist(a: String) {
+            if (a in tried) return
+            tried.add(a)
+            keysByArtist[a]?.let { result.addAll(it) }
         }
+
+        // Exact match (including empty-artist tracks in the DB)
+        tryArtist(artist)
+
+        // Semicolon split (Poweramp: "artist1; artist2", DB: "artist1")
+        if (';' in artist) {
+            artist.split(';').forEach { tryArtist(it.trim()) }
+        }
+
+        // Comma split (Poweramp splits by "," too)
+        if (',' in artist) {
+            tryArtist(artist.substringBefore(',').trim())
+        }
+
+        // Slash split ("joe henderson / alice coltrane" → "joe henderson")
+        if (" / " in artist) {
+            artist.split(" / ").forEach { tryArtist(it.trim()) }
+        }
+
+        // Period normalization: "o.c" ↔ "o.c." — try with/without trailing period,
+        // and with all periods stripped
+        if ('.' in artist && artist.length > 1) {
+            tryArtist(artist.trimEnd('.'))
+            tryArtist(artist.replace(".", ""))
+        } else if (artist.length in 1..5) {
+            // Short name without period — try with trailing period (DB might have "o.c.")
+            tryArtist("$artist.")
+        }
+
+        // & ↔ and normalization
+        if (" & " in artist) {
+            tryArtist(artist.replace(" & ", " and "))
+        } else if (" and " in artist) {
+            tryArtist(artist.replace(" and ", " & "))
+        }
+
         // Empty ↔ "unknown artist"
         if (artist.isEmpty()) {
-            keysByArtist["unknown artist"]?.let { result.addAll(it) }
+            tryArtist("unknown artist")
         }
+
         // ID3v1 artist truncation: prefix match when one side is 25-30 chars
         // (30-byte ID3v1 field, trailing spaces stripped by mutagen → 25-30 chars)
         if (artist.length >= 25) {
             for ((dbArtist, keys) in keysByArtist) {
-                if (dbArtist == artist || dbArtist.length < 25) continue
+                if (dbArtist in tried || dbArtist.length < 25) continue
                 val shorter = if (artist.length <= dbArtist.length) artist else dbArtist
                 val longer = if (artist.length > dbArtist.length) artist else dbArtist
                 if (shorter.length in 25..30 && longer.startsWith(shorter)) {
                     result.addAll(keys)
+                    tried.add(dbArtist)
                 }
             }
         }
@@ -439,6 +477,9 @@ class NewTrackDetector(
         phoneTitleStripped: String,
         keys: List<String>,
     ): Boolean {
+        // Pre-compute normalized phone title for the expensive comparisons
+        val phoneNorm = normalizeTitle(phoneTitle)
+
         for (key in keys) {
             val dbTitle = extractTitleFromKey(key)
 
@@ -456,8 +497,30 @@ class NewTrackDetector(
             // Audio extension in DB title: DB has "welcome.wav", phone has "welcome"
             val dbTitleNoExt = stripAudioExtension(dbTitle)
             if (dbTitleNoExt != dbTitle && dbTitleNoExt == phoneTitle) return true
+
+            // Normalized comparison: & ↔ and, strip special chars, collapse whitespace.
+            // Catches "turiya & ramakrishna" = "turiya and ramakrishna",
+            // "$kurrency$" = "kurrency", "ghost land" ≈ "ghostland", etc.
+            // Only compare if titles are similar length (within 20%) to avoid false matches.
+            val dbNorm = normalizeTitle(dbTitle)
+            if (phoneNorm == dbNorm && phoneNorm.length >= 3) return true
         }
         return false
+    }
+
+    /**
+     * Normalize title for fuzzy comparison: & → and, strip non-alphanumeric
+     * (except spaces), collapse whitespace. Preserves parenthetical content
+     * to avoid matching "instrumental" vs "vocal" as the same track.
+     */
+    private fun normalizeTitle(title: String): String {
+        return title
+            .replace(" & ", " and ")
+            .replace("\u2018", "'")   // left smart quote → ASCII
+            .replace("\u2019", "'")   // right smart quote → ASCII
+            .replace(NON_ALPHANUM, "")
+            .replace(MULTI_SPACE, " ")
+            .trim()
     }
 
     /** Extract the title field (3rd pipe-delimited segment) from a metadata key. */
@@ -521,9 +584,12 @@ class NewTrackDetector(
                     val lcArtist = (it.getString(artistIdx) ?: "").lowercase().trim()
                     val lcTitle = (it.getString(titleIdx) ?: "").lowercase().trim()
                     val lcAlbum = (it.getString(albumIdx) ?: "").lowercase().trim()
-                    val artist = normalizeNfc(normalizePowerampArtist(lcArtist))
-                    val album = normalizeNfc(lcAlbum)
-                    val title = normalizeNfc(stripAudioExtension(lcTitle))
+                    // Replace | with / to match desktop indexer behavior.
+                    // Pipe is the metadata key delimiter; titles like "d|lp 1.1" would
+                    // corrupt key parsing without this replacement.
+                    val artist = sanitizePipe(normalizeNfc(normalizePowerampArtist(lcArtist)))
+                    val album = sanitizePipe(normalizeNfc(lcAlbum))
+                    val title = sanitizePipe(normalizeNfc(stripAudioExtension(lcTitle)))
 
                     val path = when {
                         pathIdx >= 0 && nameIdx >= 0 -> {
@@ -544,9 +610,6 @@ class NewTrackDetector(
                         durationMs = it.getInt(durationIdx),
                         path = path,
                         metadataKey = "$artist|$album|$title|$durationRounded",
-                        rawArtist = lcArtist,
-                        rawAlbum = lcAlbum,
-                        rawTitle = lcTitle,
                     ))
                 }
             }
@@ -565,13 +628,14 @@ class NewTrackDetector(
         val durationMs: Int,
         val path: String?,
         val metadataKey: String,
-        val rawArtist: String? = null,
-        val rawAlbum: String? = null,
-        val rawTitle: String? = null,
     )
 
     private fun normalizeNfc(s: String): String =
         Normalizer.normalize(s, Normalizer.Form.NFC)
+
+    /** Replace pipe with / to match desktop indexer key format. */
+    private fun sanitizePipe(s: String): String =
+        s.replace('|', '/')
 
     private fun normalizePowerampArtist(artist: String): String =
         if (artist == "unknown artist") "" else artist

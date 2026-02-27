@@ -33,7 +33,6 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         private var cachedTracks: List<NewTrackDetector.UnindexedTrack>? = null
         private var cachedDbLastModified: Long = 0L
         private var cachedPowerampTrackCount: Int = -1
-        private var cachedHasSvdMatrix: Boolean? = null
 
         /**
          * A pending detection started by MainViewModel. IndexingViewModel will
@@ -49,7 +48,6 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
             cachedTracks = null
             cachedDbLastModified = 0L
             cachedPowerampTrackCount = -1
-            cachedHasSvdMatrix = null
         }
 
         /** Store results from an external detection (e.g. MainViewModel's check). */
@@ -76,9 +74,6 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
 
     private val _detectingStatus = MutableStateFlow("")
     val detectingStatus: StateFlow<String> = _detectingStatus.asStateFlow()
-
-    private val _hasSvdMatrix = MutableStateFlow(false)
-    val hasSvdMatrix: StateFlow<Boolean> = _hasSvdMatrix.asStateFlow()
 
     val indexingState: StateFlow<IndexingService.IndexingState> = IndexingService.state
 
@@ -121,8 +116,6 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
             val tracks = cachedTracks!!
             _unindexedTracks.value = tracks
             autoSelect(tracks)
-            cachedHasSvdMatrix?.let { _hasSvdMatrix.value = it }
-            probeSvdMatrix(dbFile)
             return
         }
 
@@ -176,10 +169,6 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
                 cachedPowerampTrackCount = powerampCount
                 // Sync dismissed fingerprint with current DB state
                 updateDismissedFingerprint()
-                // Check for existing SVD matrix
-                val hasSvd = checkSvdExists(db)
-                _hasSvdMatrix.value = hasSvd
-                cachedHasSvdMatrix = hasSvd
             } catch (e: Exception) {
                 _unindexedTracks.value = emptyList()
             } finally {
@@ -218,6 +207,14 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         _selectedIds.value = emptySet()
     }
 
+    fun selectIds(ids: Set<Long>) {
+        _selectedIds.value = _selectedIds.value + ids
+    }
+
+    fun deselectIds(ids: Set<Long>) {
+        _selectedIds.value = _selectedIds.value - ids
+    }
+
     fun dismissSelected() {
         val toDismiss = _selectedIds.value
         if (toDismiss.isEmpty()) return
@@ -250,8 +247,19 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         _selectedIds.value = _selectedIds.value + ids
     }
 
-    fun startIndexing(fusionOptions: IndexingService.FusionOptions? = null) {
-        val selected = _selectedIds.value
+    /**
+     * @param autoDismissUnselected When true, unselected visible tracks are auto-dismissed.
+     *   Should be true when the user sees the full list (no search filter) — their choice
+     *   to not select something is an intentional "don't index". Should be false when a
+     *   search filter is active — the user is only focused on the search results.
+     */
+    /**
+     * @param onlyIds When non-null, restrict indexing to these track IDs (intersection
+     *   with selected). Used when a search filter is active — only index visible tracks.
+     */
+    fun startIndexing(buildGraph: Boolean = false, autoDismissUnselected: Boolean = true,
+                      onlyIds: Set<Long>? = null) {
+        val selected = if (onlyIds != null) _selectedIds.value.intersect(onlyIds) else _selectedIds.value
         if (selected.isEmpty()) return
         val dismissed = _dismissedIds.value
         val tracks = _unindexedTracks.value.filter {
@@ -259,20 +267,21 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         }
         if (tracks.isEmpty()) return
 
-        // Auto-dismiss unselected visible tracks — user has seen the list and acknowledged it
-        val unselectedVisible = _unindexedTracks.value.filter {
-            it.powerampFileId !in selected && it.powerampFileId !in dismissed
-        }.map { it.powerampFileId }.toSet()
-        if (unselectedVisible.isNotEmpty()) {
-            val newDismissed = dismissed + unselectedVisible
-            _dismissedIds.value = newDismissed
-            saveDismissedIds(newDismissed)
+        if (autoDismissUnselected) {
+            val unselectedVisible = _unindexedTracks.value.filter {
+                it.powerampFileId !in selected && it.powerampFileId !in dismissed
+            }.map { it.powerampFileId }.toSet()
+            if (unselectedVisible.isNotEmpty()) {
+                val newDismissed = dismissed + unselectedVisible
+                _dismissedIds.value = newDismissed
+                saveDismissedIds(newDismissed)
+            }
         }
 
         // Invalidate cache so the next detectUnindexed() re-scans from the DB.
         // Can't rely on dbFile.lastModified() — SQLite WAL may not flush to the main file.
         invalidateCache()
-        IndexingService.startIndexing(getApplication(), tracks, fusionOptions = fusionOptions)
+        IndexingService.startIndexing(getApplication(), tracks, buildGraph = buildGraph)
     }
 
     fun cancelIndexing() {
@@ -350,29 +359,4 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    /** Check if the DB has a fused_projection entry (SVD matrix from a prior fusion). */
-    private fun checkSvdExists(db: EmbeddingDatabase): Boolean {
-        return try {
-            db.getRawDatabase().rawQuery(
-                "SELECT 1 FROM metadata WHERE key = 'fused_projection' LIMIT 1", null
-            ).use { it.moveToFirst() }
-        } catch (_: Exception) { false }
-    }
-
-    /** Probe SVD existence from the file path (opens DB briefly on IO thread). */
-    private fun probeSvdMatrix(dbFile: File) {
-        viewModelScope.launch(Dispatchers.IO) {
-            var db: EmbeddingDatabase? = null
-            try {
-                db = EmbeddingDatabase.open(dbFile)
-                val hasSvd = checkSvdExists(db)
-                _hasSvdMatrix.value = hasSvd
-                cachedHasSvdMatrix = hasSvd
-            } catch (_: Exception) {
-                _hasSvdMatrix.value = false
-            } finally {
-                db?.close()
-            }
-        }
-    }
 }

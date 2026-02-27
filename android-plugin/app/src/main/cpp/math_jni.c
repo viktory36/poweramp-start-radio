@@ -1,11 +1,12 @@
 /*
- * NEON-accelerated math operations for embedding fusion.
+ * NEON-accelerated math operations for embedding indexing.
  *
- * Hot loops that dominate FusionEngine runtime:
- * - k-means assignment: n × K dot products per iteration (~15s → ~2s)
+ * Hot loops:
+ * - k-means assignment: n × K dot products per iteration
  * - kNN candidate scoring: query vs N candidates
  * - Covariance accumulation: streaming outer products
- * - Matrix-vector multiply: projection (1024d → 512d per track)
+ * - Matrix-vector multiply: projection per track
+ * - int16 → mono float conversion: bulk audio decoding
  *
  * ARM NEON does 4 float multiply-adds per instruction, giving ~4x
  * speedup over scalar Kotlin loops. Combined with C loop efficiency
@@ -374,6 +375,434 @@ Java_com_powerampstartradio_indexing_NativeMath_nativeJacobiEigen(
     free(v);
     free(indices);
     return jResult;
+}
+
+/* ── Top-K search on mmap'd embedding index ─────────────── */
+/*
+ * Find top-K most similar tracks by scanning a mmap'd .emb file directly.
+ * Replaces the scalar Kotlin dotProduct loop in EmbeddingIndex.findTopK.
+ *
+ * The .emb format has track IDs at trackIdsOffset (int64[N]) and embeddings
+ * at embeddingsOffset (float32[N × dim]), both little-endian.
+ *
+ * Uses NEON dot products + C min-heap for ~30x speedup over Kotlin/mmap.
+ *
+ * @param byteBuffer     mmap'd .emb file (direct ByteBuffer)
+ * @param trackIdsOffset byte offset to int64 track ID array
+ * @param embOffset      byte offset to float32 embedding array
+ * @param jQuery         query vector [dim]
+ * @param numTracks      total tracks in the index
+ * @param dim            embedding dimension (e.g. 768)
+ * @param topK           how many results to return
+ * @param jExcludeIds    track IDs to skip (nullable)
+ * @param outTrackIds    pre-allocated long[topK] for result track IDs
+ * @param outScores      pre-allocated float[topK] for result scores
+ * @return               actual number of results (≤ topK)
+ */
+
+typedef struct {
+    int idx;
+    float score;
+} TopKEntry;
+
+static void topk_sift_down(TopKEntry *heap, int size, int i) {
+    while (1) {
+        int smallest = i;
+        int left = 2 * i + 1;
+        int right = 2 * i + 2;
+        if (left < size && heap[left].score < heap[smallest].score) smallest = left;
+        if (right < size && heap[right].score < heap[smallest].score) smallest = right;
+        if (smallest == i) break;
+        TopKEntry tmp = heap[i];
+        heap[i] = heap[smallest];
+        heap[smallest] = tmp;
+        i = smallest;
+    }
+}
+
+JNIEXPORT jint JNICALL
+Java_com_powerampstartradio_indexing_NativeMath_nativeFindTopK(
+    JNIEnv *env, jclass cls,
+    jobject byteBuffer,
+    jlong trackIdsOffset,
+    jlong embOffset,
+    jfloatArray jQuery,
+    jint numTracks,
+    jint dim,
+    jint topK,
+    jlongArray jExcludeIds,
+    jlongArray outTrackIds,
+    jfloatArray outScores)
+{
+    uint8_t *base = (uint8_t *)(*env)->GetDirectBufferAddress(env, byteBuffer);
+    if (!base) {
+        LOGE("nativeFindTopK: not a direct ByteBuffer");
+        return 0;
+    }
+
+    const int64_t *trackIds = (const int64_t *)(base + trackIdsOffset);
+    const float *embeddings = (const float *)(base + embOffset);
+
+    float *query = (*env)->GetFloatArrayElements(env, jQuery, NULL);
+    if (!query) return 0;
+
+    /* Exclude set (usually 1 element = seed track) */
+    int excludeCount = jExcludeIds ? (*env)->GetArrayLength(env, jExcludeIds) : 0;
+    int64_t *excludeIds = NULL;
+    if (excludeCount > 0) {
+        excludeIds = (*env)->GetLongArrayElements(env, jExcludeIds, NULL);
+    }
+
+    /* Allocate min-heap */
+    TopKEntry *heap = (TopKEntry *)malloc(topK * sizeof(TopKEntry));
+    if (!heap) {
+        (*env)->ReleaseFloatArrayElements(env, jQuery, query, JNI_ABORT);
+        if (excludeIds) (*env)->ReleaseLongArrayElements(env, jExcludeIds, excludeIds, JNI_ABORT);
+        return 0;
+    }
+    int heapSize = 0;
+
+    for (int i = 0; i < numTracks; i++) {
+        /* Check exclude list (linear scan — typically 1 element) */
+        if (excludeCount > 0) {
+            int64_t tid = trackIds[i];
+            int skip = 0;
+            for (int e = 0; e < excludeCount; e++) {
+                if (excludeIds[e] == tid) { skip = 1; break; }
+            }
+            if (skip) continue;
+        }
+
+        float score = dot_product(query, embeddings + (long)i * dim, dim);
+
+        if (heapSize < topK) {
+            heap[heapSize].idx = i;
+            heap[heapSize].score = score;
+            heapSize++;
+            /* Heapify once full */
+            if (heapSize == topK) {
+                for (int j = topK / 2 - 1; j >= 0; j--)
+                    topk_sift_down(heap, heapSize, j);
+            }
+        } else if (score > heap[0].score) {
+            heap[0].idx = i;
+            heap[0].score = score;
+            topk_sift_down(heap, heapSize, 0);
+        }
+    }
+
+    /* Sort by score descending (insertion sort, heapSize ≤ topK ≤ ~1500) */
+    for (int i = 1; i < heapSize; i++) {
+        TopKEntry key = heap[i];
+        int j = i - 1;
+        while (j >= 0 && heap[j].score < key.score) {
+            heap[j + 1] = heap[j];
+            j--;
+        }
+        heap[j + 1] = key;
+    }
+
+    /* Write results to output arrays */
+    int64_t *outIds = (*env)->GetLongArrayElements(env, outTrackIds, NULL);
+    float *outScr = (*env)->GetFloatArrayElements(env, outScores, NULL);
+    for (int i = 0; i < heapSize; i++) {
+        outIds[i] = trackIds[heap[i].idx];
+        outScr[i] = heap[i].score;
+    }
+    (*env)->ReleaseLongArrayElements(env, outTrackIds, outIds, 0);
+    (*env)->ReleaseFloatArrayElements(env, outScores, outScr, 0);
+
+    /* Cleanup */
+    free(heap);
+    (*env)->ReleaseFloatArrayElements(env, jQuery, query, JNI_ABORT);
+    if (excludeIds) (*env)->ReleaseLongArrayElements(env, jExcludeIds, excludeIds, JNI_ABORT);
+
+    return heapSize;
+}
+
+/* ── All-pairs similarity on mmap'd embedding index ─────── */
+/*
+ * Compute dot product of one query against all N embeddings in a mmap'd
+ * .emb file. Returns float[N] of similarities.
+ *
+ * Same NEON acceleration as nativeFindTopK but returns all scores instead
+ * of top-K. Used for precomputing seed similarities for rank lookups.
+ */
+JNIEXPORT void JNICALL
+Java_com_powerampstartradio_indexing_NativeMath_nativeAllSimilarities(
+    JNIEnv *env, jclass cls,
+    jobject byteBuffer,
+    jlong embOffset,
+    jfloatArray jQuery,
+    jint numTracks,
+    jint dim,
+    jfloatArray outScores)
+{
+    uint8_t *base = (uint8_t *)(*env)->GetDirectBufferAddress(env, byteBuffer);
+    if (!base) {
+        LOGE("nativeAllSimilarities: not a direct ByteBuffer");
+        return;
+    }
+
+    const float *embeddings = (const float *)(base + embOffset);
+    float *query = (*env)->GetFloatArrayElements(env, jQuery, NULL);
+    if (!query) return;
+
+    float *scores = (*env)->GetFloatArrayElements(env, outScores, NULL);
+    if (!scores) {
+        (*env)->ReleaseFloatArrayElements(env, jQuery, query, JNI_ABORT);
+        return;
+    }
+
+    for (int i = 0; i < numTracks; i++) {
+        scores[i] = dot_product(query, embeddings + (long)i * dim, dim);
+    }
+
+    (*env)->ReleaseFloatArrayElements(env, jQuery, query, JNI_ABORT);
+    (*env)->ReleaseFloatArrayElements(env, outScores, scores, 0);
+}
+
+/* ── Polyphase FIR resampler (NEON-accelerated) ─────────── */
+/*
+ * High-quality audio resampling equivalent to scipy.signal.resample_poly.
+ * Uses a Kaiser-windowed sinc FIR filter decomposed into polyphase filter
+ * banks, with NEON-accelerated convolution.
+ *
+ * For 44100→24000Hz: up=80, down=147, filter=2941 taps, 37 taps/phase.
+ * Each output sample requires 37 multiply-accumulates (~10 NEON ops).
+ * Total for a 4-min track: ~60ms vs ~15000ms for soxr HQ.
+ *
+ * Quality: identical to scipy resample_poly (cosine 1.000 vs soxr HQ
+ * in per-window MERT feature comparison across 3 test tracks).
+ */
+
+#include <time.h>
+
+static long nanos_math(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000000L + ts.tv_nsec;
+}
+
+/* Modified Bessel function I0 (for Kaiser window) */
+static double bessel_i0(double x) {
+    double sum = 1.0, term = 1.0;
+    double y = x * x * 0.25;
+    for (int k = 1; k <= 30; k++) {
+        term *= y / ((double)k * k);
+        sum += term;
+        if (term < sum * 1e-16) break;
+    }
+    return sum;
+}
+
+static int gcd_int(int a, int b) {
+    while (b) { int t = b; b = a % b; a = t; }
+    return a;
+}
+
+JNIEXPORT jfloatArray JNICALL
+Java_com_powerampstartradio_indexing_NativeMath_nativeResamplePolyphase(
+    JNIEnv *env, jclass cls,
+    jfloatArray inputArray, jint fromRate, jint toRate)
+{
+    jsize n_in = (*env)->GetArrayLength(env, inputArray);
+    if (n_in == 0 || fromRate == toRate) return inputArray;
+
+    long t0 = nanos_math();
+
+    jfloat *input = (*env)->GetFloatArrayElements(env, inputArray, NULL);
+    if (!input) return NULL;
+
+    /* Compute rational resampling factors */
+    int g = gcd_int((int)fromRate, (int)toRate);
+    int up = (int)toRate / g;
+    int down = (int)fromRate / g;
+    int max_rate = (up > down) ? up : down;
+
+    /* Design anti-aliasing FIR filter (Kaiser window, beta=5.0) */
+    /* Matches scipy.signal.resample_poly defaults */
+    double cutoff = 1.0 / max_rate;
+    int half_len = 10 * max_rate;
+    int filt_len = 2 * half_len + 1;
+
+    float *filt = (float *)malloc(filt_len * sizeof(float));
+    if (!filt) {
+        (*env)->ReleaseFloatArrayElements(env, inputArray, input, JNI_ABORT);
+        return NULL;
+    }
+
+    double beta = 5.0;
+    double inv_i0 = 1.0 / bessel_i0(beta);
+    double half = (double)half_len;
+
+    for (int n = 0; n < filt_len; n++) {
+        double t = n - half;
+        /* Normalized sinc */
+        double sinc = (fabs(t) < 1e-10) ? cutoff
+                    : sin(M_PI * cutoff * t) / (M_PI * t);
+        /* Kaiser window */
+        double r = t / half;
+        double w_arg = 1.0 - r * r;
+        double window = (w_arg > 0) ? bessel_i0(beta * sqrt(w_arg)) * inv_i0 : 0.0;
+        filt[n] = (float)(sinc * window * up);
+    }
+
+    /* Polyphase decomposition: split filter into 'up' phases */
+    int taps = (filt_len + up - 1) / up;
+    float *phases = (float *)calloc((size_t)up * taps, sizeof(float));
+    if (!phases) {
+        free(filt);
+        (*env)->ReleaseFloatArrayElements(env, inputArray, input, JNI_ABORT);
+        return NULL;
+    }
+    for (int p = 0; p < up; p++) {
+        for (int t = 0; t < taps; t++) {
+            int fi = p + t * up;
+            if (fi < filt_len) phases[p * taps + t] = filt[fi];
+        }
+    }
+    free(filt);
+
+    /* Reverse each polyphase filter phase (convolution = correlation with flipped kernel).
+     * The full filter is symmetric, but individual phases are NOT symmetric.
+     * Without this flip, we compute correlation instead of convolution, producing
+     * phase-shifted output that degrades embeddings (cosine 0.980 vs 0.997). */
+    for (int p = 0; p < up; p++) {
+        float *ph = &phases[p * taps];
+        for (int t = 0; t < taps / 2; t++) {
+            int rt = taps - 1 - t;
+            float tmp = ph[t];
+            ph[t] = ph[rt];
+            ph[rt] = tmp;
+        }
+    }
+
+    /* Compute output length */
+    long long n_out_ll = ((long long)n_in * up + down - 1) / down;
+    int n_out = (int)n_out_ll;
+
+    float *output = (float *)malloc(n_out * sizeof(float));
+    if (!output) {
+        free(phases);
+        (*env)->ReleaseFloatArrayElements(env, inputArray, input, JNI_ABORT);
+        return NULL;
+    }
+
+    /* Center offset: positions the filter symmetrically around each output sample */
+    int center_tap = (taps - 1) / 2;
+
+    long t1 = nanos_math();
+
+    /* ── Apply polyphase filter ────────────────────────────── */
+    /* Three regions: leading edge (bounds checks), middle (pure NEON),
+     * trailing edge (bounds checks). Middle handles >99.9% of samples. */
+
+    /* Find safe middle region (no bounds checks needed) */
+    int first_safe = 0;
+    while (first_safe < n_out) {
+        long long pos = (long long)first_safe * down;
+        int input_idx = (int)(pos / up) - center_tap;
+        if (input_idx >= 0) break;
+        first_safe++;
+    }
+
+    int last_safe = n_out;
+    while (last_safe > first_safe) {
+        long long pos = (long long)(last_safe - 1) * down;
+        int input_idx = (int)(pos / up) - center_tap + taps - 1;
+        if (input_idx < n_in) break;
+        last_safe--;
+    }
+
+#if defined(__aarch64__)
+    int neon_taps = taps & ~3;  /* largest multiple of 4 ≤ taps */
+#endif
+
+    /* Leading edge (scalar with bounds checks) */
+    for (int n = 0; n < first_safe; n++) {
+        long long pos = (long long)n * down;
+        int phase = (int)(pos % up);
+        int k_start = (int)(pos / up) - center_tap;
+        float *ph = &phases[phase * taps];
+        float sum = 0.0f;
+        for (int t = 0; t < taps; t++) {
+            int ki = k_start + t;
+            if (ki >= 0 && ki < n_in)
+                sum += ph[t] * input[ki];
+        }
+        output[n] = sum;
+    }
+
+    /* Middle region: pure NEON, no bounds checks */
+    for (int n = first_safe; n < last_safe; n++) {
+        long long pos = (long long)n * down;
+        int phase = (int)(pos % up);
+        int k_start = (int)(pos / up) - center_tap;
+        float *ph = &phases[phase * taps];
+        float *src = &input[k_start];
+
+#if defined(__aarch64__)
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        int t = 0;
+        /* Unrolled 8-wide for better ILP */
+        for (; t + 7 < taps; t += 8) {
+            acc0 = vfmaq_f32(acc0, vld1q_f32(&ph[t]),     vld1q_f32(&src[t]));
+            acc1 = vfmaq_f32(acc1, vld1q_f32(&ph[t + 4]), vld1q_f32(&src[t + 4]));
+        }
+        for (; t + 3 < taps; t += 4) {
+            acc0 = vfmaq_f32(acc0, vld1q_f32(&ph[t]), vld1q_f32(&src[t]));
+        }
+        float sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+        for (; t < taps; t++) {
+            sum += ph[t] * src[t];
+        }
+#else
+        float sum = 0.0f;
+        for (int t = 0; t < taps; t++) {
+            sum += ph[t] * src[t];
+        }
+#endif
+        output[n] = sum;
+    }
+
+    /* Trailing edge (scalar with bounds checks) */
+    for (int n = last_safe; n < n_out; n++) {
+        long long pos = (long long)n * down;
+        int phase = (int)(pos % up);
+        int k_start = (int)(pos / up) - center_tap;
+        float *ph = &phases[phase * taps];
+        float sum = 0.0f;
+        for (int t = 0; t < taps; t++) {
+            int ki = k_start + t;
+            if (ki >= 0 && ki < n_in)
+                sum += ph[t] * input[ki];
+        }
+        output[n] = sum;
+    }
+
+    long t2 = nanos_math();
+
+    free(phases);
+    (*env)->ReleaseFloatArrayElements(env, inputArray, input, JNI_ABORT);
+
+    jfloatArray result = (*env)->NewFloatArray(env, n_out);
+    if (!result) { free(output); return NULL; }
+    (*env)->SetFloatArrayRegion(env, result, 0, n_out, output);
+    free(output);
+
+    long t3 = nanos_math();
+
+    __android_log_print(ANDROID_LOG_INFO, TAG,
+        "TIMING: polyphase_resample %d->%dHz (up=%d,down=%d,taps=%d) "
+        "%d->%d samples: setup=%ldms resample=%ldms jni_out=%ldms total=%ldms",
+        fromRate, toRate, up, down, taps,
+        n_in, n_out,
+        (t1 - t0) / 1000000, (t2 - t1) / 1000000,
+        (t3 - t2) / 1000000, (t3 - t0) / 1000000);
+
+    return result;
 }
 
 /* ── int16 PCM → mono float conversion ──────────────────── */

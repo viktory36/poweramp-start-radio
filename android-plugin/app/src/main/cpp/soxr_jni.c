@@ -6,10 +6,18 @@
 #include <android/log.h>
 #include <stdlib.h>
 #include <math.h>
+#include <time.h>
 #include "soxr.h"
 
 #define TAG "SoxrJNI"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+
+static long nanos(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000000L + ts.tv_nsec;
+}
 
 JNIEXPORT jfloatArray JNICALL
 Java_com_powerampstartradio_indexing_NativeResampler_nativeResample(
@@ -25,12 +33,17 @@ Java_com_powerampstartradio_indexing_NativeResampler_nativeResample(
         return inputArray;
     }
 
+    long t0 = nanos();
+
     /* Get input samples */
-    jfloat *input = (*env)->GetFloatArrayElements(env, inputArray, NULL);
+    jboolean isCopy = JNI_FALSE;
+    jfloat *input = (*env)->GetFloatArrayElements(env, inputArray, &isCopy);
     if (!input) {
         LOGE("Failed to get input array elements");
         return NULL;
     }
+
+    long t1 = nanos();
 
     /* Compute output length */
     double ratio = (double)toRate / (double)fromRate;
@@ -43,6 +56,8 @@ Java_com_powerampstartradio_indexing_NativeResampler_nativeResample(
         LOGE("Failed to allocate output buffer (%d samples)", outputLen);
         return NULL;
     }
+
+    long t2 = nanos();
 
     /* Map quality parameter to soxr recipe */
     unsigned long recipe;
@@ -65,6 +80,8 @@ Java_com_powerampstartradio_indexing_NativeResampler_nativeResample(
         output, (size_t)outputLen, &odone,
         &io_spec, &q_spec, NULL);
 
+    long t3 = nanos();
+
     (*env)->ReleaseFloatArrayElements(env, inputArray, input, JNI_ABORT);
 
     if (error) {
@@ -82,6 +99,13 @@ Java_com_powerampstartradio_indexing_NativeResampler_nativeResample(
     }
     (*env)->SetFloatArrayRegion(env, result, 0, (jsize)odone, output);
     free(output);
+
+    long t4 = nanos();
+
+    LOGI("TIMING: %d->%dHz %d samples: jni_in=%ldms soxr=%ldms jni_out=%ldms total=%ldms (copy=%s)",
+         fromRate, toRate, inputLen,
+         (t1 - t0) / 1000000, (t3 - t2) / 1000000, (t4 - t3) / 1000000,
+         (t4 - t0) / 1000000, isCopy ? "yes" : "no");
 
     return result;
 }

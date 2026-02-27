@@ -23,7 +23,6 @@ object PowerampHelper {
     // Poweramp package and component names
     const val POWERAMP_PACKAGE = "com.maxmpz.audioplayer"
     private const val API_ACTIVITY = "com.maxmpz.audioplayer.apiactivity.ApiActivity"
-    private const val API_RECEIVER = "com.maxmpz.audioplayer.apiactivity.ApiReceiver"
 
     // Poweramp content provider authority
     private const val AUTHORITY = "com.maxmpz.audioplayer.data"
@@ -370,6 +369,13 @@ object PowerampHelper {
     }
 
     /**
+     * Check if a file is currently in the Poweramp queue.
+     */
+    fun isInQueue(context: Context, fileId: Long): Boolean {
+        return findQueueEntryByFileId(context, fileId) != null
+    }
+
+    /**
      * Replace queue contents, preserving the currently playing entry if it's in the queue.
      *
      * If [currentFileId] is found in the queue, all other entries are deleted and new tracks
@@ -463,9 +469,12 @@ data class PowerampTrack(
      */
     val metadataKey: String
         get() {
-            val a = (artist ?: "").lowercase().trim()
-            val al = (album ?: "").lowercase().trim()
-            val t = title.lowercase().trim()
+            // Replace | with / to match desktop indexer key format.
+            // Pipe is the metadata key delimiter; titles like "d|lp 1.1" would
+            // corrupt key parsing without this replacement.
+            val a = (artist ?: "").lowercase().trim().replace('|', '/')
+            val al = (album ?: "").lowercase().trim().replace('|', '/')
+            val t = title.lowercase().trim().replace('|', '/')
             val d = (durationMs / 100) * 100
             return "$a|$al|$t|$d"
         }

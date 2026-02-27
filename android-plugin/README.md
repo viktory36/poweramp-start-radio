@@ -36,7 +36,7 @@ cd android-plugin
 
 ## On-Device Indexing Setup
 
-On-device indexing lets the phone generate embeddings for new tracks without the desktop. It requires TFLite models pushed to the app's internal storage.
+On-device indexing lets the phone generate CLaMP3 embeddings for new tracks without the desktop. It requires TFLite models pushed to the app's internal storage.
 
 ### 1. Export TFLite models from PyTorch
 
@@ -47,22 +47,19 @@ cd desktop-indexer
 pip install litert-torch==0.8.0 --no-deps
 pip install jax torch_xla2 ai-edge-quantizer immutabledict --no-deps
 
-# Export all three models (MuLan, Flamingo encoder, Flamingo projector)
+# Export MERT and CLaMP3 audio encoder
 python -m poweramp_indexer.export_litert all
 # Outputs to desktop-indexer/models/:
-#   mulan_audio.tflite            (~1212 MB, FP32)
-#   mulan_audio.mel_params.json   (mel spectrogram config sidecar)
-#   flamingo_encoder.tflite       (~2432 MB, FP32)
-#   flamingo_projector.tflite     (~67 MB, FP32)
+#   mert.tflite            (~1838 MB, FP32)
+#   clamp3_audio.tflite    (~TBD MB, FP32)
 ```
 
 ### 2. Convert to FP16 (halves size, lossless for GPU)
 
 ```bash
-python scripts/convert_fp16.py models/mulan_audio.tflite
-python scripts/convert_fp16.py models/flamingo_encoder.tflite
-python scripts/convert_fp16.py models/flamingo_projector.tflite
-# Outputs: *_fp16.tflite variants (~607 MB, ~1276 MB, ~34 MB)
+python scripts/convert_fp16.py models/mert.tflite
+python scripts/convert_fp16.py models/clamp3_audio.tflite
+# Outputs: *_fp16.tflite variants
 ```
 
 ### 3. Push to phone
@@ -71,33 +68,29 @@ The app looks for models in its `filesDir`. With the app installed:
 
 ```bash
 # Push FP16 models
-adb push models/mulan_audio_fp16.tflite /data/local/tmp/
-adb push models/flamingo_encoder_fp16.tflite /data/local/tmp/
-adb push models/flamingo_projector_fp16.tflite /data/local/tmp/
-adb push models/mulan_audio.mel_params.json /data/local/tmp/
+adb push models/mert_fp16.tflite /data/local/tmp/
+adb push models/clamp3_audio_fp16.tflite /data/local/tmp/
 
 # Move into app storage (requires run-as or root)
-adb shell run-as com.powerampstartradio cp /data/local/tmp/mulan_audio_fp16.tflite files/
-adb shell run-as com.powerampstartradio cp /data/local/tmp/flamingo_encoder_fp16.tflite files/
-adb shell run-as com.powerampstartradio cp /data/local/tmp/flamingo_projector_fp16.tflite files/
-adb shell run-as com.powerampstartradio cp /data/local/tmp/mulan_audio.mel_params.json files/
+adb shell run-as com.powerampstartradio cp /data/local/tmp/mert_fp16.tflite files/
+adb shell run-as com.powerampstartradio cp /data/local/tmp/clamp3_audio_fp16.tflite files/
 
 # Also push the embedding database if not already on the phone
 adb push embeddings.db /data/local/tmp/
 adb shell run-as com.powerampstartradio cp /data/local/tmp/embeddings.db files/
 
 # Clean up temp files
-adb shell rm /data/local/tmp/*.tflite /data/local/tmp/*.json /data/local/tmp/embeddings.db
+adb shell rm /data/local/tmp/*.tflite /data/local/tmp/embeddings.db
 ```
 
-The app auto-detects `_fp16` variants and prefers them over FP32. The `mel_params.json` sidecar must be alongside the MuLan model (it falls back to defaults if missing, but the defaults match so this is optional).
+The app auto-detects `_fp16` variants and prefers them over FP32.
 
 ### 4. Index new tracks
 
 Open the app → Settings → **Manage Tracks**. The app compares the Poweramp library against the embedding database and shows unindexed tracks. Select tracks and press Start.
 
+CLaMP3 pipeline: MERT (feature extraction) → CLaMP3 audio encoder (768d embedding).
+
 Typical timing on Snapdragon 8 Gen 3 (Adreno 740 GPU):
-- ~18–26s per track per model for ~4 min FLAC files
+- Two-phase GPU pipeline (Adreno can't run two OpenCL TFLite contexts simultaneously)
 - GPU model load: ~4–7s JIT compilation (once per session)
-- Incremental fusion: ~17s (updates existing SVD/clusters/kNN)
-- Full re-fusion: ~7 min for 74K tracks (only needed on first import)

@@ -16,6 +16,7 @@ import com.powerampstartradio.R
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
+import com.powerampstartradio.poweramp.PowerampTrack
 import com.powerampstartradio.poweramp.TrackMatcher
 import com.powerampstartradio.similarity.RecommendationEngine
 import com.powerampstartradio.similarity.SimilarTrack
@@ -66,6 +67,7 @@ class RadioService : Service() {
         const val ACTION_CANCEL = "com.powerampstartradio.CANCEL"
 
         // Intent extras for RadioConfig
+        const val EXTRA_SEED_TRACK_ID = "seed_track_id"
         const val EXTRA_NUM_TRACKS = "num_tracks"
         const val EXTRA_SHOW_TOASTS = "show_toasts"
         const val EXTRA_SELECTION_MODE = "selection_mode"
@@ -151,6 +153,32 @@ class RadioService : Service() {
             context.startForegroundService(intent)
         }
 
+        /**
+         * Start radio from a specific seed track ID (e.g. from text search).
+         * Bypasses Poweramp current-track matching — the seed is known.
+         */
+        fun startRadioFromSeed(context: Context, seedTrackId: Long, config: RadioConfig) {
+            if (isSearchActive) return
+            _uiState.value = RadioUiState.Searching("Starting radio...")
+            val intent = Intent(context, RadioService::class.java).apply {
+                action = ACTION_START_RADIO
+                putExtra(EXTRA_SEED_TRACK_ID, seedTrackId)
+                putExtra(EXTRA_NUM_TRACKS, config.numTracks)
+                putExtra(EXTRA_SHOW_TOASTS, true)
+                putExtra(EXTRA_SELECTION_MODE, config.selectionMode.name)
+                putExtra(EXTRA_DRIFT_ENABLED, config.driftEnabled)
+                putExtra(EXTRA_DRIFT_MODE, config.driftMode.name)
+                putExtra(EXTRA_ANCHOR_STRENGTH, config.anchorStrength)
+                putExtra(EXTRA_ANCHOR_DECAY, config.anchorDecay.name)
+                putExtra(EXTRA_MOMENTUM_BETA, config.momentumBeta)
+                putExtra(EXTRA_PAGERANK_ALPHA, config.pageRankAlpha)
+                putExtra(EXTRA_DIVERSITY_LAMBDA, config.diversityLambda)
+                putExtra(EXTRA_MAX_PER_ARTIST, config.maxPerArtist)
+                putExtra(EXTRA_MIN_ARTIST_SPACING, config.minArtistSpacing)
+            }
+            context.startForegroundService(intent)
+        }
+
         fun cancelSearch() {
             activeJob?.cancel()
             val current = _uiState.value
@@ -192,8 +220,10 @@ class RadioService : Service() {
                 stopJob = null
                 showToasts = intent.getBooleanExtra(EXTRA_SHOW_TOASTS, false)
                 val config = extractConfig(intent)
+                val seedTrackId = intent.getLongExtra(EXTRA_SEED_TRACK_ID, -1L)
+                    .takeIf { it >= 0 }
                 startForeground(NOTIFICATION_ID, createNotification("Starting radio..."))
-                performRadio(config)
+                performRadio(config, seedTrackId)
             }
             ACTION_CANCEL -> {
                 cancelSearch()
@@ -229,25 +259,14 @@ class RadioService : Service() {
         )
     }
 
-    private fun performRadio(config: RadioConfig) {
+    private fun performRadio(config: RadioConfig, overrideSeedTrackId: Long? = null) {
         activeJob = serviceScope.launch {
             try {
+                val radioStart = System.nanoTime()
                 toast("Starting radio...")
-
-                val currentTrack = PowerampReceiver.currentTrack
-                if (currentTrack == null) {
-                    _uiState.value = RadioUiState.Error("No track playing in Poweramp")
-                    updateNotification("No track playing in Poweramp")
-                    toast("No track playing in Poweramp")
-                    stopSelfDelayed()
-                    return@launch
-                }
-
-                updateNotification("Finding similar tracks to: ${currentTrack.title}")
-                Log.d(TAG, "Starting radio for: ${currentTrack.title} by ${currentTrack.artist}")
-                Log.d(TAG, "Config: ${config.selectionMode.name}" +
-                    (if (config.driftEnabled) " drift(${config.driftMode.name})" else "") +
-                    " lambda=${config.diversityLambda}")
+                Log.i(TAG, "performRadio: mode=${config.selectionMode.name}, " +
+                    "drift=${config.driftEnabled}, numTracks=${config.numTracks}, " +
+                    "seedOverride=$overrideSeedTrackId")
 
                 val db = getOrCreateDatabase()
                 if (db == null) {
@@ -259,23 +278,89 @@ class RadioService : Service() {
                 }
 
                 val matcher = TrackMatcher(db)
-                val matchResult = matcher.findMatch(currentTrack)
 
-                if (matchResult == null) {
-                    _uiState.value = RadioUiState.Error("Track not found in database")
-                    updateNotification("Track not found in database")
-                    toast("Track not found in database")
-                    stopSelfDelayed()
-                    return@launch
+                // Resolve seed: either from override (text search) or current Poweramp track
+                val seedTrackId: Long
+                val seedDisplayTrack: PowerampTrack
+                val matchType: TrackMatcher.MatchType
+                // For text search: the seed file ID to prepend to recommendations
+                var textSearchSeedFileId: Long? = null
+                // For text search: the currently-playing track to anchor queue pos 0 (Poweramp workaround)
+                var textSearchQueueAnchorId: Long? = null
+
+                if (overrideSeedTrackId != null) {
+                    // Text search path: seed track ID is known
+                    seedTrackId = overrideSeedTrackId
+                    val track = db.getTrackById(seedTrackId)
+                    if (track == null) {
+                        _uiState.value = RadioUiState.Error("Seed track not found in database")
+                        updateNotification("Seed track not found")
+                        stopSelfDelayed()
+                        return@launch
+                    }
+                    // Resolve seed to Poweramp file ID
+                    textSearchSeedFileId = matcher.findFileId(this@RadioService, track)
+
+                    // Display: always show the text search pick as seed in UI/session history.
+                    seedDisplayTrack = PowerampTrack(
+                        realId = textSearchSeedFileId ?: -1L,
+                        title = track.title ?: "Unknown",
+                        artist = track.artist,
+                        album = track.album,
+                        durationMs = track.durationMs,
+                        path = track.filePath,
+                    )
+                    // Queue: if currently in a Poweramp queue, keep that track at pos 0
+                    // (Poweramp breaks if we replace the queue without the current track).
+                    // Seed goes at pos 1, then recommendations.
+                    // If NOT in a queue, seed goes first — no preservation needed.
+                    val currentTrack = PowerampReceiver.currentTrack
+                    val currentInQueue = currentTrack?.realId?.takeIf { it > 0 }?.let {
+                        PowerampHelper.isInQueue(this@RadioService, it)
+                    } == true
+                    textSearchQueueAnchorId = if (currentInQueue) currentTrack!!.realId else null
+                    matchType = TrackMatcher.MatchType.METADATA_EXACT
+                    Log.d(TAG, "Text search seed: ${track.title} by ${track.artist} " +
+                            "(seedFileId=$textSearchSeedFileId, queueAnchor=$textSearchQueueAnchorId)")
+                } else {
+                    // Normal path: match current Poweramp track
+                    val currentTrack = PowerampReceiver.currentTrack
+                    if (currentTrack == null) {
+                        _uiState.value = RadioUiState.Error("No track playing in Poweramp")
+                        updateNotification("No track playing in Poweramp")
+                        toast("No track playing in Poweramp")
+                        stopSelfDelayed()
+                        return@launch
+                    }
+
+                    val matchResult = matcher.findMatch(currentTrack)
+                    if (matchResult == null) {
+                        _uiState.value = RadioUiState.Error("Track not found in database")
+                        updateNotification("Track not found in database")
+                        toast("Track not found in database")
+                        stopSelfDelayed()
+                        return@launch
+                    }
+
+                    seedTrackId = matchResult.embeddedTrack.id
+                    seedDisplayTrack = currentTrack
+                    matchType = matchResult.matchType
+                    Log.d(TAG, "Found match (${matchResult.matchType}): ${matchResult.embeddedTrack.title}")
                 }
 
-                Log.d(TAG, "Found match (${matchResult.matchType}): ${matchResult.embeddedTrack.title}")
+                updateNotification("Finding similar tracks to: ${seedDisplayTrack.title}")
+                Log.d(TAG, "Config: ${config.selectionMode.name}" +
+                    (if (config.driftEnabled) " drift(${config.driftMode.name})" else "") +
+                    " lambda=${config.diversityLambda}")
 
                 val eng = getOrCreateEngine(db)
+                val tIndices = System.nanoTime()
                 eng.ensureIndices { message ->
                     _uiState.value = RadioUiState.Loading(message)
                     updateNotification(message)
                 }
+                val indicesMs = (System.nanoTime() - tIndices) / 1_000_000
+                Log.d(TAG, "ensureIndices: ${indicesMs}ms")
 
                 // Resolve auto pool size so RadioResult carries the actual value
                 val resolvedConfig = if (config.candidatePoolSize <= 0) {
@@ -305,7 +390,14 @@ class RadioService : Service() {
                             try {
                                 val count = if (isFirst) {
                                     isFirst = false
-                                    PowerampHelper.replaceQueue(this@RadioService, currentTrack.realId, batch)
+                                    // For text search: prepend seed, anchor current track for Poweramp
+                                    val firstBatch = if (textSearchSeedFileId != null) {
+                                        listOf(textSearchSeedFileId) + batch.filter { it != textSearchSeedFileId }
+                                    } else {
+                                        batch
+                                    }
+                                    val driftCurrentId = textSearchQueueAnchorId ?: seedDisplayTrack.realId
+                                    PowerampHelper.replaceQueue(this@RadioService, driftCurrentId, firstBatch)
                                 } else {
                                     PowerampHelper.addTracksToQueue(this@RadioService, batch)
                                 }
@@ -321,16 +413,17 @@ class RadioService : Service() {
                     driftReferences.value = emptyMap()
 
                     _uiState.value = RadioUiState.Streaming(RadioResult(
-                        seedTrack = currentTrack,
-                        matchType = matchResult.matchType,
+                        seedTrack = seedDisplayTrack,
+                        matchType = matchType,
                         tracks = emptyList(),
                         config = resolvedConfig,
+                        queueAnchorId = textSearchQueueAnchorId,
                         isComplete = false,
                         totalExpected = resolvedConfig.numTracks
                     ))
 
                     eng.generatePlaylist(
-                        seedTrackId = matchResult.embeddedTrack.id,
+                        seedTrackId = seedTrackId,
                         config = resolvedConfig,
                         onProgress = { message ->
                             updateNotification(message)
@@ -359,10 +452,11 @@ class RadioService : Service() {
                             ))
 
                             _uiState.value = RadioUiState.Streaming(RadioResult(
-                                seedTrack = currentTrack,
-                                matchType = matchResult.matchType,
+                                seedTrack = seedDisplayTrack,
+                                matchType = matchType,
                                 tracks = streamingTracks.toList(),
                                 config = resolvedConfig,
+                                queueAnchorId = textSearchQueueAnchorId,
                                 isComplete = false,
                                 totalExpected = resolvedConfig.numTracks
                             ))
@@ -395,11 +489,12 @@ class RadioService : Service() {
                     val driftMetrics = eng.computeQueueMetrics(driftSimilarTracks)
 
                     val finalResult = RadioResult(
-                        seedTrack = currentTrack,
-                        matchType = matchResult.matchType,
+                        seedTrack = seedDisplayTrack,
+                        matchType = matchType,
                         tracks = streamingTracks.toList(),
                         config = resolvedConfig,
                         queuedFileIds = queuedFileIds.toSet(),
+                        queueAnchorId = textSearchQueueAnchorId,
                         isComplete = true,
                         totalExpected = resolvedConfig.numTracks,
                         metrics = driftMetrics
@@ -414,7 +509,9 @@ class RadioService : Service() {
                     val notFound = streamingTracks.count { it.status == QueueStatus.NOT_IN_LIBRARY }
                     val message = buildQueueResultMessage(finalResult.queuedCount, notFound)
                     updateNotification(message)
-                    Log.d(TAG, "Queue result: ${finalResult.queuedCount} queued / ${finalResult.failedCount} failed / $notFound not found")
+                    val totalMs = (System.nanoTime() - radioStart) / 1_000_000
+                    Log.i(TAG, "TIMING: radio_drift total=${totalMs}ms, " +
+                        "${finalResult.queuedCount} queued / ${finalResult.failedCount} failed / $notFound not found")
                     Toast.makeText(this@RadioService, message, Toast.LENGTH_SHORT).show()
 
                 } else {
@@ -422,7 +519,7 @@ class RadioService : Service() {
                     _uiState.value = RadioUiState.Searching("Searching...")
 
                     val similarTracks = eng.generatePlaylist(
-                        seedTrackId = matchResult.embeddedTrack.id,
+                        seedTrackId = seedTrackId,
                         config = resolvedConfig,
                         onProgress = { message ->
                             _uiState.value = RadioUiState.Searching(message)
@@ -438,8 +535,11 @@ class RadioService : Service() {
                         return@launch
                     }
 
+                    val tMap = System.nanoTime()
                     val mappedTracks = matcher.mapSimilarTracksToFileIds(this@RadioService, similarTracks)
                     val fileIds = mappedTracks.mapNotNull { it.fileId }
+                    val mapMs = (System.nanoTime() - tMap) / 1_000_000
+                    Log.d(TAG, "Track mapping: ${similarTracks.size} → ${fileIds.size} file IDs in ${mapMs}ms")
 
                     if (fileIds.isEmpty()) {
                         _uiState.value = RadioUiState.Error("Could not find tracks in Poweramp library")
@@ -449,8 +549,21 @@ class RadioService : Service() {
                         return@launch
                     }
 
-                    val queuedCount = PowerampHelper.replaceQueue(this@RadioService, currentTrack.realId, fileIds)
-                    val queuedFileIds = fileIds.take(queuedCount).toSet()
+                    // For text search: prepend seed to recommendations.
+                    // If in queue, anchor current track at pos 0 for Poweramp stability.
+                    // Queue: [anchor?, seed, rec1, rec2, ...]
+                    val allFileIds = if (textSearchSeedFileId != null) {
+                        listOf(textSearchSeedFileId) + fileIds.filter { it != textSearchSeedFileId }
+                    } else {
+                        fileIds
+                    }
+
+                    val queueCurrentId = textSearchQueueAnchorId ?: seedDisplayTrack.realId
+                    val tQueue = System.nanoTime()
+                    val queuedCount = PowerampHelper.replaceQueue(this@RadioService, queueCurrentId, allFileIds)
+                    val queueMs = (System.nanoTime() - tQueue) / 1_000_000
+                    Log.d(TAG, "Poweramp queue: ${queuedCount}/${allFileIds.size} queued in ${queueMs}ms")
+                    val queuedFileIds = allFileIds.take(queuedCount).toSet()
 
                     val trackResults = mappedTracks.map { mapped ->
                         val status = when {
@@ -475,11 +588,12 @@ class RadioService : Service() {
                     val batchMetrics = eng.computeQueueMetrics(similarTracks)
 
                     val radioResult = RadioResult(
-                        seedTrack = currentTrack,
-                        matchType = matchResult.matchType,
+                        seedTrack = seedDisplayTrack,
+                        matchType = matchType,
                         tracks = trackResults,
                         config = resolvedConfig,
                         queuedFileIds = queuedFileIds,
+                        queueAnchorId = textSearchQueueAnchorId,
                         metrics = batchMetrics
                     )
 
@@ -489,10 +603,13 @@ class RadioService : Service() {
 
                     PowerampHelper.reloadData(this@RadioService)
 
+
                     val notFound = trackResults.count { it.status == QueueStatus.NOT_IN_LIBRARY }
                     val message = buildQueueResultMessage(radioResult.queuedCount, notFound)
                     updateNotification(message)
-                    Log.d(TAG, "Queue result: ${radioResult.queuedCount} queued / ${radioResult.failedCount} failed / $notFound not found")
+                    val totalMs = (System.nanoTime() - radioStart) / 1_000_000
+                    Log.i(TAG, "TIMING: radio_batch total=${totalMs}ms, " +
+                        "${radioResult.queuedCount} queued / ${radioResult.failedCount} failed / $notFound not found")
                     Toast.makeText(this@RadioService, message, Toast.LENGTH_SHORT).show()
                 }
 

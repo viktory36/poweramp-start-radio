@@ -5,6 +5,7 @@ import com.powerampstartradio.data.EmbeddedTrack
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.data.EmbeddingIndex
 import com.powerampstartradio.data.GraphIndex
+import com.powerampstartradio.indexing.GraphUpdater
 import com.powerampstartradio.similarity.algorithms.DppSelector
 import com.powerampstartradio.similarity.algorithms.DriftEngine
 import com.powerampstartradio.similarity.algorithms.MmrSelector
@@ -76,7 +77,7 @@ class RecommendationEngine(
         val dbModified = dbFile.lastModified()
 
         // Embedding index
-        val embFile = File(filesDir, "fused.emb")
+        val embFile = File(filesDir, "clamp3.emb")
         if (!embFile.exists() || embFile.lastModified() < dbModified) {
             Log.i(TAG, "Extracting embedding index (one-time)...")
             onProgress?.invoke("Extracting embedding index...")
@@ -93,7 +94,13 @@ class RecommendationEngine(
         val graphFile = File(filesDir, "graph.bin")
         if (!graphFile.exists() || graphFile.lastModified() < dbModified) {
             onProgress?.invoke("Extracting kNN graph...")
-            GraphIndex.extractFromDatabase(database, graphFile)
+            val extracted = GraphIndex.extractFromDatabase(database, graphFile)
+            if (!extracted && embFile.exists()) {
+                Log.i(TAG, "No graph in database, building from scratch...")
+                onProgress?.invoke("Building kNN graph (one-time)...")
+                val graphUpdater = GraphUpdater(database, filesDir)
+                graphUpdater.rebuildIndices(onProgress)
+            }
         }
         if (graphFile.exists() && graphIndex == null) {
             try {
@@ -119,10 +126,18 @@ class RecommendationEngine(
         onProgress: ((String) -> Unit)? = null,
         onResult: (suspend (SimilarTrack) -> Unit)? = null
     ): List<SimilarTrack> = withContext(Dispatchers.Default) {
+        val t0 = System.nanoTime()
         ensureIndices()
+        val indicesMs = (System.nanoTime() - t0) / 1_000_000
 
-        val index = embeddingIndex ?: return@withContext emptyList()
+        val index = embeddingIndex ?: run {
+            Log.e(TAG, "generatePlaylist: no embedding index available")
+            return@withContext emptyList()
+        }
         val cancellationCheck: () -> Unit = { coroutineContext.ensureActive() }
+        Log.i(TAG, "generatePlaylist: seed=$seedTrackId, mode=${config.selectionMode.name}, " +
+            "drift=${config.driftEnabled}, numTracks=${config.numTracks}, " +
+            "lambda=${config.diversityLambda}, index=${index.numTracks} tracks (indices=${indicesMs}ms)")
 
         // Auto-compute pool size: 2% of library, floor 100
         val poolConfig = if (config.candidatePoolSize <= 0) {
@@ -149,11 +164,15 @@ class RecommendationEngine(
             poolConfig.copy(driftEnabled = false)
         } else poolConfig
 
-        if (effectiveConfig.driftEnabled) {
+        val result = if (effectiveConfig.driftEnabled) {
             driftPlaylist(seedTrackId, seedEmb, index, effectiveConfig, onProgress, onResult, cancellationCheck)
         } else {
             batchPlaylist(seedTrackId, seedEmb, index, effectiveConfig, onProgress, cancellationCheck)
         }
+        val totalMs = (System.nanoTime() - t0) / 1_000_000
+        Log.i(TAG, "TIMING: generatePlaylist ${result.size} tracks in ${totalMs}ms " +
+            "(mode=${effectiveConfig.selectionMode.name}, drift=${effectiveConfig.driftEnabled})")
+        result
     }
 
     /**
@@ -337,16 +356,21 @@ class RecommendationEngine(
         onProgress?.invoke("Searching...")
 
         // Stage 1: Retrieve candidates
+        val t1 = System.nanoTime()
         val candidates = index.findTopK(
             seedEmb, config.candidatePoolSize,
             excludeIds = setOf(seedTrackId),
             cancellationCheck = cancellationCheck
         )
+        val retrieveMs = (System.nanoTime() - t1) / 1_000_000
+        Log.d(TAG, "Batch retrieve: ${candidates.size} candidates in ${retrieveMs}ms " +
+            "(pool=${config.candidatePoolSize})")
 
         if (candidates.isEmpty()) return emptyList()
 
         // Stage 2: Select using algorithm
         onProgress?.invoke("Selecting tracks...")
+        val t2 = System.nanoTime()
         val selected: List<SelectedTrack> = when (config.selectionMode) {
             SelectionMode.MMR -> MmrSelector.selectBatch(
                 candidates, config.numTracks, index, config.diversityLambda
@@ -357,6 +381,8 @@ class RecommendationEngine(
             // RANDOM_WALK dispatches at generatePlaylist() before reaching batchPlaylist
             else -> error("Unreachable: ${config.selectionMode}")
         }
+        val selectMs = (System.nanoTime() - t2) / 1_000_000
+        Log.d(TAG, "Batch select: ${selected.size} tracks via ${config.selectionMode.name} in ${selectMs}ms")
 
         // Resolve track metadata and build SimilarTrack with new fields
         // In batch mode query IS seed, so similarityToSeed = score
@@ -373,7 +399,12 @@ class RecommendationEngine(
         }
 
         // Stage 3: Post-filter artist constraints
-        return PostFilter.enforceBatch(tracks, config.maxPerArtist, config.minArtistSpacing)
+        val filtered = PostFilter.enforceBatch(tracks, config.maxPerArtist, config.minArtistSpacing)
+        if (filtered.size < tracks.size) {
+            Log.d(TAG, "Post-filter: ${tracks.size} → ${filtered.size} tracks " +
+                "(maxPerArtist=${config.maxPerArtist}, minSpacing=${config.minArtistSpacing})")
+        }
+        return filtered
     }
 
     /**
@@ -397,8 +428,11 @@ class RecommendationEngine(
         }
 
         onProgress?.invoke("Computing random walk...")
+        val tWalk = System.nanoTime()
         val alpha = config.pageRankAlpha
         val ranking = RandomWalkSelector.computeRanking(graph, seedTrackId, alpha)
+        val walkMs = (System.nanoTime() - tWalk) / 1_000_000
+        Log.d(TAG, "Random walk: ${ranking.size} ranked nodes in ${walkMs}ms (alpha=$alpha)")
 
         // BFS hop distances from seed for on-expand display
         val hopDistances = graph.bfsFromSeed(seedTrackId)

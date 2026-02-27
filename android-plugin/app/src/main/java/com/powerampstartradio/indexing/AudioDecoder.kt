@@ -29,26 +29,33 @@ class AudioDecoder {
      * @param samples Mono PCM samples in [-1, 1] range at [sampleRate] Hz
      * @param sampleRate Target sample rate the audio was resampled to
      * @param durationS Duration in seconds
+     * @param decodeMs Wall-clock time for MediaCodec PCM decode (ms)
+     * @param resampleMs Wall-clock time for soxr resample (ms)
      */
     data class DecodedAudio(
         val samples: FloatArray,
         val sampleRate: Int,
-        val durationS: Float
+        val durationS: Float,
+        val decodeMs: Long = 0,
+        val resampleMs: Long = 0,
     )
 
     /**
      * Decode an audio file to mono PCM at the given target sample rate.
      *
      * @param file Audio file to decode
-     * @param targetSampleRate Desired output sample rate (e.g., 24000 for MuQ-MuLan, 16000 for Flamingo)
+     * @param targetSampleRate Desired output sample rate (e.g., 24000 for MERT/CLaMP3)
      * @param maxDurationS Maximum duration to decode in seconds (0 = unlimited).
      *   Caps at native sample rate before resampling.
+     * @param startTimeS Start position in seconds (seeks to this position before decoding).
+     *   Used for chunked decoding of long tracks.
      * @return Decoded audio, or null on failure
      */
     fun decode(
         file: File,
         targetSampleRate: Int,
         maxDurationS: Int = 0,
+        startTimeS: Int = 0,
         resampleQuality: Int = NativeResampler.QUALITY_HQ,
     ): DecodedAudio? {
         val decodeStart = System.nanoTime()
@@ -62,6 +69,14 @@ class AudioDecoder {
                 return null
             }
             extractor.selectTrack(audioTrackIndex)
+
+            // Seek to start position for chunked decoding
+            if (startTimeS > 0) {
+                extractor.seekTo(
+                    startTimeS.toLong() * 1_000_000,
+                    MediaExtractor.SEEK_TO_CLOSEST_SYNC,
+                )
+            }
 
             val format = extractor.getTrackFormat(audioTrackIndex)
             val mime = format.getString(MediaFormat.KEY_MIME) ?: return null
@@ -90,10 +105,11 @@ class AudioDecoder {
             Log.i(TAG, "TIMING: decode_pcm ${file.name} = ${decodeMs}ms " +
                 "(${rawSamples.size} samples @ ${nativeSampleRate}Hz)")
 
-            // Resample if needed
+            // Resample if needed — use NEON polyphase FIR (200x faster than soxr)
             val resampleStart = System.nanoTime()
             val resampled = if (nativeSampleRate != targetSampleRate) {
-                resample(rawSamples, nativeSampleRate, targetSampleRate, resampleQuality)
+                NativeMath.resamplePolyphase(rawSamples, nativeSampleRate, targetSampleRate)
+                    ?: resample(rawSamples, nativeSampleRate, targetSampleRate, resampleQuality)
             } else {
                 rawSamples
             }
@@ -103,7 +119,7 @@ class AudioDecoder {
             Log.i(TAG, "TIMING: resample ${file.name} ${nativeSampleRate}->${targetSampleRate}Hz = ${resampleMs}ms")
             Log.i(TAG, "TIMING: decode_total ${file.name} = ${decodeMs + resampleMs}ms (${durationS}s audio)")
 
-            return DecodedAudio(resampled, targetSampleRate, durationS)
+            return DecodedAudio(resampled, targetSampleRate, durationS, decodeMs, resampleMs)
 
         } catch (e: OutOfMemoryError) {
             Log.e(TAG, "OOM decoding ${file.name} — skipping", e)
@@ -244,11 +260,6 @@ class AudioDecoder {
 
     /**
      * Resample audio using libsoxr (native) for high-quality anti-aliased conversion.
-     *
-     * Flamingo/Whisper is extremely sensitive to resampling quality — a 0.001 mel
-     * cosine difference from aliasing causes 0.40 embedding cosine degradation.
-     * Only soxr-quality resampling produces correct embeddings (0.95+ cosine vs DB).
-     * All other approaches (linear, sinc, Kaiser FIR, scipy polyphase) give ~0.55.
      */
     fun resample(
         samples: FloatArray,

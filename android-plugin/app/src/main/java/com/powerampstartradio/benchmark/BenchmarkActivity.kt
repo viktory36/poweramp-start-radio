@@ -22,22 +22,26 @@ import androidx.core.content.ContextCompat
 import com.google.gson.GsonBuilder
 import com.google.ai.edge.litert.Accelerator
 import com.powerampstartradio.data.EmbeddingDatabase
+import com.powerampstartradio.data.EmbeddingIndex
 import com.powerampstartradio.indexing.*
 import com.powerampstartradio.poweramp.PowerampHelper
 import kotlinx.coroutines.*
 import java.io.File
 
 /**
- * Standalone benchmark activity for testing TFLite inference on-device.
+ * Standalone benchmark activity for testing CLaMP3 TFLite inference on-device.
  *
- * Runs MuLan and Flamingo on a few Poweramp tracks, reports timing,
+ * Runs MERT + CLaMP3 audio encoder on a few Poweramp tracks, reports timing,
  * and saves full embeddings as JSON for desktop comparison.
  *
  * Launch via:
  *   adb shell am start -n com.powerampstartradio/.benchmark.BenchmarkActivity
  *
+ * Auto-start via adb (no UI interaction needed):
+ *   adb shell am start -n com.powerampstartradio/.benchmark.BenchmarkActivity --ez auto_start true
+ *
  * Pull results via:
- *   adb pull /data/data/com.powerampstartradio/files/benchmark_results.json
+ *   adb shell run-as com.powerampstartradio cat files/benchmark_results.json
  */
 class BenchmarkActivity : ComponentActivity() {
 
@@ -82,13 +86,35 @@ class BenchmarkActivity : ComponentActivity() {
         var selectedAccelerator by remember { mutableStateOf(Accelerator.GPU) }
         val scope = rememberCoroutineScope()
 
+        val resampleQuality = when (intent.getStringExtra("resample_quality")) {
+            "mq" -> NativeResampler.QUALITY_MQ
+            "vhq" -> NativeResampler.QUALITY_VHQ
+            else -> NativeResampler.QUALITY_HQ
+        }
+
         fun startBenchmark() {
             running = true
             status = "Starting benchmark with $selectedAccelerator..."
             scope.launch(Dispatchers.IO) {
                 try {
-                    runBenchmark(selectedAccelerator) { msg -> status = msg }
-                } catch (e: Exception) {
+                    runBenchmark(selectedAccelerator, resampleQuality) { msg -> status = msg }
+                } catch (e: Throwable) {
+                    Log.e(TAG, "Benchmark failed", e)
+                    status = "ERROR: ${e.message}\n\n${e.stackTraceToString()}"
+                } finally {
+                    running = false
+                }
+            }
+        }
+
+        fun startTextBenchmark() {
+            running = true
+            status = "Starting text search benchmark..."
+            scope.launch(Dispatchers.IO) {
+                try {
+                    runTextBenchmark { msg -> status = msg }
+                } catch (e: Throwable) {
+                    Log.e(TAG, "Text benchmark failed", e)
                     status = "ERROR: ${e.message}\n\n${e.stackTraceToString()}"
                 } finally {
                     running = false
@@ -110,12 +136,27 @@ class BenchmarkActivity : ComponentActivity() {
             }
         }
 
+        // Auto-start via intent extra: --ez auto_start true [--es benchmark_type text|audio|diagnose]
+        LaunchedEffect(Unit) {
+            if (intent.getBooleanExtra("auto_start", false)) {
+                val type = intent.getStringExtra("benchmark_type") ?: "audio"
+                when (type) {
+                    "text" -> startTextBenchmark()
+                    "diagnose" -> startDiagnostics()
+                    else -> if (hasAudioPermission()) startBenchmark()
+                }
+            }
+        }
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(16.dp)
         ) {
-            Text("LiteRT Embedding Benchmark", style = MaterialTheme.typography.headlineSmall)
+            Text(
+                "CLaMP3 Embedding Benchmark — ${if (running) "RUNNING" else "idle"}",
+                style = MaterialTheme.typography.headlineSmall,
+            )
             Spacer(Modifier.height(8.dp))
 
             Text(
@@ -162,6 +203,13 @@ class BenchmarkActivity : ComponentActivity() {
                 }
 
                 OutlinedButton(
+                    onClick = { startTextBenchmark() },
+                    enabled = !running,
+                ) {
+                    Text("Text Search")
+                }
+
+                OutlinedButton(
                     onClick = { startDiagnostics() },
                     enabled = !running,
                 ) {
@@ -193,19 +241,14 @@ class BenchmarkActivity : ComponentActivity() {
             .appendEncodedPath("files").build()
         val result = mutableListOf<TestTrack>()
 
-        // Try column sets in order until one works.
-        // Poweramp's content provider joins folder_files with folders.
-        // The correct columns are: "path" (from folders, has trailing /)
-        // and "folder_files.name" (short filename).
-        // Note: "folder_path"/"file_name" are PlaylistEntries columns, not folder_files!
         data class ColumnSet(val name: String, val columns: Array<String>)
         val columnSets = listOf(
             ColumnSet("path+name", arrayOf(
-                "folder_files._id", "artist", "title_tag", "folder_files.duration",
+                "folder_files._id", "artist", "album", "title_tag", "folder_files.duration",
                 "path", "folder_files.name"
             )),
             ColumnSet("minimal", arrayOf(
-                "folder_files._id", "artist", "title_tag", "folder_files.duration"
+                "folder_files._id", "artist", "album", "title_tag", "folder_files.duration"
             )),
         )
 
@@ -229,24 +272,21 @@ class BenchmarkActivity : ComponentActivity() {
             cursor?.use {
                 val idIdx = it.getColumnIndex("_id")
                 val artistIdx = it.getColumnIndex("artist")
+                val albumIdx = it.getColumnIndex("album")
                 val titleIdx = it.getColumnIndex("title_tag")
-                val pathIdx = it.getColumnIndex("path")       // folders.path (trailing /)
-                val nameIdx = it.getColumnIndex("name")       // folder_files.name
+                val durationIdx = it.getColumnIndex("duration")
+                val pathIdx = it.getColumnIndex("path")
+                val nameIdx = it.getColumnIndex("name")
 
-                // Log first row's available columns for debugging
                 if (it.moveToFirst()) {
                     Log.i(TAG, "Using column set '$usedSet', columns: ${it.columnNames.toList()}")
-                    val samplePath = if (pathIdx >= 0) it.getString(pathIdx) else null
-                    val sampleName = if (nameIdx >= 0) it.getString(nameIdx) else null
-                    Log.i(TAG, "Sample row: path=$samplePath, name=$sampleName")
-                    // Reset to process from first row
                     it.moveToPosition(-1)
                 }
 
                 while (it.moveToNext()) {
                     val path = when {
                         pathIdx >= 0 && nameIdx >= 0 -> {
-                            val folder = it.getString(pathIdx) ?: ""  // already has trailing /
+                            val folder = it.getString(pathIdx) ?: ""
                             val name = it.getString(nameIdx) ?: ""
                             if (name.isNotEmpty()) "$folder$name" else null
                         }
@@ -256,7 +296,9 @@ class BenchmarkActivity : ComponentActivity() {
                         result.add(TestTrack(
                             id = it.getLong(idIdx),
                             artist = it.getString(artistIdx) ?: "",
+                            album = if (albumIdx >= 0) it.getString(albumIdx) ?: "" else "",
                             title = it.getString(titleIdx) ?: "",
+                            durationMs = if (durationIdx >= 0) it.getLong(durationIdx) else 0L,
                             path = path,
                         ))
                     }
@@ -267,14 +309,19 @@ class BenchmarkActivity : ComponentActivity() {
         }
 
         Log.i(TAG, "Query returned ${result.size} tracks with paths")
-        if (result.isNotEmpty()) {
-            Log.i(TAG, "Sample paths: ${result.take(3).map { it.path }}")
-        }
-
         return result
     }
 
-    private suspend fun runBenchmark(accelerator: Accelerator, onStatus: (String) -> Unit) {
+    private suspend fun runBenchmark(
+        accelerator: Accelerator,
+        resampleQuality: Int = NativeResampler.QUALITY_HQ,
+        onStatus: (String) -> Unit,
+    ) {
+        val qualityName = when (resampleQuality) {
+            NativeResampler.QUALITY_MQ -> "mq"
+            NativeResampler.QUALITY_VHQ -> "vhq"
+            else -> "hq"
+        }
         val sb = StringBuilder()
         fun log(msg: String) {
             sb.appendLine(msg)
@@ -282,10 +329,11 @@ class BenchmarkActivity : ComponentActivity() {
             onStatus(sb.toString())
         }
 
-        log("=== LiteRT Embedding Benchmark ===")
+        log("=== CLaMP3 Embedding Benchmark ===")
         log("Device: ${Build.MANUFACTURER} ${Build.MODEL}")
         log("SOC: ${Build.SOC_MODEL}")
         log("Requested accelerator: $accelerator")
+        log("Resample quality: $qualityName")
         log("")
 
         // Discover tracks from Poweramp
@@ -293,12 +341,11 @@ class BenchmarkActivity : ComponentActivity() {
         val allTracks = withContext(Dispatchers.Main) { queryTracksWithPaths() }
         if (allTracks.isEmpty()) {
             log("ERROR: No tracks found in Poweramp library.")
-            log("Make sure Poweramp is installed and has scanned your library.")
             return
         }
         log("Found ${allTracks.size} tracks in Poweramp")
 
-        // Pick random tracks that are readable (cap attempts to avoid scanning all 74K)
+        // Pick random tracks that are readable
         val testTracks = mutableListOf<TestTrack>()
         var resolveAttempts = 0
         for (track in allTracks.shuffled()) {
@@ -311,235 +358,278 @@ class BenchmarkActivity : ComponentActivity() {
         }
         if (testTracks.isEmpty()) {
             log("ERROR: Could not resolve any audio file paths (tried $resolveAttempts).")
-            log("Sample paths: ${allTracks.take(3).map { it.path }}")
-            log("Has audio permission: ${hasAudioPermission()}")
             return
         }
         log("Selected ${testTracks.size} tracks (resolved $resolveAttempts attempts)\n")
 
-        val mulanFile = resolveModelFile(filesDir, "mulan_audio")
-        val flamingoFile = resolveModelFile(filesDir, "flamingo_encoder")
-        val projectorFile = resolveModelFile(filesDir, "flamingo_projector")
+        val mertFile = resolveModelFile(filesDir, "mert")
+        val clamp3AudioFile = resolveModelFile(filesDir, "clamp3_audio")
+
+        if (!mertFile.exists() || !clamp3AudioFile.exists()) {
+            log("ERROR: CLaMP3 models not found.")
+            log("  MERT: ${mertFile.absolutePath} (exists=${mertFile.exists()})")
+            log("  CLaMP3 audio: ${clamp3AudioFile.absolutePath} (exists=${clamp3AudioFile.exists()})")
+            log("Transfer mert.tflite and clamp3_audio.tflite to ${filesDir.absolutePath}")
+            return
+        }
 
         val results = mutableListOf<TrackResult>()
-        // Pre-populate results list so both passes write to the same entries
         for (track in testTracks) {
             results.add(TrackResult(
                 path = track.path,
                 artist = track.artist,
+                album = track.album,
                 title = track.title,
+                durationMs = track.durationMs,
             ))
         }
 
         val decoder = AudioDecoder()
-        var mulanEp: String? = null
-        var flamingoEp: String? = null
-        val hasFlamingo = flamingoFile.exists()
 
-        // Cached 16kHz audio from MuLan pass for Flamingo (decode-once optimization)
-        val cachedAudio16k = arrayOfNulls<AudioDecoder.DecodedAudio>(testTracks.size)
-
-        log("Native mel: ${if (NativeMel.isAvailable) "YES" else "NO (Kotlin fallback)"}")
+        // ── Phase 1: MERT Feature Extraction ──
+        log("Loading MERT model (requesting $accelerator)...")
+        val mertLoadStart = System.nanoTime()
+        val mertInference = try { MertInference(mertFile) }
+        catch (e: Exception) {
+            log("MERT load FAILED: ${e.message}")
+            return
+        }
+        val mertLoadMs = (System.nanoTime() - mertLoadStart) / 1_000_000
+        val mertAccel = mertInference.activeAccelerator.name
+        log("  MERT loaded in ${mertLoadMs}ms (accelerator: $mertAccel)")
+        log("  Model: ${mertFile.name} (${mertFile.length() / 1024 / 1024}MB)")
         log("")
 
-        // ── MuLan Pass ──
-        if (mulanFile.exists()) {
-            log("Loading MuQ-MuLan model (requesting $accelerator)...")
-            val loadStart = System.nanoTime()
-            var mulanInference: MuLanInference? = null
+        // Extract features for all tracks
+        data class TrackFeatures(
+            val features: List<FloatArray>,
+            val decodeMs: Long,
+            val resampleMs: Long,
+            val mertMs: Long,
+            val perWindowMs: List<Long>,
+            val audioDurationS: Float,
+        )
+        val allFeatures = arrayOfNulls<TrackFeatures>(testTracks.size)
+
+        for ((i, track) in testTracks.withIndex()) {
+            log("MERT [${i + 1}/${testTracks.size}] ${track.artist} - ${track.title}")
+
+            val audioFile = resolveFile(track.path)!!
             try {
-                mulanInference = MuLanInference(mulanFile, accelerator)
-                val loadMs = (System.nanoTime() - loadStart) / 1_000_000
-                log("  MuQ-MuLan loaded in ${loadMs}ms (${mulanInference.activeAccelerator})")
-            } catch (e: Exception) {
-                log("  MuQ-MuLan load FAILED: ${e.message}")
-            }
+                val decodeStart = System.nanoTime()
+                val audio = decoder.decode(
+                    audioFile, MertInference.SAMPLE_RATE,
+                    maxDurationS = MertInference.CHUNK_DURATION_S,
+                    resampleQuality = resampleQuality,
+                )
+                val totalDecodeMs = (System.nanoTime() - decodeStart) / 1_000_000
+                if (audio == null) { log("  Decode failed"); continue }
+                log("  Audio: ${audio.durationS}s @ ${audio.sampleRate}Hz (decode: ${audio.decodeMs}ms, resample: ${audio.resampleMs}ms)")
 
-            if (mulanInference != null) {
-                mulanEp = "LiteRT ${mulanInference.activeAccelerator}"
-                log("")
-                for ((i, track) in testTracks.withIndex()) {
-                    log("MuQ-MuLan [${i + 1}/${testTracks.size}] ${track.artist} - ${track.title}")
-
-                    val audioFile = resolveFile(track.path)!!
-
-                    try {
-                        val decodeStart = System.nanoTime()
-                        val audio = decoder.decode(audioFile, 24000, maxDurationS = 900)
-                        val decodeMs = (System.nanoTime() - decodeStart) / 1_000_000
-                        if (audio == null) {
-                            log("  Decode failed")
-                            continue
-                        }
-                        log("  Audio: ${audio.durationS}s @ ${audio.sampleRate}Hz (decode: ${decodeMs}ms)")
-
-                        // Cache 16kHz version for Flamingo pass (resample 24→16kHz via soxr)
-                        if (hasFlamingo) {
-                            try {
-                                val resampleStart = System.nanoTime()
-                                val samples16k = decoder.resample(audio.samples, 24000, 16000)
-                                val resampleMs = (System.nanoTime() - resampleStart) / 1_000_000
-                                cachedAudio16k[i] = AudioDecoder.DecodedAudio(
-                                    samples16k, 16000, samples16k.size.toFloat() / 16000
-                                )
-                                log("  Cached 16kHz: ${samples16k.size} samples (resample: ${resampleMs}ms)")
-                            } catch (e: Exception) {
-                                log("  16kHz cache failed: ${e.message}")
+                val features = mutableListOf<FloatArray>()
+                val perWindowMs = mutableListOf<Long>()
+                var lastWindowEndNs = 0L
+                val inferStart = System.nanoTime()
+                lastWindowEndNs = inferStart
+                var mertNanWindows = 0
+                val numWindows = mertInference.extractFeaturesStreaming(
+                    audio,
+                    onFeatureExtracted = { feat ->
+                        features.add(feat.copyOf())
+                        // Check for NaN/Inf in MERT output
+                        val nanCount = feat.count { it.isNaN() }
+                        val infCount = feat.count { it.isInfinite() }
+                        if (nanCount > 0 || infCount > 0) {
+                            mertNanWindows++
+                            if (mertNanWindows <= 3) {
+                                Log.w(TAG, "MERT window ${features.size}: $nanCount NaN, $infCount Inf")
                             }
                         }
+                    },
+                    onWindowDone = {
+                        val now = System.nanoTime()
+                        perWindowMs.add((now - lastWindowEndNs) / 1_000_000)
+                        lastWindowEndNs = now
+                    },
+                )
+                val mertMs = (System.nanoTime() - inferStart) / 1_000_000
+                val avgMs = if (numWindows > 0) mertMs / numWindows else 0
 
-                        val inferStart = System.nanoTime()
-                        val embedding = mulanInference.generateEmbedding(audio)
-                        val inferMs = (System.nanoTime() - inferStart) / 1_000_000
-
-                        if (embedding != null) {
-                            log("  Embedding: ${embedding.size}d in ${inferMs}ms")
-                            log("  First 5: ${embedding.take(5).map { "%.4f".format(it) }}")
-                            results[i].mulan = EmbeddingResult(
-                                ep = mulanEp!!,
-                                timingMs = inferMs,
-                                dim = embedding.size,
-                                embedding = embedding.toList(),
-                            )
-                        } else {
-                            log("  Inference FAILED")
-                        }
-                    } catch (e: Throwable) {
-                        log("  ERROR: ${e.javaClass.simpleName}: ${e.message}")
-                    }
+                log("  $numWindows windows: total=${mertMs}ms, avg=${avgMs}ms/win")
+                if (perWindowMs.isNotEmpty()) {
+                    log("  per-window: min=${perWindowMs.min()}ms, max=${perWindowMs.max()}ms")
                 }
-                mulanInference.close()
-                log("\nMuQ-MuLan session closed.")
+                if (mertNanWindows > 0) {
+                    log("  WARNING: $mertNanWindows/$numWindows MERT windows contain NaN!")
+                } else if (features.isNotEmpty()) {
+                    // Log MERT feature stats for first window
+                    val f0 = features[0]
+                    val fMin = f0.min()
+                    val fMax = f0.max()
+                    val fAbsMax = f0.maxOf { kotlin.math.abs(it) }
+                    log("  MERT features OK: min=${"%.4f".format(fMin)}, max=${"%.4f".format(fMax)}, absmax=${"%.4f".format(fAbsMax)}")
+                }
+                allFeatures[i] = TrackFeatures(features, audio.decodeMs, audio.resampleMs, mertMs, perWindowMs.toList(), audio.durationS)
+                results[i].durationS = audio.durationS
+            } catch (e: Throwable) {
+                log("  ERROR: ${e.javaClass.simpleName}: ${e.message}")
             }
-        } else {
-            log("MuQ-MuLan model not found at ${mulanFile.absolutePath}")
         }
 
-        // ── Flamingo Pass (two-phase GPU) ──
-        if (hasFlamingo) {
-            log("\nLoading Flamingo encoder (requesting $accelerator)...")
-            val loadStart = System.nanoTime()
-            var flamingoInference: FlamingoInference? = null
+        mertInference.close()
+        log("\nMERT session closed.")
+
+        // ── Phase 2: CLaMP3 Audio Encoding ──
+        log("\nLoading CLaMP3 audio encoder (requesting $accelerator)...")
+        val clamp3LoadStart = System.nanoTime()
+        val clamp3Inference = try { Clamp3AudioInference(clamp3AudioFile) }
+        catch (e: Exception) {
+            log("CLaMP3 audio load FAILED: ${e.message}")
+            return
+        }
+        val clamp3LoadMs = (System.nanoTime() - clamp3LoadStart) / 1_000_000
+        val clamp3Accel = clamp3Inference.activeAccelerator.name
+        log("  CLaMP3 audio loaded in ${clamp3LoadMs}ms (accelerator: $clamp3Accel)")
+        log("  Model: ${clamp3AudioFile.name} (${clamp3AudioFile.length() / 1024 / 1024}MB)")
+        log("")
+
+        for ((i, track) in testTracks.withIndex()) {
+            val tf = allFeatures[i] ?: continue
+            log("CLaMP3 [${i + 1}/${testTracks.size}] ${track.artist} - ${track.title}")
+
             try {
-                flamingoInference = FlamingoInference(flamingoFile, projectorFile, accelerator)
-                val loadMs = (System.nanoTime() - loadStart) / 1_000_000
-                log("  Encoder loaded in ${loadMs}ms (${flamingoInference.activeAccelerator})")
-                log("  Output dim: ${flamingoInference.outputDim}")
-            } catch (e: Exception) {
-                log("  Flamingo load FAILED: ${e.message}")
-            }
+                val numSegments = clamp3Inference.segmentCount(tf.features.size)
+                val encStart = System.nanoTime()
+                val embedding = clamp3Inference.encode(tf.features, tf.features.size)
+                val encMs = (System.nanoTime() - encStart) / 1_000_000
+                val totalMs = tf.decodeMs + tf.resampleMs + tf.mertMs + encMs
+                val realtimeFactor = if (tf.audioDurationS > 0) totalMs / (tf.audioDurationS * 1000f) else 0f
 
-            if (flamingoInference != null) {
-                flamingoEp = "LiteRT ${flamingoInference.activeAccelerator}"
-
-                // Phase 1: Encode all tracks
-                log("\n── Encoder phase ──")
-                val encoderHiddens = arrayOfNulls<List<FloatArray>>(testTracks.size)
-                val encodeTimes = LongArray(testTracks.size)
-
-                for ((i, track) in testTracks.withIndex()) {
-                    log("Encode [${i + 1}/${testTracks.size}] ${track.artist} - ${track.title}")
-                    val audioFile = resolveFile(track.path)!!
-                    try {
-                        val cached = cachedAudio16k[i]
-                        cachedAudio16k[i] = null
-
-                        val decodeStart = System.nanoTime()
-                        val audio = cached ?: decoder.decode(audioFile, 16000, maxDurationS = 1800)
-                        val decodeMs = (System.nanoTime() - decodeStart) / 1_000_000
-                        if (audio == null) { log("  Decode failed"); continue }
-                        val source = if (cached != null) "cached" else "decoded"
-                        log("  Audio: ${audio.durationS}s @ ${audio.sampleRate}Hz ($source: ${decodeMs}ms)")
-
-                        val inferStart = System.nanoTime()
-                        val hiddens = flamingoInference.encodeTrack(audio)
-                        encodeTimes[i] = (System.nanoTime() - inferStart) / 1_000_000
-                        encoderHiddens[i] = hiddens
-
-                        if (hiddens != null) {
-                            log("  Encoded ${hiddens.size} chunks in ${encodeTimes[i]}ms")
-                        } else {
-                            log("  Encode FAILED")
-                        }
-                    } catch (e: Throwable) {
-                        log("  ERROR: ${e.javaClass.simpleName}: ${e.message}")
+                if (embedding != null) {
+                    val embNanCount = embedding.count { it.isNaN() }
+                    val embInfCount = embedding.count { it.isInfinite() }
+                    if (embNanCount > 0 || embInfCount > 0) {
+                        log("  CLaMP3 output: $embNanCount NaN, $embInfCount Inf out of ${embedding.size}")
+                    } else {
+                        val norm = kotlin.math.sqrt(embedding.sumOf { (it * it).toDouble() }).toFloat()
+                        log("  CLaMP3 output OK: norm=${"%.4f".format(norm)}, absmax=${"%.4f".format(embedding.maxOf { kotlin.math.abs(it) })}")
                     }
+                    log("  ${embedding.size}d, $numSegments seg (decode=${tf.decodeMs}ms, resample=${tf.resampleMs}ms, mert=${tf.mertMs}ms, clamp3=${encMs}ms, total=${totalMs}ms)")
+                    log("  Realtime factor: ${"%.2f".format(realtimeFactor)}x (${tf.audioDurationS}s audio in ${totalMs / 1000f}s)")
+                    results[i].timing = TrackTiming(
+                        decodeMs = tf.decodeMs,
+                        resampleMs = tf.resampleMs,
+                        resampleQuality = qualityName,
+                        mertTotalMs = tf.mertMs,
+                        mertWindows = tf.features.size,
+                        mertPerWindowMs = tf.perWindowMs,
+                        mertAvgWindowMs = if (tf.features.isNotEmpty()) tf.mertMs / tf.features.size else 0,
+                        clamp3Segments = numSegments,
+                        clamp3TotalMs = encMs,
+                        totalMs = totalMs,
+                        realtimeFactor = realtimeFactor,
+                    )
+                    results[i].clamp3 = EmbeddingResult(
+                        dim = embedding.size,
+                        embedding = embedding.toList(),
+                    )
+                } else {
+                    log("  Encode FAILED")
                 }
-
-                // Phase transition: encoder → projector
-                flamingoInference.closeEncoder()
-                log("\n── Projector phase ──")
-                val projLoadStart = System.nanoTime()
-                flamingoInference.loadProjector()
-                log("  Projector loaded in ${(System.nanoTime() - projLoadStart) / 1_000_000}ms")
-
-                // Phase 2: Project all tracks
-                for ((i, track) in testTracks.withIndex()) {
-                    val hiddens = encoderHiddens[i] ?: continue
-                    log("Project [${i + 1}/${testTracks.size}] ${track.artist} - ${track.title}")
-                    try {
-                        val projStart = System.nanoTime()
-                        val embedding = flamingoInference.projectAndAverage(hiddens)
-                        val projMs = (System.nanoTime() - projStart) / 1_000_000
-                        val totalMs = encodeTimes[i] + projMs
-
-                        if (embedding != null) {
-                            log("  Embedding: ${embedding.size}d (encode=${encodeTimes[i]}ms, project=${projMs}ms, total=${totalMs}ms)")
-                            log("  First 5: ${embedding.take(5).map { "%.4f".format(it) }}")
-                            results[i].flamingo = EmbeddingResult(
-                                ep = flamingoEp!!,
-                                timingMs = totalMs,
-                                dim = embedding.size,
-                                embedding = embedding.toList(),
-                            )
-                        } else {
-                            log("  Projection FAILED")
-                        }
-                    } catch (e: Throwable) {
-                        log("  ERROR: ${e.javaClass.simpleName}: ${e.message}")
-                    }
-                }
-                flamingoInference.close()
-                log("\nFlamingo session closed.")
+            } catch (e: Throwable) {
+                log("  ERROR: ${e.javaClass.simpleName}: ${e.message}")
             }
-        } else {
-            log("\nFlamingo model not found at ${flamingoFile.absolutePath}")
         }
+
+        clamp3Inference.close()
+        log("\nCLaMP3 session closed.")
+        Log.i(TAG, "Building output JSON...")
 
         // ── Save results as JSON ──
         val output = BenchmarkOutput(
             device = "${Build.MANUFACTURER} ${Build.MODEL}",
             soc = Build.SOC_MODEL,
             androidVersion = "${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})",
-            runtime = "LiteRT 2.1.1",
-            mulanEp = mulanEp,
-            flamingoEp = flamingoEp,
+            runtime = "LiteRT",
+            mertModel = mertFile.name,
+            mertAccelerator = mertAccel,
+            mertLoadMs = mertLoadMs,
+            clamp3Model = clamp3AudioFile.name,
+            clamp3Accelerator = clamp3Accel,
+            clamp3LoadMs = clamp3LoadMs,
             tracks = results,
         )
 
+        // Check for NaN embeddings (GPU numerical issues)
+        for (r in results) {
+            val emb = r.clamp3?.embedding
+            if (emb != null && emb.any { it.isNaN() || it.isInfinite() }) {
+                val nanCount = emb.count { it.isNaN() }
+                val infCount = emb.count { it.isInfinite() }
+                Log.w(TAG, "NaN/Inf in embedding for ${r.artist} - ${r.title}: " +
+                    "$nanCount NaN, $infCount Inf out of ${emb.size}")
+                // Replace NaN/Inf with 0 so JSON serialization doesn't fail
+                r.clamp3 = EmbeddingResult(
+                    dim = emb.size,
+                    embedding = emb.map { if (it.isNaN() || it.isInfinite()) 0f else it },
+                )
+            }
+        }
+
+        Log.i(TAG, "BenchmarkOutput built, ${results.size} tracks, serializing...")
         val gson = GsonBuilder().setPrettyPrinting().create()
         val json = gson.toJson(output)
+        Log.i(TAG, "JSON serialized: ${json.length} chars")
         val outputFile = File(filesDir, "benchmark_results.json")
         outputFile.writeText(json)
+        Log.i(TAG, "Written to ${outputFile.absolutePath}")
 
         log("\n=== Results saved ===")
         log("File: ${outputFile.absolutePath}")
         log("Pull via: adb pull ${outputFile.absolutePath}")
-        log("\nMuQ-MuLan EP: ${mulanEp ?: "not loaded"}")
-        log("Flamingo EP: ${flamingoEp ?: "not loaded"}")
 
-        log("\n=== Summary ===")
+        // ── Timing Summary ──
+        log("\n=== Timing Summary ===")
+        log("Models: MERT=${mertFile.name} ($mertAccel, load=${mertLoadMs}ms)")
+        log("        CLaMP3=${clamp3AudioFile.name} ($clamp3Accel, load=${clamp3LoadMs}ms)")
+        log("")
+        log(String.format("%-30s %7s %7s %6s %6s %5s %7s %6s",
+            "Track", "Dec", "Resamp", "MERT", "CL3", "Win", "Total", "RT-x"))
+        log("-".repeat(105))
+
+        val allTimings = results.mapNotNull { it.timing }
         for (r in results) {
-            log("${r.artist} - ${r.title}")
-            r.mulan?.let { log("  MuQ-MuLan: ${it.dim}d, ${it.timingMs}ms, EP=${it.ep}") }
-            r.flamingo?.let { log("  Flamingo: ${it.dim}d, ${it.timingMs}ms, EP=${it.ep}") }
+            val t = r.timing ?: continue
+            log(String.format("%-30s %6dms %6dms %5dms %5dms %4dw %6dms %5.2fx",
+                "${r.artist} - ${r.title}".take(30),
+                t.decodeMs, t.resampleMs, t.mertTotalMs, t.clamp3TotalMs, t.mertWindows, t.totalMs, t.realtimeFactor))
+        }
+
+        if (allTimings.isNotEmpty()) {
+            log("-".repeat(105))
+            val avgDecode = allTimings.map { it.decodeMs }.average().toLong()
+            val avgResample = allTimings.map { it.resampleMs }.average().toLong()
+            val avgMert = allTimings.map { it.mertTotalMs }.average().toLong()
+            val avgClamp3 = allTimings.map { it.clamp3TotalMs }.average().toLong()
+            val avgWindows = allTimings.map { it.mertWindows }.average().toInt()
+            val avgTotal = allTimings.map { it.totalMs }.average().toLong()
+            val avgRt = allTimings.map { it.realtimeFactor.toDouble() }.average().toFloat()
+            val avgPerWindow = allTimings.flatMap { it.mertPerWindowMs }.let { if (it.isNotEmpty()) it.average().toLong() else 0 }
+            log(String.format("%-30s %6dms %6dms %5dms %5dms %4dw %6dms %5.2fx",
+                "AVERAGE", avgDecode, avgResample, avgMert, avgClamp3, avgWindows, avgTotal, avgRt))
+            log("")
+            log("MERT per-window: avg=${avgPerWindow}ms")
+            val allWindowMs = allTimings.flatMap { it.mertPerWindowMs }
+            if (allWindowMs.isNotEmpty()) {
+                log("  min=${allWindowMs.min()}ms, max=${allWindowMs.max()}ms, " +
+                    "p50=${allWindowMs.sorted()[allWindowMs.size / 2]}ms")
+            }
         }
         log("\nBenchmark complete.")
     }
 
     /**
-     * Run matching diagnostics: compare Poweramp library against embedding DB,
-     * categorize all match failures, and save detailed JSON for analysis.
+     * Run matching diagnostics: compare Poweramp library against embedding DB.
      */
     private suspend fun runDiagnostics(onStatus: (String) -> Unit) {
         val sb = StringBuilder()
@@ -553,11 +643,9 @@ class BenchmarkActivity : ComponentActivity() {
         log("Device: ${Build.MANUFACTURER} ${Build.MODEL}")
         log("")
 
-        // Open embedding database
         val dbFile = File(filesDir, "embeddings.db")
         if (!dbFile.exists()) {
             log("ERROR: embeddings.db not found at ${dbFile.absolutePath}")
-            log("Copy your fused.db to ${dbFile.absolutePath} first.")
             return
         }
 
@@ -589,14 +677,6 @@ class BenchmarkActivity : ComponentActivity() {
                 log("  $reason: $count")
             }
 
-            if (result.embeddedPathsSample.isNotEmpty()) {
-                log("")
-                log("--- Embedded path samples ---")
-                for (p in result.embeddedPathsSample) {
-                    log("  $p")
-                }
-            }
-
             if (result.unmatchedSample.isNotEmpty()) {
                 log("")
                 log("--- Unmatched samples (first ${result.unmatchedSample.size}) ---")
@@ -608,7 +688,6 @@ class BenchmarkActivity : ComponentActivity() {
                 }
             }
 
-            // Save full JSON to external files dir (accessible via adb pull without root)
             val gson = GsonBuilder().setPrettyPrinting().create()
             val json = gson.toJson(result)
             val outputDir = getExternalFilesDir(null) ?: filesDir
@@ -624,6 +703,217 @@ class BenchmarkActivity : ComponentActivity() {
         }
 
         log("\nDiagnostics complete.")
+    }
+
+    // ── Text Search Benchmark ─────────────────────────────────────────────────
+
+    private val textTestQueries = listOf(
+        "ethereal ambient",
+        "heavy metal guitar",
+        "jazz piano trio",
+        "electronic dance music",
+        "sufi devotional music",
+        "lo-fi hip hop beats",
+        "orchestral film score",
+        "acoustic folk guitar",
+    )
+
+    private suspend fun runTextBenchmark(onStatus: (String) -> Unit) {
+        val sb = StringBuilder()
+        fun log(msg: String) {
+            sb.appendLine(msg)
+            Log.i(TAG, msg)
+            onStatus(sb.toString())
+        }
+
+        log("=== CLaMP3 Text Search Benchmark ===")
+        log("Device: ${Build.MANUFACTURER} ${Build.MODEL}")
+        log("SOC: ${Build.SOC_MODEL}")
+        log("")
+
+        // Resolve text model + vocab
+        val textModelFile = resolveModelFile(filesDir, "clamp3_text")
+        val vocabFile = File(filesDir, "xlm_roberta_vocab.json")
+
+        if (!textModelFile.exists()) {
+            log("ERROR: CLaMP3 text model not found at ${textModelFile.absolutePath}")
+            log("Push clamp3_text.tflite or clamp3_text_fp16.tflite to ${filesDir.absolutePath}")
+            return
+        }
+        if (!vocabFile.exists()) {
+            log("ERROR: Vocab file not found at ${vocabFile.absolutePath}")
+            log("Push xlm_roberta_vocab.json to ${filesDir.absolutePath}")
+            return
+        }
+
+        // Load text model
+        log("Loading CLaMP3 text model...")
+        val loadStart = System.nanoTime()
+        val textInference = try {
+            Clamp3TextInference(textModelFile, vocabFile)
+        } catch (e: Exception) {
+            log("Text model load FAILED: ${e.message}")
+            log(e.stackTraceToString())
+            return
+        }
+        val loadMs = (System.nanoTime() - loadStart) / 1_000_000
+        val textAccel = textInference.activeAccelerator.name
+        log("  Loaded in ${loadMs}ms (accelerator: $textAccel)")
+        log("  Model: ${textModelFile.name} (${textModelFile.length() / 1024 / 1024}MB)")
+        log("  Vocab: ${vocabFile.name} (${vocabFile.length() / 1024}KB)")
+        log("")
+
+        // Load audio embedding index for search comparison
+        val embFile = File(filesDir, "clamp3.emb")
+        val dbFile = File(filesDir, "embeddings.db")
+        var embIndex: EmbeddingIndex? = null
+
+        if (embFile.exists()) {
+            log("Loading embedding index: ${embFile.name} (${embFile.length() / 1024 / 1024}MB)")
+            try {
+                embIndex = EmbeddingIndex.mmap(embFile)
+                log("  ${embIndex.numTracks} tracks, ${embIndex.dim}d")
+            } catch (e: Exception) {
+                log("  WARNING: Failed to load embedding index: ${e.message}")
+            }
+        } else if (dbFile.exists()) {
+            log("Extracting embedding index from DB...")
+            try {
+                val db = EmbeddingDatabase.open(dbFile)
+                EmbeddingIndex.extractFromDatabase(db, embFile)
+                db.close()
+                embIndex = EmbeddingIndex.mmap(embFile)
+                log("  Extracted ${embIndex.numTracks} tracks, ${embIndex.dim}d")
+            } catch (e: Exception) {
+                log("  WARNING: Failed to extract embeddings: ${e.message}")
+            }
+        } else {
+            log("No embedding index or DB found — search results unavailable")
+        }
+
+        // Open DB for track metadata lookups (getTrackById for each search hit)
+        var metaDb: EmbeddingDatabase? = null
+        if (embIndex != null && dbFile.exists()) {
+            try {
+                metaDb = EmbeddingDatabase.open(dbFile)
+                log("  DB opened for metadata (${metaDb.getTrackCount()} tracks)")
+            } catch (e: Exception) {
+                log("  WARNING: Failed to open DB for metadata: ${e.message}")
+            }
+        }
+        log("")
+
+        // Run test queries
+        val queryResults = mutableListOf<TextQueryResult>()
+        val debugDir = File(filesDir, "text_benchmark")
+
+        for ((qi, query) in textTestQueries.withIndex()) {
+            log("Query [${qi + 1}/${textTestQueries.size}]: \"$query\"")
+
+            val t0 = System.nanoTime()
+            val embedding = textInference.generateEmbedding(query, debugDir = debugDir)
+            val totalMs = (System.nanoTime() - t0) / 1_000_000
+
+            if (embedding == null) {
+                log("  FAILED: null embedding")
+                queryResults.add(TextQueryResult(query = query, error = "null embedding"))
+                continue
+            }
+
+            // Check embedding quality
+            val nanCount = embedding.count { it.isNaN() }
+            val infCount = embedding.count { it.isInfinite() }
+            val norm = kotlin.math.sqrt(embedding.sumOf { (it * it).toDouble() }).toFloat()
+            val absMax = embedding.maxOf { kotlin.math.abs(it) }
+
+            if (nanCount > 0 || infCount > 0) {
+                log("  WARNING: $nanCount NaN, $infCount Inf in ${embedding.size}d embedding")
+            }
+            log("  ${embedding.size}d, norm=${"%.4f".format(norm)}, absmax=${"%.4f".format(absMax)}, time=${totalMs}ms")
+
+            // Search against audio embeddings
+            var searchResults: List<TextSearchHit>? = null
+            if (embIndex != null) {
+                val searchStart = System.nanoTime()
+                val topK = embIndex.findTopK(embedding, 10)
+                val searchMs = (System.nanoTime() - searchStart) / 1_000_000
+                log("  Search: ${embIndex.numTracks} tracks in ${searchMs}ms")
+
+                searchResults = topK.map { (trackId, sim) ->
+                    val track = metaDb?.getTrackById(trackId)
+                    val label = if (track != null) {
+                        "${track.artist} - ${track.title}"
+                    } else "trackId=$trackId"
+                    TextSearchHit(trackId = trackId, similarity = sim, label = label)
+                }
+
+                for ((rank, hit) in searchResults.withIndex()) {
+                    log("    ${rank + 1}. ${"%.4f".format(hit.similarity)}  ${hit.label}")
+                }
+            }
+
+            queryResults.add(TextQueryResult(
+                query = query,
+                dim = embedding.size,
+                norm = norm,
+                absMax = absMax,
+                totalMs = totalMs,
+                embedding = embedding.toList(),
+                topMatches = searchResults,
+            ))
+            log("")
+        }
+
+        textInference.close()
+        metaDb?.close()
+        log("Text model closed.")
+
+        // Save results JSON
+        val output = TextBenchmarkOutput(
+            device = "${Build.MANUFACTURER} ${Build.MODEL}",
+            soc = Build.SOC_MODEL,
+            androidVersion = "${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})",
+            textModel = textModelFile.name,
+            textAccelerator = textAccel,
+            textLoadMs = loadMs,
+            numAudioTracks = embIndex?.numTracks ?: 0,
+            queries = queryResults,
+        )
+
+        val gson = GsonBuilder().setPrettyPrinting().create()
+        val json = gson.toJson(output)
+        val outputFile = File(filesDir, "text_benchmark_results.json")
+        outputFile.writeText(json)
+
+        log("\n=== Results saved ===")
+        log("File: ${outputFile.absolutePath}")
+        log("Pull: adb shell run-as com.powerampstartradio cat files/text_benchmark_results.json")
+
+        // Timing summary
+        log("\n=== Timing Summary ===")
+        log("Model load: ${loadMs}ms ($textAccel)")
+        log("")
+        log(String.format("%-30s %8s %8s %8s", "Query", "Total", "Norm", "AbsMax"))
+        log("-".repeat(60))
+        for (r in queryResults) {
+            if (r.error != null) {
+                log(String.format("%-30s %8s", r.query.take(30), "FAILED"))
+            } else {
+                log(String.format("%-30s %7dms %7.4f %7.4f",
+                    r.query.take(30), r.totalMs, r.norm, r.absMax))
+            }
+        }
+
+        val successfulQueries = queryResults.filter { it.error == null }
+        if (successfulQueries.isNotEmpty()) {
+            val avgMs = successfulQueries.map { it.totalMs }.average().toLong()
+            val avgNorm = successfulQueries.map { it.norm.toDouble() }.average()
+            log("-".repeat(60))
+            log(String.format("%-30s %7dms %7.4f",
+                "AVERAGE (${successfulQueries.size})", avgMs, avgNorm))
+        }
+
+        log("\nText benchmark complete.")
     }
 
     /** Prefer FP16 models (GPU-native, half size) over FP32 originals. */
@@ -642,7 +932,6 @@ class BenchmarkActivity : ComponentActivity() {
     private fun resolveFile(path: String): File? {
         val f = File(path)
         if (f.isFile && f.canRead()) return f
-        Log.w(TAG, "Could not resolve file: $path")
         return null
     }
 
@@ -650,33 +939,82 @@ class BenchmarkActivity : ComponentActivity() {
     private data class TestTrack(
         val id: Long,
         val artist: String,
+        val album: String,
         val title: String,
+        val durationMs: Long,
         val path: String,
     )
 
-    // JSON output data classes
     data class BenchmarkOutput(
         val device: String,
         val soc: String,
         val androidVersion: String,
         val runtime: String,
-        val mulanEp: String? = null,
-        val flamingoEp: String? = null,
+        val mertModel: String? = null,
+        val mertAccelerator: String? = null,
+        val mertLoadMs: Long = 0,
+        val clamp3Model: String? = null,
+        val clamp3Accelerator: String? = null,
+        val clamp3LoadMs: Long = 0,
         val tracks: List<TrackResult>,
     )
 
     data class TrackResult(
         val path: String,
         val artist: String,
+        val album: String,
         val title: String,
-        var mulan: EmbeddingResult? = null,
-        var flamingo: EmbeddingResult? = null,
+        val durationMs: Long,
+        var durationS: Float = 0f,
+        var timing: TrackTiming? = null,
+        var clamp3: EmbeddingResult? = null,
+    )
+
+    data class TrackTiming(
+        val decodeMs: Long,
+        val resampleMs: Long = 0,
+        val resampleQuality: String = "hq",
+        val mertTotalMs: Long,
+        val mertWindows: Int,
+        val mertPerWindowMs: List<Long>,
+        val mertAvgWindowMs: Long,
+        val clamp3Segments: Int,
+        val clamp3TotalMs: Long,
+        val totalMs: Long,
+        val realtimeFactor: Float,
     )
 
     data class EmbeddingResult(
-        val ep: String,
-        val timingMs: Long,
         val dim: Int,
         val embedding: List<Float>,
+    )
+
+    // Text benchmark data classes
+    data class TextBenchmarkOutput(
+        val device: String,
+        val soc: String,
+        val androidVersion: String,
+        val textModel: String,
+        val textAccelerator: String,
+        val textLoadMs: Long,
+        val numAudioTracks: Int,
+        val queries: List<TextQueryResult>,
+    )
+
+    data class TextQueryResult(
+        val query: String,
+        val dim: Int = 0,
+        val norm: Float = 0f,
+        val absMax: Float = 0f,
+        val totalMs: Long = 0,
+        val embedding: List<Float>? = null,
+        val topMatches: List<TextSearchHit>? = null,
+        val error: String? = null,
+    )
+
+    data class TextSearchHit(
+        val trackId: Long,
+        val similarity: Float,
+        val label: String,
     )
 }

@@ -15,8 +15,8 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.basicMarquee
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -31,19 +31,27 @@ import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.Canvas
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.powerampstartradio.poweramp.PowerampHelper
@@ -63,6 +71,7 @@ import com.powerampstartradio.ui.QueuedTrackResult
 import com.powerampstartradio.ui.RadioResult
 import com.powerampstartradio.ui.RadioUiState
 import com.powerampstartradio.ui.SelectionMode
+import com.powerampstartradio.ui.TextSearchResult
 import com.powerampstartradio.ui.theme.PowerampStartRadioTheme
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
@@ -133,6 +142,7 @@ fun MainScreen(
 
     var currentTrack by remember { mutableStateOf<PowerampTrack?>(PowerampReceiver.currentTrack) }
     var showSettings by remember { mutableStateOf(false) }
+    var showTextSearch by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf("") }
     var viewingSession by remember { mutableStateOf<Int?>(null) }
 
@@ -163,8 +173,11 @@ fun MainScreen(
     }
 
 
-    BackHandler(enabled = showSettings || viewingSession != null) {
-        if (showSettings) showSettings = false
+    BackHandler(enabled = showSettings || showTextSearch || viewingSession != null) {
+        if (showTextSearch) {
+            showTextSearch = false
+            viewModel.clearTextSearchResult()
+        } else if (showSettings) showSettings = false
         else {
             viewingSession = null
             viewModel.resetRadioState()
@@ -191,22 +204,31 @@ fun MainScreen(
             }
         }
     ) {
+        // Screen: 0=home, 1=settings, 2=text search
+        val screenIndex = when {
+            showTextSearch -> 2
+            showSettings -> 1
+            else -> 0
+        }
         AnimatedContent(
-            targetState = showSettings,
+            targetState = screenIndex,
             transitionSpec = {
-                slideInHorizontally { if (targetState) it else -it } togetherWith
-                    slideOutHorizontally { if (targetState) -it else it }
+                slideInHorizontally { if (targetState > initialState) it else -it } togetherWith
+                    slideOutHorizontally { if (targetState > initialState) -it else it }
             },
-            label = "settings_transition"
-        ) { isSettings ->
-            if (isSettings) {
-                SettingsScreen(viewModel = viewModel, databaseInfo = databaseInfo,
+            label = "screen_transition"
+        ) { screen ->
+            when (screen) {
+                1 -> SettingsScreen(viewModel = viewModel, databaseInfo = databaseInfo,
                     onImportDatabase = { importLauncher.launch(arrayOf("application/octet-stream", "*/*")) },
                     hasPermission = hasPermission,
                     onRequestPermission = { viewModel.requestPermission() },
                     onBack = { showSettings = false })
-            } else {
-                HomeScreen(
+                2 -> TextSearchScreen(viewModel = viewModel, onBack = {
+                    showTextSearch = false
+                    viewModel.clearTextSearchResult()
+                })
+                else -> HomeScreen(
                     radioState = radioState, currentTrack = currentTrack,
                     databaseInfo = databaseInfo, hasPermission = hasPermission,
                     sessionHistory = sessionHistory, statusMessage = statusMessage,
@@ -220,6 +242,7 @@ fun MainScreen(
                     onClearAndReset = { viewModel.resetRadioState() },
                     onRequestPermission = { viewModel.requestPermission() },
                     onOpenSettings = { showSettings = true },
+                    onOpenTextSearch = { showTextSearch = true },
                     onOpenDrawer = { scope.launch { drawerState.open() } },
                     viewingSession = viewingSession,
                     onViewSession = { viewingSession = it }
@@ -246,6 +269,7 @@ fun HomeScreen(
     onClearAndReset: () -> Unit,
     onRequestPermission: () -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenTextSearch: () -> Unit,
     onOpenDrawer: () -> Unit,
     viewingSession: Int?,
     onViewSession: (Int?) -> Unit
@@ -286,22 +310,32 @@ fun HomeScreen(
             )
         },
         floatingActionButton = {
-            if (radioState.isActiveSearch()) {
-                ExtendedFloatingActionButton(
-                    onClick = onCancelSearch,
-                    icon = { Icon(Icons.Default.Clear, contentDescription = null) },
-                    text = { Text("Cancel") },
-                    containerColor = MaterialTheme.colorScheme.errorContainer,
-                    contentColor = MaterialTheme.colorScheme.onErrorContainer,
-                    expanded = true
-                )
-            } else {
-                ExtendedFloatingActionButton(
-                    onClick = onStartRadio,
-                    icon = { Icon(Icons.Default.PlayArrow, contentDescription = null) },
-                    text = { Text("Start Radio") },
-                    expanded = true
-                )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onOpenTextSearch) {
+                    Icon(Icons.Default.Search, contentDescription = "Text Search",
+                        tint = MaterialTheme.colorScheme.onSurface)
+                }
+                val dividerColor = MaterialTheme.colorScheme.outlineVariant
+                Canvas(modifier = Modifier.height(28.dp).width(2.dp)) {
+                    val path = Path().apply {
+                        moveTo(center.x, 0f)
+                        quadraticTo(size.width, center.y, center.x, size.height)
+                        quadraticTo(0f, center.y, center.x, 0f)
+                    }
+                    drawPath(path, dividerColor)
+                }
+                if (radioState.isActiveSearch()) {
+                    IconButton(onClick = onCancelSearch) {
+                        Icon(Icons.Default.Clear, contentDescription = "Cancel",
+                            tint = MaterialTheme.colorScheme.error)
+                    }
+                } else {
+                    IconButton(onClick = onStartRadio) {
+                        Icon(painterResource(R.drawable.ic_radio_waves),
+                            contentDescription = "Start Radio",
+                            tint = MaterialTheme.colorScheme.primary)
+                    }
+                }
             }
         }
     ) { padding ->
@@ -423,10 +457,11 @@ fun CompactNowPlayingHeader(
                 }
             }
             Text(text = currentTrack.title, style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.primary)
             Text(text = listOfNotNull(currentTrack.artist, currentTrack.album).joinToString(" \u00b7 "),
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     } else {
@@ -488,7 +523,7 @@ private fun SessionSeedHeader(session: RadioResult, modifier: Modifier = Modifie
         text = summary,
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.padding(vertical = 4.dp).fillMaxWidth().basicMarquee(),
+        modifier = Modifier.padding(vertical = 4.dp).fillMaxWidth().basicMarquee(iterations = 1, initialDelayMillis = 1500),
         maxLines = 1
     )
 }
@@ -669,6 +704,7 @@ fun IdleContent(
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         if (indexStatus != null && indexStatus != "Index ready") {
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             Text(indexStatus, style = MaterialTheme.typography.bodySmall,
                 fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
@@ -679,6 +715,238 @@ fun IdleContent(
         if (isIdle && hasPermission && databaseInfo != null && statusMessage.isEmpty()) {
             Text("Ready when you are!", style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.primary)
+        }
+    }
+}
+
+// ---- Text Search Screen ----
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+@Composable
+fun TextSearchScreen(
+    viewModel: MainViewModel = viewModel(),
+    onBack: () -> Unit
+) {
+    val textSearchResult by viewModel.textSearchResult.collectAsState()
+    val isLoading by viewModel.textSearchLoading.collectAsState()
+    val recentSearches by viewModel.recentSearches.collectAsState()
+    var query by remember { mutableStateOf(TextFieldValue("")) }
+    val focusRequester = remember { FocusRequester() }
+
+    LaunchedEffect(Unit) {
+        focusRequester.requestFocus()
+    }
+
+    fun doSearch(q: String) {
+        if (q.isBlank()) return
+        query = TextFieldValue(q, selection = TextRange(q.length))
+        viewModel.performTextSearch(q.trim())
+    }
+
+    BackHandler(enabled = textSearchResult != null) {
+        viewModel.clearTextSearchResult()
+    }
+
+    val dynamicTitle = if (textSearchResult != null) "Results" else "Retrieve By Text"
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text(dynamicTitle) },
+                navigationIcon = {
+                    IconButton(onClick = {
+                        if (textSearchResult != null) {
+                            viewModel.clearTextSearchResult()
+                        } else {
+                            onBack()
+                        }
+                    }) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                }
+            )
+        }
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+        ) {
+            // Search input
+            val placeholderHint = remember {
+                listOf(
+                    "classic rock, British, 1960s, upbeat",
+                    "Heartfelt and nostalgic, with a bittersweet, melancholic feel",
+                    "A Latin jazz piece with rhythmic percussion and brass",
+                    "big band, major key, swing, brass-heavy, syncopation, baritone vocal",
+                ).random()
+            }
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                label = { Text("Describe what you want to hear...") },
+                placeholder = {
+                    Text(
+                        placeholderHint,
+                        modifier = Modifier.basicMarquee(iterations = 1, initialDelayMillis = 1500),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                        maxLines = 1,
+                    )
+                },
+                singleLine = true,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
+                    .focusRequester(focusRequester),
+                trailingIcon = {
+                    if (isLoading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                        )
+                    } else if (query.text.isNotEmpty()) {
+                        Row {
+                            IconButton(onClick = { doSearch(query.text) }) {
+                                Icon(Icons.Default.Search, contentDescription = "Search")
+                            }
+                            IconButton(onClick = {
+                                query = TextFieldValue("")
+                                viewModel.clearTextSearchResult()
+                            }) {
+                                Icon(Icons.Default.Clear, contentDescription = "Clear")
+                            }
+                        }
+                    }
+                },
+                keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+                    onSearch = { doSearch(query.text) }
+                ),
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                    imeAction = androidx.compose.ui.text.input.ImeAction.Search
+                ),
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Results or recent searches
+            val result = textSearchResult
+            if (result != null) {
+                if (result.error != null) {
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer
+                        ),
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                    ) {
+                        Text(
+                            result.error,
+                            modifier = Modifier.padding(16.dp),
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                    }
+                } else if (result.matches.isNotEmpty()) {
+                    Text(
+                        "\"${result.query}\" \u00b7 showing ${result.matches.size} results",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    LazyColumn(
+                        modifier = Modifier.weight(1f).fillMaxWidth(),
+                    ) {
+                            items(result.matches.size) { i ->
+                                val match = result.matches[i]
+                                val simPct = (match.similarity * 100).roundToInt()
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            onBack()
+                                            viewModel.startRadioFromTextSearch(match.track.id)
+                                        }
+                                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        "\u25B6",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            match.track.title ?: "Unknown",
+                                            modifier = Modifier.basicMarquee(iterations = 1, initialDelayMillis = 1500),
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                        )
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        Text(
+                                            listOfNotNull(
+                                                match.track.artist,
+                                                match.track.album
+                                            ).joinToString(" \u00b7 "),
+                                            modifier = Modifier.basicMarquee(iterations = 1, initialDelayMillis = 1500),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        "$simPct%",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                if (i < result.matches.lastIndex) {
+                                    HorizontalDivider(
+                                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.2f),
+                                    )
+                                }
+                            }
+                        }
+                    }
+            } else if (!isLoading) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "Recent searches",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    TextButton(
+                        onClick = { viewModel.clearRecentSearches() },
+                        modifier = Modifier.alpha(if (recentSearches.isNotEmpty()) 1f else 0f),
+                        enabled = recentSearches.isNotEmpty(),
+                    ) {
+                        Text("Clear")
+                    }
+                }
+                recentSearches.forEach { recent ->
+                    TextButton(
+                        onClick = {
+                            query = TextFieldValue(recent, selection = TextRange(recent.length))
+                            doSearch(recent)
+                        },
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                    ) {
+                        Text(
+                            recent,
+                            modifier = Modifier.fillMaxWidth(),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                }
+            }
         }
     }
 }
@@ -706,6 +974,7 @@ fun SettingsScreen(
     val maxPerArtist by viewModel.maxPerArtist.collectAsState()
     val minArtistSpacing by viewModel.minArtistSpacing.collectAsState()
     val numTracks by viewModel.numTracks.collectAsState()
+    val textSearchTopK by viewModel.textSearchTopK.collectAsState()
     val previews by viewModel.previews.collectAsState()
     val previewsLoading by viewModel.previewsLoading.collectAsState()
 
@@ -779,6 +1048,15 @@ fun SettingsScreen(
                     Text("Queue Size: $numTracks tracks", style = MaterialTheme.typography.titleMedium)
                     Slider(value = numTracks.toFloat(), onValueChange = { viewModel.setNumTracks(it.toInt()) },
                         valueRange = 10f..100f, steps = 8, thumb = slimThumb, track = steppedTrack)
+                }
+            }
+
+            // Text search results
+            item {
+                Column {
+                    Text("Text Search Results: $textSearchTopK", style = MaterialTheme.typography.titleMedium)
+                    Slider(value = textSearchTopK.toFloat(), onValueChange = { viewModel.setTextSearchTopK(it.toInt()) },
+                        valueRange = 5f..50f, steps = 8, thumb = slimThumb, track = steppedTrack)
                 }
             }
 
@@ -1009,9 +1287,7 @@ fun SettingsScreen(
                     if (databaseInfo != null) {
                         val trackCountFmt = "%,d".format(databaseInfo.trackCount)
                         val dimLabel = if (databaseInfo.embeddingDim != null) "${databaseInfo.embeddingDim}-dim" else ""
-                        val modelNames = databaseInfo.availableModels.map { it.first }
-                        val embType = if (databaseInfo.hasFused) "fused" else modelNames.firstOrNull()?.replaceFirstChar { it.uppercase() } ?: "unknown"
-                        Text("$trackCountFmt tracks \u00b7 $dimLabel $embType embeddings",
+                        Text("$trackCountFmt tracks \u00b7 $dimLabel CLaMP3 embeddings",
                             style = MaterialTheme.typography.bodyMedium)
                     } else {
                         Text("No database imported", color = MaterialTheme.colorScheme.error)
@@ -1067,7 +1343,7 @@ fun SettingsScreen(
                             Text("TFLite models not found",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Text("Transfer mulan_audio.tflite and flamingo_encoder.tflite to app data",
+                            Text("Transfer mert.tflite and clamp3_audio.tflite to app data",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
                         } else {

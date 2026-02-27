@@ -7,7 +7,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
-import java.util.PriorityQueue
+import com.powerampstartradio.indexing.NativeMath
 
 /**
  * Memory-mapped embedding index for fast similarity search.
@@ -68,22 +68,27 @@ class EmbeddingIndex private constructor(
          *
          * Streams rows one at a time — never holds more than one embedding in memory.
          *
+         * @param table Override the embedding table to extract from.
+         *              When null, uses the database's default table (embeddings_clamp3).
          * @param onProgress called periodically with (current, total) track counts
          */
         fun extractFromDatabase(
             db: EmbeddingDatabase,
             outFile: File,
+            table: String? = null,
             onProgress: ((current: Int, total: Int) -> Unit)? = null
         ) {
-            Log.d(TAG, "Extracting fused embeddings to ${outFile.name}")
+            val tableName = table ?: db.embeddingTable
+            val t0 = System.nanoTime()
+            Log.d(TAG, "Extracting embeddings from $tableName to ${outFile.name}")
 
-            val numTracks = db.getEmbeddingCount()
+            val numTracks = db.getEmbeddingCountForTable(tableName)
             if (numTracks == 0) {
-                Log.w(TAG, "No embeddings to extract")
+                Log.w(TAG, "No embeddings in $tableName to extract")
                 return
             }
 
-            val actualDim = db.getEmbeddingDim() ?: return
+            val actualDim = db.getEmbeddingDimForTable(tableName) ?: return
             val totalMB = numTracks.toLong() * actualDim * 4 / 1024 / 1024
             Log.i(TAG, "Extracting $numTracks embeddings (dim=$actualDim, ~${totalMB} MB)")
 
@@ -107,7 +112,7 @@ class EmbeddingIndex private constructor(
                 var i = 0
                 var skipped = 0
                 val progressInterval = maxOf(numTracks / 20, 1)  // ~5% increments
-                db.forEachEmbeddingRaw { trackId, blob ->
+                db.forEachEmbeddingRaw(tableName) { trackId, blob ->
                     if (blob.size != expectedBlobSize) {
                         skipped++
                         return@forEachEmbeddingRaw
@@ -145,7 +150,8 @@ class EmbeddingIndex private constructor(
                 buf.force()
             }
 
-            Log.i(TAG, "Wrote ${outFile.length() / 1024 / 1024} MB to ${outFile.name}")
+            val extractMs = (System.nanoTime() - t0) / 1_000_000
+            Log.i(TAG, "Wrote ${outFile.length() / 1024 / 1024} MB to ${outFile.name} in ${extractMs}ms")
         }
     }
 
@@ -213,46 +219,40 @@ class EmbeddingIndex private constructor(
     /**
      * Find the top-K most similar tracks to a query embedding.
      *
-     * Uses a min-heap of size K for O(N log K) scan.
+     * Uses NEON-accelerated dot products via JNI for ~30x speedup over scalar Kotlin.
      *
-     * @param cancellationCheck called every 10K tracks to allow coroutine cancellation
+     * @param cancellationCheck called every 10K tracks to allow coroutine cancellation (unused in native path)
      */
     fun findTopK(
         query: FloatArray,
         topK: Int,
         excludeIds: Set<Long> = emptySet(),
-        cancellationCheck: (() -> Unit)? = null
+        @Suppress("UNUSED_PARAMETER") cancellationCheck: (() -> Unit)? = null
     ): List<Pair<Long, Float>> {
-        val heap = PriorityQueue<Pair<Long, Float>>(topK + 1, compareBy { it.second })
+        val k = topK.coerceAtMost(numTracks)
+        val outTrackIds = LongArray(k)
+        val outScores = FloatArray(k)
+        val excludeArray = if (excludeIds.isEmpty()) null else excludeIds.toLongArray()
 
-        for (i in 0 until numTracks) {
-            if (i % 10000 == 0) cancellationCheck?.invoke()
-            val trackId = getTrackId(i)
-            if (trackId in excludeIds) continue
+        val count = NativeMath.findTopK(
+            buffer, trackIdsOffset.toLong(), embeddingsOffset,
+            query, numTracks, dim, k,
+            excludeArray, outTrackIds, outScores
+        )
 
-            val score = dotProduct(query, i)
-
-            if (heap.size < topK) {
-                heap.add(trackId to score)
-            } else if (score > heap.peek()!!.second) {
-                heap.poll()
-                heap.add(trackId to score)
-            }
-        }
-
-        return heap.sortedByDescending { it.second }
+        return (0 until count).map { i -> outTrackIds[i] to outScores[i] }
     }
 
     /**
      * Compute similarity of every track to a reference vector in one sequential scan.
      * Returns a FloatArray indexed by internal track index (~300KB for 75K tracks).
      * Use with [rankFromSimilarities] for O(1)-amortized rank lookups.
+     *
+     * Uses NEON-accelerated dot products via JNI.
      */
     fun computeAllSimilarities(reference: FloatArray): FloatArray {
         val sims = FloatArray(numTracks)
-        for (i in 0 until numTracks) {
-            sims[i] = dotProduct(reference, i)
-        }
+        NativeMath.allSimilarities(buffer, embeddingsOffset, reference, numTracks, dim, sims)
         return sims
     }
 

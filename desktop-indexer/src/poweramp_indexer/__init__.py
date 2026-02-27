@@ -1,7 +1,7 @@
 """Poweramp Start Radio - Desktop Indexer
 
-A CLI tool that scans music libraries, generates audio embeddings using
-MuLan and Music Flamingo models, and exports them to SQLite for use by the Android plugin.
+Scans music libraries and generates CLaMP3 audio embeddings for
+similarity search and text-to-audio retrieval on Android.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

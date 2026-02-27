@@ -2,11 +2,6 @@ package com.powerampstartradio.indexing
 
 /**
  * High-quality audio resampling via libsoxr (native).
- *
- * Uses the SoX Resampler library which produces embeddings-grade resampling
- * quality that Flamingo/Whisper requires. Standard approaches (linear interp,
- * windowed sinc, Kaiser FIR) all produce catastrophically wrong embeddings
- * due to aliasing sensitivity in the Whisper encoder.
  */
 object NativeResampler {
     init {

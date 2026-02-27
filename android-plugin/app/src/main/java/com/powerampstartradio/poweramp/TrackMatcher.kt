@@ -175,6 +175,15 @@ class TrackMatcher(
     }
 
     /**
+     * Resolve a single embedded track to its Poweramp file ID.
+     * Ensures the cache is built first. Returns null if no match found.
+     */
+    fun findFileId(context: Context, track: EmbeddedTrack): Long? {
+        ensureCache(context)
+        return resolveFileId(track)
+    }
+
+    /**
      * Resolve an embedded track to its Poweramp file ID using all matching strategies.
      * Returns null if no match found.
      */

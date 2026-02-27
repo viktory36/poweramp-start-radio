@@ -6,16 +6,19 @@ import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.powerampstartradio.data.EmbeddedTrack
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.data.EmbeddingIndex
 import com.powerampstartradio.indexing.IndexingService
 import com.powerampstartradio.indexing.IndexingViewModel
+import com.powerampstartradio.indexing.Clamp3TextInference
 import com.powerampstartradio.indexing.NewTrackDetector
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.poweramp.TrackMatcher
 import com.powerampstartradio.services.RadioService
 import com.powerampstartradio.similarity.RecommendationEngine
+import com.google.ai.edge.litert.Accelerator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -24,6 +27,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * ViewModel for the main screen.
@@ -82,6 +86,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _minArtistSpacing = MutableStateFlow(prefs.getInt("min_artist_spacing", 3))
     val minArtistSpacing: StateFlow<Int> = _minArtistSpacing.asStateFlow()
+
+    private val _textSearchTopK = MutableStateFlow(prefs.getInt("text_search_top_k", 20))
+    val textSearchTopK: StateFlow<Int> = _textSearchTopK.asStateFlow()
 
     // --- Database & permission state ---
 
@@ -148,12 +155,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val state = RadioService.uiState.value
         if (state is RadioUiState.Success) {
             val result = state.result
-            val knownIds = result.queuedFileIds + result.seedTrack.realId
+            val knownIds = buildSet {
+                addAll(result.queuedFileIds)
+                add(result.seedTrack.realId)
+                result.queueAnchorId?.let { add(it) }
+            }
             if (track == null || track.realId !in knownIds) {
                 RadioService.resetState()
             }
         }
     }
+
+    private val indicesPreparing = AtomicBoolean(false)
 
     init {
         RadioService.initHistory(application.filesDir)
@@ -179,6 +192,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         super.onCleared()
         PowerampReceiver.removeTrackChangeListener(trackChangeListener)
+        try { textInference?.close() } catch (_: Exception) {}
+        textInference = null
     }
 
     /**
@@ -256,6 +271,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         prefs.edit().putInt("min_artist_spacing", value).apply()
     }
 
+    fun setTextSearchTopK(value: Int) {
+        _textSearchTopK.value = value
+        prefs.edit().putInt("text_search_top_k", value).apply()
+    }
+
     // --- Actions ---
 
     fun startRadio() {
@@ -288,7 +308,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun getOrOpenRankIndex(): EmbeddingIndex? {
         rankIndex?.let { return it }
-        val embFile = File(getApplication<Application>().filesDir, "fused.emb")
+        val embFile = File(getApplication<Application>().filesDir, "clamp3.emb")
         if (!embFile.exists()) return null
         return try {
             EmbeddingIndex.mmap(embFile).also { rankIndex = it }
@@ -342,6 +362,179 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             db.close()
             tracks.map { t -> "${t.track.title ?: "?"} \u2013 ${t.track.artist ?: "?"}" }
         } catch (_: Exception) { null }
+    }
+
+    // --- Text search state ---
+
+    /** Current text search result. Null when idle, non-null after a search completes. */
+    private val _textSearchResult = MutableStateFlow<TextSearchResult?>(null)
+    val textSearchResult: StateFlow<TextSearchResult?> = _textSearchResult.asStateFlow()
+
+    private val _textSearchLoading = MutableStateFlow(false)
+    val textSearchLoading: StateFlow<Boolean> = _textSearchLoading.asStateFlow()
+
+    /** Recent text search queries (persisted across sessions). */
+    private val _recentSearches = MutableStateFlow<List<String>>(
+        prefs.getString("recent_searches", null)?.split("\u0000")?.filter { it.isNotBlank() }
+            ?: emptyList()
+    )
+    val recentSearches: StateFlow<List<String>> = _recentSearches.asStateFlow()
+
+    private var textInference: Clamp3TextInference? = null
+    private var textIndex: EmbeddingIndex? = null
+
+    /**
+     * Search for the best matching track by text query using CLaMP3 text embeddings.
+     */
+    fun performTextSearch(query: String) {
+        if (_textSearchLoading.value) return
+        _textSearchLoading.value = true
+        _textSearchResult.value = null
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val filesDir = getApplication<Application>().filesDir
+                val dbFile = File(filesDir, "embeddings.db")
+                if (!dbFile.exists()) {
+                    _textSearchResult.value = TextSearchResult(query = query, error = "No embedding database found")
+                    return@launch
+                }
+
+                // Lazy init text inference with fallback chain
+                val inference = textInference ?: run {
+                    val vocabFile = File(filesDir, "xlm_roberta_vocab.json")
+                    if (!vocabFile.exists()) {
+                        _textSearchResult.value = TextSearchResult(query = query, error = "Tokenizer vocab not found")
+                        return@launch
+                    }
+
+                    // Text model has INT64 ops → GPU always fails → CPU via XNNPACK.
+                    // Try GPU first for future-proofing, fall back to CPU.
+                    val candidates = buildList {
+                        val fp32 = File(filesDir, "clamp3_text.tflite")
+                        if (fp32.exists()) {
+                            add(fp32 to Accelerator.GPU)
+                            add(fp32 to Accelerator.CPU)
+                        }
+                    }
+                    if (candidates.isEmpty()) {
+                        _textSearchResult.value = TextSearchResult(query = query, error = "CLaMP3 text model not found")
+                        return@launch
+                    }
+
+                    var lastError: Exception? = null
+                    var result: Clamp3TextInference? = null
+                    for ((modelFile, accel) in candidates) {
+                        try {
+                            result = Clamp3TextInference(modelFile, vocabFile, accel)
+                            Log.i("MainViewModel", "Text model loaded: ${modelFile.name} on $accel")
+                            break
+                        } catch (e: Exception) {
+                            Log.w("MainViewModel", "Text model ${modelFile.name}+$accel failed: ${e.message}")
+                            lastError = e
+                        }
+                    }
+                    if (result == null) {
+                        _textSearchResult.value = TextSearchResult(query = query, error = "Failed to load text model: ${lastError?.message}")
+                        return@launch
+                    }
+                    result.also { textInference = it }
+                }
+
+                // Generate text embedding. If inference fails on a cached model
+                // (stale GPU context from cancelled indexing), destroy and retry once.
+                val debugDir = File(filesDir, "debug_embeddings")
+                var embedding = try {
+                    inference.generateEmbedding(query, debugDir)
+                } catch (e: Exception) {
+                    Log.w("MainViewModel", "Text inference failed, will retry with fresh model", e)
+                    null
+                }
+                if (embedding == null && textInference != null) {
+                    Log.i("MainViewModel", "Destroying stale text model and retrying")
+                    try { textInference?.close() } catch (_: Exception) {}
+                    textInference = null
+                    _textSearchResult.value = TextSearchResult(query = query, error = "Model error — retrying...")
+                    // Retry: re-run performTextSearch which will lazy-init a fresh model
+                    _textSearchLoading.value = false
+                    performTextSearch(query)
+                    return@launch
+                }
+                if (embedding == null) {
+                    _textSearchResult.value = TextSearchResult(query = query, error = "Text inference failed")
+                    return@launch
+                }
+
+                // Lazy init CLaMP3 embedding index for text search
+                // Text and audio embeddings share the same 768d space in CLaMP3
+                val index = textIndex ?: run {
+                    val embFile = File(filesDir, "clamp3.emb")
+                    if (!embFile.exists()) {
+                        val db = EmbeddingDatabase.open(dbFile)
+                        val clamp3Count = db.getEmbeddingCountForTable("embeddings_clamp3")
+                        if (clamp3Count == 0) {
+                            db.close()
+                            _textSearchResult.value = TextSearchResult(query = query, error = "No CLaMP3 embeddings in database")
+                            return@launch
+                        }
+                        EmbeddingIndex.extractFromDatabase(db, embFile, table = "embeddings_clamp3")
+                        db.close()
+                    }
+                    if (!embFile.exists()) {
+                        _textSearchResult.value = TextSearchResult(query = query, error = "Failed to extract CLaMP3 index")
+                        return@launch
+                    }
+                    EmbeddingIndex.mmap(embFile).also { textIndex = it }
+                }
+
+                // Find top matches
+                val topMatches = index.findTopK(embedding, topK = _textSearchTopK.value)
+                if (topMatches.isEmpty()) {
+                    _textSearchResult.value = TextSearchResult(query = query, error = "No matches found")
+                    return@launch
+                }
+
+                // Resolve track metadata
+                val db = EmbeddingDatabase.open(dbFile)
+                val matchedTracks = topMatches.mapNotNull { (trackId, score) ->
+                    db.getTrackById(trackId)?.let { track -> TextSearchMatch(track, score) }
+                }
+                db.close()
+
+                _textSearchResult.value = TextSearchResult(query = query, matches = matchedTracks)
+
+                // Save to recent searches
+                saveRecentSearch(query)
+
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "Text search failed", e)
+                _textSearchResult.value = TextSearchResult(query = query, error = "Search failed: ${e.message}")
+            } finally {
+                _textSearchLoading.value = false
+            }
+        }
+    }
+
+    /**
+     * Start radio using a text search match as seed.
+     */
+    fun startRadioFromTextSearch(trackId: Long) {
+        RadioService.startRadioFromSeed(getApplication(), trackId, buildConfig())
+    }
+
+    fun clearTextSearchResult() {
+        _textSearchResult.value = null
+    }
+
+    private fun saveRecentSearch(query: String) {
+        val updated = (listOf(query) + _recentSearches.value.filter { it != query }).take(10)
+        _recentSearches.value = updated
+        prefs.edit().putString("recent_searches", updated.joinToString("\u0000")).apply()
+    }
+
+    fun clearRecentSearches() {
+        _recentSearches.value = emptyList()
+        prefs.edit().remove("recent_searches").apply()
     }
 
     // --- Indexing actions ---
@@ -432,10 +625,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return null
         }
 
-        val mulanFile = findModel("mulan_audio")
-        val flamingoFile = findModel("flamingo_encoder")
-        val projectorFile = findModel("flamingo_projector")
-        _hasModels.value = mulanFile != null || flamingoFile != null
+        val mertFile = findModel("mert")
+        val clamp3AudioFile = findModel("clamp3_audio")
+        val clamp3TextFile = findModel("clamp3_text")
+        _hasModels.value = mertFile != null && clamp3AudioFile != null
 
         fun fileSizeMb(f: File?): String? {
             if (f == null) return null
@@ -444,22 +637,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val dbFile = File(filesDir, "embeddings.db")
-        val embFile = File(filesDir, "fused.emb")
+        val embFile = File(filesDir, "clamp3.emb")
         val graphFile = File(filesDir, "graph.bin")
+        val vocabFile = File(filesDir, "xlm_roberta_vocab.json")
 
         _fileStatuses.value = listOf(
             AppFileStatus("embeddings.db", dbFile.exists(), fileSizeMb(dbFile),
                 "Embedding database (required)"),
-            AppFileStatus("fused.emb", embFile.exists(), fileSizeMb(embFile),
+            AppFileStatus("clamp3.emb", embFile.exists(), fileSizeMb(embFile),
                 "Auto-generated from database"),
             AppFileStatus("graph.bin", graphFile.exists(), fileSizeMb(graphFile),
                 "kNN graph for Random Walk"),
-            AppFileStatus("mulan_audio", mulanFile != null, fileSizeMb(mulanFile),
-                if (mulanFile != null) mulanFile.name else "MuQ-MuLan model"),
-            AppFileStatus("flamingo_encoder", flamingoFile != null, fileSizeMb(flamingoFile),
-                if (flamingoFile != null) flamingoFile.name else "Flamingo encoder model"),
-            AppFileStatus("flamingo_projector", projectorFile != null, fileSizeMb(projectorFile),
-                if (projectorFile != null) projectorFile.name else "Flamingo projector"),
+            AppFileStatus("mert", mertFile != null, fileSizeMb(mertFile),
+                if (mertFile != null) mertFile.name else "MERT audio feature model"),
+            AppFileStatus("clamp3_audio", clamp3AudioFile != null, fileSizeMb(clamp3AudioFile),
+                if (clamp3AudioFile != null) clamp3AudioFile.name else "CLaMP3 audio encoder"),
+            AppFileStatus("clamp3_text", clamp3TextFile != null, fileSizeMb(clamp3TextFile),
+                if (clamp3TextFile != null) clamp3TextFile.name else "CLaMP3 text encoder (for text search)"),
+            AppFileStatus("vocab", vocabFile.exists(), fileSizeMb(vocabFile),
+                "xlm_roberta_vocab.json (for text search)"),
         )
     }
 
@@ -476,12 +672,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         setDiversityLambda(defaults.diversityLambda)
         setMaxPerArtist(defaults.maxPerArtist)
         setMinArtistSpacing(defaults.minArtistSpacing)
+        setTextSearchTopK(20)
     }
 
     fun prepareIndices() {
+        if (!indicesPreparing.compareAndSet(false, true)) return
         viewModelScope.launch(Dispatchers.IO) {
-            prepareIndicesWithProgress { message ->
-                _indexStatus.value = message
+            try {
+                prepareIndicesWithProgress { message ->
+                    _indexStatus.value = message
+                }
+            } finally {
+                indicesPreparing.set(false)
             }
         }
     }
@@ -521,6 +723,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun importDatabase(uri: Uri) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                val t0 = System.nanoTime()
+                Log.i("MainViewModel", "importDatabase: starting from URI $uri")
                 _importStatus.value = "Copying database..."
                 val app = getApplication<Application>()
                 val destFile = File(app.filesDir, "embeddings.db")
@@ -538,10 +742,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 } ?: throw IllegalArgumentException("Cannot open URI: $uri")
 
                 // Delete stale derived files so they're re-extracted from the new DB
-                File(app.filesDir, "fused.emb").delete()
+                File(app.filesDir, "clamp3.emb").delete()
                 File(app.filesDir, "graph.bin").delete()
 
                 // Atomic replace: delete old, rename temp to final
+                val copyMs = (System.nanoTime() - t0) / 1_000_000
+                val fileSizeMB = tempFile.length() / (1024 * 1024)
+                Log.i("MainViewModel", "TIMING: DB copy ${fileSizeMB}MB in ${copyMs}ms")
                 destFile.delete()
                 if (!tempFile.renameTo(destFile)) {
                     throw java.io.IOException("Failed to move imported database")
@@ -552,18 +759,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val db = EmbeddingDatabase.open(destFile)
 
                 _importStatus.value = "Reading database info..."
+                val tInfo = System.nanoTime()
                 val info = DatabaseInfo(
                     trackCount = db.getTrackCount(),
                     embeddingCount = db.getEmbeddingCount(),
                     embeddingDim = db.getEmbeddingDim(),
                     version = db.getMetadata("version"),
                     sizeKb = destFile.length() / 1024,
-                    hasFused = db.hasFusedEmbeddings,
                     hasGraph = db.hasBinaryData("knn_graph"),
                     embeddingTable = db.embeddingTable,
                     availableModels = db.getAvailableModels(),
                 )
                 db.close()
+                val infoMs = (System.nanoTime() - tInfo) / 1_000_000
+                Log.i("MainViewModel", "DB info: ${info.trackCount} tracks, " +
+                    "${info.embeddingCount} embeddings, dim=${info.embeddingDim}, " +
+                    "hasGraph=${info.hasGraph}, models=${info.availableModels} (${infoMs}ms)")
                 _databaseInfo.value = info
 
                 // Extract indices with progress updates
@@ -573,6 +784,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 checkModels()
+                val totalMs = (System.nanoTime() - t0) / 1_000_000
+                Log.i("MainViewModel", "TIMING: importDatabase total = ${totalMs}ms")
                 _importStatus.value = null
 
                 // Fire-and-forget: unindexed count updates independently
@@ -600,7 +813,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         embeddingDim = db.getEmbeddingDim(),
                         version = db.getMetadata("version"),
                         sizeKb = dbFile.length() / 1024,
-                        hasFused = db.hasFusedEmbeddings,
                         hasGraph = db.hasBinaryData("knn_graph"),
                         embeddingTable = db.embeddingTable,
                         availableModels = db.getAvailableModels(),
@@ -628,9 +840,8 @@ data class DatabaseInfo(
     val embeddingDim: Int?,
     val version: String?,
     val sizeKb: Long,
-    val hasFused: Boolean = false,
     val hasGraph: Boolean = false,
-    val embeddingTable: String = "embeddings_fused",
+    val embeddingTable: String = "embeddings_clamp3",
     val availableModels: List<Pair<String, Int>> = emptyList(),
 )
 
@@ -639,4 +850,15 @@ data class AppFileStatus(
     val present: Boolean,
     val sizeMb: String? = null,
     val detail: String? = null,
+)
+
+data class TextSearchMatch(
+    val track: EmbeddedTrack,
+    val similarity: Float,
+)
+
+data class TextSearchResult(
+    val query: String,
+    val matches: List<TextSearchMatch> = emptyList(),
+    val error: String? = null,
 )
