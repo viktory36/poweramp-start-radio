@@ -59,8 +59,30 @@ class EmbeddingIndex private constructor(
                     "File size mismatch: expected $expectedSize, got ${raf.length()}"
                 }
 
+                // Async page-cache warming: madvise(MADV_WILLNEED) tells the kernel
+                // to prefetch all pages in background. Returns in ~1ms; actual I/O
+                // happens asynchronously so pages are warm by the time findTopK() runs.
+                buf.load()
+
                 return EmbeddingIndex(buf, numTracks, dim)
             }
+        }
+
+        /**
+         * Read the track count from an .emb file header without full mmap.
+         * Returns -1 if the file is missing, too small, or has invalid magic.
+         */
+        fun readHeaderTrackCount(file: File): Int {
+            if (!file.exists() || file.length() < HEADER_SIZE) return -1
+            return try {
+                RandomAccessFile(file, "r").use { raf ->
+                    val buf = ByteArray(HEADER_SIZE)
+                    raf.readFully(buf)
+                    val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
+                    if (bb.getInt(0) != MAGIC) return -1
+                    bb.getInt(8)  // numTracks
+                }
+            } catch (_: Exception) { -1 }
         }
 
         /**

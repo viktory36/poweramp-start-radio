@@ -73,26 +73,36 @@ class RecommendationEngine(
     suspend fun ensureIndices(
         onProgress: ((message: String) -> Unit)? = null
     ) = withContext(Dispatchers.IO) {
-        val dbFile = File(filesDir, "embeddings.db")
-        val dbModified = dbFile.lastModified()
-
-        // Embedding index
+        // Embedding index — content-based staleness: compare .emb header track count
+        // against actual DB row count. Immune to WAL-recovery mtime bumps.
         val embFile = File(filesDir, "clamp3.emb")
-        if (!embFile.exists() || embFile.lastModified() < dbModified) {
-            Log.i(TAG, "Extracting embedding index (one-time)...")
-            onProgress?.invoke("Extracting embedding index...")
-            EmbeddingIndex.extractFromDatabase(database, embFile) { cur, total ->
-                onProgress?.invoke("Extracting: $cur / $total")
+        val dbEmbCount = database.getEmbeddingCountForTable(database.embeddingTable)
+        val embHeaderCount = EmbeddingIndex.readHeaderTrackCount(embFile)
+        if (embHeaderCount != dbEmbCount || dbEmbCount == 0) {
+            if (dbEmbCount == 0) {
+                Log.w(TAG, "No embeddings in DB, skipping extraction")
+            } else {
+                Log.i(TAG, "Embedding index stale (file=$embHeaderCount, db=$dbEmbCount), re-extracting...")
+                onProgress?.invoke("Extracting embedding index...")
+                EmbeddingIndex.extractFromDatabase(database, embFile) { cur, total ->
+                    onProgress?.invoke("Extracting: $cur / $total")
+                }
+                // Invalidate cached mmap since file changed
+                embeddingIndex = null
             }
         }
-        if (embeddingIndex == null) {
+        if (embFile.exists() && embeddingIndex == null) {
+            onProgress?.invoke("Loading index...")
             embeddingIndex = EmbeddingIndex.mmap(embFile)
             Log.i(TAG, "Index: ${embeddingIndex!!.numTracks} tracks, dim=${embeddingIndex!!.dim}")
         }
 
         // Graph index (optional, only for Random Walk)
+        // Content-based: compare graph.bin header N against .emb track count
         val graphFile = File(filesDir, "graph.bin")
-        if (!graphFile.exists() || graphFile.lastModified() < dbModified) {
+        val embTrackCount = embeddingIndex?.numTracks ?: embHeaderCount
+        val graphNodeCount = GraphIndex.readHeaderNodeCount(graphFile)
+        if (graphNodeCount != embTrackCount) {
             onProgress?.invoke("Extracting kNN graph...")
             val extracted = GraphIndex.extractFromDatabase(database, graphFile)
             if (!extracted && embFile.exists()) {
@@ -101,6 +111,8 @@ class RecommendationEngine(
                 val graphUpdater = GraphUpdater(database, filesDir)
                 graphUpdater.rebuildIndices(onProgress)
             }
+            // Invalidate cached mmap since file changed
+            graphIndex = null
         }
         if (graphFile.exists() && graphIndex == null) {
             try {

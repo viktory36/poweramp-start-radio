@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -72,6 +73,7 @@ fun IndexingScreen(
     val unindexedTracks by viewModel.unindexedTracks.collectAsState()
     val selectedIds by viewModel.selectedIds.collectAsState()
     val dismissedIds by viewModel.dismissedIds.collectAsState()
+    val ignoredIds by viewModel.ignoredIds.collectAsState()
     val isDetecting by viewModel.isDetecting.collectAsState()
     val detectingStatus by viewModel.detectingStatus.collectAsState()
     val indexingState by viewModel.indexingState.collectAsState()
@@ -82,28 +84,42 @@ fun IndexingScreen(
         viewModel.detectUnindexed()
     }
 
-    val visibleTracks = remember(unindexedTracks, dismissedIds) {
-        unindexedTracks.filter { it.powerampFileId !in dismissedIds }
+    val visibleTracks = remember(unindexedTracks, dismissedIds, ignoredIds) {
+        unindexedTracks.filter { it.powerampFileId !in dismissedIds && it.powerampFileId !in ignoredIds }
     }
     val selectedCount = remember(selectedIds, visibleTracks) {
         visibleTracks.count { it.powerampFileId in selectedIds }
     }
     val hasDismissed = dismissedIds.isNotEmpty()
+    val hasIgnored = ignoredIds.isNotEmpty()
 
     var showMenu by remember { mutableStateOf(false) }
-    var showHiddenTracks by remember { mutableStateOf(false) }
+    var showNeverIndex by remember { mutableStateOf(false) }
+    var showPreviouslyIgnored by remember { mutableStateOf(false) }
     var isSearchActive by remember { mutableStateOf(false) }
     var filteredTrackIds by remember { mutableStateOf<Set<Long>?>(null) }
 
-    // When all dismissed tracks are restored, auto-navigate back
-    LaunchedEffect(showHiddenTracks, hasDismissed) {
-        if (showHiddenTracks && !hasDismissed) showHiddenTracks = false
+    // Auto-close screens when their list becomes empty
+    LaunchedEffect(showNeverIndex, hasDismissed) {
+        if (showNeverIndex && !hasDismissed) showNeverIndex = false
+    }
+    LaunchedEffect(showPreviouslyIgnored, hasIgnored) {
+        if (showPreviouslyIgnored && !hasIgnored) showPreviouslyIgnored = false
     }
 
-    if (showHiddenTracks) {
-        HiddenTracksScreen(
+    if (showNeverIndex) {
+        BackHandler { showNeverIndex = false }
+        NeverIndexScreen(
             viewModel = viewModel,
-            onBack = { showHiddenTracks = false },
+            onBack = { showNeverIndex = false },
+        )
+        return
+    }
+    if (showPreviouslyIgnored) {
+        BackHandler { showPreviouslyIgnored = false }
+        PreviouslyIgnoredScreen(
+            viewModel = viewModel,
+            onBack = { showPreviouslyIgnored = false },
         )
         return
     }
@@ -118,9 +134,9 @@ fun IndexingScreen(
                     }
                 },
                 actions = {
-                    // Show overflow when idle with tracks or dismissed tracks available
+                    // Show overflow when idle with tracks or dismissed/ignored tracks available
                     if (indexingState is IndexingService.IndexingState.Idle
-                        && (visibleTracks.isNotEmpty() || hasDismissed) && !isDetecting) {
+                        && (visibleTracks.isNotEmpty() || hasDismissed || hasIgnored) && !isDetecting) {
                         Box {
                             IconButton(onClick = { showMenu = true }) {
                                 Icon(Icons.Default.MoreVert, contentDescription = "More")
@@ -140,9 +156,18 @@ fun IndexingScreen(
                                 }
                                 if (hasDismissed) {
                                     DropdownMenuItem(
-                                        text = { Text("View hidden tracks") },
+                                        text = { Text("View never-index list (${dismissedIds.size})") },
                                         onClick = {
-                                            showHiddenTracks = true
+                                            showNeverIndex = true
+                                            showMenu = false
+                                        }
+                                    )
+                                }
+                                if (hasIgnored) {
+                                    DropdownMenuItem(
+                                        text = { Text("View previously ignored (${ignoredIds.size})") },
+                                        onClick = {
+                                            showPreviouslyIgnored = true
                                             showMenu = false
                                         }
                                     )
@@ -206,6 +231,7 @@ fun IndexingScreen(
                             },
                             onSearchActiveChanged = { isSearchActive = it },
                             onFilteredIdsChanged = { filteredTrackIds = it },
+                            onDeselectAll = { viewModel.deselectAll() },
                         )
                     }
                 }
@@ -296,8 +322,10 @@ private fun TrackSelectionContent(
     onToggleFiltered: (List<NewTrackDetector.UnindexedTrack>) -> Unit,
     onSearchActiveChanged: (Boolean) -> Unit,
     onFilteredIdsChanged: (Set<Long>?) -> Unit,
+    onDeselectAll: () -> Unit,
 ) {
     var searchQuery by remember { mutableStateOf("") }
+    var hasEngagedSearch by remember { mutableStateOf(false) }
 
     // Report search state changes up
     LaunchedEffect(searchQuery) {
@@ -333,7 +361,13 @@ private fun TrackSelectionContent(
         // Search bar
         OutlinedTextField(
             value = searchQuery,
-            onValueChange = { searchQuery = it },
+            onValueChange = { newValue ->
+                if (!hasEngagedSearch && newValue.isNotEmpty() && searchQuery.isEmpty()) {
+                    hasEngagedSearch = true
+                    onDeselectAll()
+                }
+                searchQuery = newValue
+            },
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 8.dp),
@@ -381,7 +415,7 @@ private fun TrackSelectionContent(
                     "${filteredTracks.size} of ${tracks.size} tracks" +
                         if (filteredSelectedCount > 0) " ($filteredSelectedCount selected)" else ""
                 } else {
-                    "${tracks.size} unindexed tracks" +
+                    "${tracks.size} new unindexed tracks" +
                         if (selectedCount > 0) " ($selectedCount selected)" else ""
                 },
                 style = MaterialTheme.typography.titleSmall,
@@ -601,7 +635,7 @@ private fun CompleteContent(indexed: Int, failed: Int, onDone: () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun HiddenTracksScreen(
+private fun NeverIndexScreen(
     viewModel: IndexingViewModel,
     onBack: () -> Unit,
 ) {
@@ -619,7 +653,7 @@ private fun HiddenTracksScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Hidden Tracks") },
+                title = { Text("Never-Index List") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -654,7 +688,7 @@ private fun HiddenTracksScreen(
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    "No hidden tracks",
+                    "No never-index tracks",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -686,7 +720,7 @@ private fun HiddenTracksScreen(
                     )
                     Spacer(modifier = Modifier.width(12.dp))
                     Text(
-                        "${dismissedTracks.size} hidden tracks" +
+                        "${dismissedTracks.size} never-index tracks" +
                             if (localSelected.isNotEmpty()) " (${localSelected.size} selected)" else "",
                         style = MaterialTheme.typography.titleSmall,
                     )
@@ -697,6 +731,128 @@ private fun HiddenTracksScreen(
                     contentPadding = PaddingValues(vertical = 4.dp),
                 ) {
                     items(dismissedTracks, key = { it.powerampFileId }) { track ->
+                        TrackRow(
+                            track = track,
+                            isSelected = track.powerampFileId in localSelected,
+                            onToggle = {
+                                localSelected = if (track.powerampFileId in localSelected) {
+                                    localSelected - track.powerampFileId
+                                } else {
+                                    localSelected + track.powerampFileId
+                                }
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PreviouslyIgnoredScreen(
+    viewModel: IndexingViewModel,
+    onBack: () -> Unit,
+) {
+    val ignoredTracks = remember(viewModel.ignoredIds.collectAsState().value) {
+        viewModel.getIgnoredTracks()
+    }
+    var localSelected by remember { mutableStateOf(emptySet<Long>()) }
+
+    // Clean up local selection if tracks change
+    LaunchedEffect(ignoredTracks) {
+        val validIds = ignoredTracks.map { it.powerampFileId }.toSet()
+        localSelected = localSelected.intersect(validIds)
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Previously Ignored") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+            )
+        },
+        bottomBar = {
+            if (localSelected.isNotEmpty()) {
+                Surface(tonalElevation = 3.dp) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        OutlinedButton(onClick = {
+                            viewModel.moveIgnoredToNeverIndex(localSelected)
+                            localSelected = emptySet()
+                        }) {
+                            Text("Never index (${localSelected.size})")
+                        }
+                        Spacer(modifier = Modifier.weight(1f))
+                        Button(onClick = {
+                            viewModel.restoreFromIgnored(localSelected)
+                            localSelected = emptySet()
+                        }) {
+                            Text("Restore selected (${localSelected.size})")
+                        }
+                    }
+                }
+            }
+        }
+    ) { padding ->
+        if (ignoredTracks.isEmpty()) {
+            Box(
+                modifier = Modifier.fillMaxSize().padding(padding),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    "No previously ignored tracks",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        } else {
+            Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+                val allIds = remember(ignoredTracks) {
+                    ignoredTracks.map { it.powerampFileId }.toSet()
+                }
+                val allSelected = localSelected.size == ignoredTracks.size && ignoredTracks.isNotEmpty()
+                val toggleAll = {
+                    localSelected = if (allSelected) emptySet() else allIds
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(onClick = toggleAll)
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TriStateCheckbox(
+                        state = when {
+                            ignoredTracks.isEmpty() -> ToggleableState.Off
+                            allSelected -> ToggleableState.On
+                            localSelected.isEmpty() -> ToggleableState.Off
+                            else -> ToggleableState.Indeterminate
+                        },
+                        onClick = toggleAll,
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Text(
+                        "${ignoredTracks.size} previously ignored tracks" +
+                            if (localSelected.isNotEmpty()) " (${localSelected.size} selected)" else "",
+                        style = MaterialTheme.typography.titleSmall,
+                    )
+                }
+                HorizontalDivider()
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(vertical = 4.dp),
+                ) {
+                    items(ignoredTracks, key = { it.powerampFileId }) { track ->
                         TrackRow(
                             track = track,
                             isSelected = track.powerampFileId in localSelected,

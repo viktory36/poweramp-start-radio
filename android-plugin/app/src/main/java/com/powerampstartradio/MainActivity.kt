@@ -1056,7 +1056,7 @@ fun SettingsScreen(
                 Column {
                     Text("Text Search Results: $textSearchTopK", style = MaterialTheme.typography.titleMedium)
                     Slider(value = textSearchTopK.toFloat(), onValueChange = { viewModel.setTextSearchTopK(it.toInt()) },
-                        valueRange = 5f..50f, steps = 8, thumb = slimThumb, track = steppedTrack)
+                        valueRange = 20f..100f, steps = 15, thumb = slimThumb, track = steppedTrack)
                 }
             }
 

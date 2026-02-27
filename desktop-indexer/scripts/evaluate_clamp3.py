@@ -93,12 +93,13 @@ def cmd_similar(db_path, query, top_k=20):
     query_lower = query.lower().strip()
     query_words = query_lower.split()
 
-    # Score each track by how many query words appear in artist+title
+    # Score each track by how many query words appear in artist+title+album
+    # ALL query words must match (same behavior as CLI's search_tracks)
     scored = []
     for i, t in enumerate(tracks):
-        label = f"{t['artist']} {t['title']}".lower()
+        label = f"{t['artist']} {t['title']} {t['album']}".lower()
         matches = sum(1 for w in query_words if w in label)
-        if matches > 0:
+        if matches == len(query_words):
             scored.append((i, matches, label))
 
     if not scored:

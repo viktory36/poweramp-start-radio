@@ -18,8 +18,9 @@ import java.io.File
 /**
  * ViewModel for the IndexingActivity track selection and indexing UI.
  *
- * Manages the list of unindexed tracks, user selection, dismissed tracks,
- * and delegates indexing to IndexingService.
+ * Manages the list of unindexed tracks, user selection, dismissed tracks
+ * ("never-index"), ignored tracks ("previously ignored"), and delegates
+ * indexing to IndexingService.
  */
 class IndexingViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -66,8 +67,13 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
     private val _selectedIds = MutableStateFlow<Set<Long>>(emptySet())
     val selectedIds: StateFlow<Set<Long>> = _selectedIds.asStateFlow()
 
+    /** "Never-index" list: explicit user action via overflow menu + auto-moved 0:00 tracks. */
     private val _dismissedIds = MutableStateFlow<Set<Long>>(loadDismissedIdsWithDbCheck(application))
     val dismissedIds: StateFlow<Set<Long>> = _dismissedIds.asStateFlow()
+
+    /** "Previously ignored" list: auto-moved when starting indexing without search filter. */
+    private val _ignoredIds = MutableStateFlow<Set<Long>>(loadIgnoredIdsWithDbCheck(application))
+    val ignoredIds: StateFlow<Set<Long>> = _ignoredIds.asStateFlow()
 
     private val _isDetecting = MutableStateFlow(false)
     val isDetecting: StateFlow<Boolean> = _isDetecting.asStateFlow()
@@ -99,10 +105,12 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
                 "${dbFile.length()}_${dbFile.lastModified()}" else ""
             val savedFingerprint = prefs.getString("dismissed_db_fingerprint", "") ?: ""
             if (currentFingerprint != savedFingerprint) {
-                // DB replaced externally — clear stale dismissed IDs
+                // DB replaced externally — clear stale dismissed and ignored IDs
                 _dismissedIds.value = emptySet()
+                _ignoredIds.value = emptySet()
                 prefs.edit()
                     .remove("dismissed_track_ids")
+                    .remove("ignored_track_ids")
                     .putString("dismissed_db_fingerprint", currentFingerprint)
                     .apply()
                 invalidateCache()
@@ -178,11 +186,23 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    /** Auto-select visible tracks, excluding 0-duration and dismissed. */
+    /** Auto-select visible tracks, excluding 0-duration, dismissed, and ignored. */
     private fun autoSelect(tracks: List<NewTrackDetector.UnindexedTrack>) {
         val dismissed = _dismissedIds.value
+        val ignored = _ignoredIds.value
+
+        // Auto-move 0:00 tracks to never-index
+        val zeroDuration = tracks.filter { it.durationMs == 0 && it.powerampFileId !in dismissed }
+            .map { it.powerampFileId }.toSet()
+        if (zeroDuration.isNotEmpty()) {
+            val newDismissed = dismissed + zeroDuration
+            _dismissedIds.value = newDismissed
+            saveDismissedIds(newDismissed)
+        }
+
+        val allExcluded = (dismissed + zeroDuration) + ignored
         _selectedIds.value = tracks
-            .filter { it.powerampFileId !in dismissed && it.durationMs > 0 }
+            .filter { it.powerampFileId !in allExcluded && it.durationMs > 0 }
             .map { it.powerampFileId }
             .toSet()
     }
@@ -197,8 +217,9 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
 
     fun selectAll() {
         val dismissed = _dismissedIds.value
+        val ignored = _ignoredIds.value
         _selectedIds.value = _unindexedTracks.value
-            .filter { it.powerampFileId !in dismissed }
+            .filter { it.powerampFileId !in dismissed && it.powerampFileId !in ignored }
             .map { it.powerampFileId }
             .toSet()
     }
@@ -227,9 +248,10 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
     fun clearDismissed() {
         _dismissedIds.value = emptySet()
         saveDismissedIds(emptySet())
-        // Re-select all (including previously dismissed), excluding 0-duration
+        // Re-select all (including previously dismissed), excluding 0-duration and ignored
+        val ignored = _ignoredIds.value
         _selectedIds.value = _unindexedTracks.value
-            .filter { it.durationMs > 0 }
+            .filter { it.durationMs > 0 && it.powerampFileId !in ignored }
             .map { it.powerampFileId }
             .toSet()
     }
@@ -247,10 +269,40 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         _selectedIds.value = _selectedIds.value + ids
     }
 
+    /** Get ignored track details from the full unindexedTracks list. */
+    fun getIgnoredTracks(): List<NewTrackDetector.UnindexedTrack> {
+        return _unindexedTracks.value.filter { it.powerampFileId in _ignoredIds.value }
+    }
+
+    /** Restore specific tracks from ignored back to visible (and auto-select them). */
+    fun restoreFromIgnored(ids: Set<Long>) {
+        val newIgnored = _ignoredIds.value - ids
+        _ignoredIds.value = newIgnored
+        saveIgnoredIds(newIgnored)
+        _selectedIds.value = _selectedIds.value + ids
+    }
+
+    /** Move tracks from ignored to never-index (permanent exclusion). */
+    fun moveIgnoredToNeverIndex(ids: Set<Long>) {
+        val newIgnored = _ignoredIds.value - ids
+        _ignoredIds.value = newIgnored
+        saveIgnoredIds(newIgnored)
+        val newDismissed = _dismissedIds.value + ids
+        _dismissedIds.value = newDismissed
+        saveDismissedIds(newDismissed)
+    }
+
+    /** Clear all ignored tracks and re-run autoSelect. */
+    fun clearIgnored() {
+        _ignoredIds.value = emptySet()
+        saveIgnoredIds(emptySet())
+        autoSelect(_unindexedTracks.value)
+    }
+
     /**
-     * @param autoDismissUnselected When true, unselected visible tracks are auto-dismissed.
+     * @param autoDismissUnselected When true, unselected visible tracks are auto-ignored.
      *   Should be true when the user sees the full list (no search filter) — their choice
-     *   to not select something is an intentional "don't index". Should be false when a
+     *   to not select something is moved to "previously ignored". Should be false when a
      *   search filter is active — the user is only focused on the search results.
      */
     /**
@@ -262,6 +314,7 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         val selected = if (onlyIds != null) _selectedIds.value.intersect(onlyIds) else _selectedIds.value
         if (selected.isEmpty()) return
         val dismissed = _dismissedIds.value
+        val ignored = _ignoredIds.value
         val tracks = _unindexedTracks.value.filter {
             it.powerampFileId in selected && it.powerampFileId !in dismissed
         }
@@ -269,12 +322,12 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
 
         if (autoDismissUnselected) {
             val unselectedVisible = _unindexedTracks.value.filter {
-                it.powerampFileId !in selected && it.powerampFileId !in dismissed
+                it.powerampFileId !in selected && it.powerampFileId !in dismissed && it.powerampFileId !in ignored
             }.map { it.powerampFileId }.toSet()
             if (unselectedVisible.isNotEmpty()) {
-                val newDismissed = dismissed + unselectedVisible
-                _dismissedIds.value = newDismissed
-                saveDismissedIds(newDismissed)
+                val newIgnored = ignored + unselectedVisible
+                _ignoredIds.value = newIgnored
+                saveIgnoredIds(newIgnored)
             }
         }
 
@@ -312,9 +365,10 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         val savedFingerprint = prefs.getString("dismissed_db_fingerprint", "") ?: ""
 
         if (currentFingerprint != savedFingerprint) {
-            // DB has changed — clear stale dismissed IDs and detection cache
+            // DB has changed — clear stale dismissed and ignored IDs and detection cache
             prefs.edit()
                 .remove("dismissed_track_ids")
+                .remove("ignored_track_ids")
                 .putString("dismissed_db_fingerprint", currentFingerprint)
                 .apply()
             invalidateCache()
@@ -323,8 +377,30 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         return loadDismissedIds()
     }
 
+    private fun loadIgnoredIdsWithDbCheck(app: Application): Set<Long> {
+        val dbFile = File(app.filesDir, "embeddings.db")
+        val currentFingerprint = if (dbFile.exists())
+            "${dbFile.length()}_${dbFile.lastModified()}" else ""
+        val savedFingerprint = prefs.getString("dismissed_db_fingerprint", "") ?: ""
+
+        if (currentFingerprint != savedFingerprint) {
+            // Already cleared by loadDismissedIdsWithDbCheck
+            return emptySet()
+        }
+        return loadIgnoredIds()
+    }
+
     private fun loadDismissedIds(): Set<Long> {
         val json = prefs.getString("dismissed_track_ids", null) ?: return emptySet()
+        return parseIdJson(json)
+    }
+
+    private fun loadIgnoredIds(): Set<Long> {
+        val json = prefs.getString("ignored_track_ids", null) ?: return emptySet()
+        return parseIdJson(json)
+    }
+
+    private fun parseIdJson(json: String): Set<Long> {
         return try {
             val arr = JSONArray(json)
             val set = mutableSetOf<Long>()
@@ -342,6 +418,15 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         ids.forEach { arr.put(it) }
         prefs.edit()
             .putString("dismissed_track_ids", arr.toString())
+            .putString("dismissed_db_fingerprint", getDbFingerprint())
+            .apply()
+    }
+
+    private fun saveIgnoredIds(ids: Set<Long>) {
+        val arr = JSONArray()
+        ids.forEach { arr.put(it) }
+        prefs.edit()
+            .putString("ignored_track_ids", arr.toString())
             .putString("dismissed_db_fingerprint", getDbFingerprint())
             .apply()
     }

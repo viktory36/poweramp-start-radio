@@ -857,7 +857,7 @@ Examples:
         "music_dir", nargs="?", default=None,
         help="Root directory of the music library (not needed for --phase 3)")
     parser.add_argument(
-        "-o", "-d", "--output", "--db", default="embeddings_clamp3.db",
+        "-o", "--output", "--db", default="embeddings_clamp3.db",
         help="SQLite database path (default: embeddings_clamp3.db)")
     parser.add_argument(
         "--cache-dir", default=None,

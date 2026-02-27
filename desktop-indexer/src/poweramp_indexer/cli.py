@@ -109,7 +109,7 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool,
 
 @cli.command()
 @click.argument("music_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--database", "-d", type=click.Path(exists=True, path_type=Path),
+@click.option("--database", type=click.Path(exists=True, path_type=Path),
               default=Path("embeddings.db"), help="Database file to update")
 @click.option("--remove-missing/--no-remove-missing", default=True,
               help="Remove tracks whose files no longer exist")

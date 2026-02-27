@@ -573,10 +573,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (currentFingerprint != savedFingerprint) {
                     indexingPrefs.edit()
                         .remove("dismissed_track_ids")
+                        .remove("ignored_track_ids")
                         .putString("dismissed_db_fingerprint", currentFingerprint)
                         .apply()
                 }
-                // Exclude dismissed tracks from the count
+                // Exclude dismissed and ignored tracks from the count
                 val dismissedJson = indexingPrefs.getString("dismissed_track_ids", null)
                 val dismissed = if (dismissedJson != null) {
                     try {
@@ -584,7 +585,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         (0 until arr.length()).map { arr.getLong(it) }.toSet()
                     } catch (_: Exception) { emptySet() }
                 } else emptySet<Long>()
-                val visible = result.count { it.powerampFileId !in dismissed }
+                val ignoredJson = indexingPrefs.getString("ignored_track_ids", null)
+                val ignored = if (ignoredJson != null) {
+                    try {
+                        val arr = org.json.JSONArray(ignoredJson)
+                        (0 until arr.length()).map { arr.getLong(it) }.toSet()
+                    } catch (_: Exception) { emptySet() }
+                } else emptySet<Long>()
+                val visible = result.count { it.powerampFileId !in dismissed && it.powerampFileId !in ignored }
                 setUnindexedCount(visible)
             } catch (_: Exception) {
                 setUnindexedCount(0)

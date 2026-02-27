@@ -293,24 +293,50 @@ class IndexingService : Service() {
                 val mert = mertInference!!  // safe: assigned above, exception returns early
                 Log.i(TAG, "TIMING: mert_model_load = ${(System.nanoTime() - mertLoadStart) / 1_000_000}ms")
 
-                // Disk-spill: write all MERT features to a single temp file.
-                // Each window is 768 floats = 3072 bytes. For 100 tracks × 48 windows
-                // = ~14 MB disk — trivial.
-                val featuresFile = File(cacheDir, "mert_features.tmp")
+                // Per-track MERT feature cache for crash-resilient indexing.
+                // Each track's features are written to filesDir/mert_cache/{powerampFileId}.bin
+                // (768 floats = 3072 bytes per window). On resume, existing cache files
+                // are reused, skipping MERT for those tracks.
+                val mertCacheDir = File(filesDir, "mert_cache").apply { mkdirs() }
                 val windowCounts = IntArray(unindexed.size)
                 val windowBytes = MertInference.FEATURE_DIM * 4  // 768 × 4 = 3072
 
+                // Pre-scan for cached MERT features from prior (interrupted) runs
+                var cachedTracks = 0
+                for ((i, track) in unindexed.withIndex()) {
+                    val cacheFile = File(mertCacheDir, "${track.powerampFileId}.bin")
+                    if (cacheFile.exists()) {
+                        val fileWindows = (cacheFile.length() / windowBytes).toInt()
+                        if (fileWindows > 0 && cacheFile.length() % windowBytes == 0L) {
+                            windowCounts[i] = fileWindows
+                            windowsCompleted += fileWindows
+                            cachedTracks++
+                        } else {
+                            cacheFile.delete()  // corrupt partial → discard
+                        }
+                    }
+                }
+                if (cachedTracks > 0) {
+                    Log.i(TAG, "MERT cache: $cachedTracks/${unindexed.size} tracks cached " +
+                        "($windowsCompleted windows), extracting remaining ${unindexed.size - cachedTracks}")
+                }
+
                 mertPhaseStartTime = System.currentTimeMillis()
 
-                try {  // ensures featuresFile is cleaned up
                 val writeBuf = java.nio.ByteBuffer.allocate(windowBytes)
                     .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                val writeChannel = java.io.FileOutputStream(featuresFile).channel
 
                 // CPU prefetch: decode first chunk of track N+1 while GPU runs
                 // MERT on track N. Decode+resample is CPU-bound; MERT is GPU-bound.
                 var prefetchJob: kotlinx.coroutines.Deferred<AudioDecoder.DecodedAudio?>? = null
                 var prefetchIndex = -1
+
+                fun nextCacheMiss(fromIdx: Int): Int {
+                    for (j in fromIdx until unindexed.size) {
+                        if (windowCounts[j] == 0) return j
+                    }
+                    return unindexed.size
+                }
 
                 fun startPrefetch(idx: Int, chunkS: Int) {
                     if (idx >= unindexed.size) return
@@ -331,6 +357,7 @@ class IndexingService : Service() {
                 try {
                 for ((i, track) in unindexed.withIndex()) {
                     ensureActive()
+                    if (windowCounts[i] > 0) continue  // cache hit → skip
                     val trackProgress = "${i + 1}/${unindexed.size}"
                     var windowsDone = 0
                     val expectedWindows = windowsPerTrack[i]
@@ -363,6 +390,9 @@ class IndexingService : Service() {
                         continue
                     }
 
+                    val cacheFile = File(mertCacheDir, "${track.powerampFileId}.bin")
+                    val trackWriteChannel = java.io.FileOutputStream(cacheFile).channel
+
                     // Chunked decode+MERT: process the full track in memory-adaptive
                     // chunks. Chunk size is recomputed per-track from available heap,
                     // so it adapts if memory pressure changes mid-run. Each chunk is
@@ -380,6 +410,7 @@ class IndexingService : Service() {
                     var prefetchStarted = false
                     var chunkStart = 0  // position cursor in seconds
 
+                    try {
                     while (chunkStart < trackDurationS || chunkStart == 0) {
                         ensureActive()
                         val chunkS = computeChunkDurationS()
@@ -408,7 +439,7 @@ class IndexingService : Service() {
 
                         // Prefetch next track's first chunk during last chunk of this track
                         if (isLastChunk && !prefetchStarted) {
-                            startPrefetch(i + 1, chunkS)
+                            startPrefetch(nextCacheMiss(i + 1), chunkS)
                             prefetchStarted = true
                         }
 
@@ -421,7 +452,7 @@ class IndexingService : Service() {
                                 writeBuf.clear()
                                 writeBuf.asFloatBuffer().put(feature)
                                 writeBuf.rewind()
-                                writeChannel.write(writeBuf)
+                                trackWriteChannel.write(writeBuf)
                             },
                             onWindowDone = {
                                 windowsCompleted++
@@ -441,6 +472,9 @@ class IndexingService : Service() {
                         trackWindowsExtracted += numExtracted
                         chunkStart += chunkS
                     }
+                    } finally {
+                        trackWriteChannel.close()
+                    }
 
                     val trackMs = (System.nanoTime() - trackStart) / 1_000_000
                     Log.i(TAG, "TIMING: mert_track ${i+1}/${unindexed.size} " +
@@ -459,9 +493,8 @@ class IndexingService : Service() {
                         failed++
                     }
                 }
-                prefetchJob?.cancel()
                 } finally {
-                    writeChannel.close()
+                    prefetchJob?.cancel()
                 }
 
                 val actualTotalWindows = windowCounts.sum()
@@ -493,18 +526,23 @@ class IndexingService : Service() {
                 Log.i(TAG, "TIMING: clamp3_audio_load = ${(System.nanoTime() - clamp3LoadStart) / 1_000_000}ms")
 
                 // ── Phase 2: CLaMP3 Audio Encoding ───────────────────────
-                // Read MERT features from disk, encode into 768d embeddings,
-                // write to database.
+                // Read MERT features from per-track cache files, encode into
+                // 768d embeddings, write to database.
                 val readBuf = java.nio.ByteBuffer.allocate(windowBytes)
                     .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                val readChannel = java.io.FileInputStream(featuresFile).channel
 
-                try {
                 val encodableCount = windowCounts.count { it > 0 }
                 var encoded = 0
                 for ((i, track) in unindexed.withIndex()) {
                     val numWindows = windowCounts[i]
                     if (numWindows == 0) continue
+
+                    val cacheFile = File(mertCacheDir, "${track.powerampFileId}.bin")
+                    if (!cacheFile.exists()) {
+                        Log.w(TAG, "Cache file missing for: ${track.artist} - ${track.title}")
+                        failed++
+                        continue
+                    }
 
                     ensureActive()
                     encoded++
@@ -524,19 +562,24 @@ class IndexingService : Service() {
                     updateNotification(encMsg, windowsCompleted, totalWindows)
                     val encStart = System.nanoTime()
 
-                    // Stream MERT features from disk one window at a time
-                    val embedding = clamp3.encodeStreaming(
-                        numWindows = numWindows,
-                        readNextWindow = {
-                            readBuf.clear()
-                            readChannel.read(readBuf)
-                            readBuf.flip()
-                            FloatArray(MertInference.FEATURE_DIM).also { arr ->
-                                readBuf.asFloatBuffer().get(arr)
-                            }
-                        },
-                        onSegmentDone = { },
-                    )
+                    // Stream MERT features from per-track cache file
+                    val readChannel = java.io.FileInputStream(cacheFile).channel
+                    val embedding = try {
+                        clamp3.encodeStreaming(
+                            numWindows = numWindows,
+                            readNextWindow = {
+                                readBuf.clear()
+                                readChannel.read(readBuf)
+                                readBuf.flip()
+                                FloatArray(MertInference.FEATURE_DIM).also { arr ->
+                                    readBuf.asFloatBuffer().get(arr)
+                                }
+                            },
+                            onSegmentDone = { },
+                        )
+                    } finally {
+                        readChannel.close()
+                    }
 
                     if (embedding == null) {
                         Log.w(TAG, "CLaMP3 encode failed for: ${track.artist} - ${track.title}")
@@ -560,6 +603,7 @@ class IndexingService : Service() {
 
                     if (trackId > 0) {
                         indexed++
+                        cacheFile.delete()  // Delete only after successful DB write
                     } else {
                         Log.e(TAG, "DB write failed for: ${track.artist} - ${track.title}")
                         failed++
@@ -567,16 +611,12 @@ class IndexingService : Service() {
                     Log.i(TAG, "TIMING: clamp3_encode " +
                         "\"${track.artist} - ${track.title}\" = ${encMs}ms")
                 }
-                } finally {
-                    readChannel.close()
-                }
 
                 clamp3.close()
                 clamp3Inference = null
 
-                } finally {
-                    featuresFile.delete()
-                }
+                // Clean up MERT cache after successful completion
+                mertCacheDir.deleteRecursively()
 
                 val clamp3PassMs = System.currentTimeMillis() - batchStartTime
                 Log.i(TAG, "TIMING: clamp3_pass_total = ${clamp3PassMs}ms " +

@@ -64,6 +64,21 @@ class GraphIndex private constructor(
         }
 
         /**
+         * Read the node count (N) from a graph.bin file header without full mmap.
+         * Returns -1 if the file is missing, too small, or unreadable.
+         */
+        fun readHeaderNodeCount(file: File): Int {
+            if (!file.exists() || file.length() < HEADER_SIZE) return -1
+            return try {
+                java.io.RandomAccessFile(file, "r").use { raf ->
+                    val buf = ByteArray(HEADER_SIZE)
+                    raf.readFully(buf)
+                    java.nio.ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).getInt(0)
+                }
+            } catch (_: Exception) { -1 }
+        }
+
+        /**
          * Extract graph binary from SQLite binary_data table and write to file.
          * Uses chunked reading to avoid Android's ~2 MB CursorWindow limit.
          */
