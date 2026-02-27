@@ -1084,7 +1084,7 @@ fun SettingsScreen(
                 Column(modifier = Modifier.selectableGroup()) {
                     AlgorithmOption(
                         label = "Maximum Marginal Relevance (MMR)",
-                        description = "Starts with the closest matches to the seed, then skips candidates that sound too similar to tracks already picked. Each pick is evaluated against the full queue so far.",
+                        description = "Scores every candidate by similarity to the seed minus an adjustable penalty for sounding too similar to whichever single track in the queue it most resembles.",
                         preview = previews[SelectionMode.MMR],
                         isLoading = SelectionMode.MMR in previewsLoading,
                         selected = selectionMode == SelectionMode.MMR,
@@ -1096,7 +1096,7 @@ fun SettingsScreen(
                     )
                     AlgorithmOption(
                         label = "Determinantal Point Process (DPP)",
-                        description = "Picks tracks one at a time, each scored by relevance to the seed and how different it is from every track already in the queue — all considered together, not just the nearest match. Spreads picks across different parts of the seed's neighborhood instead of clustering in one area.",
+                        description = "Scores every candidate by similarity to the seed minus a penalty for sounding like anything already in the queue. Unlike MMR, the penalty accounts for every similar track already picked, not just the closest one. The more a particular sound is represented in the queue, the harder it becomes to add more of it.",
                         preview = previews[SelectionMode.DPP],
                         isLoading = SelectionMode.DPP in previewsLoading,
                         selected = selectionMode == SelectionMode.DPP,
@@ -1127,7 +1127,7 @@ fun SettingsScreen(
                     Column {
                         Text("Similarity: ${(diversityLambda * 100).roundToInt()}%",
                             style = MaterialTheme.typography.titleSmall)
-                        Text("All the way up: no penalty, picks the most similar tracks. All the way down: strong penalty, spreads picks apart even if individually less similar.",
+                        Text("Max diversity penalty: cuts redundant-sounding tracks. No penalty: picks the most similar tracks to the seed.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1148,7 +1148,7 @@ fun SettingsScreen(
                     Column {
                         Text("Return Frequency: ${(walkRestartAlpha * 100).roundToInt()}%",
                             style = MaterialTheme.typography.titleSmall)
-                        Text("How often the walk jumps back to the seed instead of continuing to the next neighbor. Low = wanders further through the graph. High = stays in the immediate neighborhood.",
+                        Text("How often the walk jumps back to the seed instead of continuing to the next neighbor.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1223,7 +1223,7 @@ fun SettingsScreen(
                                 if (driftMode == DriftMode.SEED_INTERPOLATION) {
                                     Text("Seed weight: ${(anchorStrength * 100).roundToInt()}%",
                                         style = MaterialTheme.typography.titleSmall)
-                                    Text("Each query is a weighted mix of the seed and the last picked track. High = mostly seed. Low = mostly last pick.",
+                                    Text("Each query is a weighted mix of the seed and the last picked track.",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     Row(verticalAlignment = Alignment.CenterVertically) {
