@@ -99,6 +99,16 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool,
     if phase in ("2", "both"):
         db = EmbeddingDatabase(output)
         scan_phase2(music_path, cache_dir, db, generator, verbose=verbose)
+
+        # Build kNN graph for Random Walk mode
+        from .graph import build_index
+        click.echo()
+        result = build_index(
+            db, n_clusters=200, knn_k=5,
+            on_progress=lambda msg: click.echo(msg)
+        )
+        click.echo(f"kNN graph: K={result['knn_k']} ({result['graph_size_mb']:.1f} MB)")
+
         db.close()
 
     generator.unload_models()
@@ -216,7 +226,7 @@ def _process_files(audio_files, generator, store_fn, desc):
     return successful, failed
 
 
-# ─── Index (k-means + kNN) ───────────────────────────────────────────────────
+# ─── Graph (k-means + kNN) ────────────────────────────────────────────────────
 
 @cli.command()
 @click.argument("database", type=click.Path(exists=True, dir_okay=False, path_type=Path))
@@ -225,20 +235,19 @@ def _process_files(audio_files, generator, store_fn, desc):
 @click.option("--knn", type=int, default=5,
               help="kNN graph neighbors (default: 5)")
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
-def index(database: Path, clusters: int, knn: int, verbose: bool):
-    """Build k-means clusters and kNN graph for a CLaMP3 database.
+def graph(database: Path, clusters: int, knn: int, verbose: bool):
+    """Build k-means clusters and kNN graph from embeddings.
 
-    Clusters enable cluster-based navigation and kNN graph enables
-    random walk exploration on Android.
+    The kNN graph enables Random Walk exploration on Android.
 
     DATABASE: Path to embeddings database with CLaMP3 embeddings
 
     Examples:
 
-      poweramp-indexer index embeddings.db
-      poweramp-indexer index embeddings.db --clusters 200 --knn 20
+      poweramp-indexer graph embeddings.db
+      poweramp-indexer graph embeddings.db --clusters 200 --knn 5
     """
-    from .fusion import build_index
+    from .graph import build_index
 
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)

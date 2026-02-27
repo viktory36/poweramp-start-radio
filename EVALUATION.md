@@ -153,9 +153,3 @@ On-device embeddings match desktop within cosine 0.990-0.997 across 25+ validate
 | Full radio pipeline (batch) | 300-500ms |
 | Text search query | 23-70ms |
 | On-device MERT (per window) | 200ms |
-
-## Bug Found During Audit
-
-**kNN Graph Staleness**: The kNN graph extracted from the database was not rebuilt after on-device indexing added new tracks. Graph had 74,753 nodes while the embedding index had 75,035 tracks. Random Walk returned 0 results for any seed track not in the graph.
-
-**Fix**: `GraphUpdater.rebuildIndices()` now detects when the graph node count is less than the embedding count and triggers a full graph rebuild. Deployed in this build.

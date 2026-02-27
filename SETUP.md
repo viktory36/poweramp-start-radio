@@ -41,15 +41,13 @@ This runs a two-phase pipeline:
 
 Progress is cached per-track — safe to interrupt and resume.
 
-### 3. Build kNN Graph
+The scan automatically builds k-means clusters and a K=5 kNN graph (required for Random Walk mode). To rebuild the graph separately (e.g. with different K):
 
 ```bash
-poweramp-indexer index embeddings.db
+poweramp-indexer graph embeddings.db --knn 5
 ```
 
-Builds k-means clusters and a kNN graph (K=20). Required for the Random Walk recommendation mode.
-
-### 4. Test
+### 3. Test
 
 ```bash
 # Find similar tracks
@@ -62,7 +60,7 @@ poweramp-indexer search embeddings.db "dark minimal techno"
 poweramp-indexer info embeddings.db
 ```
 
-### 5. Incremental Updates
+### 4. Incremental Updates
 
 ```bash
 poweramp-indexer update /path/to/music -d embeddings.db
@@ -146,7 +144,7 @@ Progress is cached per-track. If interrupted, indexing resumes from the last com
 
 **"Track not found in database"**: The current Poweramp track doesn't match any entry in embeddings.db. Check that the music library scanned on desktop matches what's on the phone.
 
-**"No similar tracks found" with Random Walk**: The seed track may not be in the kNN graph. This happens when the track was indexed on-device after the graph was built. Re-run `poweramp-indexer index embeddings.db` on desktop and re-push the DB, or trigger on-device indexing which rebuilds the graph automatically.
+**"No similar tracks found" with Random Walk**: The seed track may not be in the kNN graph. This happens when the track was indexed on-device after the graph was built. Re-run `poweramp-indexer graph embeddings.db` on desktop and re-push the DB, or trigger on-device indexing which rebuilds the graph automatically.
 
 **Signature mismatch on install**: Run `adb uninstall com.powerampstartradio` first, then install again.
 

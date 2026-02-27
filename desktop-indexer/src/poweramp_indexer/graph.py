@@ -1,4 +1,4 @@
-"""Post-processing: k-means clustering and kNN graph construction for CLaMP3 embeddings."""
+"""K-means clustering and kNN graph construction for CLaMP3 embeddings."""
 
 import logging
 import struct
