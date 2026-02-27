@@ -1,4 +1,4 @@
-"""Post-processing: k-means clustering and kNN graph construction for CLaMP3 embeddings."""
+"""K-means clustering and kNN graph construction for CLaMP3 embeddings."""
 
 import logging
 import struct
@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 def build_index(db: EmbeddingDatabase, n_clusters: int = 200,
-                knn_k: int = 20, on_progress=None):
+                knn_k: int = 5, on_progress=None):
     """
     Build k-means clusters and kNN graph from CLaMP3 embeddings.
 
@@ -34,7 +34,7 @@ def build_index(db: EmbeddingDatabase, n_clusters: int = 200,
     # --- Step 1: Load embeddings ---
     progress("Loading CLaMP3 embeddings...")
 
-    embs = db.get_all_embeddings(model="clamp3")
+    embs = db.get_all_embeddings()
     if not embs:
         raise ValueError("Database has no CLaMP3 embeddings")
 

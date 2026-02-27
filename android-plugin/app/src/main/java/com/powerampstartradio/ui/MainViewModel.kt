@@ -66,8 +66,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _anchorStrength = MutableStateFlow(prefs.getFloat("anchor_strength", 0.5f))
     val anchorStrength: StateFlow<Float> = _anchorStrength.asStateFlow()
 
-    private val _pageRankAlpha = MutableStateFlow(prefs.getFloat("pagerank_alpha", 0.5f))
-    val pageRankAlpha: StateFlow<Float> = _pageRankAlpha.asStateFlow()
+    private val _walkRestartAlpha = MutableStateFlow(prefs.getFloat("walk_restart_alpha", 0.5f))
+    val walkRestartAlpha: StateFlow<Float> = _walkRestartAlpha.asStateFlow()
 
     private val _anchorDecay = MutableStateFlow(
         try { DecaySchedule.valueOf(prefs.getString("anchor_decay", DecaySchedule.EXPONENTIAL.name)!!) }
@@ -207,7 +207,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         driftMode = _driftMode.value,
         anchorStrength = _anchorStrength.value,
         anchorDecay = _anchorDecay.value,
-        pageRankAlpha = _pageRankAlpha.value,
+        walkRestartAlpha = _walkRestartAlpha.value,
         momentumBeta = _momentumBeta.value,
         diversityLambda = _diversityLambda.value,
         maxPerArtist = _maxPerArtist.value,
@@ -241,9 +241,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         prefs.edit().putFloat("anchor_strength", value).apply()
     }
 
-    fun setPageRankAlpha(value: Float) {
-        _pageRankAlpha.value = value
-        prefs.edit().putFloat("pagerank_alpha", value).apply()
+    fun setWalkRestartAlpha(value: Float) {
+        _walkRestartAlpha.value = value
+        prefs.edit().putFloat("walk_restart_alpha", value).apply()
     }
 
     fun setAnchorDecay(schedule: DecaySchedule) {
@@ -674,7 +674,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         setDriftEnabled(defaults.driftEnabled)
         setDriftMode(defaults.driftMode)
         setAnchorStrength(defaults.anchorStrength)
-        setPageRankAlpha(defaults.pageRankAlpha)
+        setWalkRestartAlpha(defaults.walkRestartAlpha)
         setAnchorDecay(defaults.anchorDecay)
         setMomentumBeta(defaults.momentumBeta)
         setDiversityLambda(defaults.diversityLambda)

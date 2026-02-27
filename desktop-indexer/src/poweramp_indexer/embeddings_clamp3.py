@@ -665,7 +665,7 @@ def scan_phase2(music_dir: Path, cache_dir: Path, db, generator: 'CLaMP3Embeddin
 
     generator._load_clamp3_audio_if_needed()
 
-    existing = db.get_existing_paths(model="clamp3")
+    existing = db.get_existing_paths()
 
     # Build lookup for orphan tracks
     orphan_tracks = {}
@@ -721,14 +721,14 @@ def scan_phase2(music_dir: Path, cache_dir: Path, db, generator: 'CLaMP3Embeddin
             if original_path in orphan_tracks:
                 track_id = orphan_tracks[original_path]
             else:
-                track_id = db.add_track(metadata, embedding, model="clamp3")
+                track_id = db.add_track(metadata, embedding)
                 success += 1
                 if verbose:
                     label = f"{metadata.artist} - {metadata.title}" if metadata.artist else metadata.title
                     print(f"  OK [{i+1}/{len(to_process)}] {label[:60]}")
                 continue
 
-            db.add_embedding(track_id, "clamp3", embedding)
+            db.add_embedding(track_id, embedding)
             success += 1
             if verbose:
                 label = f"{metadata.artist} - {metadata.title}" if metadata.artist else metadata.title
@@ -743,7 +743,7 @@ def scan_phase2(music_dir: Path, cache_dir: Path, db, generator: 'CLaMP3Embeddin
     elapsed = time.time() - t0
 
     total_tracks = db.count_tracks()
-    total_embs = db.count_embeddings("clamp3")
+    total_embs = db.count_embeddings()
     print(f"\nPhase 2 complete: {success} ok, {fail} fail in {elapsed:.0f}s "
           f"({elapsed / max(1, success):.3f}s/track)")
     print(f"Database: {total_tracks} tracks, {total_embs} CLaMP3 embeddings")

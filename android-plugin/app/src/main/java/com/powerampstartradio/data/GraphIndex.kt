@@ -120,6 +120,38 @@ class GraphIndex private constructor(
     }
 
     /**
+     * Sample a uniformly random neighbor for Monte Carlo random walks.
+     *
+     * Uniform selection lets the graph *topology* drive exploration.
+     * Non-backtracking: [excludeId] prevents the walk from immediately
+     * reversing direction (A→B→A oscillation wastes steps).
+     *
+     * Single-pass reservoir sampling: O(K) time, zero allocations.
+     *
+     * @param excludeId track ID to skip (previous node), or -1 to allow all
+     * @return neighbor track ID, or -1 if the node has no valid neighbors
+     */
+    fun sampleNeighbor(trackId: Long, rand: java.util.Random, excludeId: Long = -1L): Long {
+        val nodeIndex = trackIdToIndex[trackId] ?: return -1L
+        val entryOffset = graphOffset + nodeIndex.toLong() * k * 8
+        var selected = -1L
+        var validCount = 0
+        for (j in 0 until k) {
+            val offset = (entryOffset + j * 8).toInt()
+            val neighborIndex = buffer.getInt(offset)
+            val weight = buffer.getFloat(offset + 4)
+            if (neighborIndex !in 0 until numNodes || weight <= 0f) continue
+            val neighborId = indexToTrackId[neighborIndex]
+            if (neighborId == excludeId) continue
+            validCount++
+            if (rand.nextInt(validCount) == 0) {
+                selected = neighborId
+            }
+        }
+        return selected
+    }
+
+    /**
      * Check if a track exists in the graph.
      */
     fun hasTrack(trackId: Long): Boolean = trackId in trackIdToIndex

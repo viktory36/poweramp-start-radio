@@ -80,6 +80,15 @@
                 android:resource="@xml/start_radio_widget_info" />
         </receiver>
 
+        <!-- Debug: trigger radio from ADB for automated testing -->
+        <receiver
+            android:name=".debug.DebugRadioReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.powerampstartradio.DEBUG_START_RADIO" />
+            </intent-filter>
+        </receiver>
+
         <!-- Broadcast receiver for Poweramp track changes -->
         <receiver
             android:name=".poweramp.PowerampReceiver"

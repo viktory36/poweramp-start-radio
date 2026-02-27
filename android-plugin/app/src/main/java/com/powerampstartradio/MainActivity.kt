@@ -597,7 +597,7 @@ private fun TrackExplanation(
                 color = MaterialTheme.colorScheme.error.copy(alpha = 0.8f))
         } else if (session != null && trackResult.seedRank != null) {
             val subtleColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
-            val isPageRank = session.config.selectionMode == SelectionMode.RANDOM_WALK
+            val isRandomWalk = session.config.selectionMode == SelectionMode.RANDOM_WALK
             val isDrift = session.config.driftEnabled &&
                 session.config.selectionMode != SelectionMode.DPP &&
                 session.config.selectionMode != SelectionMode.RANDOM_WALK
@@ -619,7 +619,7 @@ private fun TrackExplanation(
                     DriftMode.MOMENTUM -> "to last few"
                 }
                 "#${trackResult.seedRank} to seed \u00b7 #$driftRank $driftLabel"
-            } else if (isPageRank) {
+            } else if (isRandomWalk) {
                 val hopsText = when (trackResult.graphHops) {
                     null, 0 -> ""
                     1 -> " \u00b7 direct neighbor"
@@ -968,7 +968,7 @@ fun SettingsScreen(
     val driftMode by viewModel.driftMode.collectAsState()
     val anchorStrength by viewModel.anchorStrength.collectAsState()
     val anchorDecay by viewModel.anchorDecay.collectAsState()
-    val pageRankAlpha by viewModel.pageRankAlpha.collectAsState()
+    val walkRestartAlpha by viewModel.walkRestartAlpha.collectAsState()
     val momentumBeta by viewModel.momentumBeta.collectAsState()
     val diversityLambda by viewModel.diversityLambda.collectAsState()
     val maxPerArtist by viewModel.maxPerArtist.collectAsState()
@@ -1022,7 +1022,7 @@ fun SettingsScreen(
         viewModel.invalidatePreview(SelectionMode.DPP)
         expandedPeek[SelectionMode.DPP] = false
     }
-    LaunchedEffect(commonKeys, pageRankAlpha) {
+    LaunchedEffect(commonKeys, walkRestartAlpha) {
         viewModel.invalidatePreview(SelectionMode.RANDOM_WALK)
         expandedPeek[SelectionMode.RANDOM_WALK] = false
     }
@@ -1084,7 +1084,7 @@ fun SettingsScreen(
                 Column(modifier = Modifier.selectableGroup()) {
                     AlgorithmOption(
                         label = "Maximum Marginal Relevance (MMR)",
-                        description = "Starts with the closest matches to the seed, then skips candidates that sound too similar to tracks already picked. Each pick is evaluated against the full queue so far.",
+                        description = "Scores every candidate by similarity to the seed minus an adjustable penalty for sounding too similar to whichever single track in the queue it most resembles.",
                         preview = previews[SelectionMode.MMR],
                         isLoading = SelectionMode.MMR in previewsLoading,
                         selected = selectionMode == SelectionMode.MMR,
@@ -1096,7 +1096,7 @@ fun SettingsScreen(
                     )
                     AlgorithmOption(
                         label = "Determinantal Point Process (DPP)",
-                        description = "Looks at the full candidate pool at once. Scores every possible pair of tracks on both relevance to the seed and how different they sound from each other. Relevance and diversity are always balanced, the algorithm cannot trade one for the other.",
+                        description = "Scores every candidate by similarity to the seed minus a penalty for sounding like anything already in the queue. Unlike MMR, the penalty accounts for every similar track already picked, not just the closest one. The more a particular sound is represented in the queue, the harder it becomes to add more of it.",
                         preview = previews[SelectionMode.DPP],
                         isLoading = SelectionMode.DPP in previewsLoading,
                         selected = selectionMode == SelectionMode.DPP,
@@ -1106,8 +1106,8 @@ fun SettingsScreen(
                         onClick = { viewModel.setSelectionMode(SelectionMode.DPP) }
                     )
                     AlgorithmOption(
-                        label = "Personalized PageRank",
-                        description = "Walks a similarity graph starting from the seed. At each step, hops to a similar neighbor or jumps back to the seed. Tracks visited more often rank higher. Surfaces tracks reachable through multiple paths of similarity, even if not directly similar to the seed." +
+                        label = "Random Walk",
+                        description = "Sends 10,000 random walks through a K=5 similarity graph starting from the seed. Each walk follows one neighbor at a time, discovering chains of similarity. Surfaces tracks connected through intermediate links, even if not directly similar to the seed." +
                             if (databaseInfo?.hasGraph != true) " (requires similarity graph in database)" else "",
                         preview = previews[SelectionMode.RANDOM_WALK],
                         isLoading = SelectionMode.RANDOM_WALK in previewsLoading,
@@ -1115,7 +1115,7 @@ fun SettingsScreen(
                         expanded = expandedPeek[SelectionMode.RANDOM_WALK] == true,
                         onToggleExpanded = { expandedPeek[SelectionMode.RANDOM_WALK] = !(expandedPeek[SelectionMode.RANDOM_WALK] ?: false) },
                         onRequestPreview = { viewModel.computePreview(SelectionMode.RANDOM_WALK) },
-                        previewInfo = "return ${(pageRankAlpha * 100).roundToInt()}%",
+                        previewInfo = "return ${(walkRestartAlpha * 100).roundToInt()}%",
                         onClick = { viewModel.setSelectionMode(SelectionMode.RANDOM_WALK) }
                     )
                 }
@@ -1127,7 +1127,7 @@ fun SettingsScreen(
                     Column {
                         Text("Similarity: ${(diversityLambda * 100).roundToInt()}%",
                             style = MaterialTheme.typography.titleSmall)
-                        Text("All the way up: no penalty, picks the most similar tracks. All the way down: strong penalty, spreads picks apart even if individually less similar.",
+                        Text("Max diversity penalty: cuts redundant-sounding tracks. No penalty: picks the most similar tracks to the seed.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1142,19 +1142,19 @@ fun SettingsScreen(
                 }
             }
 
-            // Return Frequency - only for PageRank
+            // Return Frequency - only for Random Walk
             if (isRandomWalk) {
                 item {
                     Column {
-                        Text("Return Frequency: ${(pageRankAlpha * 100).roundToInt()}%",
+                        Text("Return Frequency: ${(walkRestartAlpha * 100).roundToInt()}%",
                             style = MaterialTheme.typography.titleSmall)
-                        Text("How often the walk jumps back to the seed instead of continuing to the next neighbor. Low = wanders further through the graph. High = stays in the immediate neighborhood.",
+                        Text("How often the walk jumps back to the seed instead of continuing to the next neighbor.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text("Rarely returns", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
-                            Slider(value = pageRankAlpha, onValueChange = { viewModel.setPageRankAlpha(it) },
+                            Slider(value = walkRestartAlpha, onValueChange = { viewModel.setWalkRestartAlpha(it) },
                                 valueRange = 0.05f..0.95f, modifier = Modifier.weight(1f), thumb = slimThumb, track = cleanTrack)
                             Text("Returns often", style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
@@ -1223,7 +1223,7 @@ fun SettingsScreen(
                                 if (driftMode == DriftMode.SEED_INTERPOLATION) {
                                     Text("Seed weight: ${(anchorStrength * 100).roundToInt()}%",
                                         style = MaterialTheme.typography.titleSmall)
-                                    Text("Each query is a weighted mix of the seed and the last picked track. High = mostly seed. Low = mostly last pick.",
+                                    Text("Each query is a weighted mix of the seed and the last picked track.",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1564,12 +1564,12 @@ private fun humanSelectionMode(mode: SelectionMode, drift: Boolean = false): Str
     val base = when (mode) {
         SelectionMode.MMR -> "MMR"
         SelectionMode.DPP -> "DPP"
-        SelectionMode.RANDOM_WALK -> "PageRank"
+        SelectionMode.RANDOM_WALK -> "Random Walk"
     }
     return if (drift && mode != SelectionMode.DPP && mode != SelectionMode.RANDOM_WALK) "$base + drift" else base
 }
 
-/** Mode name with knob values, e.g. "MMR λ=0.4 + drift α=0.5 exp" or "PageRank α=0.5". */
+/** Mode name with knob values, e.g. "MMR λ=0.4 + drift α=0.5 exp" or "Walk α=0.5". */
 private fun humanModeWithKnobs(config: RadioConfig): String = buildString {
     when (config.selectionMode) {
         SelectionMode.MMR -> {
@@ -1588,7 +1588,7 @@ private fun humanModeWithKnobs(config: RadioConfig): String = buildString {
             }
         }
         SelectionMode.DPP -> append("DPP")
-        SelectionMode.RANDOM_WALK -> append("PageRank \u03b1=${formatKnob(config.pageRankAlpha)}")
+        SelectionMode.RANDOM_WALK -> append("Walk \u03b1=${formatKnob(config.walkRestartAlpha)}")
     }
 }
 

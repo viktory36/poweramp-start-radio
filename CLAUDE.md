@@ -8,7 +8,7 @@ Poweramp Start Radio is a two-part system for music similarity-based radio on An
 - **Desktop Indexer** (Python): Generates CLaMP3 audio embeddings from a music library
 - **Android Plugin** (Kotlin): Uses embeddings to find similar tracks and queue them in Poweramp
 
-The workflow: scan music on desktop → generate embeddings.db → build kNN graph → transfer to phone → app matches current Poweramp track → queues similar tracks. Alternatively, transfer TFLite models to the phone and index new tracks on-device.
+The workflow: scan music on desktop → generate embeddings.db (includes kNN graph) → transfer to phone → app matches current Poweramp track → queues similar tracks. Alternatively, transfer TFLite models to the phone and index new tracks on-device.
 
 ## Build & Run Commands
 
@@ -99,8 +99,7 @@ Poweramp library → NewTrackDetector → IndexingActivity (track selection UI)
 **Recommendation Algorithms** (Android, user-selectable):
 - **MMR** (Balanced): `lambda * relevance - (1-lambda) * max_sim_to_selected`. Penalizes redundancy.
 - **DPP** (Diverse): Greedy MAP with incremental Cholesky. Maximizes list-wise diversity.
-- **Random Walk** (Explorer): Personalized PageRank on precomputed kNN graph. Discovers transitive connections.
-- **Temperature** (Surprise Me): Gumbel-max trick for controlled randomness.
+- **Random Walk** (Explorer): Monte Carlo random walks on precomputed K=5 kNN graph. 10,000 walks with terminal-only counting, non-backtracking. Alpha controls restart probability (exploration depth).
 - **Drift mode**: Optional modifier. Each result influences the next query via seed interpolation or EMA momentum.
 - **Post-filter**: Artist caps (max per artist, min spacing between same artist).
 
@@ -148,6 +147,7 @@ Poweramp API uses:
 | CLaMP3 embedding generation | `desktop-indexer/scripts/generate_clamp3_embeddings.py` |
 | CLaMP3 evaluation (similar/search) | `desktop-indexer/scripts/evaluate_clamp3.py` |
 | SQLite database schema | `desktop-indexer/src/poweramp_indexer/database.py` |
+| k-means + kNN graph builder | `desktop-indexer/src/poweramp_indexer/graph.py` |
 | PyTorch → TFLite export | `desktop-indexer/src/poweramp_indexer/export_litert.py` |
 | Poweramp API wrapper | `android-plugin/.../poweramp/PowerampHelper.kt` |
 | Recommendation engine | `android-plugin/.../similarity/RecommendationEngine.kt` |

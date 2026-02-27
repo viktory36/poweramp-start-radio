@@ -100,7 +100,7 @@ class EmbeddingDatabase:
             pass  # Column already exists
         self.conn.commit()
 
-    def add_embedding(self, track_id: int, model: str, embedding: list[float]):
+    def add_embedding(self, track_id: int, embedding: list[float]):
         """Insert an embedding into the embeddings table."""
         blob = float_list_to_blob(embedding)
         self.conn.execute(
@@ -142,7 +142,6 @@ class EmbeddingDatabase:
         self,
         metadata: TrackMetadata,
         embedding: list[float],
-        model: str = "clamp3",
         source: str = "desktop",
     ) -> int:
         """
@@ -168,10 +167,10 @@ class EmbeddingDatabase:
             )
         )
         track_id = cursor.lastrowid
-        self.add_embedding(track_id, model, embedding)
+        self.add_embedding(track_id, embedding)
         return track_id
 
-    def get_existing_paths(self, model: str = "clamp3") -> set[str]:
+    def get_existing_paths(self) -> set[str]:
         """Get file paths that have embeddings."""
         rows = self.conn.execute(
             "SELECT t.file_path FROM tracks t "
@@ -198,7 +197,7 @@ class EmbeddingDatabase:
         row = self.conn.execute("SELECT COUNT(*) as count FROM tracks").fetchone()
         return row["count"]
 
-    def count_embeddings(self, model: str = "clamp3") -> int:
+    def count_embeddings(self) -> int:
         """Return the number of embeddings."""
         try:
             row = self.conn.execute(
@@ -220,7 +219,7 @@ class EmbeddingDatabase:
         """Reclaim unused space in the database."""
         self.conn.execute("VACUUM")
 
-    def get_all_embeddings(self, model: str = "clamp3") -> dict[int, list[float]]:
+    def get_all_embeddings(self) -> dict[int, list[float]]:
         """Load all embeddings from the database.
 
         Returns:
@@ -231,7 +230,7 @@ class EmbeddingDatabase:
         ).fetchall()
         return {row["track_id"]: blob_to_float_list(row["embedding"]) for row in rows}
 
-    def get_embedding_by_id(self, track_id: int, model: str = "clamp3") -> Optional[list[float]]:
+    def get_embedding_by_id(self, track_id: int) -> Optional[list[float]]:
         """Get the embedding for a specific track."""
         row = self.conn.execute(
             "SELECT embedding FROM embeddings_clamp3 WHERE track_id = ?", (track_id,)

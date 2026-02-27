@@ -747,7 +747,7 @@ def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False, fp16=False):
 
 # ─── Phase 3: kNN graph construction ──────────────────────────────────────────
 
-def build_knn_graph(db_path, k=20):
+def build_knn_graph(db_path, k=5):
     """Build a kNN graph from CLaMP3 embeddings and store in binary_data.
 
     For each track, brute-force find K nearest neighbors via cosine similarity
