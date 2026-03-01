@@ -464,6 +464,29 @@ class EmbeddingDatabase private constructor(
         return result
     }
 
+    /**
+     * Search tracks by free-text query against artist + title.
+     * Splits query into tokens and requires all tokens to match (case-insensitive).
+     *
+     * @param query Free text like "time pachanga boys"
+     * @param limit Maximum results to return
+     * @return Matching tracks, best matches first
+     */
+    fun searchTracksByText(query: String, limit: Int = 10): List<EmbeddedTrack> {
+        val tokens = query.trim().lowercase().split("\\s+".toRegex()).filter { it.isNotBlank() }
+        if (tokens.isEmpty()) return emptyList()
+
+        // Build WHERE clause: each token must appear in artist||' '||title
+        val whereClauses = tokens.map { "LOWER(COALESCE(artist,'') || ' ' || COALESCE(title,'')) LIKE ?" }
+        val whereArgs = tokens.map { "%$it%" }.toTypedArray()
+        val sql = "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path " +
+            "FROM tracks WHERE ${whereClauses.joinToString(" AND ")} LIMIT ?"
+
+        val allArgs = whereArgs + arrayOf(limit.toString())
+        val cursor = db.rawQuery(sql, allArgs)
+        return cursor.use { cursorToTrackList(it) }
+    }
+
     // --- Write operations (require openReadWrite) ---
 
     /**

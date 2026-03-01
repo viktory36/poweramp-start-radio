@@ -27,6 +27,7 @@ import com.powerampstartradio.ui.QueuedTrackResult
 import com.powerampstartradio.ui.RadioConfig
 import com.powerampstartradio.ui.RadioResult
 import com.powerampstartradio.ui.RadioUiState
+import com.powerampstartradio.ui.SeedSpec
 import com.powerampstartradio.ui.SelectionMode
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
@@ -80,7 +81,13 @@ class RadioService : Service() {
         const val EXTRA_DIVERSITY_LAMBDA = "diversity_lambda"
         const val EXTRA_MAX_PER_ARTIST = "max_per_artist"
         const val EXTRA_MIN_ARTIST_SPACING = "min_artist_spacing"
+        const val EXTRA_MULTI_SEED = "multi_seed"
+        const val ACTION_START_MULTI_SEED = "com.powerampstartradio.START_MULTI_SEED"
         const val DEFAULT_NUM_TRACKS = 50
+
+        /** Transient seed list for multi-seed radio (too large for Intent extras). */
+        @Volatile
+        var pendingMultiSeeds: List<SeedSpec>? = null
 
         private var activeJob: Job? = null
         val isSearchActive: Boolean get() = activeJob?.isActive == true
@@ -177,6 +184,24 @@ class RadioService : Service() {
             context.startForegroundService(intent)
         }
 
+        /**
+         * Start radio from multiple seeds (text + song references).
+         * Seeds are passed via [pendingMultiSeeds] (too large for Intent extras).
+         */
+        fun startRadioFromMultiSeed(context: Context, seeds: List<SeedSpec>, config: RadioConfig) {
+            if (isSearchActive) return
+            pendingMultiSeeds = seeds
+            _uiState.value = RadioUiState.Searching("Starting multi-seed search...")
+            val intent = Intent(context, RadioService::class.java).apply {
+                action = ACTION_START_MULTI_SEED
+                putExtra(EXTRA_NUM_TRACKS, config.numTracks)
+                putExtra(EXTRA_SHOW_TOASTS, true)
+                putExtra(EXTRA_MAX_PER_ARTIST, config.maxPerArtist)
+                putExtra(EXTRA_MIN_ARTIST_SPACING, config.minArtistSpacing)
+            }
+            context.startForegroundService(intent)
+        }
+
         fun cancelSearch() {
             activeJob?.cancel()
             val current = _uiState.value
@@ -222,6 +247,21 @@ class RadioService : Service() {
                     .takeIf { it >= 0 }
                 startForeground(NOTIFICATION_ID, createNotification("Starting radio..."))
                 performRadio(config, seedTrackId)
+            }
+            ACTION_START_MULTI_SEED -> {
+                stopJob?.cancel()
+                stopJob = null
+                showToasts = intent.getBooleanExtra(EXTRA_SHOW_TOASTS, true)
+                val config = extractConfig(intent)
+                val seeds = pendingMultiSeeds
+                pendingMultiSeeds = null
+                startForeground(NOTIFICATION_ID, createNotification("Multi-seed search..."))
+                if (seeds != null) {
+                    performMultiSeedRadio(config, seeds)
+                } else {
+                    _uiState.value = RadioUiState.Error("No seeds provided")
+                    stopSelfDelayed()
+                }
             }
             ACTION_CANCEL -> {
                 cancelSearch()
@@ -620,6 +660,133 @@ class RadioService : Service() {
                 Log.e(TAG, "Error starting radio", e)
                 _uiState.value = RadioUiState.Error("Error: ${e.message}")
                 updateNotification("Error: ${e.message}")
+                toast("Error: ${e.message}")
+                stopSelfDelayed()
+            } finally {
+                activeJob = null
+            }
+        }
+    }
+
+    private fun performMultiSeedRadio(config: RadioConfig, seeds: List<SeedSpec>) {
+        activeJob = serviceScope.launch {
+            try {
+                val radioStart = System.nanoTime()
+                toast("Multi-seed search...")
+                Log.i(TAG, "performMultiSeedRadio: ${seeds.size} seeds, numTracks=${config.numTracks}")
+
+                val db = getOrCreateDatabase()
+                if (db == null) {
+                    _uiState.value = RadioUiState.Error("No embedding database found")
+                    stopSelfDelayed()
+                    return@launch
+                }
+
+                val matcher = TrackMatcher(db)
+                val eng = getOrCreateEngine(db)
+
+                eng.ensureIndices { message ->
+                    _uiState.value = RadioUiState.Loading(message)
+                    updateNotification(message)
+                }
+
+                _uiState.value = RadioUiState.Searching("Computing multi-seed ranking...")
+                updateNotification("Computing multi-seed ranking...")
+
+                val similarTracks = eng.generateMultiSeedPlaylist(
+                    seeds = seeds,
+                    config = config,
+                    onProgress = { message ->
+                        _uiState.value = RadioUiState.Searching(message)
+                        updateNotification(message)
+                    }
+                )
+
+                if (similarTracks.isEmpty()) {
+                    _uiState.value = RadioUiState.Error("No similar tracks found")
+                    toast("No similar tracks found")
+                    stopSelfDelayed()
+                    return@launch
+                }
+
+                // Map to Poweramp file IDs
+                val mappedTracks = matcher.mapSimilarTracksToFileIds(this@RadioService, similarTracks)
+                val fileIds = mappedTracks.mapNotNull { it.fileId }
+
+                if (fileIds.isEmpty()) {
+                    _uiState.value = RadioUiState.Error("Could not find tracks in Poweramp library")
+                    toast("Could not find tracks in Poweramp library")
+                    stopSelfDelayed()
+                    return@launch
+                }
+
+                // Build display seed track from the first labeled seed
+                val displayLabel = seeds.firstOrNull()?.label ?: "Multi-seed"
+                val seedDisplayTrack = PowerampTrack(
+                    realId = -1L,
+                    title = displayLabel,
+                    artist = seeds.drop(1).joinToString(", ") { it.label }.ifEmpty { null },
+                    album = null,
+                    durationMs = 0,
+                    path = "",
+                )
+
+                // Queue: anchor current Poweramp track if in queue, else just queue results
+                val currentTrack = PowerampReceiver.currentTrack
+                val currentInQueue = currentTrack?.realId?.takeIf { it > 0 }?.let {
+                    PowerampHelper.isInQueue(this@RadioService, it)
+                } == true
+                val queueAnchorId = if (currentInQueue) currentTrack!!.realId else null
+                val queueCurrentId = queueAnchorId ?: (currentTrack?.realId ?: -1L)
+
+                val queuedCount = PowerampHelper.replaceQueue(this@RadioService, queueCurrentId, fileIds)
+                val queuedFileIds = fileIds.take(queuedCount).toSet()
+
+                val trackResults = mappedTracks.map { mapped ->
+                    val status = when {
+                        mapped.fileId == null -> QueueStatus.NOT_IN_LIBRARY
+                        mapped.fileId in queuedFileIds -> QueueStatus.QUEUED
+                        else -> QueueStatus.QUEUE_FAILED
+                    }
+                    QueuedTrackResult(
+                        track = mapped.similarTrack.track,
+                        similarity = mapped.similarTrack.similarity,
+                        similarityToSeed = mapped.similarTrack.similarityToSeed,
+                        status = status,
+                    )
+                }
+
+                val metrics = eng.computeQueueMetrics(similarTracks)
+                val radioResult = RadioResult(
+                    seedTrack = seedDisplayTrack,
+                    matchType = TrackMatcher.MatchType.METADATA_EXACT,
+                    tracks = trackResults,
+                    config = config,
+                    queuedFileIds = queuedFileIds,
+                    queueAnchorId = queueAnchorId,
+                    metrics = metrics,
+                )
+
+                _uiState.value = RadioUiState.Success(radioResult)
+                _sessionHistory.value = (_sessionHistory.value + radioResult).takeLast(MAX_SESSIONS)
+                saveHistory()
+                PowerampHelper.reloadData(this@RadioService)
+
+                val notFound = trackResults.count { it.status == QueueStatus.NOT_IN_LIBRARY }
+                val message = buildQueueResultMessage(radioResult.queuedCount, notFound)
+                updateNotification(message)
+                val totalMs = (System.nanoTime() - radioStart) / 1_000_000
+                Log.i(TAG, "TIMING: radio_multiseed total=${totalMs}ms, " +
+                    "${radioResult.queuedCount} queued / ${radioResult.failedCount} failed / $notFound not found")
+                Toast.makeText(this@RadioService, message, Toast.LENGTH_SHORT).show()
+
+                stopSelfDelayed()
+            } catch (e: CancellationException) {
+                Log.d(TAG, "Multi-seed search cancelled")
+                stopSelfDelayed()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in multi-seed radio", e)
+                _uiState.value = RadioUiState.Error("Error: ${e.message}")
                 toast("Error: ${e.message}")
                 stopSelfDelayed()
             } finally {

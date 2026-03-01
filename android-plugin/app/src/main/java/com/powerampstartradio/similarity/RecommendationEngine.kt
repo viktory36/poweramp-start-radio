@@ -8,6 +8,7 @@ import com.powerampstartradio.data.GraphIndex
 import com.powerampstartradio.indexing.GraphUpdater
 import com.powerampstartradio.similarity.algorithms.DppSelector
 import com.powerampstartradio.similarity.algorithms.DriftEngine
+import com.powerampstartradio.similarity.algorithms.GeoMeanSelector
 import com.powerampstartradio.similarity.algorithms.MmrSelector
 import com.powerampstartradio.similarity.algorithms.PostFilter
 import com.powerampstartradio.similarity.algorithms.RandomWalkSelector
@@ -15,6 +16,7 @@ import com.powerampstartradio.ui.DriftMode
 import com.powerampstartradio.ui.Influence
 import com.powerampstartradio.ui.QueueMetrics
 import com.powerampstartradio.ui.RadioConfig
+import com.powerampstartradio.ui.SeedSpec
 import com.powerampstartradio.ui.SelectionMode
 import com.powerampstartradio.ui.TrackProvenance
 import kotlinx.coroutines.Dispatchers
@@ -507,6 +509,69 @@ class RecommendationEngine(
         return MmrSelector.selectOne(
             candidates, selectedEmbeddings, index, config.diversityLambda
         )
+    }
+
+    /**
+     * Generate a playlist from multiple seeds using Geometric Mean of Percentiles.
+     *
+     * @param seeds List of SeedSpec (embedding + weight + metadata)
+     * @param config Algorithm configuration (numTracks, artist constraints)
+     * @param onProgress Status message callback
+     * @return List of similar tracks ranked by geo mean score
+     */
+    suspend fun generateMultiSeedPlaylist(
+        seeds: List<SeedSpec>,
+        config: RadioConfig,
+        onProgress: ((String) -> Unit)? = null,
+    ): List<SimilarTrack> = withContext(Dispatchers.Default) {
+        val t0 = System.nanoTime()
+        ensureIndices(onProgress)
+
+        val index = embeddingIndex ?: run {
+            Log.e(TAG, "generateMultiSeedPlaylist: no embedding index")
+            return@withContext emptyList()
+        }
+
+        val validSeeds = seeds.filter { it.weight != 0f }
+        if (validSeeds.isEmpty()) return@withContext emptyList()
+
+        Log.i(TAG, "generateMultiSeedPlaylist: ${validSeeds.size} seeds, " +
+            "numTracks=${config.numTracks}")
+
+        onProgress?.invoke("Computing multi-seed ranking...")
+
+        // Exclude song seeds from results
+        val excludeIds = validSeeds.mapNotNull { it.trackId }.toSet()
+
+        // Over-request to compensate for post-filter drops
+        val requestK = (config.numTracks * 3).coerceAtMost(index.numTracks)
+        val ranking = GeoMeanSelector.computeRanking(
+            index,
+            validSeeds.map { it.embedding to it.weight },
+            requestK,
+            excludeIds,
+        )
+
+        // Resolve track metadata
+        val tracks = ranking.mapNotNull { (trackId, score) ->
+            database.getTrackById(trackId)?.let { track ->
+                SimilarTrack(
+                    track = track,
+                    similarity = score,
+                    similarityToSeed = score,  // geo mean score used as similarity display
+                )
+            }
+        }
+
+        // Post-filter artist constraints
+        val filtered = PostFilter.enforceBatch(
+            tracks, config.maxPerArtist, config.minArtistSpacing
+        ).take(config.numTracks)
+
+        val totalMs = (System.nanoTime() - t0) / 1_000_000
+        Log.i(TAG, "TIMING: generateMultiSeedPlaylist ${filtered.size} tracks in ${totalMs}ms")
+
+        filtered
     }
 
     /**

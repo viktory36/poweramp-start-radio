@@ -9,6 +9,7 @@ import androidx.lifecycle.viewModelScope
 import com.powerampstartradio.data.EmbeddedTrack
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.data.EmbeddingIndex
+import com.powerampstartradio.similarity.SimilarTrack
 import com.powerampstartradio.indexing.IndexingService
 import com.powerampstartradio.indexing.IndexingViewModel
 import com.powerampstartradio.indexing.Clamp3TextInference
@@ -537,6 +538,315 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         prefs.edit().remove("recent_searches").apply()
     }
 
+    // --- Multi-seed (song seed) state ---
+
+    private val _songSeeds = MutableStateFlow<List<SongSeedState>>(emptyList())
+    val songSeeds: StateFlow<List<SongSeedState>> = _songSeeds.asStateFlow()
+
+    private val _songSeedSearchResults = MutableStateFlow<List<EmbeddedTrack>?>(null)
+    val songSeedSearchResults: StateFlow<List<EmbeddedTrack>?> = _songSeedSearchResults.asStateFlow()
+
+    /** Index of the song seed currently showing search results dropdown. */
+    private val _activeSeedSearchIndex = MutableStateFlow(-1)
+    val activeSeedSearchIndex: StateFlow<Int> = _activeSeedSearchIndex.asStateFlow()
+
+    /** Multi-seed search results (separate from single text search results). */
+    private val _multiSeedResult = MutableStateFlow<TextSearchResult?>(null)
+    val multiSeedResult: StateFlow<TextSearchResult?> = _multiSeedResult.asStateFlow()
+
+    private val _multiSeedLoading = MutableStateFlow(false)
+    val multiSeedLoading: StateFlow<Boolean> = _multiSeedLoading.asStateFlow()
+
+    fun addSongSeed() {
+        _songSeeds.value = _songSeeds.value + SongSeedState()
+    }
+
+    fun removeSongSeed(index: Int) {
+        val current = _songSeeds.value.toMutableList()
+        if (index in current.indices) {
+            current.removeAt(index)
+            _songSeeds.value = current
+        }
+        if (_activeSeedSearchIndex.value == index) {
+            _songSeedSearchResults.value = null
+            _activeSeedSearchIndex.value = -1
+        }
+    }
+
+    fun updateSongSeedQuery(index: Int, query: String) {
+        val current = _songSeeds.value.toMutableList()
+        if (index in current.indices) {
+            current[index] = current[index].copy(query = query, confirmedTrack = null)
+            _songSeeds.value = current
+        }
+    }
+
+    fun confirmSongSeed(index: Int, track: EmbeddedTrack) {
+        val current = _songSeeds.value.toMutableList()
+        if (index in current.indices) {
+            current[index] = current[index].copy(
+                query = "${track.artist ?: ""} - ${track.title ?: ""}".trim(),
+                confirmedTrack = track,
+            )
+            _songSeeds.value = current
+        }
+        _songSeedSearchResults.value = null
+        _activeSeedSearchIndex.value = -1
+    }
+
+    fun updateSongSeedWeight(index: Int, weight: Float) {
+        val current = _songSeeds.value.toMutableList()
+        if (index in current.indices) {
+            current[index] = current[index].copy(weight = weight)
+            _songSeeds.value = current
+        }
+    }
+
+    fun searchSongSeed(index: Int) {
+        val seeds = _songSeeds.value
+        if (index !in seeds.indices) return
+        val query = seeds[index].query.trim()
+        if (query.isBlank()) return
+
+        _activeSeedSearchIndex.value = index
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
+                if (!dbFile.exists()) return@launch
+                val db = EmbeddingDatabase.open(dbFile)
+                val results = db.searchTracksByText(query)
+                db.close()
+                _songSeedSearchResults.value = results
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "Song seed search failed", e)
+                _songSeedSearchResults.value = emptyList()
+            }
+        }
+    }
+
+    fun dismissSongSeedSearch() {
+        _songSeedSearchResults.value = null
+        _activeSeedSearchIndex.value = -1
+    }
+
+    /**
+     * Perform a multi-seed search: text query + song seeds → geo mean of percentiles.
+     * If only text query with no song seeds, degenerates to regular text search.
+     */
+    fun performMultiSeedSearch(textQuery: String) {
+        val seeds = _songSeeds.value
+        val hasText = textQuery.isNotBlank()
+        val confirmedSeeds = seeds.filter { it.confirmedTrack != null && it.weight != 0f }
+
+        // If no song seeds, fall back to regular text search
+        if (confirmedSeeds.isEmpty() && hasText) {
+            performTextSearch(textQuery)
+            return
+        }
+
+        if (confirmedSeeds.isEmpty() && !hasText) return
+
+        _multiSeedLoading.value = true
+        _multiSeedResult.value = null
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val filesDir = getApplication<Application>().filesDir
+                val dbFile = File(filesDir, "embeddings.db")
+                if (!dbFile.exists()) {
+                    _multiSeedResult.value = TextSearchResult(query = textQuery, error = "No embedding database found")
+                    return@launch
+                }
+
+                val seedSpecs = mutableListOf<SeedSpec>()
+
+                // Text seed
+                if (hasText) {
+                    val inference = getOrInitTextInference(textQuery) ?: return@launch
+                    val debugDir = File(filesDir, "debug_embeddings")
+                    val embedding = try {
+                        inference.generateEmbedding(textQuery.trim(), debugDir)
+                    } catch (e: Exception) {
+                        Log.w("MainViewModel", "Text inference failed in multi-seed", e)
+                        null
+                    }
+                    if (embedding == null) {
+                        _multiSeedResult.value = TextSearchResult(query = textQuery, error = "Text inference failed")
+                        return@launch
+                    }
+                    seedSpecs.add(SeedSpec(
+                        embedding = embedding,
+                        weight = 1.0f,
+                        label = textQuery.trim(),
+                        type = SeedType.TEXT,
+                    ))
+                }
+
+                // Song seeds
+                val db = EmbeddingDatabase.open(dbFile)
+                for (seed in confirmedSeeds) {
+                    val track = seed.confirmedTrack!!
+                    val embedding = db.getEmbedding(track.id)
+                    if (embedding != null) {
+                        seedSpecs.add(SeedSpec(
+                            embedding = embedding,
+                            weight = seed.weight,
+                            label = "${track.artist ?: "?"} - ${track.title ?: "?"}",
+                            type = SeedType.SONG,
+                            trackId = track.id,
+                        ))
+                    }
+                }
+                db.close()
+
+                if (seedSpecs.isEmpty()) {
+                    _multiSeedResult.value = TextSearchResult(query = textQuery, error = "No valid seeds")
+                    return@launch
+                }
+
+                // Use embedding index for geo-mean ranking
+                val index = textIndex ?: run {
+                    val embFile = File(filesDir, "clamp3.emb")
+                    if (!embFile.exists()) {
+                        val db2 = EmbeddingDatabase.open(dbFile)
+                        EmbeddingIndex.extractFromDatabase(db2, embFile, table = "embeddings_clamp3")
+                        db2.close()
+                    }
+                    if (!embFile.exists()) {
+                        _multiSeedResult.value = TextSearchResult(query = textQuery, error = "Failed to extract index")
+                        return@launch
+                    }
+                    EmbeddingIndex.mmap(embFile).also { textIndex = it }
+                }
+
+                val excludeIds = seedSpecs.mapNotNull { it.trackId }.toSet()
+                val topK = _textSearchTopK.value
+
+                val ranking = com.powerampstartradio.similarity.algorithms.GeoMeanSelector.computeRanking(
+                    index,
+                    seedSpecs.map { it.embedding to it.weight },
+                    topK,
+                    excludeIds,
+                )
+
+                // Resolve track metadata
+                val db3 = EmbeddingDatabase.open(dbFile)
+                val matches = ranking.mapNotNull { (trackId, score) ->
+                    db3.getTrackById(trackId)?.let { TextSearchMatch(it, score) }
+                }
+                db3.close()
+
+                val queryLabel = buildList {
+                    if (hasText) add("\"$textQuery\"")
+                    for (s in confirmedSeeds) add("${if (s.weight < 0) "-" else "+"}${s.confirmedTrack!!.title}")
+                }.joinToString(" + ")
+
+                _multiSeedResult.value = TextSearchResult(query = queryLabel, matches = matches)
+
+                if (hasText) saveRecentSearch(textQuery)
+
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "Multi-seed search failed", e)
+                _multiSeedResult.value = TextSearchResult(query = textQuery, error = "Search failed: ${e.message}")
+            } finally {
+                _multiSeedLoading.value = false
+            }
+        }
+    }
+
+    /** Helper: get or init text inference, returning null (with error set) on failure. */
+    private fun getOrInitTextInference(queryForError: String): com.powerampstartradio.indexing.Clamp3TextInference? {
+        textInference?.let { return it }
+        val filesDir = getApplication<Application>().filesDir
+        val vocabFile = File(filesDir, "xlm_roberta_vocab.json")
+        if (!vocabFile.exists()) {
+            _multiSeedResult.value = TextSearchResult(query = queryForError, error = "Tokenizer vocab not found")
+            return null
+        }
+        val candidates = buildList {
+            val fp32 = File(filesDir, "clamp3_text.tflite")
+            if (fp32.exists()) {
+                add(fp32 to com.google.ai.edge.litert.Accelerator.GPU)
+                add(fp32 to com.google.ai.edge.litert.Accelerator.CPU)
+            }
+        }
+        if (candidates.isEmpty()) {
+            _multiSeedResult.value = TextSearchResult(query = queryForError, error = "CLaMP3 text model not found")
+            return null
+        }
+        var lastError: Exception? = null
+        for ((modelFile, accel) in candidates) {
+            try {
+                return com.powerampstartradio.indexing.Clamp3TextInference(modelFile, vocabFile, accel)
+                    .also { textInference = it }
+            } catch (e: Exception) {
+                lastError = e
+            }
+        }
+        _multiSeedResult.value = TextSearchResult(query = queryForError, error = "Failed to load text model: ${lastError?.message}")
+        return null
+    }
+
+    fun clearMultiSeedResult() {
+        _multiSeedResult.value = null
+    }
+
+    /**
+     * Start radio from multi-seed search results.
+     * Builds SeedSpec list from current state and sends to RadioService.
+     */
+    fun startRadioFromMultiSeed(textQuery: String) {
+        val seeds = _songSeeds.value
+        val confirmedSeeds = seeds.filter { it.confirmedTrack != null && it.weight != 0f }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val filesDir = getApplication<Application>().filesDir
+                val dbFile = File(filesDir, "embeddings.db")
+                if (!dbFile.exists()) return@launch
+
+                val seedSpecs = mutableListOf<SeedSpec>()
+
+                // Text seed
+                if (textQuery.isNotBlank()) {
+                    val inference = textInference ?: return@launch
+                    val debugDir = File(filesDir, "debug_embeddings")
+                    val embedding = inference.generateEmbedding(textQuery.trim(), debugDir) ?: return@launch
+                    seedSpecs.add(SeedSpec(
+                        embedding = embedding,
+                        weight = 1.0f,
+                        label = textQuery.trim(),
+                        type = SeedType.TEXT,
+                    ))
+                }
+
+                // Song seeds
+                val db = EmbeddingDatabase.open(dbFile)
+                for (seed in confirmedSeeds) {
+                    val track = seed.confirmedTrack!!
+                    val embedding = db.getEmbedding(track.id)
+                    if (embedding != null) {
+                        seedSpecs.add(SeedSpec(
+                            embedding = embedding,
+                            weight = seed.weight,
+                            label = "${track.artist ?: "?"} - ${track.title ?: "?"}",
+                            type = SeedType.SONG,
+                            trackId = track.id,
+                        ))
+                    }
+                }
+                db.close()
+
+                if (seedSpecs.isEmpty()) return@launch
+
+                val config = buildConfig()
+                RadioService.startRadioFromMultiSeed(getApplication(), seedSpecs, config)
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "startRadioFromMultiSeed failed", e)
+            }
+        }
+    }
+
     // --- Indexing actions ---
 
     fun checkUnindexedTracks() {
@@ -869,4 +1179,13 @@ data class TextSearchResult(
     val query: String,
     val matches: List<TextSearchMatch> = emptyList(),
     val error: String? = null,
+)
+
+/**
+ * State for a single song seed in multi-seed search.
+ */
+data class SongSeedState(
+    val query: String = "",
+    val confirmedTrack: EmbeddedTrack? = null,
+    val weight: Float = 1.0f,
 )

@@ -5,6 +5,35 @@ import com.powerampstartradio.poweramp.PowerampTrack
 import com.powerampstartradio.poweramp.TrackMatcher
 
 /**
+ * Type of seed for multi-seed search.
+ */
+enum class SeedType { TEXT, SONG }
+
+/**
+ * A single seed for multi-seed search.
+ *
+ * @param embedding 768d CLaMP3 embedding (text or audio)
+ * @param weight -1.0 to 1.0. Positive = "more like", negative = "less like". 0 = ignored.
+ * @param label Display label (e.g. "90s boombap" or "Time - Pachanga Boys")
+ * @param type TEXT or SONG
+ * @param trackId For SONG seeds: the embedding DB track ID (for exclusion from results)
+ */
+data class SeedSpec(
+    val embedding: FloatArray,
+    val weight: Float,
+    val label: String,
+    val type: SeedType,
+    val trackId: Long? = null,
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is SeedSpec) return false
+        return label == other.label && weight == other.weight && type == other.type && trackId == other.trackId
+    }
+    override fun hashCode(): Int = label.hashCode() * 31 + type.hashCode()
+}
+
+/**
  * User-selectable recommendation algorithm.
  */
 enum class SelectionMode {

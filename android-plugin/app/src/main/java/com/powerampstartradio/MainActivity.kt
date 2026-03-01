@@ -27,7 +27,9 @@ import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
@@ -70,7 +72,9 @@ import com.powerampstartradio.ui.QueueStatus
 import com.powerampstartradio.ui.QueuedTrackResult
 import com.powerampstartradio.ui.RadioResult
 import com.powerampstartradio.ui.RadioUiState
+import com.powerampstartradio.ui.RotaryKnob
 import com.powerampstartradio.ui.SelectionMode
+import com.powerampstartradio.ui.SongSeedState
 import com.powerampstartradio.ui.TextSearchResult
 import com.powerampstartradio.ui.theme.PowerampStartRadioTheme
 import kotlinx.coroutines.launch
@@ -728,26 +732,54 @@ fun TextSearchScreen(
     onBack: () -> Unit
 ) {
     val textSearchResult by viewModel.textSearchResult.collectAsState()
+    val multiSeedResult by viewModel.multiSeedResult.collectAsState()
     val isLoading by viewModel.textSearchLoading.collectAsState()
+    val isMultiSeedLoading by viewModel.multiSeedLoading.collectAsState()
     val recentSearches by viewModel.recentSearches.collectAsState()
+    val songSeeds by viewModel.songSeeds.collectAsState()
+    val songSeedSearchResults by viewModel.songSeedSearchResults.collectAsState()
+    val activeSeedSearchIndex by viewModel.activeSeedSearchIndex.collectAsState()
     var query by remember { mutableStateOf(TextFieldValue("")) }
     val focusRequester = remember { FocusRequester() }
+
+    val hasSongSeeds = songSeeds.isNotEmpty()
+    val anyLoading = isLoading || isMultiSeedLoading
+
+    // Active result: prefer multi-seed if it exists, else text-only
+    val activeResult = multiSeedResult ?: textSearchResult
 
     LaunchedEffect(Unit) {
         focusRequester.requestFocus()
     }
 
     fun doSearch(q: String) {
-        if (q.isBlank()) return
-        query = TextFieldValue(q, selection = TextRange(q.length))
-        viewModel.performTextSearch(q.trim())
+        if (hasSongSeeds) {
+            viewModel.performMultiSeedSearch(q.trim())
+        } else {
+            if (q.isBlank()) return
+            query = TextFieldValue(q, selection = TextRange(q.length))
+            viewModel.performTextSearch(q.trim())
+        }
     }
 
-    BackHandler(enabled = textSearchResult != null) {
+    BackHandler(enabled = activeResult != null) {
         viewModel.clearTextSearchResult()
+        viewModel.clearMultiSeedResult()
     }
 
-    val dynamicTitle = if (textSearchResult != null) "Results" else "Retrieve By Text"
+    val dynamicTitle = if (activeResult != null) "Results" else "Retrieve By Text"
+
+    // Song name placeholders for seed fields
+    val songPlaceholders = remember {
+        listOf(
+            "time pachanga boys",
+            "bohemian rhapsody queen",
+            "billie jean michael jackson",
+            "africa toto",
+            "stairway to heaven led zeppelin",
+            "like a prayer madonna",
+        ).shuffled()
+    }
 
     Scaffold(
         topBar = {
@@ -755,8 +787,9 @@ fun TextSearchScreen(
                 title = { Text(dynamicTitle) },
                 navigationIcon = {
                     IconButton(onClick = {
-                        if (textSearchResult != null) {
+                        if (activeResult != null) {
                             viewModel.clearTextSearchResult()
+                            viewModel.clearMultiSeedResult()
                         } else {
                             onBack()
                         }
@@ -772,7 +805,7 @@ fun TextSearchScreen(
                 .fillMaxSize()
                 .padding(padding)
         ) {
-            // Search input
+            // Text description field
             val placeholderHint = remember {
                 listOf(
                     "classic rock, British, 1960s, upbeat",
@@ -781,56 +814,205 @@ fun TextSearchScreen(
                     "big band, major key, swing, brass-heavy, syncopation, baritone vocal",
                 ).random()
             }
-            OutlinedTextField(
-                value = query,
-                onValueChange = { query = it },
-                label = { Text("Describe what you want to hear...") },
-                placeholder = {
-                    Text(
-                        placeholderHint,
-                        modifier = Modifier.basicMarquee(iterations = 1, initialDelayMillis = 1500),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
-                        maxLines = 1,
-                    )
-                },
-                singleLine = true,
+
+            val isLastField = songSeeds.isEmpty()
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp)
-                    .focusRequester(focusRequester),
-                trailingIcon = {
-                    if (isLoading) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            strokeWidth = 2.dp,
+                    .padding(start = 16.dp, end = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedTextField(
+                    value = query,
+                    onValueChange = { query = it },
+                    label = { Text("Describe what you want to hear...") },
+                    placeholder = {
+                        Text(
+                            placeholderHint,
+                            modifier = Modifier.basicMarquee(iterations = 1, initialDelayMillis = 1500),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                            maxLines = 1,
                         )
-                    } else if (query.text.isNotEmpty()) {
-                        Row {
-                            IconButton(onClick = { doSearch(query.text) }) {
-                                Icon(Icons.Default.Search, contentDescription = "Search")
+                    },
+                    singleLine = true,
+                    modifier = Modifier
+                        .weight(1f)
+                        .focusRequester(focusRequester),
+                    trailingIcon = {
+                        if (anyLoading && isLastField) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                strokeWidth = 2.dp,
+                            )
+                        } else if (isLastField && (query.text.isNotEmpty() || hasSongSeeds)) {
+                            Row {
+                                IconButton(onClick = { doSearch(query.text) }) {
+                                    Icon(Icons.Default.Search, contentDescription = "Search")
+                                }
+                                if (query.text.isNotEmpty()) {
+                                    IconButton(onClick = {
+                                        query = TextFieldValue("")
+                                        viewModel.clearTextSearchResult()
+                                        viewModel.clearMultiSeedResult()
+                                    }) {
+                                        Icon(Icons.Default.Clear, contentDescription = "Clear")
+                                    }
+                                }
                             }
-                            IconButton(onClick = {
-                                query = TextFieldValue("")
-                                viewModel.clearTextSearchResult()
-                            }) {
-                                Icon(Icons.Default.Clear, contentDescription = "Clear")
+                        }
+                    },
+                    keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+                        onSearch = { doSearch(query.text) }
+                    ),
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                        imeAction = androidx.compose.ui.text.input.ImeAction.Search
+                    ),
+                )
+                // "+" button to add first song seed
+                IconButton(onClick = { viewModel.addSongSeed() }) {
+                    Icon(Icons.Default.Add, contentDescription = "Add song seed")
+                }
+            }
+
+            // Song seed rows
+            songSeeds.forEachIndexed { index, seed ->
+                val isSeedLastField = index == songSeeds.lastIndex
+                val songPlaceholder = songPlaceholders.getOrElse(index) { "artist name title" }
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 16.dp, end = 4.dp, top = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    OutlinedTextField(
+                        value = TextFieldValue(seed.query, selection = TextRange(seed.query.length)),
+                        onValueChange = { viewModel.updateSongSeedQuery(index, it.text) },
+                        label = { Text("And also sounds like...") },
+                        placeholder = {
+                            Text(
+                                songPlaceholder,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                                maxLines = 1,
+                            )
+                        },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                        trailingIcon = {
+                            Row {
+                                if (isSeedLastField && anyLoading) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(20.dp),
+                                        strokeWidth = 2.dp,
+                                    )
+                                } else if (isSeedLastField) {
+                                    IconButton(onClick = { doSearch(query.text) }) {
+                                        Icon(Icons.Default.Search, contentDescription = "Search")
+                                    }
+                                }
+                                // Magnifying glass to look up song in DB
+                                if (seed.confirmedTrack == null && seed.query.isNotBlank()) {
+                                    IconButton(onClick = { viewModel.searchSongSeed(index) }) {
+                                        Icon(
+                                            Icons.Default.Search,
+                                            contentDescription = "Look up song",
+                                            tint = MaterialTheme.colorScheme.tertiary,
+                                        )
+                                    }
+                                }
+                                // Clear/remove button
+                                IconButton(onClick = { viewModel.removeSongSeed(index) }) {
+                                    Icon(Icons.Default.Close, contentDescription = "Remove")
+                                }
+                            }
+                        },
+                        keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+                            onSearch = { viewModel.searchSongSeed(index) }
+                        ),
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                            imeAction = androidx.compose.ui.text.input.ImeAction.Search
+                        ),
+                        // Visual indicator for confirmed vs unconfirmed
+                        colors = if (seed.confirmedTrack != null) {
+                            OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = MaterialTheme.colorScheme.tertiary,
+                                unfocusedBorderColor = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.5f),
+                            )
+                        } else {
+                            OutlinedTextFieldDefaults.colors()
+                        },
+                    )
+
+                    // Rotary knob for weight
+                    RotaryKnob(
+                        value = seed.weight,
+                        onValueChange = { viewModel.updateSongSeedWeight(index, it) },
+                        modifier = Modifier.padding(start = 4.dp),
+                    )
+
+                    // "+" to add another seed
+                    IconButton(onClick = { viewModel.addSongSeed() }) {
+                        Icon(Icons.Default.Add, contentDescription = "Add song seed")
+                    }
+                }
+
+                // Song seed search dropdown
+                if (activeSeedSearchIndex == index && songSeedSearchResults != null) {
+                    val results = songSeedSearchResults!!
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                        ),
+                    ) {
+                        if (results.isEmpty()) {
+                            Text(
+                                "No matches found",
+                                modifier = Modifier.padding(12.dp),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        } else {
+                            results.take(5).forEach { track ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            viewModel.confirmSongSeed(index, track)
+                                        }
+                                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            track.title ?: "Unknown",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                        Text(
+                                            track.artist ?: "Unknown",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
-                },
-                keyboardActions = androidx.compose.foundation.text.KeyboardActions(
-                    onSearch = { doSearch(query.text) }
-                ),
-                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
-                    imeAction = androidx.compose.ui.text.input.ImeAction.Search
-                ),
-            )
+                }
+            }
 
             Spacer(modifier = Modifier.height(16.dp))
 
             // Results or recent searches
-            val result = textSearchResult
+            val result = activeResult
             if (result != null) {
                 if (result.error != null) {
                     Card(
@@ -847,10 +1029,12 @@ fun TextSearchScreen(
                     }
                 } else if (result.matches.isNotEmpty()) {
                     Text(
-                        "\"${result.query}\" \u00b7 showing ${result.matches.size} results",
+                        "${result.query} \u00b7 showing ${result.matches.size} results",
                         style = MaterialTheme.typography.titleSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(horizontal = 16.dp),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
                     Spacer(modifier = Modifier.height(8.dp))
 
@@ -864,8 +1048,14 @@ fun TextSearchScreen(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .clickable {
-                                            onBack()
-                                            viewModel.startRadioFromTextSearch(match.track.id)
+                                            if (hasSongSeeds) {
+                                                // Multi-seed: start radio from all seeds
+                                                onBack()
+                                                viewModel.startRadioFromMultiSeed(query.text)
+                                            } else {
+                                                onBack()
+                                                viewModel.startRadioFromTextSearch(match.track.id)
+                                            }
                                         }
                                         .padding(horizontal = 16.dp, vertical = 10.dp),
                                     verticalAlignment = Alignment.CenterVertically,
@@ -910,8 +1100,26 @@ fun TextSearchScreen(
                                 }
                             }
                         }
+
+                    // "Start Radio" button for multi-seed results
+                    if (hasSongSeeds) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Button(
+                            onClick = {
+                                onBack()
+                                viewModel.startRadioFromMultiSeed(query.text)
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 8.dp),
+                        ) {
+                            Icon(Icons.Default.PlayArrow, contentDescription = null)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Start Radio from Multi-Seed")
+                        }
                     }
-            } else if (!isLoading) {
+                }
+            } else if (!anyLoading) {
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,

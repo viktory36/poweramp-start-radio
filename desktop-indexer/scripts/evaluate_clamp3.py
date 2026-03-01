@@ -21,6 +21,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import math
 
 
 # ─── CLaMP3 constants ─────────────────────────────────────────────────────────
@@ -279,6 +280,154 @@ def cmd_search(db_path, query, top_k=20):
         print(f"  {sim:.4f}  [{t['precision']}] {t['artist']} - {t['title']}")
 
 
+# ─── Song lookup helper ──────────────────────────────────────────────────────
+
+def find_song_embedding(tracks, emb_matrix, query):
+    """Find a song by fuzzy name match. Returns (embedding, index, label) or Nones."""
+    query_words = query.lower().strip().split()
+    scored = []
+    for i, t in enumerate(tracks):
+        label = f"{t['artist']} {t['title']} {t['album']}".lower()
+        matches = sum(1 for w in query_words if w in label)
+        if matches == len(query_words):
+            scored.append((i, matches, label))
+    if not scored:
+        return None, None, "NOT FOUND"
+    scored.sort(key=lambda x: (-x[1], x[2]))
+    idx = scored[0][0]
+    t = tracks[idx]
+    return emb_matrix[idx], idx, f"{t['artist']} - {t['title']}"
+
+
+# ─── Multi-seed search (Geometric Mean of Percentiles) ──────────────────────
+
+def cmd_multiseed(db_path, text_query, songs, top_k=20):
+    """Multi-seed search using geometric mean of percentile ranks.
+
+    Args:
+        text_query: Optional text description (can be None)
+        songs: List of (song_query, weight) tuples
+    """
+    tracks, emb_matrix = load_all_embeddings(db_path)
+    print(f"Loaded {len(tracks)} tracks with embeddings")
+
+    seed_embs = []
+    seed_weights = []
+    seed_labels = []
+    exclude_indices = set()
+
+    # Text seed (if provided)
+    if text_query:
+        from huggingface_hub import hf_hub_download
+        from transformers import AutoTokenizer
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Loading CLaMP3 text encoder on {device}...")
+        weights_path = hf_hub_download("sander-wood/clamp3", CLAMP3_WEIGHTS_FILENAME)
+        encoder = CLaMP3TextEncoder.from_clamp3_checkpoint(weights_path, device=device)
+
+        tokenizer = AutoTokenizer.from_pretrained(TEXT_MODEL_NAME)
+        lines = list(set(text_query.split("\n")))
+        lines = [c for c in lines if len(c) > 0]
+        text = tokenizer.sep_token.join(lines)
+        tokens = tokenizer(text, return_tensors="pt")
+        input_ids = tokens['input_ids'].squeeze(0)
+
+        segment_list = []
+        for i in range(0, len(input_ids), MAX_TEXT_LENGTH):
+            segment_list.append(input_ids[i:i + MAX_TEXT_LENGTH])
+        segment_list[-1] = input_ids[-MAX_TEXT_LENGTH:]
+
+        hidden_states_list = []
+        for seg in segment_list:
+            actual_len = seg.size(0)
+            attention_mask = torch.zeros(MAX_TEXT_LENGTH)
+            attention_mask[:actual_len] = 1.0
+            if actual_len < MAX_TEXT_LENGTH:
+                pad = torch.full(
+                    (MAX_TEXT_LENGTH - actual_len,),
+                    tokenizer.pad_token_id, dtype=torch.long,
+                )
+                seg = torch.cat([seg, pad], dim=0)
+            feat = encoder.encode(
+                seg.unsqueeze(0).to(device),
+                attention_mask.unsqueeze(0).to(device),
+            )
+            hidden_states_list.append(feat)
+
+        total_tokens = len(input_ids)
+        full_cnt = total_tokens // MAX_TEXT_LENGTH
+        remain = total_tokens % MAX_TEXT_LENGTH
+        if remain == 0:
+            weights = torch.tensor([MAX_TEXT_LENGTH] * full_cnt, device=device).view(-1, 1)
+        else:
+            weights = torch.tensor([MAX_TEXT_LENGTH] * full_cnt + [remain], device=device).view(-1, 1)
+        stacked = torch.cat(hidden_states_list, dim=0)
+        text_emb = (stacked * weights).sum(0) / weights.sum()
+        text_emb = text_emb.squeeze(0).cpu()  # [768]
+
+        seed_embs.append(text_emb)
+        seed_weights.append(1.0)
+        seed_labels.append(f'text: "{text_query}"')
+
+    # Song seeds
+    for song_query, weight in songs:
+        emb, idx, label = find_song_embedding(tracks, emb_matrix, song_query)
+        if emb is None:
+            print(f"WARNING: song '{song_query}' not found in DB, skipping")
+            continue
+        seed_embs.append(emb)
+        seed_weights.append(weight)
+        seed_labels.append(f'song: {label} (w={weight:+.1f})')
+        exclude_indices.add(idx)
+
+    if not seed_embs:
+        print("ERROR: No valid seeds found")
+        return 1
+
+    # Print seeds
+    print(f"\nSeeds ({len(seed_embs)}):")
+    for label in seed_labels:
+        print(f"  {label}")
+
+    # Compute geometric mean of percentiles
+    N = emb_matrix.shape[0]
+    emb_np = emb_matrix.numpy()
+    percentiles = []
+    t0 = time.time()
+
+    for emb, w in zip(seed_embs, seed_weights):
+        emb_1d = emb.numpy() if isinstance(emb, torch.Tensor) else emb
+        sims = emb_np @ emb_1d  # dot product (L2-normalized = cosine)
+        if w < 0:
+            sims = -sims
+        ranks = sims.argsort().argsort()
+        pctile = (ranks + 1) / N  # (0, 1]
+        percentiles.append(pctile)
+
+    # Weighted geometric mean
+    abs_w = np.array([abs(w) for w in seed_weights])
+    abs_w = abs_w / abs_w.sum()
+    log_geo = sum(wt * np.log(pct) for wt, pct in zip(abs_w, percentiles))
+    geo_mean = np.exp(log_geo)
+
+    # Exclude seed songs
+    for idx in exclude_indices:
+        geo_mean[idx] = -1
+
+    elapsed = time.time() - t0
+    top_indices = np.argsort(geo_mean)[::-1][:top_k]
+
+    print(f"\nTop {top_k} results (geo mean of percentiles, {elapsed:.2f}s):")
+    print("-" * 80)
+    for rank, idx in enumerate(top_indices, 1):
+        t = tracks[idx]
+        score = geo_mean[idx]
+        print(f"  {rank:2d}. {score:.4f}  {t['artist']} - {t['title']}")
+
+    return 0
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -303,6 +452,21 @@ Examples:
     p_search.add_argument("query", help="Text query (e.g. 'space rock')")
     p_search.add_argument("-k", "--top-k", type=int, default=20)
 
+    p_multi = subparsers.add_parser("multiseed",
+        help="Multi-seed search (geo mean of percentiles)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  python evaluate_clamp3.py db multiseed --text "90s boombap"
+  python evaluate_clamp3.py db multiseed --text "90s boombap" --song "time pachanga boys" --weight 0.8
+  python evaluate_clamp3.py db multiseed --song "time pachanga boys" --song "lost phaxe" --weight -0.5
+        """)
+    p_multi.add_argument("--text", default=None, help="Text description seed")
+    p_multi.add_argument("--song", action="append", default=[], help="Song reference (fuzzy name match)")
+    p_multi.add_argument("--weight", action="append", type=float, default=[],
+        help="Weight for the preceding --song (default 1.0, negative = 'less like')")
+    p_multi.add_argument("-k", "--top-k", type=int, default=20)
+
     args = parser.parse_args()
 
     if not Path(args.db).exists():
@@ -313,6 +477,16 @@ Examples:
         cmd_similar(args.db, args.query, args.top_k)
     elif args.command == "search":
         cmd_search(args.db, args.query, args.top_k)
+    elif args.command == "multiseed":
+        if not args.text and not args.song:
+            print("ERROR: provide at least --text or --song")
+            return 1
+        # Pair songs with weights (default weight = 1.0)
+        songs = []
+        for i, song in enumerate(args.song):
+            weight = args.weight[i] if i < len(args.weight) else 1.0
+            songs.append((song, weight))
+        return cmd_multiseed(args.db, args.text, songs, args.top_k)
     else:
         parser.print_help()
         return 1
