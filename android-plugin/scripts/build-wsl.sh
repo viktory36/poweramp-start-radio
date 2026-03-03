@@ -15,3 +15,10 @@ source "$ENV_FILE"
 
 cd "$ANDROID_PROJECT_DIR"
 ./gradlew --no-daemon :app:assembleDebug "$@"
+
+# Auto-install to connected device if adb is available
+if command -v adb &>/dev/null && adb get-state &>/dev/null 2>&1; then
+  echo ""
+  echo "Installing to device..."
+  adb install -r app/build/outputs/apk/debug/app-debug.apk
+fi

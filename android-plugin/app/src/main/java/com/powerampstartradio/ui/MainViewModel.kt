@@ -27,8 +27,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.roundToInt
 
 /**
  * ViewModel for the main screen.
@@ -374,12 +377,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _textSearchLoading = MutableStateFlow(false)
     val textSearchLoading: StateFlow<Boolean> = _textSearchLoading.asStateFlow()
 
-    /** Recent text search queries (persisted across sessions). */
-    private val _recentSearches = MutableStateFlow<List<String>>(
-        prefs.getString("recent_searches", null)?.split("\u0000")?.filter { it.isNotBlank() }
-            ?: emptyList()
-    )
-    val recentSearches: StateFlow<List<String>> = _recentSearches.asStateFlow()
+    /** Recent searches (persisted across sessions, includes full multi-seed state). */
+    private val _recentSearches = MutableStateFlow<List<RecentSearch>>(loadRecentSearches())
+    val recentSearches: StateFlow<List<RecentSearch>> = _recentSearches.asStateFlow()
+
+    private fun loadRecentSearches(): List<RecentSearch> {
+        // Try v2 JSON format first
+        prefs.getString("recent_searches_v2", null)?.let { json ->
+            try {
+                return RecentSearch.fromJsonArray(json)
+            } catch (e: Exception) {
+                Log.w("MainViewModel", "Failed to parse recent_searches_v2", e)
+            }
+        }
+        // Migrate from v1 (null-delimited text-only)
+        prefs.getString("recent_searches", null)?.let { v1 ->
+            val migrated = v1.split("\u0000").filter { it.isNotBlank() }
+                .map { RecentSearch(textQuery = it) }
+            if (migrated.isNotEmpty()) {
+                prefs.edit()
+                    .putString("recent_searches_v2", RecentSearch.toJsonArray(migrated))
+                    .remove("recent_searches")
+                    .apply()
+            }
+            return migrated
+        }
+        return emptyList()
+    }
 
     private var textInference: Clamp3TextInference? = null
     private var textIndex: EmbeddingIndex? = null
@@ -505,7 +529,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _textSearchResult.value = TextSearchResult(query = query, matches = matchedTracks)
 
                 // Save to recent searches
-                saveRecentSearch(query)
+                saveRecentSearch(RecentSearch(textQuery = query))
 
             } catch (e: Exception) {
                 Log.e("MainViewModel", "Text search failed", e)
@@ -520,22 +544,98 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * Start radio using a text search match as seed.
      */
     fun startRadioFromTextSearch(trackId: Long) {
+        Log.i("MainViewModel", "START_RADIO_FROM_SONG: trackId=$trackId (single-seed radio)")
         RadioService.startRadioFromSeed(getApplication(), trackId, buildConfig())
+    }
+
+    /**
+     * Queue a specific search result list directly into Poweramp.
+     * The caller passes the exact result being displayed — no ambiguity.
+     */
+    fun queueDisplayedResults(result: TextSearchResult) {
+        val tracks = result.matches.map { it.track }
+        if (tracks.isEmpty()) return
+        Log.i("MainViewModel", "QUEUE_DISPLAYED: queueing ${tracks.size} displayed results for '${result.query}'")
+        for ((i, t) in tracks.withIndex()) {
+            Log.d("MainViewModel", "QUEUE_DISPLAYED: [$i] ${t.artist} - ${t.title} (score=${result.matches[i].similarity})")
+        }
+        RadioService.queueDirectly(getApplication(), tracks, result.query)
     }
 
     fun clearTextSearchResult() {
         _textSearchResult.value = null
     }
 
-    private fun saveRecentSearch(query: String) {
-        val updated = (listOf(query) + _recentSearches.value.filter { it != query }).take(10)
+    private fun saveRecentSearch(search: RecentSearch) {
+        // Deduplicate by display label
+        val label = search.displayLabel
+        val updated = (listOf(search) + _recentSearches.value.filter { it.displayLabel != label }).take(10)
         _recentSearches.value = updated
-        prefs.edit().putString("recent_searches", updated.joinToString("\u0000")).apply()
+        prefs.edit().putString("recent_searches_v2", RecentSearch.toJsonArray(updated)).apply()
     }
 
     fun clearRecentSearches() {
         _recentSearches.value = emptyList()
-        prefs.edit().remove("recent_searches").apply()
+        prefs.edit().remove("recent_searches_v2").remove("recent_searches").apply()
+    }
+
+    /**
+     * Replay a recent search: restore full multi-seed state and re-run the search.
+     * Returns the text query to put in the search field.
+     */
+    fun replayRecentSearch(search: RecentSearch) {
+        if (search.songSeeds.isEmpty()) {
+            // Text-only search — just run it
+            if (search.textQuery.isNotBlank()) {
+                performTextSearch(search.textQuery)
+            }
+            return
+        }
+
+        // Restore song seed state
+        viewModelScope.launch(Dispatchers.IO) {
+            val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
+            val restoredSeeds = mutableListOf<SongSeedState>()
+            if (dbFile.exists()) {
+                val db = EmbeddingDatabase.open(dbFile)
+                for (s in search.songSeeds) {
+                    val track = db.getTrackById(s.trackId)
+                    if (track != null) {
+                        restoredSeeds.add(SongSeedState(
+                            query = "${s.artist ?: ""} - ${s.title ?: ""}".trim(),
+                            confirmedTrack = track,
+                            weight = s.weight,
+                            negative = s.negative,
+                        ))
+                    }
+                }
+                db.close()
+            }
+
+            if (restoredSeeds.isEmpty() && search.textQuery.isBlank()) return@launch
+
+            // Renormalize weights if some tracks were lost
+            if (restoredSeeds.size < search.songSeeds.size) {
+                val totalWeight = (if (search.textQuery.isNotBlank()) _textSeedWeight.value else 0f) +
+                    restoredSeeds.sumOf { it.weight.toDouble() }.toFloat()
+                if (totalWeight > 0f) {
+                    val scale = 1f / totalWeight
+                    for (i in restoredSeeds.indices) {
+                        restoredSeeds[i] = restoredSeeds[i].copy(weight = restoredSeeds[i].weight * scale)
+                    }
+                }
+            }
+
+            kotlinx.coroutines.withContext(Dispatchers.Main) {
+                _songSeeds.value = restoredSeeds
+                _textSeedLocked.value = false
+                _textSeedNegative.value = false
+            }
+
+            // Run the search
+            _multiSeedLoading.value = true
+            doMultiSeedSearch(search.textQuery, search.textQuery.isNotBlank(), restoredSeeds)
+        }
     }
 
     // --- Multi-seed (song seed) state ---
@@ -557,8 +657,226 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _multiSeedLoading = MutableStateFlow(false)
     val multiSeedLoading: StateFlow<Boolean> = _multiSeedLoading.asStateFlow()
 
+    private val _textSeedWeight = MutableStateFlow(1.0f)
+    val textSeedWeight: StateFlow<Float> = _textSeedWeight.asStateFlow()
+
+    private val _textSeedLocked = MutableStateFlow(false)
+    val textSeedLocked: StateFlow<Boolean> = _textSeedLocked.asStateFlow()
+
+    private val _textSeedNegative = MutableStateFlow(false)
+    val textSeedNegative: StateFlow<Boolean> = _textSeedNegative.asStateFlow()
+
+    fun toggleTextSeedSign() {
+        _textSeedNegative.value = !_textSeedNegative.value
+    }
+
+    fun toggleTextSeedLock() {
+        _textSeedLocked.value = !_textSeedLocked.value
+    }
+
+    companion object {
+        /** Minimum weight per seed — prevents any seed from being zeroed out. */
+        private const val MIN_WEIGHT = 0.01f
+    }
+
+    /**
+     * Budget available for unlocked seeds = 1.0 − sum(locked weights).
+     * Each unlocked seed gets at least [MIN_WEIGHT].
+     */
+    private fun unlockedBudget(): Float {
+        val lockedSum = lockedWeightSum()
+        return (1f - lockedSum).coerceAtLeast(0f)
+    }
+
+    private fun lockedWeightSum(): Float {
+        var sum = 0f
+        if (_textSeedLocked.value) sum += _textSeedWeight.value
+        for (s in _songSeeds.value) {
+            if (s.locked) sum += s.weight
+        }
+        return sum
+    }
+
+    /**
+     * Update text seed weight during drag. Only updates this knob — no redistribution.
+     * Redistribution + auto-lock happen in [finalizeTextSeedWeight] on drag end.
+     */
+    fun updateTextSeedWeight(weight: Float) {
+        val budget = unlockedBudget()
+        val otherUnlockedCount = _songSeeds.value.count { !it.locked }
+        val maxForThis = (budget - otherUnlockedCount * MIN_WEIGHT).coerceAtLeast(MIN_WEIGHT)
+        _textSeedWeight.value = weight.coerceIn(MIN_WEIGHT, maxForThis)
+    }
+
+    /** Called on drag end: redistribute remaining budget among unlocked seeds. */
+    fun finalizeTextSeedWeight() {
+        redistributeUnlocked(changedIndex = -1)
+    }
+
+    /**
+     * Update song seed weight during drag. Only updates this knob — no redistribution.
+     * Redistribution + auto-lock happen in [finalizeSongSeedWeight] on drag end.
+     */
+    fun updateSongSeedWeight(index: Int, weight: Float) {
+        val current = _songSeeds.value.toMutableList()
+        if (index !in current.indices) return
+
+        val budget = unlockedBudget()
+        var otherUnlockedCount = 0
+        if (!_textSeedLocked.value) otherUnlockedCount++
+        for (i in current.indices) {
+            if (i != index && !current[i].locked) otherUnlockedCount++
+        }
+        val maxForThis = (budget - otherUnlockedCount * MIN_WEIGHT).coerceAtLeast(MIN_WEIGHT)
+        current[index] = current[index].copy(weight = weight.coerceIn(MIN_WEIGHT, maxForThis))
+        _songSeeds.value = current
+    }
+
+    /** Called on drag end: redistribute remaining budget and auto-lock the song seed. */
+    fun finalizeSongSeedWeight(index: Int) {
+        if (index !in _songSeeds.value.indices) return
+        redistributeUnlocked(changedIndex = index)
+    }
+
+    /**
+     * Redistribute unlocked budget among unlocked seeds (excluding changedIndex).
+     * Locked seeds are never touched. changedIndex = -1 means text seed changed.
+     * The changed seed keeps its new value; the remaining unlocked budget is split
+     * proportionally among the other unlocked seeds.
+     *
+     * If no other unlocked seeds exist, the changed seed is snapped to the full
+     * unlocked budget (it must consume 100% of what's left after locked seeds).
+     */
+    private fun redistributeUnlocked(changedIndex: Int) {
+        val budget = unlockedBudget()
+
+        // Collect other unlocked seeds and their current weights
+        val others = mutableListOf<Pair<Int, Float>>() // index -> weight (-1 = text)
+        if (!_textSeedLocked.value && changedIndex != -1) {
+            others.add(-1 to _textSeedWeight.value)
+        }
+        val seeds = _songSeeds.value
+        for (i in seeds.indices) {
+            if (i != changedIndex && !seeds[i].locked) {
+                others.add(i to seeds[i].weight)
+            }
+        }
+
+        // If no other unlocked seeds, snap the changed seed to the full budget
+        if (others.isEmpty()) {
+            val newSeeds = seeds.toMutableList()
+            when (changedIndex) {
+                -1 -> _textSeedWeight.value = budget.coerceAtLeast(MIN_WEIGHT)
+                else -> {
+                    newSeeds[changedIndex] = newSeeds[changedIndex].copy(
+                        weight = budget.coerceAtLeast(MIN_WEIGHT)
+                    )
+                    _songSeeds.value = newSeeds
+                }
+            }
+            return
+        }
+
+        // How much budget is left after the changed seed?
+        // If the changed seed is locked (auto-lock on drag end), the budget already excludes it.
+        // If it's unlocked (live drag), subtract it from the budget.
+        val changedIsLocked = when (changedIndex) {
+            -1 -> _textSeedLocked.value
+            else -> seeds[changedIndex].locked
+        }
+        val remaining = if (changedIsLocked) {
+            budget.coerceAtLeast(others.size * MIN_WEIGHT)
+        } else {
+            val changedWeight = when (changedIndex) {
+                -1 -> _textSeedWeight.value
+                else -> seeds[changedIndex].weight
+            }
+            (budget - changedWeight).coerceAtLeast(others.size * MIN_WEIGHT)
+        }
+
+        // Distribute proportionally among others
+        val totalOthers = others.sumOf { it.second.toDouble() }.toFloat()
+        val newSeeds = seeds.toMutableList()
+
+        if (totalOthers <= 0.001f) {
+            // Equal split as fallback
+            val each = remaining / others.size
+            for ((idx, _) in others) {
+                if (idx == -1) _textSeedWeight.value = each
+                else newSeeds[idx] = newSeeds[idx].copy(weight = each)
+            }
+        } else {
+            var assigned = 0f
+            for (j in others.indices) {
+                val (idx, w) = others[j]
+                val share = if (j == others.lastIndex) {
+                    // Last one gets remainder to avoid rounding drift
+                    (remaining - assigned).coerceAtLeast(MIN_WEIGHT)
+                } else {
+                    (w / totalOthers * remaining).coerceAtLeast(MIN_WEIGHT)
+                }
+                assigned += share
+                if (idx == -1) _textSeedWeight.value = share
+                else newSeeds[idx] = newSeeds[idx].copy(weight = share)
+            }
+        }
+        _songSeeds.value = newSeeds
+    }
+
+    /**
+     * Renormalize only unlocked weights so all weights sum to 1.0.
+     * Locked weights are never changed.
+     */
+    private fun renormalize() {
+        val lockedSum = lockedWeightSum()
+        val targetUnlocked = (1f - lockedSum).coerceAtLeast(0f)
+
+        val seeds = _songSeeds.value
+        var unlockSum = 0f
+        if (!_textSeedLocked.value) unlockSum += _textSeedWeight.value
+        for (s in seeds) {
+            if (!s.locked) unlockSum += s.weight
+        }
+
+        if (unlockSum <= 0.001f || targetUnlocked <= 0.001f) return
+        val scale = targetUnlocked / unlockSum
+
+        if (!_textSeedLocked.value) {
+            _textSeedWeight.value = (_textSeedWeight.value * scale).coerceAtLeast(MIN_WEIGHT)
+        }
+        val newSeeds = seeds.map {
+            if (!it.locked) it.copy(weight = (it.weight * scale).coerceAtLeast(MIN_WEIGHT))
+            else it
+        }
+        _songSeeds.value = newSeeds
+    }
+
+    fun clearSongSeeds() {
+        _songSeeds.value = emptyList()
+        _songSeedSearchResults.value = null
+        _activeSeedSearchIndex.value = -1
+        _textSeedWeight.value = 1.0f
+        _textSeedLocked.value = false
+        _textSeedNegative.value = false
+    }
+
     fun addSongSeed() {
-        _songSeeds.value = _songSeeds.value + SongSeedState()
+        // New seed gets an equal share of the unlocked budget
+        val budget = unlockedBudget()
+        val currentUnlockedCount = countUnlocked()
+        val newTotalUnlocked = currentUnlockedCount + 1
+        val shareForNew = (budget / newTotalUnlocked).coerceAtLeast(MIN_WEIGHT)
+        _songSeeds.value = _songSeeds.value + SongSeedState(weight = shareForNew)
+        renormalize()
+    }
+
+    private fun countUnlocked(): Int {
+        var n = 0
+        if (!_textSeedLocked.value) n++
+        for (s in _songSeeds.value) {
+            if (!s.locked) n++
+        }
+        return n
     }
 
     fun removeSongSeed(index: Int) {
@@ -570,6 +888,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (_activeSeedSearchIndex.value == index) {
             _songSeedSearchResults.value = null
             _activeSeedSearchIndex.value = -1
+        }
+        if (current.isEmpty()) {
+            // Removed last seed — clear multi-seed results and reset text weight
+            _multiSeedResult.value = null
+            _textSeedWeight.value = 1.0f
+            _textSeedLocked.value = false
+            _textSeedNegative.value = false
+        } else {
+            renormalize()
         }
     }
 
@@ -594,10 +921,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _activeSeedSearchIndex.value = -1
     }
 
-    fun updateSongSeedWeight(index: Int, weight: Float) {
+    fun toggleSongSeedLock(index: Int) {
         val current = _songSeeds.value.toMutableList()
         if (index in current.indices) {
-            current[index] = current[index].copy(weight = weight)
+            current[index] = current[index].copy(locked = !current[index].locked)
+            _songSeeds.value = current
+        }
+    }
+
+    fun toggleSongSeedSign(index: Int) {
+        val current = _songSeeds.value.toMutableList()
+        if (index in current.indices) {
+            current[index] = current[index].copy(negative = !current[index].negative)
             _songSeeds.value = current
         }
     }
@@ -634,123 +969,228 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * If only text query with no song seeds, degenerates to regular text search.
      */
     fun performMultiSeedSearch(textQuery: String) {
-        val seeds = _songSeeds.value
         val hasText = textQuery.isNotBlank()
+
+        // Auto-confirm unconfirmed seeds that have query text
+        _multiSeedLoading.value = true
+        viewModelScope.launch(Dispatchers.IO) {
+            val seeds = _songSeeds.value.toMutableList()
+            var changed = false
+            val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
+            if (dbFile.exists()) {
+                val lookupDb = EmbeddingDatabase.open(dbFile)
+                for (i in seeds.indices) {
+                    if (seeds[i].confirmedTrack == null && seeds[i].query.isNotBlank()) {
+                        val matches = lookupDb.searchTracksByText(seeds[i].query)
+                        if (matches.isNotEmpty()) {
+                            val track = matches.first()
+                            seeds[i] = seeds[i].copy(
+                                query = "${track.artist ?: ""} - ${track.title ?: ""}".trim(),
+                                confirmedTrack = track,
+                            )
+                            changed = true
+                            Log.d("MultiSeed", "Auto-confirmed seed[$i] '${seeds[i].query}' → ${track.artist} - ${track.title}")
+                        }
+                    }
+                }
+                lookupDb.close()
+            }
+            if (changed) {
+                _songSeeds.value = seeds
+            }
+            // Now proceed on IO thread
+            doMultiSeedSearch(textQuery, hasText, seeds)
+        }
+    }
+
+    private suspend fun doMultiSeedSearch(textQuery: String, hasText: Boolean, seeds: List<SongSeedState>) {
         val confirmedSeeds = seeds.filter { it.confirmedTrack != null && it.weight != 0f }
+
+        Log.d("MultiSeed", "performMultiSeedSearch: text='$textQuery', " +
+            "songSeeds=${seeds.size}, confirmedSeeds=${confirmedSeeds.size}")
+        for ((i, s) in confirmedSeeds.withIndex()) {
+            Log.d("MultiSeed", "  seed[$i]: '${s.confirmedTrack?.title}' " +
+                "weight=${s.weight} negative=${s.negative} → effective=${if (s.negative) -s.weight else s.weight}")
+        }
 
         // If no song seeds, fall back to regular text search
         if (confirmedSeeds.isEmpty() && hasText) {
-            performTextSearch(textQuery)
+            Log.d("MultiSeed", "No confirmed song seeds, falling back to text-only search")
+            kotlinx.coroutines.withContext(Dispatchers.Main) { performTextSearch(textQuery) }
+            _multiSeedLoading.value = false
             return
         }
 
-        if (confirmedSeeds.isEmpty() && !hasText) return
+        if (confirmedSeeds.isEmpty() && !hasText) {
+            _multiSeedLoading.value = false
+            return
+        }
 
-        _multiSeedLoading.value = true
         _multiSeedResult.value = null
 
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val filesDir = getApplication<Application>().filesDir
-                val dbFile = File(filesDir, "embeddings.db")
-                if (!dbFile.exists()) {
-                    _multiSeedResult.value = TextSearchResult(query = textQuery, error = "No embedding database found")
-                    return@launch
+        try {
+            val filesDir = getApplication<Application>().filesDir
+            val dbFile = File(filesDir, "embeddings.db")
+            if (!dbFile.exists()) {
+                _multiSeedResult.value = TextSearchResult(query = textQuery, error = "No embedding database found")
+                return
+            }
+
+            val seedSpecs = mutableListOf<SeedSpec>()
+
+            // Text seed (skip if weight is 0 — no influence)
+            val textWeight = _textSeedWeight.value
+            val textNegative = _textSeedNegative.value
+            if (hasText && textWeight != 0f) {
+                val inference = getOrInitTextInference(textQuery) ?: return
+                val debugDir = File(filesDir, "debug_embeddings")
+                val embedding = try {
+                    inference.generateEmbedding(textQuery.trim(), debugDir)
+                } catch (e: Exception) {
+                    Log.w("MainViewModel", "Text inference failed in multi-seed", e)
+                    null
                 }
+                if (embedding == null) {
+                    _multiSeedResult.value = TextSearchResult(query = textQuery, error = "Text inference failed")
+                    return
+                }
+                val effectiveTextWeight = if (textNegative) -textWeight else textWeight
+                seedSpecs.add(SeedSpec(
+                    embedding = embedding,
+                    weight = effectiveTextWeight,
+                    label = textQuery.trim(),
+                    type = SeedType.TEXT,
+                ))
+            }
 
-                val seedSpecs = mutableListOf<SeedSpec>()
-
-                // Text seed
-                if (hasText) {
-                    val inference = getOrInitTextInference(textQuery) ?: return@launch
-                    val debugDir = File(filesDir, "debug_embeddings")
-                    val embedding = try {
-                        inference.generateEmbedding(textQuery.trim(), debugDir)
-                    } catch (e: Exception) {
-                        Log.w("MainViewModel", "Text inference failed in multi-seed", e)
-                        null
-                    }
-                    if (embedding == null) {
-                        _multiSeedResult.value = TextSearchResult(query = textQuery, error = "Text inference failed")
-                        return@launch
-                    }
+            // Song seeds
+            val db = EmbeddingDatabase.open(dbFile)
+            for (seed in confirmedSeeds) {
+                val track = seed.confirmedTrack!!
+                val embedding = db.getEmbedding(track.id)
+                if (embedding != null) {
+                    val effectiveWeight = if (seed.negative) -seed.weight else seed.weight
                     seedSpecs.add(SeedSpec(
                         embedding = embedding,
-                        weight = 1.0f,
-                        label = textQuery.trim(),
-                        type = SeedType.TEXT,
+                        weight = effectiveWeight,
+                        label = "${track.artist ?: "?"} - ${track.title ?: "?"}",
+                        type = SeedType.SONG,
+                        trackId = track.id,
                     ))
                 }
-
-                // Song seeds
-                val db = EmbeddingDatabase.open(dbFile)
-                for (seed in confirmedSeeds) {
-                    val track = seed.confirmedTrack!!
-                    val embedding = db.getEmbedding(track.id)
-                    if (embedding != null) {
-                        seedSpecs.add(SeedSpec(
-                            embedding = embedding,
-                            weight = seed.weight,
-                            label = "${track.artist ?: "?"} - ${track.title ?: "?"}",
-                            type = SeedType.SONG,
-                            trackId = track.id,
-                        ))
-                    }
-                }
-                db.close()
-
-                if (seedSpecs.isEmpty()) {
-                    _multiSeedResult.value = TextSearchResult(query = textQuery, error = "No valid seeds")
-                    return@launch
-                }
-
-                // Use embedding index for geo-mean ranking
-                val index = textIndex ?: run {
-                    val embFile = File(filesDir, "clamp3.emb")
-                    if (!embFile.exists()) {
-                        val db2 = EmbeddingDatabase.open(dbFile)
-                        EmbeddingIndex.extractFromDatabase(db2, embFile, table = "embeddings_clamp3")
-                        db2.close()
-                    }
-                    if (!embFile.exists()) {
-                        _multiSeedResult.value = TextSearchResult(query = textQuery, error = "Failed to extract index")
-                        return@launch
-                    }
-                    EmbeddingIndex.mmap(embFile).also { textIndex = it }
-                }
-
-                val excludeIds = seedSpecs.mapNotNull { it.trackId }.toSet()
-                val topK = _textSearchTopK.value
-
-                val ranking = com.powerampstartradio.similarity.algorithms.GeoMeanSelector.computeRanking(
-                    index,
-                    seedSpecs.map { it.embedding to it.weight },
-                    topK,
-                    excludeIds,
-                )
-
-                // Resolve track metadata
-                val db3 = EmbeddingDatabase.open(dbFile)
-                val matches = ranking.mapNotNull { (trackId, score) ->
-                    db3.getTrackById(trackId)?.let { TextSearchMatch(it, score) }
-                }
-                db3.close()
-
-                val queryLabel = buildList {
-                    if (hasText) add("\"$textQuery\"")
-                    for (s in confirmedSeeds) add("${if (s.weight < 0) "-" else "+"}${s.confirmedTrack!!.title}")
-                }.joinToString(" + ")
-
-                _multiSeedResult.value = TextSearchResult(query = queryLabel, matches = matches)
-
-                if (hasText) saveRecentSearch(textQuery)
-
-            } catch (e: Exception) {
-                Log.e("MainViewModel", "Multi-seed search failed", e)
-                _multiSeedResult.value = TextSearchResult(query = textQuery, error = "Search failed: ${e.message}")
-            } finally {
-                _multiSeedLoading.value = false
             }
+            db.close()
+
+            if (seedSpecs.isEmpty()) {
+                _multiSeedResult.value = TextSearchResult(query = textQuery, error = "No valid seeds")
+                return
+            }
+
+            // Use embedding index for geo-mean ranking
+            val index = textIndex ?: run {
+                val embFile = File(filesDir, "clamp3.emb")
+                if (!embFile.exists()) {
+                    val db2 = EmbeddingDatabase.open(dbFile)
+                    EmbeddingIndex.extractFromDatabase(db2, embFile, table = "embeddings_clamp3")
+                    db2.close()
+                }
+                if (!embFile.exists()) {
+                    _multiSeedResult.value = TextSearchResult(query = textQuery, error = "Failed to extract index")
+                    return
+                }
+                EmbeddingIndex.mmap(embFile).also { textIndex = it }
+            }
+
+            val excludeIds = seedSpecs.mapNotNull { it.trackId }.toSet()
+            val topK = _textSearchTopK.value
+
+            Log.d("MultiSeed", "Calling GeoMeanSelector with ${seedSpecs.size} specs:")
+            for ((i, spec) in seedSpecs.withIndex()) {
+                Log.d("MultiSeed", "  spec[$i]: type=${spec.type} label='${spec.label}' weight=${spec.weight}")
+            }
+
+            val ranking = com.powerampstartradio.similarity.algorithms.GeoMeanSelector.computeRanking(
+                index,
+                seedSpecs.map { it.embedding to it.weight },
+                topK,
+                excludeIds,
+            )
+
+            // Resolve track metadata
+            val db3 = EmbeddingDatabase.open(dbFile)
+            val matches = ranking.mapNotNull { (trackId, score) ->
+                db3.getTrackById(trackId)?.let { TextSearchMatch(it, score) }
+            }
+            db3.close()
+
+            Log.d("MultiSeed", "GeoMeanSelector returned ${ranking.size} results")
+            if (ranking.isNotEmpty()) {
+                Log.d("MultiSeed", "  top score: ${ranking.first().second}")
+            }
+
+            // Structured verification logging (replay on desktop with multi_seed_search.py)
+            val queryJson = JSONObject().apply {
+                if (hasText) {
+                    put("text", textQuery)
+                    put("text_weight", textWeight.toDouble())
+                    if (textNegative) put("text_negative", true)
+                }
+                val seedArr = JSONArray()
+                for (s in confirmedSeeds) {
+                    seedArr.put(JSONObject().apply {
+                        put("track_id", s.confirmedTrack!!.id)
+                        s.confirmedTrack.artist?.let { put("artist", it) }
+                        s.confirmedTrack.title?.let { put("title", it) }
+                        val effectiveWeight = if (s.negative) -s.weight else s.weight
+                        put("weight", effectiveWeight.toDouble())
+                    })
+                }
+                put("seeds", seedArr)
+            }
+            Log.i("MultiSeed", "MULTISEED_QUERY: $queryJson")
+
+            val resultsJson = JSONArray()
+            for ((i, m) in matches.withIndex()) {
+                resultsJson.put(JSONObject().apply {
+                    put("rank", i)
+                    put("track_id", m.track.id)
+                    m.track.artist?.let { put("artist", it) }
+                    m.track.title?.let { put("title", it) }
+                    put("score", m.similarity.toDouble())
+                })
+            }
+            Log.i("MultiSeed", "MULTISEED_RESULTS: $resultsJson")
+
+            val queryLabel = buildList {
+                if (hasText) add("$textQuery (${(textWeight * 100).roundToInt()}%)")
+                for (s in confirmedSeeds) {
+                    val prefix = if (s.negative) "\u2212 " else "+ "
+                    val pct = (s.weight * 100).roundToInt()
+                    add("$prefix${s.confirmedTrack!!.title} ($pct%)")
+                }
+            }.joinToString(" \u00b7 ")
+
+            _multiSeedResult.value = TextSearchResult(query = queryLabel, matches = matches)
+
+            // Save full multi-seed state to recent searches
+            saveRecentSearch(RecentSearch(
+                textQuery = if (hasText) textQuery else "",
+                songSeeds = confirmedSeeds.map { s ->
+                    RecentSongSeed(
+                        trackId = s.confirmedTrack!!.id,
+                        artist = s.confirmedTrack.artist,
+                        title = s.confirmedTrack.title,
+                        weight = s.weight,
+                        negative = s.negative,
+                    )
+                },
+            ))
+
+        } catch (e: Exception) {
+            Log.e("MainViewModel", "Multi-seed search failed", e)
+            _multiSeedResult.value = TextSearchResult(query = textQuery, error = "Search failed: ${e.message}")
+        } finally {
+            _multiSeedLoading.value = false
         }
     }
 
@@ -807,14 +1247,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
                 val seedSpecs = mutableListOf<SeedSpec>()
 
-                // Text seed
-                if (textQuery.isNotBlank()) {
+                // Text seed (skip if weight is 0)
+                val textWeight = _textSeedWeight.value
+                val textNeg = _textSeedNegative.value
+                if (textQuery.isNotBlank() && textWeight != 0f) {
                     val inference = textInference ?: return@launch
                     val debugDir = File(filesDir, "debug_embeddings")
                     val embedding = inference.generateEmbedding(textQuery.trim(), debugDir) ?: return@launch
+                    val effTextWeight = if (textNeg) -textWeight else textWeight
                     seedSpecs.add(SeedSpec(
                         embedding = embedding,
-                        weight = 1.0f,
+                        weight = effTextWeight,
                         label = textQuery.trim(),
                         type = SeedType.TEXT,
                     ))
@@ -826,9 +1269,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     val track = seed.confirmedTrack!!
                     val embedding = db.getEmbedding(track.id)
                     if (embedding != null) {
+                        val effectiveWeight = if (seed.negative) -seed.weight else seed.weight
                         seedSpecs.add(SeedSpec(
                             embedding = embedding,
-                            weight = seed.weight,
+                            weight = effectiveWeight,
                             label = "${track.artist ?: "?"} - ${track.title ?: "?"}",
                             type = SeedType.SONG,
                             trackId = track.id,
@@ -1185,7 +1629,93 @@ data class TextSearchResult(
  * State for a single song seed in multi-seed search.
  */
 data class SongSeedState(
+    val id: Long = nextSeedId(),
     val query: String = "",
     val confirmedTrack: EmbeddedTrack? = null,
     val weight: Float = 1.0f,
+    val negative: Boolean = false,  // true = "less like this"
+    val locked: Boolean = false,
 )
+
+private var seedIdCounter = 0L
+fun nextSeedId(): Long = seedIdCounter++
+
+/**
+ * A saved song seed for recent search replay.
+ */
+data class RecentSongSeed(
+    val trackId: Long,
+    val artist: String?,
+    val title: String?,
+    val weight: Float,
+    val negative: Boolean,
+)
+
+/**
+ * A recent search entry with full multi-seed state.
+ */
+data class RecentSearch(
+    val textQuery: String,
+    val songSeeds: List<RecentSongSeed> = emptyList(),
+) {
+    /** Composite display label: "sufi music · +Ragini · −Ektaal" */
+    val displayLabel: String
+        get() = buildList {
+            if (textQuery.isNotBlank()) add(textQuery)
+            for (s in songSeeds) {
+                val prefix = if (s.negative) "\u2212" else "+"
+                add("$prefix${s.title ?: "?"}")
+            }
+        }.joinToString(" \u00b7 ")
+
+    companion object {
+        fun toJsonArray(list: List<RecentSearch>): String {
+            val arr = JSONArray()
+            for (search in list) {
+                val obj = JSONObject()
+                obj.put("text", search.textQuery)
+                if (search.songSeeds.isNotEmpty()) {
+                    val seedArr = JSONArray()
+                    for (s in search.songSeeds) {
+                        val seedObj = JSONObject()
+                        seedObj.put("id", s.trackId)
+                        s.artist?.let { seedObj.put("artist", it) }
+                        s.title?.let { seedObj.put("title", it) }
+                        seedObj.put("weight", s.weight.toDouble())
+                        seedObj.put("negative", s.negative)
+                        seedArr.put(seedObj)
+                    }
+                    obj.put("seeds", seedArr)
+                }
+                arr.put(obj)
+            }
+            return arr.toString()
+        }
+
+        fun fromJsonArray(json: String): List<RecentSearch> {
+            val arr = JSONArray(json)
+            val result = mutableListOf<RecentSearch>()
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                val seeds = if (obj.has("seeds")) {
+                    val seedArr = obj.getJSONArray("seeds")
+                    (0 until seedArr.length()).map { j ->
+                        val s = seedArr.getJSONObject(j)
+                        RecentSongSeed(
+                            trackId = s.getLong("id"),
+                            artist = if (s.has("artist")) s.getString("artist") else null,
+                            title = if (s.has("title")) s.getString("title") else null,
+                            weight = s.getDouble("weight").toFloat(),
+                            negative = s.optBoolean("negative", false),
+                        )
+                    }
+                } else emptyList()
+                result.add(RecentSearch(
+                    textQuery = obj.optString("text", ""),
+                    songSeeds = seeds,
+                ))
+            }
+            return result
+        }
+    }
+}

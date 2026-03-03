@@ -13,6 +13,7 @@ import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import com.powerampstartradio.MainActivity
 import com.powerampstartradio.R
+import com.powerampstartradio.data.EmbeddedTrack
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
@@ -83,11 +84,16 @@ class RadioService : Service() {
         const val EXTRA_MIN_ARTIST_SPACING = "min_artist_spacing"
         const val EXTRA_MULTI_SEED = "multi_seed"
         const val ACTION_START_MULTI_SEED = "com.powerampstartradio.START_MULTI_SEED"
+        const val ACTION_QUEUE_DIRECTLY = "com.powerampstartradio.QUEUE_DIRECTLY"
         const val DEFAULT_NUM_TRACKS = 50
 
         /** Transient seed list for multi-seed radio (too large for Intent extras). */
         @Volatile
         var pendingMultiSeeds: List<SeedSpec>? = null
+
+        /** Transient track list for direct queueing (embedding DB track IDs). */
+        @Volatile
+        var pendingDirectQueue: List<EmbeddedTrack>? = null
 
         private var activeJob: Job? = null
         val isSearchActive: Boolean get() = activeJob?.isActive == true
@@ -202,6 +208,21 @@ class RadioService : Service() {
             context.startForegroundService(intent)
         }
 
+        /**
+         * Queue a pre-computed list of tracks directly into Poweramp.
+         * No recommendation engine — just map and queue.
+         */
+        fun queueDirectly(context: Context, tracks: List<EmbeddedTrack>, label: String) {
+            if (isSearchActive) cancelSearch()
+            pendingDirectQueue = tracks
+            _uiState.value = RadioUiState.Searching("Adding to queue...")
+            val intent = Intent(context, RadioService::class.java).apply {
+                action = ACTION_QUEUE_DIRECTLY
+                putExtra("label", label)
+            }
+            context.startForegroundService(intent)
+        }
+
         fun cancelSearch() {
             activeJob?.cancel()
             val current = _uiState.value
@@ -260,6 +281,21 @@ class RadioService : Service() {
                     performMultiSeedRadio(config, seeds)
                 } else {
                     _uiState.value = RadioUiState.Error("No seeds provided")
+                    stopSelfDelayed()
+                }
+            }
+            ACTION_QUEUE_DIRECTLY -> {
+                stopJob?.cancel()
+                stopJob = null
+                showToasts = true
+                val tracks = pendingDirectQueue
+                pendingDirectQueue = null
+                val label = intent.getStringExtra("label") ?: "Direct queue"
+                startForeground(NOTIFICATION_ID, createNotification("Adding to queue..."))
+                if (tracks != null) {
+                    performDirectQueue(tracks, label)
+                } else {
+                    _uiState.value = RadioUiState.Error("No tracks provided")
                     stopSelfDelayed()
                 }
             }
@@ -786,6 +822,112 @@ class RadioService : Service() {
                 stopSelfDelayed()
             } catch (e: Exception) {
                 Log.e(TAG, "Error in multi-seed radio", e)
+                _uiState.value = RadioUiState.Error("Error: ${e.message}")
+                toast("Error: ${e.message}")
+                stopSelfDelayed()
+            } finally {
+                activeJob = null
+            }
+        }
+    }
+
+    /**
+     * Directly queue a pre-computed list of tracks into Poweramp.
+     * Maps embedding DB tracks to Poweramp file IDs via TrackMatcher, then queues.
+     */
+    private fun performDirectQueue(tracks: List<EmbeddedTrack>, label: String) {
+        activeJob = serviceScope.launch {
+            try {
+                val radioResult = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                    val db = getOrCreateDatabase()
+                        ?: return@withContext null
+                    val matcher = TrackMatcher(db)
+
+                    Log.i(TAG, "DIRECT_QUEUE: queueing ${tracks.size} tracks, label='$label'")
+                    for ((i, t) in tracks.withIndex()) {
+                        Log.d(TAG, "DIRECT_QUEUE: [$i] ${t.artist} - ${t.title} (id=${t.id})")
+                    }
+
+                    // Map to Poweramp file IDs and build track results
+                    val fileIds = mutableListOf<Long>()
+                    val trackResults = mutableListOf<QueuedTrackResult>()
+                    var notFound = 0
+                    for (track in tracks) {
+                        val fileId = matcher.findFileId(this@RadioService, track)
+                        val status = if (fileId != null) {
+                            fileIds.add(fileId)
+                            QueueStatus.QUEUED
+                        } else {
+                            notFound++
+                            Log.w(TAG, "DIRECT_QUEUE: no Poweramp file for ${track.artist} - ${track.title}")
+                            QueueStatus.NOT_IN_LIBRARY
+                        }
+                        trackResults.add(QueuedTrackResult(
+                            track = track,
+                            similarity = 0f,
+                            similarityToSeed = 0f,
+                            status = status,
+                        ))
+                    }
+
+                    if (fileIds.isEmpty()) return@withContext null
+
+                    // Queue: anchor current Poweramp track if in queue
+                    val currentTrack = PowerampReceiver.currentTrack
+                    val currentInQueue = currentTrack?.realId?.takeIf { it > 0 }?.let {
+                        PowerampHelper.isInQueue(this@RadioService, it)
+                    } == true
+                    val queueAnchorId = if (currentInQueue) currentTrack!!.realId else null
+                    val queueCurrentId = queueAnchorId ?: (currentTrack?.realId ?: -1L)
+
+                    val queuedCount = PowerampHelper.replaceQueue(this@RadioService, queueCurrentId, fileIds)
+                    PowerampHelper.reloadData(this@RadioService)
+
+                    Log.i(TAG, "DIRECT_QUEUE: queued $queuedCount of ${fileIds.size} tracks " +
+                        "($notFound not in Poweramp library)")
+
+                    // Build RadioResult with synthetic seed
+                    val syntheticSeed = PowerampTrack(
+                        realId = -1L,
+                        title = label,
+                        artist = null,
+                        album = null,
+                        durationMs = 0,
+                        path = null,
+                    )
+                    RadioResult(
+                        seedTrack = syntheticSeed,
+                        matchType = TrackMatcher.MatchType.METADATA_EXACT,
+                        tracks = trackResults,
+                        queuedFileIds = fileIds.toSet(),
+                        queueAnchorId = queueAnchorId,
+                        isDirectQueue = true,
+                    )
+                }
+
+                if (radioResult == null) {
+                    _uiState.value = RadioUiState.Error("Could not find tracks in Poweramp library")
+                    toast("Could not find tracks in Poweramp library")
+                    stopSelfDelayed()
+                    return@launch
+                }
+
+                _sessionHistory.value = (_sessionHistory.value + radioResult).takeLast(MAX_SESSIONS)
+                saveHistory()
+
+                val message = buildQueueResultMessage(
+                    radioResult.queuedCount,
+                    radioResult.tracks.count { it.status == QueueStatus.NOT_IN_LIBRARY }
+                )
+                updateNotification(message)
+                Toast.makeText(this@RadioService, message, Toast.LENGTH_SHORT).show()
+                _uiState.value = RadioUiState.Success(radioResult)
+                stopSelfDelayed()
+            } catch (e: CancellationException) {
+                Log.d(TAG, "Direct queue cancelled")
+                stopSelfDelayed()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in direct queue", e)
                 _uiState.value = RadioUiState.Error("Error: ${e.message}")
                 toast("Error: ${e.message}")
                 stopSelfDelayed()

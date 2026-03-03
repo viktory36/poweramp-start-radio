@@ -89,6 +89,15 @@
             </intent-filter>
         </receiver>
 
+        <!-- Debug: trigger multi-seed search from ADB -->
+        <receiver
+            android:name=".debug.DebugMultiSeedReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.powerampstartradio.DEBUG_MULTI_SEED" />
+            </intent-filter>
+        </receiver>
+
         <!-- Broadcast receiver for Poweramp track changes -->
         <receiver
             android:name=".poweramp.PowerampReceiver"

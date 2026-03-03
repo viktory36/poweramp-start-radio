@@ -151,7 +151,9 @@ data class RadioResult(
     val queueAnchorId: Long? = null,
     val isComplete: Boolean = true,
     val totalExpected: Int = 0,
-    val metrics: QueueMetrics? = null
+    val metrics: QueueMetrics? = null,
+    /** True for direct-queue sessions (text/multi-seed search results). No meaningful single-seed distance. */
+    val isDirectQueue: Boolean = false,
 ) {
     val queuedCount: Int get() = tracks.count { it.status == QueueStatus.QUEUED }
     val failedCount: Int get() = tracks.count { it.status != QueueStatus.QUEUED }

@@ -67,6 +67,7 @@ import com.powerampstartradio.ui.DatabaseInfo
 import com.powerampstartradio.ui.DecaySchedule
 import com.powerampstartradio.ui.DriftMode
 import com.powerampstartradio.ui.MainViewModel
+import com.powerampstartradio.ui.RecentSearch
 import com.powerampstartradio.ui.RadioConfig
 import com.powerampstartradio.ui.QueueStatus
 import com.powerampstartradio.ui.QueuedTrackResult
@@ -190,7 +191,7 @@ fun MainScreen(
 
     ModalNavigationDrawer(
         drawerState = drawerState,
-        gesturesEnabled = sessionHistory.isNotEmpty(),
+        gesturesEnabled = sessionHistory.isNotEmpty() && !showTextSearch,
         drawerContent = {
             ModalDrawerSheet(modifier = Modifier.width(280.dp)) {
                 SessionHistoryDrawer(
@@ -231,6 +232,8 @@ fun MainScreen(
                 2 -> TextSearchScreen(viewModel = viewModel, onBack = {
                     showTextSearch = false
                     viewModel.clearTextSearchResult()
+                    viewModel.clearMultiSeedResult()
+                    viewModel.clearSongSeeds()
                 })
                 else -> HomeScreen(
                     radioState = radioState, currentTrack = currentTrack,
@@ -520,8 +523,10 @@ private fun SessionSeedHeader(session: RadioResult, modifier: Modifier = Modifie
         } else {
             append("${session.queuedCount} tracks")
         }
-        append(" \u00b7 ")
-        append(humanModeWithKnobs(config))
+        if (!session.isDirectQueue) {
+            append(" \u00b7 ")
+            append(humanModeWithKnobs(config))
+        }
     }
     Text(
         text = summary,
@@ -667,8 +672,13 @@ fun SessionHistoryDrawer(sessions: List<RadioResult>, onSessionTap: (Int) -> Uni
                             Column {
                                 Text(session.seedTrack.title, style = MaterialTheme.typography.bodyMedium,
                                     maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                val modeLabel = humanSelectionMode(session.config.selectionMode, session.config.driftEnabled)
-                                Text("${session.seedTrack.artist ?: "Unknown"} \u00b7 $timeStr \u00b7 ${session.queuedCount} tracks \u00b7 $modeLabel",
+                                val subtitle = if (session.isDirectQueue) {
+                                    "$timeStr \u00b7 ${session.queuedCount} tracks \u00b7 Geo Mean"
+                                } else {
+                                    val modeLabel = humanSelectionMode(session.config.selectionMode, session.config.driftEnabled)
+                                    "${session.seedTrack.artist ?: "Unknown"} \u00b7 $timeStr \u00b7 ${session.queuedCount} tracks \u00b7 $modeLabel"
+                                }
+                                Text(subtitle,
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -816,10 +826,13 @@ fun TextSearchScreen(
             }
 
             val isLastField = songSeeds.isEmpty()
+            val textSeedWeight by viewModel.textSeedWeight.collectAsState()
+            val textSeedLocked by viewModel.textSeedLocked.collectAsState()
+            val textSeedNegative by viewModel.textSeedNegative.collectAsState()
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(start = 16.dp, end = 4.dp),
+                    .padding(start = 16.dp, end = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 OutlinedTextField(
@@ -869,147 +882,52 @@ fun TextSearchScreen(
                         imeAction = androidx.compose.ui.text.input.ImeAction.Search
                     ),
                 )
-                // "+" button to add first song seed
-                IconButton(onClick = { viewModel.addSongSeed() }) {
-                    Icon(Icons.Default.Add, contentDescription = "Add song seed")
-                }
-            }
-
-            // Song seed rows
-            songSeeds.forEachIndexed { index, seed ->
-                val isSeedLastField = index == songSeeds.lastIndex
-                val songPlaceholder = songPlaceholders.getOrElse(index) { "artist name title" }
-
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(start = 16.dp, end = 4.dp, top = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    OutlinedTextField(
-                        value = TextFieldValue(seed.query, selection = TextRange(seed.query.length)),
-                        onValueChange = { viewModel.updateSongSeedQuery(index, it.text) },
-                        label = { Text("And also sounds like...") },
-                        placeholder = {
-                            Text(
-                                songPlaceholder,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
-                                maxLines = 1,
-                            )
-                        },
-                        singleLine = true,
-                        modifier = Modifier.weight(1f),
-                        trailingIcon = {
-                            Row {
-                                if (isSeedLastField && anyLoading) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(20.dp),
-                                        strokeWidth = 2.dp,
-                                    )
-                                } else if (isSeedLastField) {
-                                    IconButton(onClick = { doSearch(query.text) }) {
-                                        Icon(Icons.Default.Search, contentDescription = "Search")
-                                    }
-                                }
-                                // Magnifying glass to look up song in DB
-                                if (seed.confirmedTrack == null && seed.query.isNotBlank()) {
-                                    IconButton(onClick = { viewModel.searchSongSeed(index) }) {
-                                        Icon(
-                                            Icons.Default.Search,
-                                            contentDescription = "Look up song",
-                                            tint = MaterialTheme.colorScheme.tertiary,
-                                        )
-                                    }
-                                }
-                                // Clear/remove button
-                                IconButton(onClick = { viewModel.removeSongSeed(index) }) {
-                                    Icon(Icons.Default.Close, contentDescription = "Remove")
-                                }
-                            }
-                        },
-                        keyboardActions = androidx.compose.foundation.text.KeyboardActions(
-                            onSearch = { viewModel.searchSongSeed(index) }
-                        ),
-                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
-                            imeAction = androidx.compose.ui.text.input.ImeAction.Search
-                        ),
-                        // Visual indicator for confirmed vs unconfirmed
-                        colors = if (seed.confirmedTrack != null) {
-                            OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = MaterialTheme.colorScheme.tertiary,
-                                unfocusedBorderColor = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.5f),
-                            )
-                        } else {
-                            OutlinedTextFieldDefaults.colors()
-                        },
-                    )
-
-                    // Rotary knob for weight
+                if (hasSongSeeds) {
+                    Spacer(Modifier.width(6.dp))
+                    // Text seed knob (visible when song seeds exist)
                     RotaryKnob(
-                        value = seed.weight,
-                        onValueChange = { viewModel.updateSongSeedWeight(index, it) },
-                        modifier = Modifier.padding(start = 4.dp),
+                        value = textSeedWeight,
+                        onValueChange = { viewModel.updateTextSeedWeight(it) },
+                        onDragEnd = { viewModel.finalizeTextSeedWeight() },
+                        negative = textSeedNegative,
+                        onToggleSign = { viewModel.toggleTextSeedSign() },
+                        locked = textSeedLocked,
+                        onToggleLock = { viewModel.toggleTextSeedLock() },
                     )
-
-                    // "+" to add another seed
+                } else {
+                    // "+" button to add first song seed (only when no seeds yet)
                     IconButton(onClick = { viewModel.addSongSeed() }) {
                         Icon(Icons.Default.Add, contentDescription = "Add song seed")
                     }
                 }
+            }
 
-                // Song seed search dropdown
-                if (activeSeedSearchIndex == index && songSeedSearchResults != null) {
-                    val results = songSeedSearchResults!!
-                    Card(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                        ),
-                    ) {
-                        if (results.isEmpty()) {
-                            Text(
-                                "No matches found",
-                                modifier = Modifier.padding(12.dp),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        } else {
-                            results.take(5).forEach { track ->
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clickable {
-                                            viewModel.confirmSongSeed(index, track)
-                                        }
-                                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            track.title ?: "Unknown",
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            fontWeight = FontWeight.Bold,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
-                                        Text(
-                                            track.artist ?: "Unknown",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            maxLines = 1,
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
+            // Song seed rows
+            for (index in songSeeds.indices) {
+                key(songSeeds[index].id) {
+                    SongSeedRow(
+                        seed = songSeeds[index],
+                        index = index,
+                        isLast = index == songSeeds.lastIndex,
+                        placeholder = songPlaceholders.getOrElse(index) { "artist title" },
+                        anyLoading = anyLoading,
+                        isShowingDropdown = activeSeedSearchIndex == index && songSeedSearchResults != null,
+                        dropdownResults = if (activeSeedSearchIndex == index) songSeedSearchResults else null,
+                        onQueryChange = { viewModel.updateSongSeedQuery(index, it) },
+                        onRemove = { viewModel.removeSongSeed(index) },
+                        onAdd = { viewModel.addSongSeed() },
+                        onLookup = { viewModel.searchSongSeed(index) },
+                        onConfirm = { viewModel.confirmSongSeed(index, it) },
+                        onSubmitSearch = { doSearch(query.text) },
+                        onWeightChange = { viewModel.updateSongSeedWeight(index, it) },
+                        onWeightDragEnd = { viewModel.finalizeSongSeedWeight(index) },
+                        onToggleSign = { viewModel.toggleSongSeedSign(index) },
+                        onToggleLock = { viewModel.toggleSongSeedLock(index) },
+                    )
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(8.dp))
 
             // Results or recent searches
             val result = activeResult
@@ -1048,14 +966,9 @@ fun TextSearchScreen(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .clickable {
-                                            if (hasSongSeeds) {
-                                                // Multi-seed: start radio from all seeds
-                                                onBack()
-                                                viewModel.startRadioFromMultiSeed(query.text)
-                                            } else {
-                                                onBack()
-                                                viewModel.startRadioFromTextSearch(match.track.id)
-                                            }
+                                            // Start radio with this specific song as seed
+                                            onBack()
+                                            viewModel.startRadioFromTextSearch(match.track.id)
                                         }
                                         .padding(horizontal = 16.dp, vertical = 10.dp),
                                     verticalAlignment = Alignment.CenterVertically,
@@ -1101,22 +1014,20 @@ fun TextSearchScreen(
                             }
                         }
 
-                    // "Start Radio" button for multi-seed results
-                    if (hasSongSeeds) {
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Button(
-                            onClick = {
-                                onBack()
-                                viewModel.startRadioFromMultiSeed(query.text)
-                            },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 8.dp),
-                        ) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Start Radio from Multi-Seed")
-                        }
+                    // "Add this list to queue" — queues exactly what's displayed
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(
+                        onClick = {
+                            onBack()
+                            viewModel.queueDisplayedResults(result)
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                    ) {
+                        Icon(Icons.Default.PlayArrow, contentDescription = null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(if (hasSongSeeds) "Add this list to queue (Geo Mean)" else "Add this list to queue")
                     }
                 }
             } else if (!anyLoading) {
@@ -1141,17 +1052,225 @@ fun TextSearchScreen(
                 recentSearches.forEach { recent ->
                     TextButton(
                         onClick = {
-                            query = TextFieldValue(recent, selection = TextRange(recent.length))
-                            doSearch(recent)
+                            val textPart = recent.textQuery
+                            query = TextFieldValue(textPart, selection = TextRange(textPart.length))
+                            if (recent.songSeeds.isNotEmpty()) {
+                                viewModel.replayRecentSearch(recent)
+                            } else {
+                                doSearch(textPart)
+                            }
                         },
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
                     ) {
                         Text(
-                            recent,
+                            recent.displayLabel,
                             modifier = Modifier.fillMaxWidth(),
                             style = MaterialTheme.typography.bodyMedium,
                         )
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---- Song Seed Row (extracted composable with local text state) ----
+
+@Composable
+private fun SongSeedRow(
+    seed: SongSeedState,
+    index: Int,
+    isLast: Boolean,
+    placeholder: String,
+    anyLoading: Boolean,
+    isShowingDropdown: Boolean,
+    dropdownResults: List<com.powerampstartradio.data.EmbeddedTrack>?,
+    onQueryChange: (String) -> Unit,
+    onRemove: () -> Unit,
+    onAdd: () -> Unit,
+    onLookup: () -> Unit,
+    onConfirm: (com.powerampstartradio.data.EmbeddedTrack) -> Unit,
+    onSubmitSearch: () -> Unit,
+    onToggleSign: () -> Unit,
+    onWeightChange: (Float) -> Unit,
+    onWeightDragEnd: () -> Unit,
+    onToggleLock: () -> Unit,
+) {
+    // Local text state — synced from ViewModel but owned here to avoid
+    // recomposition cursor fights. The ViewModel is the source of truth
+    // for confirmed tracks (which overwrite the local text).
+    var localText by remember { mutableStateOf(seed.query) }
+
+    // Sync from ViewModel when confirmed track changes the query externally
+    LaunchedEffect(seed.query) {
+        if (seed.confirmedTrack != null && localText != seed.query) {
+            localText = seed.query
+        }
+    }
+
+    Column {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 16.dp, end = 8.dp, top = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            OutlinedTextField(
+                value = localText,
+                onValueChange = {
+                    localText = it
+                    onQueryChange(it)
+                },
+                label = {
+                    Text(
+                        if (seed.negative) "And sounds less like..." else "And sounds like...",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                },
+                placeholder = {
+                    Text(
+                        placeholder,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                        maxLines = 1,
+                    )
+                },
+                singleLine = true,
+                modifier = Modifier
+                    .weight(1f)
+                    .heightIn(min = 56.dp),
+                trailingIcon = {
+                    if (isLast && anyLoading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                        )
+                    } else if (isLast) {
+                        IconButton(onClick = onSubmitSearch) {
+                            Icon(Icons.Default.Search, contentDescription = "Search")
+                        }
+                    } else if (seed.confirmedTrack == null && localText.isNotBlank()) {
+                        IconButton(onClick = onLookup) {
+                            Icon(Icons.Default.Search, contentDescription = "Look up song",
+                                tint = MaterialTheme.colorScheme.tertiary)
+                        }
+                    }
+                },
+                keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+                    onSearch = {
+                        if (seed.confirmedTrack == null && localText.isNotBlank()) {
+                            onLookup()
+                        } else {
+                            onSubmitSearch()
+                        }
+                    }
+                ),
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                    imeAction = androidx.compose.ui.text.input.ImeAction.Search
+                ),
+                colors = if (seed.confirmedTrack != null) {
+                    val borderColor = if (seed.negative)
+                        MaterialTheme.colorScheme.error
+                    else
+                        MaterialTheme.colorScheme.tertiary
+                    OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = borderColor,
+                        unfocusedBorderColor = borderColor.copy(alpha = 0.5f),
+                    )
+                } else {
+                    OutlinedTextFieldDefaults.colors()
+                },
+            )
+
+            Spacer(Modifier.width(6.dp))
+            // Knob
+            RotaryKnob(
+                value = seed.weight,
+                onValueChange = onWeightChange,
+                onDragEnd = onWeightDragEnd,
+                negative = seed.negative,
+                onToggleSign = onToggleSign,
+                locked = seed.locked,
+                onToggleLock = onToggleLock,
+            )
+            // Add/remove buttons
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                IconButton(
+                    onClick = onRemove,
+                    modifier = Modifier.size(36.dp),
+                ) {
+                    Text(
+                        "\u2212",
+                        style = MaterialTheme.typography.titleLarge,
+                        color = MaterialTheme.colorScheme.error.copy(alpha = 0.7f),
+                    )
+                }
+                if (isLast) {
+                    IconButton(
+                        onClick = onAdd,
+                        modifier = Modifier.size(36.dp),
+                    ) {
+                        Icon(Icons.Default.Add, contentDescription = "Add song seed",
+                            modifier = Modifier.size(20.dp))
+                    }
+                }
+            }
+        }
+
+        // Song lookup dropdown
+        if (isShowingDropdown && dropdownResults != null) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 32.dp, end = 16.dp)
+                    .background(
+                        MaterialTheme.colorScheme.surfaceContainerHigh,
+                        MaterialTheme.shapes.small,
+                    ),
+            ) {
+                if (dropdownResults.isEmpty()) {
+                    Text(
+                        "No matches found",
+                        modifier = Modifier.padding(16.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    dropdownResults.take(5).forEachIndexed { i, track ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onConfirm(track) }
+                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    track.title ?: "Unknown",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    track.artist ?: "Unknown",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                        if (i < dropdownResults.take(5).lastIndex) {
+                            HorizontalDivider(
+                                modifier = Modifier.padding(horizontal = 12.dp),
+                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.2f),
+                            )
+                        }
                     }
                 }
             }

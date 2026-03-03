@@ -1,126 +1,211 @@
 package com.powerampstartradio.ui
 
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
-import kotlin.math.abs
+import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.roundToInt
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 /**
- * A rotary knob composable for controlling a value from -1.0 to +1.0.
+ * Circular knob for 0.0 to 1.0 with sign and lock.
  *
- * 270-degree arc from 7 o'clock (–1.0) through 12 o'clock (0.0) to 5 o'clock (+1.0).
- * Drag gesture maps vertical movement to value changes.
+ * 270° arc: 7 o'clock (0) → 5 o'clock (1.0). Fills the textbox height.
+ * Drag horizontally to adjust. Tap to toggle sign (+/−).
+ * Long press to toggle lock. When locked, drags are ignored and knob is dimmed.
  *
- * @param value Current value in [-1.0, 1.0]
- * @param onValueChange Called when the user drags the knob
- * @param modifier Modifier for the knob container
+ * Percentage label is drawn inside the arc gap (between 5 and 7 o'clock).
  */
 @Composable
 fun RotaryKnob(
     value: Float,
     onValueChange: (Float) -> Unit,
+    onDragEnd: () -> Unit,
+    negative: Boolean,
+    onToggleSign: () -> Unit,
+    locked: Boolean,
+    onToggleLock: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val trackColor = MaterialTheme.colorScheme.surfaceVariant
-    val activeColor = MaterialTheme.colorScheme.primary
-    val indicatorColor = MaterialTheme.colorScheme.primary
-    val textStyle = MaterialTheme.typography.labelSmall
-    val textColor = MaterialTheme.colorScheme.onSurfaceVariant
+    val positiveColor = MaterialTheme.colorScheme.primary
+    val negativeColor = MaterialTheme.colorScheme.error
+    val activeColor = when {
+        locked -> MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
+        negative -> negativeColor
+        else -> positiveColor
+    }
+    val lockColor = if (locked)
+        MaterialTheme.colorScheme.outline
+    else
+        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f)
 
-    // Display: snap to 0.1 increments for display
-    val displayValue = (value * 10).roundToInt() / 10f
-    val displayText = if (displayValue >= 0f) "+%.1f".format(displayValue) else "%.1f".format(displayValue)
+    val pct = (value * 100).roundToInt()
+    val sign = if (negative) "\u2212" else ""
+    val displayText = "$sign${pct}%"
 
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = modifier,
-    ) {
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier = Modifier
-                .size(44.dp)
-                .pointerInput(Unit) {
-                    detectDragGestures { change, dragAmount ->
-                        change.consume()
-                        // Drag up = increase, drag down = decrease
-                        // Scale: 200px drag = full range
-                        val delta = -dragAmount.y / 200f
-                        val newValue = (value + delta).coerceIn(-1f, 1f)
-                        onValueChange(newValue)
+    val labelColor = when {
+        locked -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+        negative -> negativeColor
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+
+    val currentValue = rememberUpdatedState(value)
+    val currentLocked = rememberUpdatedState(locked)
+    val textMeasurer = rememberTextMeasurer()
+    val labelStyle = TextStyle(
+        fontSize = 9.sp,
+        color = labelColor,
+    )
+
+    Canvas(
+        modifier = modifier
+            .size(56.dp)
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    down.consume()
+                    var totalDx = 0f
+                    var totalDy = 0f
+                    var isTap = true
+                    val tapThreshold = 12.dp.toPx()
+                    val longPressMs = 400L
+                    var longPressFired = false
+                    // Launch timer on Main dispatcher for long-press detection
+                    val timerJob = CoroutineScope(Dispatchers.Main).launch {
+                        delay(longPressMs)
+                        if (isTap) {
+                            longPressFired = true
+                            onToggleLock()
+                        }
                     }
-                },
-        ) {
-            Canvas(modifier = Modifier.size(40.dp)) {
-                val centerX = size.width / 2
-                val centerY = size.height / 2
-                val radius = size.width / 2 - 4.dp.toPx()
-                val strokeWidth = 3.dp.toPx()
-
-                // Arc angles: 270° arc from 135° (7 o'clock) to 45° (5 o'clock)
-                // In Canvas: 0° is 3 o'clock, goes clockwise
-                val startAngle = 135f  // 7 o'clock
-                val sweepAngle = 270f  // to 5 o'clock
-
-                // Background track
-                drawArc(
-                    color = trackColor,
-                    startAngle = startAngle,
-                    sweepAngle = sweepAngle,
-                    useCenter = false,
-                    style = Stroke(width = strokeWidth, cap = StrokeCap.Round),
-                )
-
-                // Active portion: from center (0 = 12 o'clock = 270°) to current value
-                // Value -1 maps to startAngle (135°), +1 maps to startAngle + sweepAngle (405°)
-                // 0 maps to 270° (12 o'clock)
-                val centerAngle = 270f // 12 o'clock in Canvas coords
-                val valueAngle = centerAngle + value * 135f // ±135° from center
-
-                if (abs(value) > 0.01f) {
-                    val activeStart = if (value >= 0) centerAngle else valueAngle
-                    val activeSweep = abs(value) * 135f
-                    drawArc(
-                        color = activeColor,
-                        startAngle = activeStart,
-                        sweepAngle = activeSweep,
-                        useCenter = false,
-                        style = Stroke(width = strokeWidth, cap = StrokeCap.Round),
-                    )
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val change = event.changes.firstOrNull() ?: break
+                        if (!change.pressed) break
+                        val dx = change.positionChange().x
+                        val dy = change.positionChange().y
+                        totalDx += dx
+                        totalDy += dy
+                        if (sqrt(totalDx * totalDx + totalDy * totalDy) > tapThreshold) {
+                            isTap = false
+                            timerJob?.cancel()
+                        }
+                        if (!isTap && !currentLocked.value && dx != 0f) {
+                            change.consume()
+                            val delta = dx / 150f
+                            val newVal = (currentValue.value + delta).coerceIn(0f, 1f)
+                            onValueChange(newVal)
+                        }
+                    }
+                    timerJob?.cancel()
+                    if (isTap && !longPressFired) {
+                        onToggleSign()
+                    } else if (!isTap) {
+                        onDragEnd()
+                    }
                 }
+            },
+    ) {
+        val cx = size.width / 2
+        val cy = size.height / 2
+        // Radius fills the square tightly; indicator dot may slightly clip at top
+        val r = size.height / 2 - 2.dp.toPx()
+        val stroke = 2.5.dp.toPx()
 
-                // Indicator dot at current position
-                val indicatorAngle = Math.toRadians(valueAngle.toDouble())
-                val dotRadius = 3.dp.toPx()
-                drawCircle(
-                    color = indicatorColor,
-                    radius = dotRadius,
-                    center = Offset(
-                        centerX + radius * cos(indicatorAngle).toFloat(),
-                        centerY + radius * sin(indicatorAngle).toFloat(),
-                    ),
-                )
+        // Background track
+        drawArc(
+            color = trackColor,
+            startAngle = 135f,
+            sweepAngle = 270f,
+            useCenter = false,
+            topLeft = Offset(cx - r, cy - r),
+            size = androidx.compose.ui.geometry.Size(r * 2, r * 2),
+            style = Stroke(width = stroke, cap = StrokeCap.Round),
+        )
+
+        // Active arc
+        val v = currentValue.value
+        if (v > 0.01f) {
+            drawArc(
+                color = activeColor,
+                startAngle = 135f,
+                sweepAngle = v * 270f,
+                useCenter = false,
+                topLeft = Offset(cx - r, cy - r),
+                size = androidx.compose.ui.geometry.Size(r * 2, r * 2),
+                style = Stroke(width = stroke, cap = StrokeCap.Round),
+            )
+        }
+
+        // Indicator dot
+        val angleDeg = 135f + v * 270f
+        val angleRad = angleDeg * PI.toFloat() / 180f
+        drawCircle(
+            color = activeColor,
+            radius = 3.dp.toPx(),
+            center = Offset(cx + r * cos(angleRad), cy + r * sin(angleRad)),
+        )
+
+        // Center icon: lock when locked, +/− sign when unlocked
+        if (locked) {
+            val lockR = 4.dp.toPx()
+            drawCircle(
+                color = lockColor,
+                radius = lockR,
+                center = Offset(cx, cy + 1.dp.toPx()),
+            )
+            drawArc(
+                color = lockColor,
+                startAngle = 180f,
+                sweepAngle = 180f,
+                useCenter = false,
+                topLeft = Offset(cx - lockR * 0.6f, cy - lockR * 1.3f),
+                size = androidx.compose.ui.geometry.Size(lockR * 1.2f, lockR * 1.2f),
+                style = Stroke(width = 1.5.dp.toPx(), cap = StrokeCap.Round),
+            )
+        } else {
+            val signLen = 5.dp.toPx()
+            val signColor = activeColor
+            // Horizontal bar (both + and −)
+            drawLine(signColor, Offset(cx - signLen, cy), Offset(cx + signLen, cy),
+                strokeWidth = 2.dp.toPx(), cap = StrokeCap.Round)
+            if (!negative) {
+                // Vertical bar (+ only)
+                drawLine(signColor, Offset(cx, cy - signLen), Offset(cx, cy + signLen),
+                    strokeWidth = 2.dp.toPx(), cap = StrokeCap.Round)
             }
         }
 
-        Text(
-            text = displayText,
-            style = textStyle,
-            color = textColor,
+        // Percentage label snug in the arc gap (between 5 and 7 o'clock)
+        val textResult = textMeasurer.measure(displayText, labelStyle)
+        drawText(
+            textResult,
+            topLeft = Offset(
+                (size.width - textResult.size.width) / 2f,
+                cy + r * 0.7f,
+            ),
         )
     }
 }

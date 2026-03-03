@@ -256,6 +256,10 @@ fun IndexingScreen(
                             onBack()
                         },
                     )
+                    // Also reset on back button press (top bar)
+                    DisposableEffect(Unit) {
+                        onDispose { IndexingService.resetState() }
+                    }
                 }
                 is IndexingService.IndexingState.Error -> {
                     ErrorContent(message = state.message, onBack = onBack)
