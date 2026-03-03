@@ -704,8 +704,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun updateTextSeedWeight(weight: Float) {
         val budget = unlockedBudget()
         val otherUnlockedCount = _songSeeds.value.count { !it.locked }
-        val maxForThis = (budget - otherUnlockedCount * MIN_WEIGHT).coerceAtLeast(MIN_WEIGHT)
-        _textSeedWeight.value = weight.coerceIn(MIN_WEIGHT, maxForThis)
+        // Text weight can go to 0 when song seeds exist (song-only mode)
+        val minForText = if (_songSeeds.value.isNotEmpty()) 0f else MIN_WEIGHT
+        val maxForThis = (budget - otherUnlockedCount * MIN_WEIGHT).coerceAtLeast(minForText)
+        _textSeedWeight.value = weight.coerceIn(minForText, maxForThis)
     }
 
     /** Called on drag end: redistribute remaining budget among unlocked seeds. */
@@ -722,12 +724,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (index !in current.indices) return
 
         val budget = unlockedBudget()
-        var otherUnlockedCount = 0
-        if (!_textSeedLocked.value) otherUnlockedCount++
+        // Reserve MIN_WEIGHT for each other unlocked song seed.
+        // Text seed doesn't need reservation — it can go to 0 when song seeds exist.
+        var otherReserve = 0f
         for (i in current.indices) {
-            if (i != index && !current[i].locked) otherUnlockedCount++
+            if (i != index && !current[i].locked) otherReserve += MIN_WEIGHT
         }
-        val maxForThis = (budget - otherUnlockedCount * MIN_WEIGHT).coerceAtLeast(MIN_WEIGHT)
+        val maxForThis = (budget - otherReserve).coerceAtLeast(MIN_WEIGHT)
         current[index] = current[index].copy(weight = weight.coerceIn(MIN_WEIGHT, maxForThis))
         _songSeeds.value = current
     }
@@ -766,7 +769,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (others.isEmpty()) {
             val newSeeds = seeds.toMutableList()
             when (changedIndex) {
-                -1 -> _textSeedWeight.value = budget.coerceAtLeast(MIN_WEIGHT)
+                -1 -> {
+                    // Text can be 0 when song seeds exist
+                    val floor = if (seeds.isNotEmpty()) 0f else MIN_WEIGHT
+                    _textSeedWeight.value = budget.coerceAtLeast(floor)
+                }
                 else -> {
                     newSeeds[changedIndex] = newSeeds[changedIndex].copy(
                         weight = budget.coerceAtLeast(MIN_WEIGHT)
@@ -784,14 +791,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             -1 -> _textSeedLocked.value
             else -> seeds[changedIndex].locked
         }
+        // Min reserve for others: text can be 0 when song seeds exist, songs need MIN_WEIGHT
+        val othersMinReserve = others.sumOf { (idx, _) ->
+            if (idx == -1 && seeds.isNotEmpty()) 0.0 else MIN_WEIGHT.toDouble()
+        }.toFloat()
         val remaining = if (changedIsLocked) {
-            budget.coerceAtLeast(others.size * MIN_WEIGHT)
+            budget.coerceAtLeast(othersMinReserve)
         } else {
             val changedWeight = when (changedIndex) {
                 -1 -> _textSeedWeight.value
                 else -> seeds[changedIndex].weight
             }
-            (budget - changedWeight).coerceAtLeast(others.size * MIN_WEIGHT)
+            (budget - changedWeight).coerceAtLeast(othersMinReserve)
         }
 
         // Distribute proportionally among others
@@ -809,11 +820,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             var assigned = 0f
             for (j in others.indices) {
                 val (idx, w) = others[j]
+                val floor = if (idx == -1 && seeds.isNotEmpty()) 0f else MIN_WEIGHT
                 val share = if (j == others.lastIndex) {
                     // Last one gets remainder to avoid rounding drift
-                    (remaining - assigned).coerceAtLeast(MIN_WEIGHT)
+                    (remaining - assigned).coerceAtLeast(floor)
                 } else {
-                    (w / totalOthers * remaining).coerceAtLeast(MIN_WEIGHT)
+                    (w / totalOthers * remaining).coerceAtLeast(floor)
                 }
                 assigned += share
                 if (idx == -1) _textSeedWeight.value = share
@@ -842,7 +854,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val scale = targetUnlocked / unlockSum
 
         if (!_textSeedLocked.value) {
-            _textSeedWeight.value = (_textSeedWeight.value * scale).coerceAtLeast(MIN_WEIGHT)
+            // Text can be 0 when song seeds exist (song-only mode)
+            val textFloor = if (seeds.isNotEmpty()) 0f else MIN_WEIGHT
+            _textSeedWeight.value = (_textSeedWeight.value * scale).coerceAtLeast(textFloor)
         }
         val newSeeds = seeds.map {
             if (!it.locked) it.copy(weight = (it.weight * scale).coerceAtLeast(MIN_WEIGHT))
@@ -861,9 +875,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun addSongSeed() {
-        // New seed gets an equal share of the unlocked budget
+        val isFirst = _songSeeds.value.isEmpty()
+        if (isFirst && !_textSeedLocked.value) {
+            // First song seed: text defaults to 0%, song gets 100%
+            _textSeedWeight.value = 0f
+        }
         val budget = unlockedBudget()
-        val currentUnlockedCount = countUnlocked()
+        // Don't count text at 0% in budget split — it doesn't participate
+        val textParticipates = !_textSeedLocked.value && _textSeedWeight.value > 0f
+        var currentUnlockedCount = if (textParticipates) 1 else 0
+        for (s in _songSeeds.value) { if (!s.locked) currentUnlockedCount++ }
         val newTotalUnlocked = currentUnlockedCount + 1
         val shareForNew = (budget / newTotalUnlocked).coerceAtLeast(MIN_WEIGHT)
         _songSeeds.value = _songSeeds.value + SongSeedState(weight = shareForNew)
