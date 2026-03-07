@@ -1,74 +1,72 @@
 # Setup Guide
 
+This repository supports two workflows:
+
+1. Desktop-first, where a computer builds `embeddings.db` and the phone consumes it
+2. Desktop-first plus on-device incremental indexing, where the phone adds embeddings for tracks that were not in the desktop database yet
+
+The first workflow is the normal one. The second is optional.
+
 ## Prerequisites
 
-- **Python 3.10+** with pip (for desktop indexing)
-- **CUDA GPU** recommended (NVIDIA, for faster indexing)
-- **Android phone** with Poweramp installed
-- **ADB** (Android Debug Bridge)
+### Desktop indexer
 
-For building the Android app from source:
-- Java 17 (JDK)
-- Android SDK (platform 34+, NDK 27)
-- Or use the one-time setup script (see below)
+- Python 3.10+
+- `pip`
+- enough disk space for the database and model cache
+- a reasonably fast CPU or GPU if you are indexing a large library
 
-## Desktop Indexing
+### Android app
 
-### 1. Install
+- an Android device with Poweramp installed
+- `adb`
+
+### Building the Android app from source
+
+- WSL is supported through the scripts in `android-plugin/scripts/`
+- the setup script installs JDK 17, Gradle, Android command-line tools, and SDK packages locally under `~/.local/share/poweramp-start-radio/`
+
+## Recommended Workflow
+
+### 1. Install the desktop indexer
 
 ```bash
 cd desktop-indexer
-pip install -e .
+python -m pip install -e .
 ```
 
-Key dependencies installed automatically: torch, torchaudio, transformers, mutagen, huggingface-hub.
-
-### 2. Generate Embeddings
+### 2. Build the desktop database
 
 ```bash
-# Scan your entire music library
 poweramp-indexer scan /path/to/music -o embeddings.db
-
-# Options:
-#   --fp16          Half-precision (saves VRAM, no quality loss)
-#   --batch-size N  Batch size (default 8; higher = faster, more VRAM)
-#   --max-duration 600  Skip files longer than N seconds
 ```
 
-This runs a two-phase pipeline:
-1. **MERT** extracts audio features (768d per 5-second window)
-2. **CLaMP3** encodes features into a single 768d embedding per track
+Useful options:
 
-Progress is cached per-track — safe to interrupt and resume.
+- `--fp16`
+  - halves VRAM use on desktop MERT inference
+- `--batch-size N`
+  - larger batch sizes improve throughput if desktop VRAM allows it
+- `--max-duration 600`
+  - skip or cap unusually long files
+- `--phase 1` or `--phase 2`
+  - run only half of the pipeline when debugging
 
-The scan automatically builds k-means clusters and a K=5 kNN graph (required for Random Walk mode). To rebuild the graph separately (e.g. with different K):
+What `scan` does:
+
+1. reads audio from your music library
+2. extracts MERT features in `5s` windows
+3. encodes those features into one CLaMP3 embedding per track
+4. writes `embeddings.db`
+5. builds clusters and a kNN graph for Random Walk
+
+### 3. Inspect the finished database
 
 ```bash
-poweramp-indexer graph embeddings.db --knn 5
-```
-
-### 3. Test
-
-```bash
-# Find similar tracks
-poweramp-indexer similar embeddings.db "radiohead everything in its right place"
-
-# Text search (genre, mood, description)
-poweramp-indexer search embeddings.db "dark minimal techno"
-
-# Database info
 poweramp-indexer info embeddings.db
 ```
 
-### 4. Incremental Updates
-
-```bash
-poweramp-indexer update /path/to/music -d embeddings.db
-```
-
-## Deploy to Phone
-
-### Transfer the Database
+### 4. Push the database to the phone
 
 ```bash
 adb push embeddings.db /data/local/tmp/
@@ -76,76 +74,166 @@ adb shell run-as com.powerampstartradio cp /data/local/tmp/embeddings.db files/
 adb shell rm /data/local/tmp/embeddings.db
 ```
 
-### Install the App
+### 5. Install or rebuild the Android app
 
-Pre-built APK:
-```bash
-adb install app-debug.apk
-adb shell pm grant com.powerampstartradio android.permission.READ_MEDIA_AUDIO
-```
-
-Or build from source:
 ```bash
 cd android-plugin
-bash scripts/setup-wsl-android-env.sh  # one-time: installs JDK, SDK, NDK
-bash scripts/build-wsl.sh
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+./scripts/setup-wsl-android-env.sh
+./scripts/build-wsl.sh
 ```
 
-### Use
+`build-wsl.sh` installs the debug APK automatically if a device is connected over `adb`.
 
-1. Open Poweramp, start playing any track
-2. Open Poweramp Start Radio
-3. The app matches the current track to its embedding database
-4. Tap **Start Radio** — the app queues 30 similar tracks in Poweramp
-5. Adjust mode (MMR/DPP/Random Walk) and sliders to taste
+### 6. Use the app
 
-## On-Device Indexing (Optional)
+- Start playback in Poweramp
+- Open Poweramp Start Radio
+- Use `Start Radio` for current-track radio
+- Use search for text or multi-seed retrieval
+- Use `Manage Tracks` only if you want the phone to add embeddings for missing tracks
 
-Index new tracks directly on your phone, without the desktop pipeline. Requires pushing TFLite model files (~722 MB total).
+## Incremental Desktop Updates
 
-### Export TFLite Models
+If your desktop music library changes:
+
+```bash
+poweramp-indexer update /path/to/music --database embeddings.db
+```
+
+Important:
+
+- `update` adds and removes tracks in the database
+- `update` does not rebuild the kNN graph automatically
+- after a desktop update, rebuild the graph before pushing the DB back to the phone:
+
+```bash
+poweramp-indexer graph embeddings.db --clusters 200 --knn 5
+```
+
+## Optional: On-Device Indexing
+
+On-device indexing is for tracks that exist in Poweramp but are not in the desktop database yet.
+
+To enable it, copy audio models into the app's internal storage.
+
+### 1. Export the LiteRT models
 
 ```bash
 cd desktop-indexer
-pip install litert-torch==0.8.0 ai-edge-litert jax torch_xla2 --no-deps
 poweramp-indexer export all
 ```
 
-Produces in `models/`:
-- `mert.tflite` (~378 MB) — audio feature extractor
-- `clamp3_audio.tflite` (~344 MB) — audio encoder
-- `clamp3_text.tflite` — text encoder (for text search)
-- `xlm_roberta_vocab.json` — tokenizer vocabulary
+The current production-relevant files are:
 
-**All models must be FP32.** FP16 model files are incompatible with the required FP32 GPU precision.
+- `mert.tflite`
+- `clamp3_audio.tflite`
+- `clamp3_text.tflite`
+- `xlm_roberta_vocab.json`
 
-### Push Models to Phone
+### 2. Push models to the phone
+
+For on-device indexing, only the audio models are required:
 
 ```bash
-for f in mert.tflite clamp3_audio.tflite clamp3_text.tflite xlm_roberta_vocab.json; do
-    adb push "models/$f" /data/local/tmp/
-    adb shell run-as com.powerampstartradio cp "/data/local/tmp/$f" files/
-    adb shell rm "/data/local/tmp/$f"
+for f in mert.tflite clamp3_audio.tflite; do
+  adb push "desktop-indexer/models/$f" /data/local/tmp/
+  adb shell run-as com.powerampstartradio cp "/data/local/tmp/$f" files/
+  adb shell rm "/data/local/tmp/$f"
 done
 ```
 
-### Index on Device
+For on-device text search, also push:
 
-1. Open the app → tap **Manage Tracks**
-2. The app detects tracks in Poweramp that aren't in the database
-3. Select tracks → tap **Start Indexing**
-4. Two-phase GPU pipeline runs: MERT (Phase 1) → CLaMP3 (Phase 2)
-5. ~15-30 seconds per 3-minute track on Snapdragon 8 Gen 3
+```bash
+for f in clamp3_text.tflite xlm_roberta_vocab.json; do
+  adb push "desktop-indexer/models/$f" /data/local/tmp/
+  adb shell run-as com.powerampstartradio cp "/data/local/tmp/$f" files/
+  adb shell rm "/data/local/tmp/$f"
+done
+```
 
-Progress is cached per-track. If interrupted, indexing resumes from the last completed track.
+Important notes:
+
+- use the FP32 model files for the Android app's audio indexing path
+- text search is optional
+- the app can run radio from a desktop-built DB without any on-device model files
+
+### 3. Index tracks on the phone
+
+- open the app
+- go to `Manage Tracks`
+- let it compare the Poweramp library against `embeddings.db`
+- select tracks and start indexing
+
+The Android indexing pipeline is:
+
+1. `AudioDecoder` decodes and resamples audio to `24kHz` mono
+2. `MertInference` extracts `768d` features per `5s` window
+3. `Clamp3AudioInference` turns those features into one `768d` track embedding
+4. `GraphUpdater` updates the Random Walk graph on phone
+
+The current implementation preserves MERT window alignment across decode chunks so multi-chunk tracks match the desktop windowing rule.
+
+## Benchmarks and Validation
+
+When you need to validate on-device embedding quality, use the benchmark activity in full-track mode.
+
+### Run the audio benchmark
+
+```bash
+adb shell am start -n com.powerampstartradio/.benchmark.BenchmarkActivity \
+  --ez auto_start true --ei max_duration_s 0
+```
+
+### Pull the result JSON
+
+```bash
+adb shell run-as com.powerampstartradio cat files/benchmark_results.json > /tmp/benchmark_results.json
+```
+
+### Validate against the desktop database
+
+```bash
+python3 desktop-indexer/scripts/validate_benchmark.py \
+  /tmp/benchmark_results.json \
+  desktop-indexer/audit_raw_data/embeddings_clamp3.db
+```
+
+Do not treat a capped `120s` benchmark run as a quality comparison against a full-track desktop database. That is measuring different audio.
 
 ## Troubleshooting
 
-**"Track not found in database"**: The current Poweramp track doesn't match any entry in embeddings.db. Check that the music library scanned on desktop matches what's on the phone.
+### Current track is not found in the database
 
-**"No similar tracks found" with Random Walk**: The seed track may not be in the kNN graph. This happens when the track was indexed on-device after the graph was built. Re-run `poweramp-indexer graph embeddings.db` on desktop and re-push the DB, or trigger on-device indexing which rebuilds the graph automatically.
+The Poweramp track metadata or file set does not line up with the database you pushed. Rebuild or repush the desktop database, or inspect `TrackMatcher` behavior.
 
-**Signature mismatch on install**: Run `adb uninstall com.powerampstartradio` first, then install again.
+### Random Walk returns poor or empty results
 
-**Build fails with NDK errors**: Ensure NDK 27 is installed. The setup script handles this, but manual installations may need `sdkmanager "ndk;27.2.12479018"`.
+The database or on-device extracted files do not have a current graph. Rebuild the graph on desktop after `update`, or let on-device indexing rebuild it after new phone-side embeddings are added.
+
+### On-device indexing progress overruns the expected window count
+
+That was historically caused by chunk-boundary window leakage. The current code carries leftover samples across chunks so only the final track tail may create a padded window.
+
+### Android build fails inside WSL
+
+Re-run:
+
+```bash
+cd android-plugin
+./scripts/setup-wsl-android-env.sh
+```
+
+Then build again with:
+
+```bash
+./scripts/build-wsl.sh
+```
+
+### APK install fails because of a signature mismatch
+
+```bash
+adb uninstall com.powerampstartradio
+```
+
+Then reinstall.

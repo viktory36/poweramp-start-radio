@@ -219,7 +219,7 @@ class IndexingService : Service() {
                 // wall-clock per-track ≈ MERT windows × ms/window. We measure
                 // this directly.
 
-                // Pre-compute expected window counts per track (full duration, no cap)
+                // Pre-compute expected window counts per track from full-track duration.
                 val windowsPerTrack = IntArray(unindexed.size)
                 var totalWindows = 0
                 for ((i, t) in unindexed.withIndex()) {
@@ -246,7 +246,10 @@ class IndexingService : Service() {
                 var lastEta = 0L
 
                 fun fraction(): Float {
-                    val raw = if (totalWindows > 0) windowsCompleted.toFloat() / totalWindows else 0f
+                    if (windowsCompleted > totalWindows) totalWindows = windowsCompleted
+                    val raw = if (totalWindows > 0) {
+                        (windowsCompleted.toFloat() / totalWindows).coerceAtMost(1f)
+                    } else 0f
                     // CLaMP3 phase is fast (~1% of total) — reserve last 5% for it + graph
                     val scaled = raw * 0.95f
                     fractionFloor = maxOf(fractionFloor, scaled)
@@ -360,7 +363,17 @@ class IndexingService : Service() {
                     if (windowCounts[i] > 0) continue  // cache hit → skip
                     val trackProgress = "${i + 1}/${unindexed.size}"
                     var windowsDone = 0
-                    val expectedWindows = windowsPerTrack[i]
+                    var expectedWindows = windowsPerTrack[i]
+                    fun growExpectedWindows(minExpected: Int, reason: String) {
+                        if (minExpected <= expectedWindows) return
+                        totalWindows += minExpected - expectedWindows
+                        Log.w(
+                            TAG,
+                            "MERT window count exceeded duration estimate for " +
+                                "\"${track.artist} - ${track.title}\": $expectedWindows->$minExpected ($reason)"
+                        )
+                        expectedWindows = minExpected
+                    }
                     fun emitProgress(detail: String, etaMs: Long = eta()) {
                         val msg = "MERT $trackProgress ${track.title} \u2013 $detail${formatEta(etaMs)}"
                         _state.value = IndexingState.Processing(
@@ -403,6 +416,9 @@ class IndexingService : Service() {
                     var totalResampleMs = 0L
                     var totalMertMs = 0L
                     var numChunks = 0
+                    // Preserve the sub-window tail across decode chunks so only
+                    // the final whole-track tail may become a padded MERT window.
+                    var carrySamples = FloatArray(0)
 
                     windowsDone = 0
                     emitProgress("window 0/$expectedWindows")
@@ -434,9 +450,6 @@ class IndexingService : Service() {
                         totalResampleMs += audio24k.resampleMs
                         numChunks++
 
-                        val chunkWindows = mert.windowCount(audio24k.durationS)
-                        if (chunkWindows == 0) { chunkStart += chunkS; continue }
-
                         // Prefetch next track's first chunk during last chunk of this track
                         if (isLastChunk && !prefetchStarted) {
                             startPrefetch(nextCacheMiss(i + 1), chunkS)
@@ -446,8 +459,10 @@ class IndexingService : Service() {
                         // Stream MERT features to disk
                         val mertStart = System.nanoTime()
                         if (windowsDone == 0) currentTrackMertStart = mertStart
-                        val numExtracted = mert.extractFeaturesStreaming(
+                        val extraction = mert.extractFeaturesStreaming(
                             audio24k,
+                            carrySamples = carrySamples,
+                            flushTail = isLastChunk,
                             onFeatureExtracted = { feature ->
                                 writeBuf.clear()
                                 writeBuf.asFloatBuffer().put(feature)
@@ -457,6 +472,7 @@ class IndexingService : Service() {
                             onWindowDone = {
                                 windowsCompleted++
                                 windowsDone++
+                                growExpectedWindows(windowsDone, reason = "runtime")
                                 // Update EMA from within-track MERT windows. This gives
                                 // an ETA even during the first track (after ~3 windows).
                                 if (windowsDone >= 3) {
@@ -468,8 +484,9 @@ class IndexingService : Service() {
                                 emitProgress("window $windowsDone/$expectedWindows")
                             },
                         )
+                        carrySamples = extraction.carrySamples
                         totalMertMs += (System.nanoTime() - mertStart) / 1_000_000
-                        trackWindowsExtracted += numExtracted
+                        trackWindowsExtracted += extraction.windowsExtracted
                         chunkStart += chunkS
                     }
                     } finally {

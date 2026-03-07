@@ -127,9 +127,8 @@ class GraphUpdater(
 
         // Preload new track embeddings for reuse
         val newEmbs = Array(m) { j ->
-            index.getEmbeddingByTrackId(index.getTrackId(newTrackIndices[j]))!!
+            index.getEmbedding(newTrackIndices[j])
         }
-        val newIdxSet = newTrackIndices.toHashSet()
 
         val neighbors = Array(totalN) { IntArray(k) }
         val weights = Array(totalN) { FloatArray(k) }
@@ -142,46 +141,65 @@ class GraphUpdater(
             writeTopK(neighbors[ni], weights[ni], topK, idToIdx, k)
         }
 
-        // Step 2: Existing tracks — check M new candidates vs current K neighbors
-        var updatedCount = 0
+        // Step 2a: Existing tracks — seed each row with the old graph's K neighbors.
         val oldN = oldGraph.trackIds.size
+        val oldIndices = IntArray(oldN) { oi -> idToIdx[oldGraph.trackIds[oi]] ?: -1 }
+        val updatedByNew = BooleanArray(oldN)
+        val reuseEmb = FloatArray(index.dim)
+
         for (oi in 0 until oldN) {
             if (oi % 5000 == 0 && oi > 0) {
-                onProgress?.invoke("Checking existing: $oi/$oldN")
+                onProgress?.invoke("Preparing existing: $oi/$oldN")
             }
 
-            val trackId = oldGraph.trackIds[oi]
-            val idx = idToIdx[trackId] ?: continue
-            val emb = index.getEmbeddingByTrackId(trackId) ?: continue
+            val idx = oldIndices[oi]
+            if (idx < 0) continue
 
-            // Collect old neighbors with recomputed raw similarities
-            val candidates = ArrayList<Pair<Int, Float>>(k + m)
+            index.copyEmbedding(idx, reuseEmb)
+            var writePos = 0
             for (nid in oldGraph.neighborTrackIds[oi]) {
                 if (nid < 0L) continue
                 val nIdx = idToIdx[nid] ?: continue
-                candidates.add(nIdx to maxOf(index.dotProduct(emb, nIdx), 0f))
+                neighbors[idx][writePos] = nIdx
+                weights[idx][writePos] = maxOf(index.dotProduct(reuseEmb, nIdx), 0f)
+                writePos++
+                if (writePos == k) break
             }
-
-            // Add new tracks as candidates
-            for (j in 0 until m) {
-                val sim = index.dotProduct(emb, newTrackIndices[j])
-                if (sim > 0f) candidates.add(newTrackIndices[j] to sim)
-            }
-
-            // Select top-K from K+M candidates
-            candidates.sortByDescending { it.second }
-            val selected = candidates.take(k)
-            if (selected.any { it.first in newIdxSet }) updatedCount++
-
-            for (ki in selected.indices) {
-                neighbors[idx][ki] = selected[ki].first
-                weights[idx][ki] = selected[ki].second
-            }
-            for (ki in selected.size until k) {
+            for (ki in writePos until k) {
                 neighbors[idx][ki] = 0
                 weights[idx][ki] = 0f
             }
+            sortRowDescending(neighbors[idx], weights[idx], k)
+        }
+
+        // Step 2b: Stream each new track through the native allSimilarities() path.
+        val newProgressInterval = maxOf(m / 20, 1)
+        for (j in 0 until m) {
+            if ((j + 1) % newProgressInterval == 0 || j == 0 || j == m - 1) {
+                onProgress?.invoke("Checking new tracks: ${j + 1}/$m")
+            }
+
+            val newIdx = newTrackIndices[j]
+            val sims = index.computeAllSimilarities(newEmbs[j])
+            for (oi in 0 until oldN) {
+                val idx = oldIndices[oi]
+                if (idx < 0) continue
+
+                val sim = sims[idx]
+                if (sim <= 0f) continue
+                if (maybeInsertCandidate(neighbors[idx], weights[idx], newIdx, sim, k)) {
+                    updatedByNew[oi] = true
+                }
+            }
+        }
+
+        var updatedCount = 0
+        for (oi in 0 until oldN) {
+            val idx = oldIndices[oi]
+            if (idx < 0) continue
+            sortRowDescending(neighbors[idx], weights[idx], k)
             normalizeRow(weights[idx], k)
+            if (updatedByNew[oi]) updatedCount++
         }
 
         Log.i(TAG, "$updatedCount of $oldN existing nodes gained new neighbors")
@@ -271,7 +289,7 @@ class GraphUpdater(
             }
 
             val trackId = index.getTrackId(i)
-            val embedding = index.getEmbeddingByTrackId(trackId) ?: continue
+            val embedding = index.getEmbedding(i)
             val topK = index.findTopK(embedding, k, excludeIds = setOf(trackId))
             writeTopK(neighbors[i], weights[i], topK, idToIndex, k)
         }
@@ -319,6 +337,47 @@ class GraphUpdater(
         var sum = 0f
         for (j in 0 until k) sum += row[j]
         if (sum > 0f) for (j in 0 until k) row[j] /= sum
+    }
+
+    /** Replace the weakest candidate when a better score arrives. */
+    private fun maybeInsertCandidate(
+        neighborsRow: IntArray,
+        weightsRow: FloatArray,
+        neighborIdx: Int,
+        score: Float,
+        k: Int
+    ): Boolean {
+        var minPos = 0
+        var minScore = weightsRow[0]
+        for (j in 1 until k) {
+            if (weightsRow[j] < minScore) {
+                minScore = weightsRow[j]
+                minPos = j
+            }
+        }
+        if (score <= minScore) return false
+        neighborsRow[minPos] = neighborIdx
+        weightsRow[minPos] = score
+        return true
+    }
+
+    /** K is tiny, so a simple in-place sort keeps rows ordered by descending score. */
+    private fun sortRowDescending(neighborsRow: IntArray, weightsRow: FloatArray, k: Int) {
+        for (i in 0 until k - 1) {
+            var best = i
+            for (j in i + 1 until k) {
+                if (weightsRow[j] > weightsRow[best]) best = j
+            }
+            if (best == i) continue
+
+            val tmpNeighbor = neighborsRow[i]
+            neighborsRow[i] = neighborsRow[best]
+            neighborsRow[best] = tmpNeighbor
+
+            val tmpWeight = weightsRow[i]
+            weightsRow[i] = weightsRow[best]
+            weightsRow[best] = tmpWeight
+        }
     }
 
     /**

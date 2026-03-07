@@ -32,13 +32,18 @@ import java.io.File
  * Standalone benchmark activity for testing CLaMP3 TFLite inference on-device.
  *
  * Runs MERT + CLaMP3 audio encoder on a few Poweramp tracks, reports timing,
- * and saves full embeddings as JSON for desktop comparison.
+ * and saves embeddings as JSON for desktop comparison. `max_duration_s=0`
+ * means full-track mode, which uses the same chunk-stitched extraction path
+ * as on-device indexing instead of the older truncated benchmark path.
  *
  * Launch via:
  *   adb shell am start -n com.powerampstartradio/.benchmark.BenchmarkActivity
  *
  * Auto-start via adb (no UI interaction needed):
  *   adb shell am start -n com.powerampstartradio/.benchmark.BenchmarkActivity --ez auto_start true
+ *
+ * Full-track auto-start:
+ *   adb shell am start -n com.powerampstartradio/.benchmark.BenchmarkActivity --ez auto_start true --ei max_duration_s 0
  *
  * Pull results via:
  *   adb shell run-as com.powerampstartradio cat files/benchmark_results.json
@@ -334,6 +339,8 @@ class BenchmarkActivity : ComponentActivity() {
         log("SOC: ${Build.SOC_MODEL}")
         log("Requested accelerator: $accelerator")
         log("Resample quality: $qualityName")
+        val benchmarkMaxDurationS = intent.getIntExtra("max_duration_s", 0)
+        log("Max duration: ${if (benchmarkMaxDurationS > 0) "${benchmarkMaxDurationS}s cap" else "full track"}")
         log("")
 
         // Discover tracks from Poweramp
@@ -416,45 +423,83 @@ class BenchmarkActivity : ComponentActivity() {
 
             val audioFile = resolveFile(track.path)!!
             try {
-                val decodeStart = System.nanoTime()
-                val audio = decoder.decode(
-                    audioFile, MertInference.SAMPLE_RATE,
-                    maxDurationS = MertInference.CHUNK_DURATION_S,
-                    resampleQuality = resampleQuality,
-                )
-                val totalDecodeMs = (System.nanoTime() - decodeStart) / 1_000_000
-                if (audio == null) { log("  Decode failed"); continue }
-                log("  Audio: ${audio.durationS}s @ ${audio.sampleRate}Hz (decode: ${audio.decodeMs}ms, resample: ${audio.resampleMs}ms)")
-
                 val features = mutableListOf<FloatArray>()
                 val perWindowMs = mutableListOf<Long>()
-                var lastWindowEndNs = 0L
-                val inferStart = System.nanoTime()
-                lastWindowEndNs = inferStart
+                var lastWindowEndNs = System.nanoTime()
                 var mertNanWindows = 0
-                val numWindows = mertInference.extractFeaturesStreaming(
-                    audio,
-                    onFeatureExtracted = { feat ->
-                        features.add(feat.copyOf())
-                        // Check for NaN/Inf in MERT output
-                        val nanCount = feat.count { it.isNaN() }
-                        val infCount = feat.count { it.isInfinite() }
-                        if (nanCount > 0 || infCount > 0) {
-                            mertNanWindows++
-                            if (mertNanWindows <= 3) {
-                                Log.w(TAG, "MERT window ${features.size}: $nanCount NaN, $infCount Inf")
+                var carrySamples = FloatArray(0)
+                var totalDecodeMs = 0L
+                var totalResampleMs = 0L
+                var totalMertMs = 0L
+                var chunkCount = 0
+
+                val trackDurationS = (track.durationMs / 1000L).toInt()
+                val targetDurationS = if (benchmarkMaxDurationS > 0) {
+                    minOf(trackDurationS, benchmarkMaxDurationS)
+                } else {
+                    trackDurationS
+                }
+                if (targetDurationS <= 0) {
+                    log("  Audio too short")
+                    continue
+                }
+
+                var chunkStartS = 0
+                while (chunkStartS < targetDurationS || chunkStartS == 0) {
+                    val remainingS = targetDurationS - chunkStartS
+                    val chunkDurationS = minOf(MertInference.CHUNK_DURATION_S, remainingS)
+                    val isLastChunk = chunkStartS + chunkDurationS >= targetDurationS
+
+                    val audio = decoder.decode(
+                        audioFile,
+                        MertInference.SAMPLE_RATE,
+                        maxDurationS = chunkDurationS,
+                        startTimeS = chunkStartS,
+                        resampleQuality = resampleQuality,
+                    )
+                    if (audio == null || audio.samples.isEmpty()) {
+                        log("  Decode failed at chunk ${chunkCount + 1}")
+                        break
+                    }
+
+                    totalDecodeMs += audio.decodeMs
+                    totalResampleMs += audio.resampleMs
+                    chunkCount++
+
+                    val inferStart = System.nanoTime()
+                    // Keep benchmark windowing identical to indexing so quality
+                    // validation catches chunk-boundary regressions too.
+                    val extraction = mertInference.extractFeaturesStreaming(
+                        audio,
+                        carrySamples = carrySamples,
+                        flushTail = isLastChunk,
+                        onFeatureExtracted = { feat ->
+                            features.add(feat.copyOf())
+                            val nanCount = feat.count { it.isNaN() }
+                            val infCount = feat.count { it.isInfinite() }
+                            if (nanCount > 0 || infCount > 0) {
+                                mertNanWindows++
+                                if (mertNanWindows <= 3) {
+                                    Log.w(TAG, "MERT window ${features.size}: $nanCount NaN, $infCount Inf")
+                                }
                             }
-                        }
-                    },
-                    onWindowDone = {
-                        val now = System.nanoTime()
-                        perWindowMs.add((now - lastWindowEndNs) / 1_000_000)
-                        lastWindowEndNs = now
-                    },
-                )
-                val mertMs = (System.nanoTime() - inferStart) / 1_000_000
+                        },
+                        onWindowDone = {
+                            val now = System.nanoTime()
+                            perWindowMs.add((now - lastWindowEndNs) / 1_000_000)
+                            lastWindowEndNs = now
+                        },
+                    )
+                    totalMertMs += (System.nanoTime() - inferStart) / 1_000_000
+                    carrySamples = extraction.carrySamples
+                    chunkStartS += chunkDurationS
+                }
+
+                val numWindows = features.size
+                val mertMs = totalMertMs
                 val avgMs = if (numWindows > 0) mertMs / numWindows else 0
 
+                log("  Audio: ${targetDurationS}s @ ${MertInference.SAMPLE_RATE}Hz (${chunkCount} chunk(s), decode=${totalDecodeMs}ms, resample=${totalResampleMs}ms)")
                 log("  $numWindows windows: total=${mertMs}ms, avg=${avgMs}ms/win")
                 if (perWindowMs.isNotEmpty()) {
                     log("  per-window: min=${perWindowMs.min()}ms, max=${perWindowMs.max()}ms")
@@ -469,8 +514,15 @@ class BenchmarkActivity : ComponentActivity() {
                     val fAbsMax = f0.maxOf { kotlin.math.abs(it) }
                     log("  MERT features OK: min=${"%.4f".format(fMin)}, max=${"%.4f".format(fMax)}, absmax=${"%.4f".format(fAbsMax)}")
                 }
-                allFeatures[i] = TrackFeatures(features, audio.decodeMs, audio.resampleMs, mertMs, perWindowMs.toList(), audio.durationS)
-                results[i].durationS = audio.durationS
+                allFeatures[i] = TrackFeatures(
+                    features,
+                    totalDecodeMs,
+                    totalResampleMs,
+                    mertMs,
+                    perWindowMs.toList(),
+                    targetDurationS.toFloat(),
+                )
+                results[i].durationS = targetDurationS.toFloat()
             } catch (e: Throwable) {
                 log("  ERROR: ${e.javaClass.simpleName}: ${e.message}")
             }

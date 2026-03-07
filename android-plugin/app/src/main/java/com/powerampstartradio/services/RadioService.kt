@@ -43,6 +43,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
@@ -115,17 +116,19 @@ class RadioService : Service() {
 
         fun initHistory(filesDir: File) {
             historyDir = filesDir
-            try {
-                val file = File(filesDir, HISTORY_FILE)
-                if (file.exists()) {
-                    val json = file.readText()
-                    val loaded: List<RadioResult> = gson.fromJson(json, historyType) ?: emptyList()
-                    _sessionHistory.value = loaded.takeLast(MAX_SESSIONS)
-                    Log.d(TAG, "Loaded ${_sessionHistory.value.size} sessions from disk")
+            saveScope.launch {
+                try {
+                    val file = File(filesDir, HISTORY_FILE)
+                    if (file.exists()) {
+                        val json = file.readText()
+                        val loaded: List<RadioResult> = gson.fromJson(json, historyType) ?: emptyList()
+                        _sessionHistory.value = loaded.takeLast(MAX_SESSIONS)
+                        Log.d(TAG, "Loaded ${_sessionHistory.value.size} sessions from disk")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to load session history", e)
+                    _sessionHistory.value = emptyList()
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to load session history", e)
-                _sessionHistory.value = emptyList()
             }
         }
 
@@ -609,8 +612,13 @@ class RadioService : Service() {
                         return@launch
                     }
 
+                    _uiState.value = RadioUiState.Searching("Matching tracks to Poweramp...")
+                    updateNotification("Matching tracks to Poweramp...")
+
                     val tMap = System.nanoTime()
-                    val mappedTracks = matcher.mapSimilarTracksToFileIds(this@RadioService, similarTracks)
+                    val mappedTracks = withContext(Dispatchers.IO) {
+                        matcher.mapSimilarTracksToFileIds(this@RadioService, similarTracks)
+                    }
                     val fileIds = mappedTracks.mapNotNull { it.fileId }
                     val mapMs = (System.nanoTime() - tMap) / 1_000_000
                     Log.d(TAG, "Track mapping: ${similarTracks.size} → ${fileIds.size} file IDs in ${mapMs}ms")
@@ -633,8 +641,12 @@ class RadioService : Service() {
                     }
 
                     val queueCurrentId = textSearchQueueAnchorId ?: seedDisplayTrack.realId
+                    _uiState.value = RadioUiState.Searching("Queueing in Poweramp...")
+                    updateNotification("Queueing in Poweramp...")
                     val tQueue = System.nanoTime()
-                    val queuedCount = PowerampHelper.replaceQueue(this@RadioService, queueCurrentId, allFileIds)
+                    val queuedCount = withContext(Dispatchers.IO) {
+                        PowerampHelper.replaceQueue(this@RadioService, queueCurrentId, allFileIds)
+                    }
                     val queueMs = (System.nanoTime() - tQueue) / 1_000_000
                     Log.d(TAG, "Poweramp queue: ${queuedCount}/${allFileIds.size} queued in ${queueMs}ms")
                     val queuedFileIds = allFileIds.take(queuedCount).toSet()
@@ -745,8 +757,13 @@ class RadioService : Service() {
                     return@launch
                 }
 
+                _uiState.value = RadioUiState.Searching("Matching tracks to Poweramp...")
+                updateNotification("Matching tracks to Poweramp...")
+
                 // Map to Poweramp file IDs
-                val mappedTracks = matcher.mapSimilarTracksToFileIds(this@RadioService, similarTracks)
+                val mappedTracks = withContext(Dispatchers.IO) {
+                    matcher.mapSimilarTracksToFileIds(this@RadioService, similarTracks)
+                }
                 val fileIds = mappedTracks.mapNotNull { it.fileId }
 
                 if (fileIds.isEmpty()) {
@@ -775,7 +792,12 @@ class RadioService : Service() {
                 val queueAnchorId = if (currentInQueue) currentTrack!!.realId else null
                 val queueCurrentId = queueAnchorId ?: (currentTrack?.realId ?: -1L)
 
-                val queuedCount = PowerampHelper.replaceQueue(this@RadioService, queueCurrentId, fileIds)
+                _uiState.value = RadioUiState.Searching("Queueing in Poweramp...")
+                updateNotification("Queueing in Poweramp...")
+
+                val queuedCount = withContext(Dispatchers.IO) {
+                    PowerampHelper.replaceQueue(this@RadioService, queueCurrentId, fileIds)
+                }
                 val queuedFileIds = fileIds.take(queuedCount).toSet()
 
                 val trackResults = mappedTracks.map { mapped ->

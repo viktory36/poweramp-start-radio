@@ -1,96 +1,210 @@
-# Android Plugin (WSL Build)
+# Android App
 
-This project can be built inside WSL without Android Studio by bootstrapping a local toolchain.
+This directory contains the Android side of Poweramp Start Radio.
 
-## One-time setup
+The app is not just a thin remote control for Poweramp. It has its own recommendation engine, text search path, session history, track-management UI, and on-device indexing pipeline.
+
+## What The App Does
+
+The current app supports:
+
+1. single-seed radio from the current Poweramp track
+2. text search in the shared CLaMP3 audio-text embedding space
+3. multi-seed search and multi-seed radio
+4. on-device indexing for tracks that exist in Poweramp but are missing from `embeddings.db`
+5. benchmark and debug entry points for validation
+
+## Runtime Files In `filesDir`
+
+The app expects or produces the following files in its internal storage.
+
+### Required
+
+- `embeddings.db`
+  - canonical database produced on desktop and consumed on Android
+
+### Derived on phone
+
+- `clamp3.emb`
+  - mmap dump extracted from `embeddings.db` for fast embedding scans
+- `graph.bin`
+  - mmap dump of the kNN graph used by Random Walk
+
+### Optional, only if you want the corresponding feature
+
+- `mert.tflite`
+  - required for on-device indexing
+- `clamp3_audio.tflite`
+  - required for on-device indexing
+- `clamp3_text.tflite`
+  - required for text search on phone
+- `xlm_roberta_vocab.json`
+  - required for text search on phone
+
+## Build In WSL
+
+### One-time setup
 
 ```bash
 cd android-plugin
 ./scripts/setup-wsl-android-env.sh
 ```
 
-This installs (under `~/.local/share/poweramp-start-radio/`):
-- JDK 17
-- Gradle 8.13 distribution
-- Android cmdline-tools + SDK packages (`platforms;android-34`, `build-tools;34.0.0`, `platform-tools`)
+This installs a local Android toolchain and writes:
 
-It also creates:
-- `android-plugin/local.properties`
-- `android-plugin/.android-wsl-env`
-- `android-plugin/gradlew` + `android-plugin/gradle/wrapper/gradle-wrapper.jar`
+- `local.properties`
+- `.android-wsl-env`
+- the Gradle wrapper if it is missing
 
-## Build
-
-```bash
-cd android-plugin
-source .android-wsl-env
-./gradlew --no-daemon :app:assembleDebug
-```
-
-Or use:
+### Build and install
 
 ```bash
 cd android-plugin
 ./scripts/build-wsl.sh
 ```
 
-## On-Device Indexing Setup
+`build-wsl.sh` runs `:app:assembleDebug` and installs the APK automatically if `adb` sees a device.
 
-On-device indexing lets the phone generate CLaMP3 embeddings for new tracks without the desktop. It requires TFLite models pushed to the app's internal storage.
+## Deploy Data To The App
 
-### 1. Export TFLite models from PyTorch
-
-```bash
-cd desktop-indexer
-
-# Install export dependencies (litert-torch is picky about versions)
-pip install litert-torch==0.8.0 --no-deps
-pip install jax torch_xla2 ai-edge-quantizer immutabledict --no-deps
-
-# Export MERT and CLaMP3 audio encoder
-python -m poweramp_indexer.export_litert all
-# Outputs to desktop-indexer/models/:
-#   mert.tflite            (~1838 MB, FP32)
-#   clamp3_audio.tflite    (~TBD MB, FP32)
-```
-
-### 2. Convert to FP16 (halves size, lossless for GPU)
+### Push the desktop database
 
 ```bash
-python scripts/convert_fp16.py models/mert.tflite
-python scripts/convert_fp16.py models/clamp3_audio.tflite
-# Outputs: *_fp16.tflite variants
-```
-
-### 3. Push to phone
-
-The app looks for models in its `filesDir`. With the app installed:
-
-```bash
-# Push FP16 models
-adb push models/mert_fp16.tflite /data/local/tmp/
-adb push models/clamp3_audio_fp16.tflite /data/local/tmp/
-
-# Move into app storage (requires run-as or root)
-adb shell run-as com.powerampstartradio cp /data/local/tmp/mert_fp16.tflite files/
-adb shell run-as com.powerampstartradio cp /data/local/tmp/clamp3_audio_fp16.tflite files/
-
-# Also push the embedding database if not already on the phone
 adb push embeddings.db /data/local/tmp/
 adb shell run-as com.powerampstartradio cp /data/local/tmp/embeddings.db files/
-
-# Clean up temp files
-adb shell rm /data/local/tmp/*.tflite /data/local/tmp/embeddings.db
+adb shell rm /data/local/tmp/embeddings.db
 ```
 
-The app auto-detects `_fp16` variants and prefers them over FP32.
+### Push on-device indexing models
 
-### 4. Index new tracks
+```bash
+for f in mert.tflite clamp3_audio.tflite; do
+  adb push "../desktop-indexer/models/$f" /data/local/tmp/
+  adb shell run-as com.powerampstartradio cp "/data/local/tmp/$f" files/
+  adb shell rm "/data/local/tmp/$f"
+done
+```
 
-Open the app → Settings → **Manage Tracks**. The app compares the Poweramp library against the embedding database and shows unindexed tracks. Select tracks and press Start.
+### Push text-search assets
 
-CLaMP3 pipeline: MERT (feature extraction) → CLaMP3 audio encoder (768d embedding).
+```bash
+for f in clamp3_text.tflite xlm_roberta_vocab.json; do
+  adb push "../desktop-indexer/models/$f" /data/local/tmp/
+  adb shell run-as com.powerampstartradio cp "/data/local/tmp/$f" files/
+  adb shell rm "/data/local/tmp/$f"
+done
+```
 
-Typical timing on Snapdragon 8 Gen 3 (Adreno 740 GPU):
-- Two-phase GPU pipeline (Adreno can't run two OpenCL TFLite contexts simultaneously)
-- GPU model load: ~4–7s JIT compilation (once per session)
+## Product Behavior Notes
+
+### Recommendation modes
+
+- `MMR`
+  - stays close to the current query while penalizing overlap with the single most-similar chosen result
+- `DPP`
+  - re-scores each candidate against the chosen set as a whole
+- `Random Walk`
+  - follows a precomputed graph instead of scoring against the seed embedding directly at runtime
+
+### Drift
+
+- drift is meaningful only on the sequential embedding-scan path
+- the engine disables drift when `DPP` is selected
+- the UI treats drift as not applicable to `Random Walk`
+
+### Text search
+
+- text and audio share the same CLaMP3 embedding space
+- the text model currently falls back to CPU in practice because its graph uses INT64 ops that the GPU path does not handle cleanly
+
+### On-device indexing
+
+- indexing runs in two GPU phases because the device cannot keep both audio models active in the way the app needs
+- chunked decoding preserves `5s` MERT window alignment across chunk boundaries
+- only the final tail of the whole track may become a padded partial window
+
+## Benchmarks And Debugging
+
+### Audio benchmark
+
+The benchmark activity is the best built-in way to validate on-device embedding quality.
+
+Run a full-track benchmark:
+
+```bash
+adb shell am start -n com.powerampstartradio/.benchmark.BenchmarkActivity \
+  --ez auto_start true --ei max_duration_s 0
+```
+
+Pull the result JSON:
+
+```bash
+adb shell run-as com.powerampstartradio cat files/benchmark_results.json > /tmp/benchmark_results.json
+```
+
+Recent full-track validation against the desktop DB passes with mean cosine around `0.9955`.
+
+### Text benchmark
+
+```bash
+adb shell am start -n com.powerampstartradio/.benchmark.BenchmarkActivity \
+  --ez auto_start true --es benchmark_type text
+```
+
+### Matching diagnostics
+
+```bash
+adb shell am start -n com.powerampstartradio/.benchmark.BenchmarkActivity \
+  --ez auto_start true --es benchmark_type diagnose
+```
+
+### Debug radio receiver
+
+```bash
+adb shell am broadcast -a com.powerampstartradio.DEBUG_START_RADIO \
+  -n com.powerampstartradio/.debug.DebugRadioReceiver \
+  --es selection_mode MMR --ef diversity_lambda 0.4 --ei num_tracks 30
+```
+
+### Debug multi-seed receiver
+
+```bash
+adb shell am broadcast -a com.powerampstartradio.DEBUG_MULTI_SEED \
+  -n com.powerampstartradio/.debug.DebugMultiSeedReceiver \
+  --es song1 "artist title" --ef weight1 1.0 --ei top_k 10
+```
+
+Lookup-only mode for finding seed names:
+
+```bash
+adb shell am broadcast -a com.powerampstartradio.DEBUG_MULTI_SEED \
+  -n com.powerampstartradio/.debug.DebugMultiSeedReceiver \
+  --es lookup "partial artist or title"
+```
+
+## Code Map
+
+If you are trying to understand the app, start with these files.
+
+- `app/src/main/java/com/powerampstartradio/MainActivity.kt`
+  - main Compose UI
+- `app/src/main/java/com/powerampstartradio/ui/MainViewModel.kt`
+  - settings, text search, multi-seed state, import flow
+- `app/src/main/java/com/powerampstartradio/services/RadioService.kt`
+  - foreground service orchestrating radio startup, queueing, and session history
+- `app/src/main/java/com/powerampstartradio/similarity/RecommendationEngine.kt`
+  - recommendation core
+- `app/src/main/java/com/powerampstartradio/poweramp/TrackMatcher.kt`
+  - resolves Poweramp tracks against the embedding database
+- `app/src/main/java/com/powerampstartradio/indexing/IndexingService.kt`
+  - on-device indexing pipeline
+- `app/src/main/java/com/powerampstartradio/benchmark/BenchmarkActivity.kt`
+  - audio, text, and matching benchmarks
+
+## Common Failure Modes
+
+- stale or missing `graph.bin` after a desktop DB update
+- missing `clamp3_text.tflite` or vocab for text search
+- missing audio models for on-device indexing
+- mismatched Poweramp metadata causing track resolution misses
+- comparing truncated benchmark audio against full-track desktop embeddings

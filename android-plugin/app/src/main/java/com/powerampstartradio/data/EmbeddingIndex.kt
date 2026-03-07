@@ -302,15 +302,32 @@ class EmbeddingIndex private constructor(
     }
 
     /**
+     * Copy the embedding at a given internal index into [out].
+     */
+    fun copyEmbedding(index: Int, out: FloatArray) {
+        require(index in 0 until numTracks) { "Index out of range: $index" }
+        require(out.size >= dim) { "Output buffer too small: ${out.size} < $dim" }
+
+        val offset = (embeddingsOffset + index.toLong() * dim * 4).toInt()
+        for (d in 0 until dim) {
+            out[d] = buffer.getFloat(offset + d * 4)
+        }
+    }
+
+    /**
+     * Get the embedding at a given internal index.
+     */
+    fun getEmbedding(index: Int): FloatArray {
+        val result = FloatArray(dim)
+        copyEmbedding(index, result)
+        return result
+    }
+
+    /**
      * Get the embedding for a specific track ID, or null if not found.
      */
     fun getEmbeddingByTrackId(trackId: Long): FloatArray? {
         val index = trackIdToIndex[trackId] ?: return null
-        val offset = (embeddingsOffset + index.toLong() * dim * 4).toInt()
-        val result = FloatArray(dim)
-        for (d in 0 until dim) {
-            result[d] = buffer.getFloat(offset + d * 4)
-        }
-        return result
+        return getEmbedding(index)
     }
 }

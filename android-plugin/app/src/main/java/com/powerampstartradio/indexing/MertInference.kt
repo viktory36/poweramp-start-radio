@@ -34,8 +34,9 @@ class MertInference(
         const val FEATURE_DIM = 768
         /** Max audio duration per decode chunk in seconds.
          *  Longer tracks are decoded in multiple chunks to bound memory.
-         *  Each chunk is processed independently — MERT windows are identical
-         *  regardless of chunking. 120s keeps peak memory ~33 MB. */
+         *  Chunk boundaries are stitched with carry-over samples so MERT
+         *  windows stay aligned to the whole track. 120s keeps peak memory
+         *  ~33 MB. */
         const val CHUNK_DURATION_S = 120
 
         /**
@@ -66,6 +67,11 @@ class MertInference(
 
     /** Which accelerator is actually in use (may differ from requested if fallback occurred). */
     val activeAccelerator: Accelerator
+
+    data class ExtractionResult(
+        val windowsExtracted: Int,
+        val carrySamples: FloatArray,
+    )
 
     // Pre-allocated buffer for one 5s window (reused across all windows)
     private val windowBuffer = FloatArray(WINDOW_SAMPLES)
@@ -101,33 +107,49 @@ class MertInference(
      * (disk spill for two-phase GPU, or in-memory for small batches).
      *
      * @param audio Decoded audio at 24kHz
+     * @param carrySamples Unprocessed tail samples from the previous decode chunk
+     * @param flushTail Whether to emit a final zero-padded tail window for this call
      * @param onFeatureExtracted Callback with 768d feature vector per window
      * @param onWindowDone Optional callback for progress tracking (called after each window)
-     * @return Number of successfully processed windows (0 = failure)
+     * @return Extracted windows plus any carry-over tail for the next chunk
      */
     fun extractFeaturesStreaming(
         audio: AudioDecoder.DecodedAudio,
+        carrySamples: FloatArray = FloatArray(0),
+        flushTail: Boolean = true,
         onFeatureExtracted: (FloatArray) -> Unit,
         onWindowDone: (() -> Unit)? = null,
-    ): Int {
+    ): ExtractionResult {
         require(audio.sampleRate == SAMPLE_RATE) {
             "MERT requires ${SAMPLE_RATE}Hz audio, got ${audio.sampleRate}Hz"
         }
 
-        val fullWindows = audio.samples.size / WINDOW_SAMPLES
-        val remainingSamples = audio.samples.size % WINDOW_SAMPLES
-        // Match desktop: zero-pad partial tail windows >= 1 second, discard < 1 second
-        val hasPartial = remainingSamples >= SAMPLE_RATE
+        val samples = if (carrySamples.isEmpty()) {
+            audio.samples
+        } else {
+            FloatArray(carrySamples.size + audio.samples.size).also { merged ->
+                System.arraycopy(carrySamples, 0, merged, 0, carrySamples.size)
+                System.arraycopy(audio.samples, 0, merged, carrySamples.size, audio.samples.size)
+            }
+        }
+
+        val fullWindows = samples.size / WINDOW_SAMPLES
+        val remainingSamples = samples.size % WINDOW_SAMPLES
+        // Match desktop: only the final tail of the whole track may be zero-padded.
+        val hasPartial = flushTail && remainingSamples >= SAMPLE_RATE
         val numWindows = fullWindows + if (hasPartial) 1 else 0
 
         if (numWindows == 0) {
-            Log.w(TAG, "Audio too short (${audio.durationS}s < 1s)")
-            return 0
+            if (flushTail) {
+                Log.w(TAG, "Audio too short (${audio.durationS}s < 1s)")
+                return ExtractionResult(0, FloatArray(0))
+            }
+            return ExtractionResult(0, samples)
         }
 
         // Per-track zero-mean unit-variance normalization
         // (matches Wav2Vec2FeatureExtractor(do_normalize=True) on desktop)
-        normalizeAudio(audio.samples)
+        normalizeAudio(samples)
 
         var count = 0
         var totalInferMs = 0L
@@ -137,9 +159,9 @@ class MertInference(
             if (w == fullWindows && hasPartial) {
                 // Partial last window: zero-pad to WINDOW_SAMPLES (matches desktop)
                 windowBuffer.fill(0f)
-                System.arraycopy(audio.samples, startSample, windowBuffer, 0, remainingSamples)
+                System.arraycopy(samples, startSample, windowBuffer, 0, remainingSamples)
             } else {
-                System.arraycopy(audio.samples, startSample, windowBuffer, 0, WINDOW_SAMPLES)
+                System.arraycopy(samples, startSample, windowBuffer, 0, WINDOW_SAMPLES)
             }
 
             val feature = runInference(windowBuffer) { inferMs ->
@@ -152,10 +174,18 @@ class MertInference(
             onWindowDone?.invoke()
         }
 
-        Log.i(TAG, "TIMING: mert $numWindows windows${if (hasPartial) " (last zero-padded)" else ""}: " +
+        val carry = if (!flushTail && remainingSamples > 0) {
+            samples.copyOfRange(fullWindows * WINDOW_SAMPLES, samples.size)
+        } else {
+            FloatArray(0)
+        }
+
+        Log.i(TAG, "TIMING: mert $numWindows windows" +
+            "${if (hasPartial) " (last zero-padded)" else ""}" +
+            "${if (carry.isNotEmpty()) " (+${carry.size} carry samples)" else ""}: " +
             "inference=${totalInferMs}ms, ${if (numWindows > 0) totalInferMs / numWindows else 0}ms/window")
 
-        return count
+        return ExtractionResult(count, carry)
     }
 
     /**

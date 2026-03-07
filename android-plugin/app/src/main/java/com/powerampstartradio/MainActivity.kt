@@ -1411,7 +1411,7 @@ fun SettingsScreen(
                 Column(modifier = Modifier.selectableGroup()) {
                     AlgorithmOption(
                         label = "Maximum Marginal Relevance (MMR)",
-                        description = "Scores every candidate by similarity to the seed minus an adjustable penalty for sounding too similar to whichever single track in the queue it most resembles.",
+                        description = "Starts with tracks closest to the current search, then re-scores them one by one. A candidate keeps its relevance, but is penalized when it overlaps too much with the single chosen track it most resembles.",
                         preview = previews[SelectionMode.MMR],
                         isLoading = SelectionMode.MMR in previewsLoading,
                         selected = selectionMode == SelectionMode.MMR,
@@ -1423,7 +1423,7 @@ fun SettingsScreen(
                     )
                     AlgorithmOption(
                         label = "Determinantal Point Process (DPP)",
-                        description = "Scores every candidate by similarity to the seed minus a penalty for sounding like anything already in the queue. Unlike MMR, the penalty accounts for every similar track already picked, not just the closest one. The more a particular sound is represented in the queue, the harder it becomes to add more of it.",
+                        description = "Starts with tracks closest to the current search, then re-scores each remaining candidate against the chosen set as a whole. When several chosen tracks already sit in the same local neighborhood, another very similar track ranks lower for the next slot.",
                         preview = previews[SelectionMode.DPP],
                         isLoading = SelectionMode.DPP in previewsLoading,
                         selected = selectionMode == SelectionMode.DPP,
@@ -1434,7 +1434,7 @@ fun SettingsScreen(
                     )
                     AlgorithmOption(
                         label = "Random Walk",
-                        description = "Sends 10,000 random walks through a K=5 similarity graph starting from the seed. Each walk follows one neighbor at a time, discovering chains of similarity. Surfaces tracks connected through intermediate links, even if not directly similar to the seed." +
+                        description = "Starts at the seed and follows local similarity links from track to track. A track can rise because many paths reach it through intermediate connections, not just because it is one of the seed's closest direct matches." +
                             if (databaseInfo?.hasGraph != true) " (requires similarity graph in database)" else "",
                         preview = previews[SelectionMode.RANDOM_WALK],
                         isLoading = SelectionMode.RANDOM_WALK in previewsLoading,

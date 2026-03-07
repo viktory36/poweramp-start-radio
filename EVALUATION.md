@@ -1,155 +1,133 @@
-# Evaluation Report
+# Validation Notes
 
-Comprehensive audit of all features — recommendation modes, text search, on-device indexing, and track matching. All data collected from a Sony XQ-EC72 (Snapdragon 8 Gen 3, Adreno 740) with 75,035 indexed tracks (74,288 desktop + 747 on-device).
+This file documents how the project is validated today and records the latest benchmark snapshot that is still representative of the current code.
 
-## Recommendation Modes
+It is intentionally not a grab-bag of timeless performance claims. If the code changes, rerun the commands below.
 
-Controlled experiments: same seed track, 30 tracks requested, only one parameter varied at a time. Seed: My Terrible Friend - Almost Gone (pop/electronic).
+## What To Validate
 
-### MMR (Maximal Marginal Relevance)
+When changing the audio or indexing stack, there are two questions:
 
-Lambda controls the relevance/diversity tradeoff. Higher lambda = more relevance, lower = more diversity.
+1. Do the on-device embeddings still agree with the desktop reference?
+2. Does chunked on-device extraction preserve the desktop windowing rule?
 
-| Lambda | Tracks | Artists | Sim Range | Mean Sim |
-|--------|--------|---------|-----------|----------|
-| 0.3    | 30     | 30      | 62-88%    | 66.1%    |
-| 0.6    | 28     | 22      | 75-88%    | 82.3%    |
-| 0.9    | 28     | 20      | 81-88%    | 83.3%    |
+Those are separate checks and both matter.
 
-- Lambda 0.3: Maximum diversity — 30 unique artists out of 30 tracks, wide similarity range
-- Lambda 0.9: Maximum relevance — tightest cluster (6.7% range), 20 artists
-- The slider produces a smooth, predictable gradient between exploration and focus
+## Current Verified Snapshot
 
-### DPP (Determinantal Point Process)
+Device used for the latest verified run:
 
-| Tracks | Artists | Sim Range | Mean Sim |
-|--------|---------|-----------|----------|
-| 30     | 29      | 62-88%    | 69.8%    |
+- Sony XQ-EC72
+- Snapdragon 8 Gen 3 / Adreno 740
+- Android 16 (SDK 36)
 
-- Maximizes list-wise diversity via greedy MAP with incremental Cholesky
-- 29 unique artists — comparable to MMR at lambda=0.3
-- Better quality floor than MMR-0.3: pulls fewer low-similarity outliers
-- DPP selection takes ~263ms vs MMR's ~127ms (2x, due to Cholesky updates)
+Date of the snapshot in this file:
 
-### Random Walk (Monte Carlo)
+- March 7, 2026
 
-10,000 random walks on a K=5 kNN graph with terminal-only counting and non-backtracking. Alpha = restart probability. Higher alpha = returns to seed more often (shorter walks).
+## Full-Track On-Device Audio Benchmark
 
-| Alpha | Tracks | Artists | Sim Range | Mean Sim | Hop Distribution |
-|-------|--------|---------|-----------|----------|-----------------|
-| 0.95  | 22     | 16      | 73-88%    | 81.2%    | 1:4, 2:11, 3:7  |
-| 0.50  | 30     | 21      | 69-88%    | 80.4%    | 1:4, 2:11, 3:15 |
-| 0.05  | 29     | 21      | 43-88%    | 78.3%    | 1:4, 2:8, 3:8, 4:6, 6:2, 9:1 |
+Use the full-track benchmark, not a capped `120s` run, when comparing device embeddings to the desktop database.
 
-- Replaced Personalized PageRank (power iteration), which produced near-identical results at all alpha values
-- K reduced from 20 to 5 to increase graph diameter and enable genuine exploration
-- Alpha now has clear effect: 0.05 reaches hop 9 with sim floor 43%, 0.95 stays within hop 3
-- Alpha 0.95 produces fewer tracks (22 vs 30) because short walks on K=5 have limited unique terminals
-- Stochastic: each run gives slightly different results
-- Walk computation: <10ms for 10,000 walks
+### Run benchmark on device
 
-### Drift Mode
+```bash
+adb shell am start -n com.powerampstartradio/.benchmark.BenchmarkActivity \
+  --ez auto_start true --ei max_duration_s 0
+```
 
-Drift modifies the query at each step, causing the playlist to progressively explore away from the seed.
+### Pull benchmark JSON
 
-| Drift Mode         | Tracks | Artists | Sim Range | Mean Sim |
-|-------------------|--------|---------|-----------|----------|
-| Seed Interpolation | 30     | 30      | 60-88%    | 74.3%    |
-| Momentum          | 30     | 29      | 57-88%    | 72.1%    |
+```bash
+adb shell run-as com.powerampstartradio cat files/benchmark_results.json > /tmp/benchmark_results.json
+```
 
-- **Seed Interpolation** (anchor=0.5): Gradually blends seed with each result. Smooth, controlled exploration with 28.3% similarity range.
-- **Momentum** (beta=0.7): EMA-based query evolution. More aggressive — similarity drops to 57%, widest range (30.7%).
-- Both achieve 29-30 unique artists — drift inherently prevents artist clustering.
-- Drift takes ~2.5s (30 sequential selection steps) vs ~300ms for batch modes.
+### Validate against the desktop database
 
-### Post-Filter (Artist Constraints)
+```bash
+python3 desktop-indexer/scripts/validate_benchmark.py \
+  /tmp/benchmark_results.json \
+  desktop-indexer/audit_raw_data/embeddings_clamp3.db
+```
 
-| Setting | Tracks | Artists | Mean Sim |
-|---------|--------|---------|----------|
-| maxPerArtist=8, minSpacing=3 | 28-30 | 20-30 | varies |
-| maxPerArtist=100 (off) | 30 | 27 | 77.6% |
+### Latest result
 
-- Post-filter removes duplicate artists and enforces minimum spacing
-- Impact depends on seed: genres with few dominant artists (e.g., a single artist's discography) see more filtering
-- When disabled, artist count drops from 30 to 27 for this seed — filter caught 3 duplicate artists
+Recent full-track validation passed with:
 
-## Text Search
+- mean cosine vs desktop: `0.995522`
+- min cosine: `0.990923`
+- max cosine: `0.998122`
+- device mean pairwise cosine: `0.2451`
+- desktop mean pairwise cosine: `0.2438`
 
-CLaMP3's shared audio-text embedding space (768d) enables semantic text-to-audio retrieval. 15 queries tested on 74,288 tracks.
+That is the result to beat or at least stay close to for the current code path.
 
-### Genre Queries
+## Multi-Chunk Windowing Check
 
-| Query | Mean Score | Top Artist |
-|-------|-----------|------------|
-| psychedelic trance | 0.317 | Hallucinogen |
-| jazz fusion | 0.310 | John McLaughlin |
-| progressive metal | 0.282 | Tool, Opeth |
-| ambient electronic | 0.282 | Gas |
-| dark minimal techno | 0.264 | Plastikman |
-| shoegaze dream pop | 0.263 | My Bloody Valentine |
-| 90s boom bap hip hop | 0.243 | A Tribe Called Quest |
-| brazilian mpb bossa nova | 0.236 | Elis Regina |
-| sufi devotional music | 0.203 | Nusrat Fateh Ali Khan |
-| indian classical raga | 0.198 | L. Subramaniam |
+A separate benchmark change validated that chunked extraction is now aligned to the whole-track desktop rule again.
 
-### Mood/Texture Queries
+Recent full-track benchmark samples:
 
-| Query | Mean Score | Example Results |
-|-------|-----------|----------------|
-| melancholy atmospheric | 0.306 | Burial, Radiohead |
-| energetic upbeat dance | 0.281 | Underworld |
-| calm meditation peaceful | 0.269 | Brian Eno |
-| aggressive heavy distorted | 0.268 | Melvins, Unsane |
-| romantic strings orchestral | 0.276 | Ravel, Debussy |
+- `282s -> 57 windows`
+- `164s -> 33 windows`
+- `350s -> 70 windows`
+- `603s -> 121 windows`
+- `411s -> 83 windows`
 
-- All queries return highly relevant results with clear genre/mood clustering
-- Score range 0.19-0.33 (cosine similarity in shared embedding space)
-- Inference: ~23ms/query after warmup (GPU fails on INT64 ops, CPU fallback)
-- First query: ~420ms (model warmup)
+All of these match the desktop rule exactly:
 
-## On-Device Indexing
+- full `5s` windows
+- plus one final padded partial window only if the final tail is at least `1s`
 
-Two-phase GPU pipeline on Adreno 740 with FP32 precision.
+This matters because the older bug was not just a progress-display issue. Chunk-local tail padding could create extra MERT windows near the end of a track.
 
-### Performance
+## How To Interpret Failures
 
-| Metric | Value |
-|--------|-------|
-| MERT inference | ~200ms/window (5s audio) |
-| Typical 3-min track | ~12-15s total |
-| CLaMP3 audio encode | ~50ms/track |
-| Embedding quality | cosine 0.990-0.997 vs desktop |
-| Per-track cache | Crash-resilient, resumes from last complete track |
-| Graph rebuild | Automatic on count mismatch detection |
+### Low cosine in `validate_benchmark.py`
 
-### Quality Validation
+Check whether the benchmark used full tracks.
 
-On-device embeddings match desktop within cosine 0.990-0.997 across 25+ validated tracks. FP32 GPU precision is required — FP16 causes embedding collapse (pairwise cosine 0.97+).
+- If the device benchmark was capped to `120s` but the desktop DB stores full-track embeddings, the comparison is not meaningful.
+- If both sides used the full track and cosine drops materially below the current `~0.995` range, investigate the audio path.
 
-## Track Matching
+### Pairwise cosine collapse
 
-4-strategy matching between Poweramp library (75K tracks) and embedding database (74K tracks):
+If device pairwise similarity becomes much higher than desktop pairwise similarity across unrelated tracks, the model path is collapsing numerically.
 
-| Strategy | Method |
-|----------|--------|
-| 1 | Exact metadata key (`artist\|album\|title\|duration`) |
-| 2 | Prefix match (ignore duration rounding) |
-| 3 | Artist + title (ignore album) |
-| 4 | Fuzzy artist matching (ID3v1 truncation, semicolons, normalization) |
+Historically, this has been caused by precision mistakes rather than by recommendation logic.
 
-**Results**: 74,265 matched / 718 genuinely unmatched (309 unscanned folders, 235 phone-only, 180 corrupt audio). **Zero false matching failures.**
+### Window count overrun during indexing
 
-## Performance Summary
+If logs show progress like `67/55`, the chunked extractor is leaking extra windows at chunk boundaries.
 
-| Operation | Time |
-|-----------|------|
-| Embedding retrieval (1500 candidates) | 9ms |
-| MMR selection (30 tracks) | 127ms |
-| DPP selection (30 tracks) | 263ms |
-| Random Walk (10K walks, K=5 graph) | <10ms |
-| Drift playlist (30 steps) | 2,500ms |
-| Track mapping (first run) | 8,000ms |
-| Track mapping (cached) | 1ms |
-| Full radio pipeline (batch) | 300-500ms |
-| Text search query | 23-70ms |
-| On-device MERT (per window) | 200ms |
+The intended behavior is:
+
+- decode in chunks for memory safety
+- keep leftover samples between chunks
+- only allow the final whole-track tail to become a padded partial window
+
+## Related Commands
+
+### Desktop TFLite validation
+
+```bash
+python3 desktop-indexer/scripts/validate_tflite_clamp3.py \
+  --db desktop-indexer/audit_raw_data/embeddings_clamp3.db \
+  --music /path/to/music_subset --n 20
+```
+
+### Debug radio launch
+
+```bash
+adb shell am broadcast -a com.powerampstartradio.DEBUG_START_RADIO \
+  -n com.powerampstartradio/.debug.DebugRadioReceiver \
+  --es selection_mode MMR --ef diversity_lambda 0.4 --ei num_tracks 30
+```
+
+### Debug multi-seed launch
+
+```bash
+adb shell am broadcast -a com.powerampstartradio.DEBUG_MULTI_SEED \
+  -n com.powerampstartradio/.debug.DebugMultiSeedReceiver \
+  --es song1 "artist title" --ef weight1 1.0 --ei top_k 10
+```
