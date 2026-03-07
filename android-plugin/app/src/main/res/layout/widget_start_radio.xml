@@ -1,26 +1,53 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
+    android:background="@drawable/widget_background"
+    android:gravity="center_vertical"
     android:orientation="horizontal"
-    android:gravity="center"
-    android:background="#1E1E2E"
-    android:padding="12dp">
+    android:padding="2dp">
 
-    <TextView
-        android:layout_width="wrap_content"
+    <FrameLayout
+        android:id="@+id/widget_start_button"
+        android:layout_width="32dp"
+        android:layout_height="32dp"
+        android:background="@drawable/widget_badge_background"
+        android:padding="8dp">
+
+        <ImageView
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:src="@drawable/ic_radio_waves"
+            android:tint="#FFFFFFFF" />
+    </FrameLayout>
+
+    <LinearLayout
+        android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:text="\u25B6"
-        android:textColor="#89B4FA"
-        android:textStyle="bold"
-        android:textSize="16sp" />
+        android:layout_marginStart="6dp"
+        android:layout_weight="1"
+        android:orientation="vertical">
 
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginStart="8dp"
-        android:text="Start Radio"
-        android:textColor="#FFFFFF"
-        android:textSize="14sp" />
+        <TextView
+            android:id="@+id/widget_track_title"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:text="Current track title"
+            android:textColor="#FFF5F7FA"
+            android:textSize="11sp"
+            android:textStyle="bold" />
 
+        <TextView
+            android:id="@+id/widget_track_subtitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:text="Artist · Album"
+            android:textColor="#B3F5F7FA"
+            android:textSize="9sp" />
+    </LinearLayout>
 </LinearLayout>

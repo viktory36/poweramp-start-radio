@@ -5,8 +5,10 @@ import android.content.ContentProviderOperation
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.database.Cursor
 import android.net.Uri
+import android.os.Build
 import android.util.Log
 import java.text.Normalizer
 
@@ -127,6 +129,17 @@ object PowerampHelper {
             durationMs = trackBundle.getInt(TRACK_DURATION, 0) * 1000, // Poweramp sends seconds
             path = trackBundle.getString(TRACK_PATH)
         )
+    }
+
+    fun getStickyCurrentTrack(context: Context): PowerampTrack? {
+        val filter = IntentFilter(ACTION_TRACK_CHANGED)
+        val sticky = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(null, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            context.registerReceiver(null, filter)
+        }
+        return sticky?.let(::getCurrentTrackFromIntent)
     }
 
     /**

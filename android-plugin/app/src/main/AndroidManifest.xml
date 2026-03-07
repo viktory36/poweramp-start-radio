@@ -74,6 +74,7 @@
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
                 <action android:name="com.maxmpz.audioplayer.TRACK_CHANGED" />
+                <action android:name="com.maxmpz.audioplayer.STATUS_CHANGED" />
             </intent-filter>
             <meta-data
                 android:name="android.appwidget.provider"

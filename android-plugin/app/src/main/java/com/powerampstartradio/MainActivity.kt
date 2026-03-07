@@ -145,7 +145,7 @@ fun MainScreen(
     val sessionHistory by viewModel.sessionHistory.collectAsState()
     val indexStatus by viewModel.indexStatus.collectAsState()
 
-    var currentTrack by remember { mutableStateOf<PowerampTrack?>(PowerampReceiver.currentTrack) }
+    var currentTrack by remember { mutableStateOf<PowerampTrack?>(PowerampReceiver.getCurrentTrack(context)) }
     var showSettings by remember { mutableStateOf(false) }
     var showTextSearch by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf("") }

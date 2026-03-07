@@ -391,7 +391,7 @@ class RadioService : Service() {
                     // (Poweramp breaks if we replace the queue without the current track).
                     // Seed goes at pos 1, then recommendations.
                     // If NOT in a queue, seed goes first — no preservation needed.
-                    val currentTrack = PowerampReceiver.currentTrack
+                    val currentTrack = PowerampReceiver.getCurrentTrack(this@RadioService)
                     val currentInQueue = currentTrack?.realId?.takeIf { it > 0 }?.let {
                         PowerampHelper.isInQueue(this@RadioService, it)
                     } == true
@@ -401,7 +401,7 @@ class RadioService : Service() {
                             "(seedFileId=$textSearchSeedFileId, queueAnchor=$textSearchQueueAnchorId)")
                 } else {
                     // Normal path: match current Poweramp track
-                    val currentTrack = PowerampReceiver.currentTrack
+                    val currentTrack = PowerampReceiver.getCurrentTrack(this@RadioService)
                     if (currentTrack == null) {
                         _uiState.value = RadioUiState.Error("No track playing in Poweramp")
                         updateNotification("No track playing in Poweramp")
@@ -785,7 +785,7 @@ class RadioService : Service() {
                 )
 
                 // Queue: anchor current Poweramp track if in queue, else just queue results
-                val currentTrack = PowerampReceiver.currentTrack
+                val currentTrack = PowerampReceiver.getCurrentTrack(this@RadioService)
                 val currentInQueue = currentTrack?.realId?.takeIf { it > 0 }?.let {
                     PowerampHelper.isInQueue(this@RadioService, it)
                 } == true
@@ -895,7 +895,7 @@ class RadioService : Service() {
                     if (fileIds.isEmpty()) return@withContext null
 
                     // Queue: anchor current Poweramp track if in queue
-                    val currentTrack = PowerampReceiver.currentTrack
+                    val currentTrack = PowerampReceiver.getCurrentTrack(this@RadioService)
                     val currentInQueue = currentTrack?.realId?.takeIf { it > 0 }?.let {
                         PowerampHelper.isInQueue(this@RadioService, it)
                     } == true

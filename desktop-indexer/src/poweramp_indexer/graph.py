@@ -9,9 +9,55 @@ from .database import EmbeddingDatabase, float_list_to_blob
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_N_CLUSTERS = 200
+DEFAULT_KNN_K = 5
+GRAPH_CLUSTERS_METADATA_KEY = "graph_clusters"
+GRAPH_KNN_METADATA_KEY = "graph_knn"
 
-def build_index(db: EmbeddingDatabase, n_clusters: int = 200,
-                knn_k: int = 5, on_progress=None):
+
+def resolve_graph_params(
+    db: EmbeddingDatabase,
+    n_clusters: int | None = None,
+    knn_k: int | None = None,
+) -> tuple[int, int]:
+    """Resolve graph parameters from explicit args, metadata, or defaults."""
+
+    def metadata_int(key: str, default: int) -> int:
+        raw = db.get_metadata(key)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+            return value if value > 0 else default
+        except (TypeError, ValueError):
+            return default
+
+    if n_clusters is None:
+        n_clusters = metadata_int(GRAPH_CLUSTERS_METADATA_KEY, DEFAULT_N_CLUSTERS)
+    if knn_k is None:
+        knn_k = metadata_int(GRAPH_KNN_METADATA_KEY, DEFAULT_KNN_K)
+
+    return n_clusters, knn_k
+
+
+def clear_index(db: EmbeddingDatabase):
+    """Remove stored cluster assignments and the kNN graph from the database."""
+    db.conn.execute("BEGIN")
+    try:
+        try:
+            db.conn.execute("UPDATE tracks SET cluster_id = NULL")
+        except Exception:
+            pass
+        db.conn.execute("DELETE FROM clusters")
+        db.conn.execute("DELETE FROM binary_data WHERE key = ?", ("knn_graph",))
+        db.conn.execute("COMMIT")
+    except Exception:
+        db.conn.execute("ROLLBACK")
+        raise
+
+
+def build_index(db: EmbeddingDatabase, n_clusters: int = DEFAULT_N_CLUSTERS,
+                knn_k: int = DEFAULT_KNN_K, on_progress=None):
     """
     Build k-means clusters and kNN graph from CLaMP3 embeddings.
 
@@ -59,6 +105,8 @@ def build_index(db: EmbeddingDatabase, n_clusters: int = 200,
     # Store metadata
     db.set_metadata("model", "clamp3")
     db.set_metadata("embedding_dim", str(dim))
+    db.set_metadata(GRAPH_CLUSTERS_METADATA_KEY, str(n_clusters))
+    db.set_metadata(GRAPH_KNN_METADATA_KEY, str(knn_k))
 
     # --- Step 2: k-means clustering ---
     progress(f"Running k-means (K={n_clusters})...")

@@ -102,7 +102,7 @@ The user-facing mode names should stay aligned with the selectors.
 
 - Random Walk depends on a valid kNN graph
 - desktop `scan` builds the graph after embedding generation
-- desktop `update` changes the database but does not rebuild the graph automatically
+- desktop `update` refreshes the graph by default and can skip it with `--no-rebuild-graph`
 - on-device indexing updates the graph on the phone
 
 ### On-device indexing

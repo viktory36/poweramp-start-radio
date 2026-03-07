@@ -97,7 +97,9 @@ If your desktop library changes, update the database in place:
 poweramp-indexer update /path/to/music --database embeddings.db
 ```
 
-`update` adds new files and can remove missing ones, but it does not rebuild the kNN graph automatically. Rebuild the graph before copying the database back to the phone:
+`update` adds new files, can remove missing ones, and refreshes the Random Walk graph by default. If you want to skip that work for a quick pass, use `--no-rebuild-graph`.
+
+You can still rebuild the graph explicitly at any time:
 
 ```bash
 poweramp-indexer graph embeddings.db --clusters 200 --knn 5

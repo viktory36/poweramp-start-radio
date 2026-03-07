@@ -46,7 +46,9 @@ Useful options:
 poweramp-indexer update /path/to/music --database embeddings.db
 ```
 
-`update` adds new files and can remove missing ones, but it does not rebuild the kNN graph automatically. Rebuild the graph before copying the database back to Android:
+`update` adds new files, can remove missing ones, and refreshes the Random Walk graph by default. Use `--no-rebuild-graph` if you want to skip that step temporarily.
+
+You can also rebuild the graph explicitly:
 
 ```bash
 poweramp-indexer graph embeddings.db --clusters 200 --knn 5

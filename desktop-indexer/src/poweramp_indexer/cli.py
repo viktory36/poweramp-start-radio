@@ -127,11 +127,19 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool,
 @click.option("--fp16", is_flag=True, help="Run MERT in FP16")
 @click.option("--batch-size", type=int, default=8, help="MERT batch size")
 @click.option("--max-duration", type=int, default=600, help="Max audio duration in seconds")
+@click.option("--rebuild-graph/--no-rebuild-graph", default=True,
+              help="Refresh clusters and the kNN graph after updating (default: on)")
+@click.option("--graph-clusters", type=int, default=None,
+              help="Cluster count for graph rebuild (default: reuse stored value or 200)")
+@click.option("--graph-knn", type=int, default=None,
+              help="Neighbor count for graph rebuild (default: reuse stored value or 5)")
 def update(music_path: Path, database: Path, remove_missing: bool, verbose: bool,
-           fp16: bool, batch_size: int, max_duration: int):
+           fp16: bool, batch_size: int, max_duration: int,
+           rebuild_graph: bool, graph_clusters: int | None, graph_knn: int | None):
     """Incrementally update an existing database.
 
-    Adds new files and optionally removes missing ones.
+    Adds new files, optionally removes missing ones, and refreshes the
+    Random Walk graph unless disabled.
 
     MUSIC_PATH: Path to your music library folder
     """
@@ -148,6 +156,7 @@ def update(music_path: Path, database: Path, remove_missing: bool, verbose: bool
     db = EmbeddingDatabase(database)
     existing_tracks = db.count_tracks()
     click.echo(f"Existing tracks in database: {existing_tracks}")
+    removed = 0
 
     # Remove missing if requested
     if remove_missing:
@@ -160,40 +169,64 @@ def update(music_path: Path, database: Path, remove_missing: bool, verbose: bool
     # Find new files
     existing_paths = db.get_existing_paths()
     new_files = [f for f in audio_files if str(f) not in existing_paths]
+    successful = 0
+    failed = 0
 
-    if not new_files:
+    if new_files:
+        click.echo(f"Found {len(new_files)} new files to index")
+
+        generator = CLaMP3EmbeddingGenerator(
+            max_duration=max_duration, batch_size=batch_size, fp16=fp16,
+        )
+
+        def store_track(filepath, metadata, embedding):
+            db.add_track(metadata, embedding)
+            if (store_track.count % 10) == 0:
+                db.commit()
+            store_track.count += 1
+        store_track.count = 0
+
+        successful, failed = _process_files(
+            new_files, generator, store_track, "CLaMP3"
+        )
+        db.commit()
+
+        click.echo(f"\n  Added: {successful}")
+        click.echo(f"  Failed: {failed}")
+
+        generator.unload_models()
+    else:
         click.echo("No new files to add.")
-        db.vacuum()
-        db.close()
-        return
-
-    click.echo(f"Found {len(new_files)} new files to index")
-
-    generator = CLaMP3EmbeddingGenerator(
-        max_duration=max_duration, batch_size=batch_size, fp16=fp16,
-    )
-
-    def store_track(filepath, metadata, embedding):
-        db.add_track(metadata, embedding)
-        if (store_track.count % 10) == 0:
-            db.commit()
-        store_track.count += 1
-    store_track.count = 0
-
-    successful, failed = _process_files(
-        new_files, generator, store_track, "CLaMP3"
-    )
-    db.commit()
-
-    click.echo(f"\n  Added: {successful}")
-    click.echo(f"  Failed: {failed}")
-
-    generator.unload_models()
 
     db.set_metadata("version", __version__)
     db.set_metadata("source_path", str(music_path))
     db.set_metadata("model", "clamp3")
     db.set_metadata("embedding_dim", "768")
+
+    graph_missing = db.get_binary("knn_graph") is None
+    cluster_count = db.conn.execute("SELECT COUNT(*) FROM clusters").fetchone()[0]
+    graph_needs_refresh = removed > 0 or successful > 0 or graph_missing or cluster_count == 0
+
+    if rebuild_graph and graph_needs_refresh:
+        from .graph import build_index, clear_index, resolve_graph_params
+
+        if db.count_embeddings() == 0:
+            clear_index(db)
+            click.echo("Cleared clusters and kNN graph because the database has no embeddings.")
+        else:
+            clusters, knn = resolve_graph_params(
+                db, n_clusters=graph_clusters, knn_k=graph_knn
+            )
+            click.echo(f"\nRebuilding graph (clusters={clusters}, knn={knn})...")
+            result = build_index(
+                db, n_clusters=clusters, knn_k=knn,
+                on_progress=lambda msg: click.echo(msg)
+            )
+            click.echo(f"  Graph refreshed: K={result['knn_k']} ({result['graph_size_mb']:.1f} MB)")
+    elif not rebuild_graph and (removed > 0 or successful > 0):
+        click.echo("Skipped graph rebuild; Random Walk will not reflect these changes until `poweramp-indexer graph` is run.")
+    elif rebuild_graph and not graph_needs_refresh:
+        click.echo("Graph already matches the current database; no rebuild needed.")
 
     db.vacuum()
     total_tracks = db.count_tracks()
@@ -310,13 +343,21 @@ def info(database: Path):
     # Check for clusters and graph
     try:
         cluster_count = db.conn.execute("SELECT COUNT(*) FROM clusters").fetchone()[0]
-        click.echo(f"Clusters: {cluster_count}")
+        graph_clusters = db.get_metadata("graph_clusters")
+        if graph_clusters:
+            click.echo(f"Clusters: {cluster_count} (target K={graph_clusters})")
+        else:
+            click.echo(f"Clusters: {cluster_count}")
     except Exception:
         click.echo("Clusters: none")
 
     graph = db.get_binary("knn_graph")
     if graph:
-        click.echo(f"kNN graph: {len(graph) / 1024 / 1024:.1f} MB")
+        graph_knn = db.get_metadata("graph_knn")
+        if graph_knn:
+            click.echo(f"kNN graph: {len(graph) / 1024 / 1024:.1f} MB (K={graph_knn})")
+        else:
+            click.echo(f"kNN graph: {len(graph) / 1024 / 1024:.1f} MB")
     else:
         click.echo("kNN graph: none")
 

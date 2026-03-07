@@ -344,7 +344,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun runPreviewForMode(mode: SelectionMode): List<String>? {
-        val currentTrack = PowerampReceiver.currentTrack ?: return null
+        val currentTrack = PowerampReceiver.getCurrentTrack(getApplication()) ?: return null
         val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
         if (!dbFile.exists()) return null
 
