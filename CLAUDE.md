@@ -1,162 +1,177 @@
 # CLAUDE.md
 
-This file gives repository-specific guidance to coding agents working in this project.
+Repository reference for coding agents working in Poweramp Start Radio.
 
-## What This Repo Is
+## Overview
 
-Poweramp Start Radio is a desktop-plus-Android system for local music similarity and text-to-audio retrieval.
-
-- `desktop-indexer/` builds the library database on a desktop machine.
-- `android-plugin/` is the Android app that talks to Poweramp, serves recommendations, and can index new tracks on-device.
-- The project root `README.md` is intentionally left for a hand-written overview and should not be auto-filled.
-
-The active model path today is CLaMP3:
-
-- audio: MERT -> CLaMP3 audio encoder -> 768d embedding
-- text: CLaMP3 text encoder -> 768d embedding in the same space
-
-There are legacy experiment artifacts in `desktop-indexer/models/` and other audit files, but the production path is the CLaMP3 pipeline above.
-
-## Current Product Surfaces
-
-The Android app currently has four meaningful surfaces:
-
-1. Single-seed radio from the current Poweramp track
-2. Text search and multi-seed search
-3. On-device indexing of tracks missing from the desktop database
-4. Benchmark / debug entry points launched through `adb`
-
-## Repository Map
+Poweramp Start Radio has two main halves:
 
 - `desktop-indexer/`
-  - CLI for scanning, updating, exporting models, graph building, and offline evaluation
+  - scans a music library, computes CLaMP3 embeddings, and writes `embeddings.db`
 - `android-plugin/`
-  - Compose UI, Poweramp integration, recommendation engine, on-device indexing, benchmark tooling
-- `SETUP.md`
-  - practical setup and deployment instructions
-- `EVALUATION.md`
-  - current validation method and recent verified benchmark snapshot
+  - matches Poweramp tracks to that database, generates playlists, supports text and multi-seed search, and can index missing tracks on-device
 
-## Data Artifacts
+The active model path is CLaMP3:
 
-The important runtime artifacts are:
+- audio: MERT -> CLaMP3 audio encoder -> `768d` embedding
+- text: CLaMP3 text encoder -> `768d` embedding in the same space
 
-- `embeddings.db`
-  - canonical SQLite database shared between desktop and phone
-  - stores track metadata, `embeddings_clamp3`, clusters, and `knn_graph`
-- `clamp3.emb`
-  - mmap-friendly embedding dump extracted from `embeddings.db` on Android
-- `graph.bin`
-  - mmap-friendly kNN graph for Random Walk on Android
-- `mert.tflite`
-  - required for on-device indexing
-- `clamp3_audio.tflite`
-  - required for on-device indexing
-- `clamp3_text.tflite` and `xlm_roberta_vocab.json`
-  - optional, required only for on-device text search
+The normal workflow is desktop-first:
 
-## Hot Paths
+1. build `embeddings.db` on a desktop machine
+2. copy it to the phone
+3. let the Android app extract `clamp3.emb` and `graph.bin` for fast runtime access
+4. optionally let the phone index tracks that were not in the desktop database yet
 
-If a user reports wrong recommendations, slow startup, or indexing problems, start here.
+## End-To-End Flow
 
-### Radio startup
+### Desktop pipeline
 
-`RadioService` -> `TrackMatcher` -> `RecommendationEngine` -> `PowerampHelper`
+```text
+Music files
+  -> MERT (24kHz waveform -> 768d features per 5s window)
+  -> CLaMP3 audio encoder (window features -> one 768d track embedding)
+  -> embeddings.db (tracks, embeddings_clamp3, clusters, knn_graph)
+```
 
-Relevant files:
+### Android radio path
+
+```text
+Poweramp current track
+  -> TrackMatcher
+  -> RecommendationEngine
+  -> selector (MMR / DPP / Random Walk / Drift path)
+  -> TrackMatcher / PowerampHelper
+  -> Poweramp queue
+```
+
+### Android on-device indexing path
+
+```text
+Poweramp library
+  -> NewTrackDetector
+  -> AudioDecoder + resampler
+  -> MertInference
+  -> Clamp3AudioInference
+  -> embeddings.db update
+  -> GraphUpdater
+```
+
+## Core Concepts
+
+### Matching
+
+Poweramp tracks are matched to the embedding database primarily through a metadata key:
+
+- `artist|album|title|duration_rounded_to_100ms`
+
+`TrackMatcher` then falls back through progressively looser strategies:
+
+1. exact metadata key
+2. artist + album + title without duration
+3. artist + title without album
+4. fuzzy artist and title normalization
+5. filename-based fallback
+
+If matching behavior changes, read `TrackMatcher` and `NewTrackDetector` together.
+
+### Embeddings and similarity
+
+- audio is decoded to `24kHz` mono
+- MERT works on non-overlapping `5s` windows
+- CLaMP3 produces one `768d` embedding per track
+- embeddings are L2-normalized, so dot product equals cosine similarity
+- Android hot paths use mmap-backed indices rather than repeated SQLite reads
+
+### Recommendation modes
+
+The user-facing mode names should stay aligned with the selectors.
+
+- `MMR`
+  - relevance to the current query minus a penalty from the single chosen track with the greatest overlap
+- `DPP`
+  - re-scores remaining candidates against the chosen set as a whole through pairwise interactions
+- `Random Walk`
+  - walks a precomputed kNN graph from the seed track id and ranks reachable terminals
+- `Drift`
+  - updates the query after each pick on the sequential embedding-scan path
+- `Multi-seed`
+  - uses `GeoMeanSelector`; it is not the same path as single-seed radio
+
+### Graph expectations
+
+- Random Walk depends on a valid kNN graph
+- desktop `scan` builds the graph after embedding generation
+- desktop `update` changes the database but does not rebuild the graph automatically
+- on-device indexing updates the graph on the phone
+
+### On-device indexing
+
+A few details matter here because they have caused real regressions.
+
+- Android audio indexing uses FP32 GPU precision; FP16 precision causes numerical collapse
+- use FP32 model files on phone for `mert.tflite` and `clamp3_audio.tflite`
+- the Android indexing path is split into two GPU phases because the device cannot keep both models active in the way the app needs
+- decode chunk boundaries must not create extra MERT windows
+- only the final tail of the whole track may be zero-padded, and only if it is at least `1s`
+- chunked extraction preserves alignment by carrying leftover samples across chunks
+- the text model currently falls back to CPU in practice because its graph uses INT64 ops that the GPU path does not handle cleanly
+
+### Native and packaging notes
+
+- the audio path uses native resampling and math helpers under `android-plugin/app/src/main/cpp/`
+- stereo-to-mono conversion must widen to `int32` before summing channels; `int16` addition can wrap on loud masters and corrupt embeddings
+- the app ships `arm64-v8a` native libraries only
+- `useLegacyPackaging = true` keeps the JNI libraries uncompressed for reliable loading
+
+### Android integration
+
+The app talks to Poweramp through its content provider and broadcast surface.
+
+- content provider: `content://com.maxmpz.audioplayer.data`
+- permission request action: `com.maxmpz.audioplayer.ACTION_ASK_FOR_DATA_PERMISSION`
+- package visibility is declared through the app manifest `<queries>` section
+
+## Where To Look First
+
+### Radio startup and queueing
 
 - `android-plugin/app/src/main/java/com/powerampstartradio/services/RadioService.kt`
 - `android-plugin/app/src/main/java/com/powerampstartradio/poweramp/TrackMatcher.kt`
 - `android-plugin/app/src/main/java/com/powerampstartradio/similarity/RecommendationEngine.kt`
 - `android-plugin/app/src/main/java/com/powerampstartradio/poweramp/PowerampHelper.kt`
 
-### Batch selection algorithms
+### Selection algorithms
 
-- `MMR`: `MmrSelector.kt`
-- `DPP`: `DppSelector.kt`
-- `Random Walk`: `RandomWalkSelector.kt`
-- `Drift`: `DriftEngine.kt`
+- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/algorithms/MmrSelector.kt`
+- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/algorithms/DppSelector.kt`
+- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/algorithms/RandomWalkSelector.kt`
+- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/algorithms/DriftEngine.kt`
+- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/algorithms/GeoMeanSelector.kt`
 
 ### Text and multi-seed
 
-- `MainViewModel.kt`
-- `GeoMeanSelector.kt`
-- `Clamp3TextInference.kt`
+- `android-plugin/app/src/main/java/com/powerampstartradio/ui/MainViewModel.kt`
+- `android-plugin/app/src/main/java/com/powerampstartradio/indexing/Clamp3TextInference.kt`
 
 ### On-device indexing
 
-`IndexingActivity` / `IndexingViewModel` -> `IndexingService` -> `NewTrackDetector` -> `AudioDecoder` -> `MertInference` -> `Clamp3AudioInference` -> `GraphUpdater`
-
-Relevant files:
-
 - `android-plugin/app/src/main/java/com/powerampstartradio/indexing/IndexingActivity.kt`
-- `android-plugin/app/src/main/java/com/powerampstartradio/indexing/IndexingViewModel.kt`
 - `android-plugin/app/src/main/java/com/powerampstartradio/indexing/IndexingService.kt`
 - `android-plugin/app/src/main/java/com/powerampstartradio/indexing/AudioDecoder.kt`
 - `android-plugin/app/src/main/java/com/powerampstartradio/indexing/MertInference.kt`
 - `android-plugin/app/src/main/java/com/powerampstartradio/indexing/Clamp3AudioInference.kt`
 - `android-plugin/app/src/main/java/com/powerampstartradio/indexing/GraphUpdater.kt`
 
-## Recommendation Behavior That Matters
+### Desktop pipeline
 
-The user-facing mode names should stay aligned to the actual selectors.
+- `desktop-indexer/src/poweramp_indexer/cli.py`
+- `desktop-indexer/src/poweramp_indexer/database.py`
+- `desktop-indexer/src/poweramp_indexer/graph.py`
+- `desktop-indexer/src/poweramp_indexer/export_litert.py`
+- `desktop-indexer/scripts/generate_clamp3_embeddings.py`
 
-- `MMR`
-  - candidate relevance to the current query minus a penalty from the single chosen track it overlaps with most
-- `DPP`
-  - re-scores remaining candidates against the chosen set as a whole through pairwise interactions
-- `Random Walk`
-  - ranks tracks by walking a precomputed similarity graph from the seed track id
-- `Drift`
-  - only meaningful on the sequential embedding-scan path; it is disabled for `DPP` and not used for `Random Walk`
-- `Multi-seed`
-  - does not reuse the batch radio selectors; it uses `GeoMeanSelector`
-
-## Invariants Worth Protecting
-
-### Matching
-
-- metadata key format is `artist|album|title|duration_rounded_to_100ms`
-- matching falls back through progressively looser strategies in `TrackMatcher`
-- do not casually change matching rules without checking `NewTrackDetector` and `TrackMatcher` together
-
-### Embeddings and similarity
-
-- embeddings are L2-normalized
-- dot product equals cosine similarity
-- `EmbeddingIndex` and `GraphIndex` are mmap-backed for hot loops
-
-### On-device audio windowing
-
-- MERT windows are `5s`, non-overlapping
-- only the final tail of the whole track may be zero-padded if it is at least `1s`
-- decode chunk boundaries must not create extra padded windows
-- the current implementation preserves alignment by carrying leftover samples across chunks
-
-### Graph expectations
-
-- Random Walk depends on a valid kNN graph
-- desktop `scan` builds a graph after phase 2
-- desktop `update` does not rebuild the graph automatically; run `poweramp-indexer graph` afterward if the desktop DB changed
-- on-device indexing updates the graph on phone
-
-## On-Device Model Requirements
-
-The Android app's model requirements are easy to get wrong.
-
-- use FP32 model files on phone for audio indexing
-- LiteRT GPU precision is forced to FP32 in `LiteRtUtils.kt`
-- FP16 audio model files are not part of the supported production path for on-device indexing
-- text search currently falls back to CPU in practice because the text model uses INT64 ops that the GPU path does not handle
-
-Approximate current model sizes in `desktop-indexer/models/`:
-
-- `mert.tflite`: ~361 MB
-- `clamp3_audio.tflite`: ~328 MB
-- `clamp3_text.tflite`: ~1.1 GB
-- `xlm_roberta_vocab.json`: ~11 MB
-
-## Common Commands
+## Useful Commands
 
 ### Desktop CLI
 
@@ -167,9 +182,9 @@ python -m pip install -e .
 poweramp-indexer scan /path/to/music -o embeddings.db
 poweramp-indexer update /path/to/music --database embeddings.db
 poweramp-indexer graph embeddings.db --clusters 200 --knn 5
-poweramp-indexer info embeddings.db
 poweramp-indexer similar embeddings.db "artist title"
 poweramp-indexer search embeddings.db "dark minimal techno"
+poweramp-indexer info embeddings.db
 poweramp-indexer export all
 ```
 
@@ -181,34 +196,12 @@ cd android-plugin
 ./scripts/build-wsl.sh
 ```
 
-`build-wsl.sh` assembles a debug APK and installs it automatically if `adb` sees a device.
-
-### Benchmark and validation
-
-Run a full-track on-device audio benchmark:
+### Benchmarks and debug entry points
 
 ```bash
 adb shell am start -n com.powerampstartradio/.benchmark.BenchmarkActivity \
   --ez auto_start true --ei max_duration_s 0
-```
 
-Pull results:
-
-```bash
-adb shell run-as com.powerampstartradio cat files/benchmark_results.json > /tmp/benchmark_results.json
-```
-
-Validate against the desktop database:
-
-```bash
-python3 desktop-indexer/scripts/validate_benchmark.py \
-  /tmp/benchmark_results.json \
-  desktop-indexer/audit_raw_data/embeddings_clamp3.db
-```
-
-### Debug receivers
-
-```bash
 adb shell am broadcast -a com.powerampstartradio.DEBUG_START_RADIO \
   -n com.powerampstartradio/.debug.DebugRadioReceiver \
   --es selection_mode MMR --ef diversity_lambda 0.4 --ei num_tracks 30
@@ -218,19 +211,13 @@ adb shell am broadcast -a com.powerampstartradio.DEBUG_MULTI_SEED \
   --es song1 "artist title" --ef weight1 1.0 --ei top_k 10
 ```
 
-## Validation Rules
+## Validation
 
-Prefer code-backed validation over old notes.
+A small amount of targeted validation goes a long way in this repo.
 
-- If you are checking audio embedding quality, use the full-track benchmark path, not a truncated benchmark run.
-- If `validate_benchmark.py` reports low cosine but the benchmark capped audio length, the comparison is not meaningful.
-- If a change touches indexing chunking, verify both:
-  - emitted window counts on multi-chunk tracks
-  - benchmark cosine vs the desktop database
-- If a change touches the radio startup path, inspect `adb logcat` for `RadioService`, `TrackMatcher`, `RecommendationEngine`, and `PowerampHelper` rather than assuming the selector math is the bottleneck.
+- if audio or indexing changes, compare full-track on-device benchmark output against the desktop database
+- if chunking changes, check both cosine agreement and MERT window counts on multi-chunk tracks
+- if Random Walk changes, make sure the graph is current before judging the results
+- if radio startup stalls, inspect `adb logcat` for `RadioService`, `TrackMatcher`, `RecommendationEngine`, and `PowerampHelper`
 
-## Editing Guidance
-
-- Keep root `README.md` untouched for the user to write by hand.
-- Prefer updating stale numbers into reproducible commands or clearly labeled snapshots.
-- When documenting behavior, trust the current code over historical experiment text.
+`EVALUATION.md` collects the measured results and the commands used to reproduce the most important checks.

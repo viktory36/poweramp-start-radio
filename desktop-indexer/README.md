@@ -2,11 +2,15 @@
 
 This directory contains the desktop pipeline that builds the database used by the Android app.
 
-The active production path is CLaMP3:
+## Overview
+
+The production path is CLaMP3:
 
 - MERT extracts `768d` features from `5s` windows of audio
-- the CLaMP3 audio encoder turns those features into one `768d` embedding per track
-- the same embedding space is also used by the text encoder
+- the CLaMP3 audio encoder turns those window features into one `768d` embedding per track
+- the CLaMP3 text encoder produces embeddings in the same space for text search
+
+The resulting `embeddings.db` is portable. Once built, it can be copied to the phone and used offline by the Android app.
 
 ## Install
 
@@ -14,6 +18,8 @@ The active production path is CLaMP3:
 cd desktop-indexer
 python -m pip install -e .
 ```
+
+Large libraries benefit from a GPU-capable PyTorch installation, but the CLI can still run without one.
 
 ## Main CLI Commands
 
@@ -40,11 +46,7 @@ Useful options:
 poweramp-indexer update /path/to/music --database embeddings.db
 ```
 
-Important:
-
-- `update` adds new files and can remove missing ones
-- `update` does not rebuild the kNN graph automatically
-- after `update`, rebuild the graph before copying the database back to Android:
+`update` adds new files and can remove missing ones, but it does not rebuild the kNN graph automatically. Rebuild the graph before copying the database back to Android:
 
 ```bash
 poweramp-indexer graph embeddings.db --clusters 200 --knn 5
@@ -56,7 +58,7 @@ poweramp-indexer graph embeddings.db --clusters 200 --knn 5
 poweramp-indexer info embeddings.db
 ```
 
-### Query similar tracks from the desktop database
+### Query similar tracks
 
 ```bash
 poweramp-indexer similar embeddings.db "radiohead karma police"
@@ -70,13 +72,13 @@ poweramp-indexer similar embeddings.db --random
 poweramp-indexer search embeddings.db "dark minimal techno"
 ```
 
-### Export models for Android
+### Export Android model files
 
 ```bash
 poweramp-indexer export all
 ```
 
-The current Android-relevant outputs are:
+This writes the Android-facing LiteRT assets such as:
 
 - `mert.tflite`
 - `clamp3_audio.tflite`
@@ -91,18 +93,22 @@ The current Android-relevant outputs are:
 - audio embeddings in `embeddings_clamp3`
 - cluster centroids in `clusters`
 - the Random Walk graph in `binary_data.knn_graph`
-- metadata such as version, source path, and embedding dimension
+- metadata such as source path, model, version, and embedding dimension
 
-On Android, that database is later materialized into mmap files for the hot paths.
+On Android, that database is later materialized into mmap-backed runtime files for the hot paths.
 
-## Validation Scripts
+## Supporting Scripts
 
-The most useful scripts in this directory are:
+The CLI is the main entry point, but a few scripts are useful when validating or inspecting the system:
 
+- `scripts/generate_clamp3_embeddings.py`
+  - lower-level generation path and graph-building helpers
+- `src/poweramp_indexer/export_litert.py`
+  - exports the Android LiteRT models
 - `scripts/validate_tflite_clamp3.py`
-  - checks desktop TFLite audio output against the desktop database
+  - compares desktop TFLite audio output against the desktop database
 - `scripts/validate_benchmark.py`
-  - checks on-device benchmark JSON against the desktop database
+  - compares Android benchmark JSON against the desktop database
 - `scripts/replay_multiseed.py`
   - replays logged multi-seed runs
 - `scripts/test_incremental_graph.py`
@@ -110,9 +116,9 @@ The most useful scripts in this directory are:
 - `scripts/evaluate_clamp3.py`
   - ad hoc offline similarity and text-search inspection
 
-## Notes For Future Readers
+## Notes
 
-- The CLI entry point is `poweramp_indexer.cli:cli`.
-- `scan` builds the graph; `update` does not.
-- The Android app relies on the graph for Random Walk mode.
-- Legacy MuLan and Flamingo artifacts still exist in `models/` and audit files, but they are not the active production path for the current Android app.
+- CLI entry point: `poweramp_indexer.cli:cli`
+- `scan` builds the graph; `update` does not
+- the Android app relies on the graph for Random Walk mode
+- legacy MuLan and Flamingo artifacts may still exist in `models/` or audit files, but they are not part of the active production path for the current app
