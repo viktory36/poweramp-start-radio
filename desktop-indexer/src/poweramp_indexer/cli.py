@@ -47,7 +47,11 @@ def cli():
     help="Skip files already in the database"
 )
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
-@click.option("--fp16", is_flag=True, help="Run MERT in FP16 (halves VRAM, ~2x faster)")
+@click.option(
+    "--fp16/--fp32",
+    default=True,
+    help="Run MERT in FP16 (default) or force FP32"
+)
 @click.option("--batch-size", type=int, default=8, help="MERT batch size for GPU (default: 8)")
 @click.option("--max-duration", type=int, default=600,
               help="Max audio duration in seconds (default: 600)")
@@ -68,7 +72,8 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool,
     Examples:
 
       poweramp-indexer scan /path/to/music -o embeddings.db
-      poweramp-indexer scan /path/to/music -o embeddings.db --fp16 --batch-size 48
+      poweramp-indexer scan /path/to/music -o embeddings.db --batch-size 48
+      poweramp-indexer scan /path/to/music -o embeddings.db --fp32
       poweramp-indexer scan /path/to/music -o embeddings.db --phase 1
     """
     from .embeddings_clamp3 import scan_phase1, scan_phase2
@@ -124,7 +129,11 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool,
 @click.option("--remove-missing/--no-remove-missing", default=True,
               help="Remove tracks whose files no longer exist")
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
-@click.option("--fp16", is_flag=True, help="Run MERT in FP16")
+@click.option(
+    "--fp16/--fp32",
+    default=True,
+    help="Run MERT in FP16 (default) or force FP32"
+)
 @click.option("--batch-size", type=int, default=8, help="MERT batch size")
 @click.option("--max-duration", type=int, default=600, help="Max audio duration in seconds")
 @click.option("--rebuild-graph/--no-rebuild-graph", default=True,

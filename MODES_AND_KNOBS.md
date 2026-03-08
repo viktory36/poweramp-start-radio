@@ -219,7 +219,7 @@ The active weights are normalized against each other, so what matters is each se
 
 Important details in the current app:
 - the text seed can drop to `0%` when song seeds are present, allowing song-only multi-seed search
-- song seeds keep a small nonzero floor while active so they are not accidentally dragged out of the mix
+- song seeds keep a small nonzero floor while active so they stay present in the mix
 
 ### Sign
 
@@ -227,7 +227,7 @@ Every seed can be either:
 - positive: `more like this`
 - negative: `less like this`
 
-Sign is not cosmetic. It changes the search direction.
+Sign changes the search direction.
 
 A negative seed tells the ranking system to favor tracks that do well on the other active seeds while ranking poorly against that seed.
 

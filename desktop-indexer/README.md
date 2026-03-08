@@ -16,10 +16,12 @@ The resulting `embeddings.db` is portable. Once built, it can be copied to the p
 
 ```bash
 cd desktop-indexer
-python -m pip install -e .
+python -m pip install -e '.[export]'
 ```
 
-Large libraries benefit from a GPU-capable PyTorch installation, but the CLI can still run without one.
+For library-scale indexing, use a GPU-capable PyTorch installation. CPU is best kept for debugging and small test runs.
+
+`.[export]` includes the LiteRT export dependencies used by `poweramp-indexer export all`.
 
 ## Main CLI Commands
 
@@ -31,7 +33,7 @@ poweramp-indexer scan /path/to/music -o embeddings.db
 
 Useful options:
 
-- `--fp16`
+- `--fp32`
 - `--batch-size N`
 - `--max-duration 600`
 - `--cache-dir /path/to/mert_cache`
@@ -39,6 +41,8 @@ Useful options:
 - `--phase 2`
 
 `scan` performs both embedding generation and graph building.
+
+Desktop MERT defaults to FP16. Use `--fp32` when you want the full-precision path.
 
 ### Incrementally update an existing database
 
@@ -121,6 +125,8 @@ The CLI is the main entry point, but a few scripts are useful when validating or
 ## Notes
 
 - CLI entry point: `poweramp_indexer.cli:cli`
-- `scan` builds the graph; `update` does not
+- `scan` builds the graph
+- `update` refreshes the graph by default
 - the Android app relies on the graph for Random Walk mode
-- legacy MuLan and Flamingo artifacts may still exist in `models/` or audit files, but they are not part of the active production path for the current app
+- some legacy MuLan and Flamingo artifacts may still appear in `models/` or audit files
+- current app work centers on the CLaMP3 path

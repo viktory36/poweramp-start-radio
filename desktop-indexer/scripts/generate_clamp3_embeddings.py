@@ -266,10 +266,10 @@ def make_cache_key(file_path, music_dir):
 
 
 def _read_manifest_entry(entry):
-    """Read manifest entry, handling old (string) and new (dict) formats."""
+    """Read manifest entry, handling old and newer formats."""
     if isinstance(entry, str):
-        return entry, 'fp32'
-    return entry['path'], entry['precision']
+        return entry
+    return entry['path']
 
 
 # ─── Phase 1: MERT feature extraction ────────────────────────────────────────
@@ -367,21 +367,18 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False,
         manifest = {}
 
     # Find files needing processing
-    precision_str = 'fp16' if fp16 else 'fp32'
     to_process = []
     for fpath in all_files:
         cache_key = make_cache_key(fpath, music_dir)
         npy_path = cache_dir / (cache_key + ".npy")
         if not npy_path.exists():
             to_process.append(fpath)
-            # New files get current precision (written after successful .npy save)
         else:
-            # Existing .npy — upgrade old manifest format, preserve precision
             existing = manifest.get(cache_key)
-            if isinstance(existing, str):
-                manifest[cache_key] = {'path': existing, 'precision': 'fp32'}
+            if isinstance(existing, dict):
+                manifest[cache_key] = existing['path']
             elif existing is None:
-                manifest[cache_key] = {'path': str(fpath), 'precision': 'fp32'}
+                manifest[cache_key] = str(fpath)
 
     # Save manifest (even if nothing to process — captures format upgrades)
     with open(manifest_path, 'w') as f:
@@ -479,7 +476,7 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False,
             all_features = all_features.mean(dim=0, keepdim=True)  # [1, chunks, H]
 
             np.save(str(npy_path), all_features.numpy())
-            manifest[cache_key] = {'path': str(fpath), 'precision': precision_str}
+            manifest[cache_key] = str(fpath)
             success += 1
             if verbose:
                 dur_s = num_samples / MERT_SR
@@ -493,7 +490,7 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False,
 
     pool.shutdown(wait=False)
 
-    # Save manifest with precision info for new files
+    # Save manifest for new files
     with open(manifest_path, 'w') as f:
         json.dump(manifest, f, indent=0)
 
@@ -509,7 +506,7 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False,
 
 # ─── Phase 2: CLaMP3 encoding + DB storage ───────────────────────────────────
 
-def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False, fp16=False):
+def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False):
     """Encode cached MERT features with CLaMP3 and store in SQLite.
 
     Pipeline (matches official CLaMP3 exactly):
@@ -519,7 +516,6 @@ def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False, fp16=False):
         → weighted average of segments → L2 normalize → 768d
         → store in SQLite with track metadata
 
-    When fp16=True, new embeddings are tagged with precision='fp16'.
     """
     print("\n" + "=" * 70)
     print("PHASE 2: CLaMP3 Encoding → SQLite")
@@ -548,15 +544,6 @@ def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False, fp16=False):
     # Init DB and check existing embeddings
     conn = init_db(db_path)
 
-    # Migrate: add precision column if it doesn't exist yet
-    try:
-        conn.execute(
-            "ALTER TABLE embeddings_clamp3 ADD COLUMN precision TEXT DEFAULT 'fp32'"
-        )
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-
     existing = get_existing_paths_with_embeddings(conn)
 
     # Build lookup for orphan tracks (exist in DB without embeddings)
@@ -572,29 +559,9 @@ def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False, fp16=False):
         cache_key = npy_path.stem
         entry = manifest.get(cache_key)
         if entry:
-            original_path, precision = _read_manifest_entry(entry)
+            original_path = _read_manifest_entry(entry)
             if original_path not in existing:
-                to_process.append((npy_path, cache_key, original_path, precision))
-
-    # Fix precision tags for existing embeddings using manifest data
-    path_to_precision = {}
-    for cache_key_fix, entry in manifest.items():
-        orig, prec = _read_manifest_entry(entry)
-        path_to_precision[orig] = prec
-    fixed = 0
-    for row in conn.execute(
-        "SELECT e.track_id, e.precision, t.file_path "
-        "FROM embeddings_clamp3 e JOIN tracks t ON t.id = e.track_id"
-    ).fetchall():
-        correct = path_to_precision.get(row['file_path'], 'fp32')
-        if row['precision'] != correct:
-            conn.execute(
-                "UPDATE embeddings_clamp3 SET precision = ? WHERE track_id = ?",
-                (correct, row['track_id']))
-            fixed += 1
-    if fixed:
-        conn.commit()
-        print(f"Fixed precision tags for {fixed} existing embeddings")
+                to_process.append((npy_path, cache_key, original_path))
 
     print(f"Need to encode {len(to_process)} tracks "
           f"({len(npy_files) - len(to_process)} already in DB)")
@@ -629,7 +596,7 @@ def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False, fp16=False):
     success = 0
     fail = 0
 
-    for i, (npy_path, cache_key, original_path, precision_tag) in enumerate(to_process):
+    for i, (npy_path, cache_key, original_path) in enumerate(to_process):
         if i > 0 and i % 500 == 0:
             elapsed = time.time() - t0
             rate = elapsed / i
@@ -711,8 +678,8 @@ def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False, fp16=False):
 
             conn.execute(
                 "INSERT OR REPLACE INTO embeddings_clamp3 "
-                "(track_id, embedding, precision) VALUES (?, ?, ?)",
-                (track_id, float_list_to_blob(emb_list), precision_tag)
+                "(track_id, embedding) VALUES (?, ?)",
+                (track_id, float_list_to_blob(emb_list))
             )
             success += 1
             if verbose:
@@ -918,8 +885,7 @@ Examples:
                     verbose=args.verbose, fp16=use_fp16)
 
     if args.phase in ("2", "both"):
-        phase2_clamp3(music_dir, cache_dir, db_path, verbose=args.verbose,
-                      fp16=use_fp16)
+        phase2_clamp3(music_dir, cache_dir, db_path, verbose=args.verbose)
 
     if args.phase == "both":
         build_knn_graph(db_path)

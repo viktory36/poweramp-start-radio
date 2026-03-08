@@ -203,10 +203,10 @@ def _load_audio_chunks(fpath, processor, max_duration):
 
 
 def _read_manifest_entry(entry):
-    """Read manifest entry, handling old (string) and new (dict) formats."""
+    """Read manifest entry, handling old and newer formats."""
     if isinstance(entry, str):
-        return entry, 'fp32'
-    return entry['path'], entry['precision']
+        return entry
+    return entry['path']
 
 
 class CLaMP3EmbeddingGenerator:
@@ -221,7 +221,7 @@ class CLaMP3EmbeddingGenerator:
         self,
         max_duration: int = 600,
         batch_size: int = 8,
-        fp16: bool = False,
+        fp16: bool = True,
     ):
         self.max_duration = max_duration
         self.batch_size = batch_size
@@ -527,7 +527,6 @@ def scan_phase1(music_dir: Path, cache_dir: Path, generator: 'CLaMP3EmbeddingGen
     else:
         manifest = {}
 
-    precision_str = 'fp16' if generator.fp16 else 'fp32'
     to_process = []
     for fpath in all_files:
         cache_key = make_cache_key(fpath, music_dir)
@@ -536,10 +535,10 @@ def scan_phase1(music_dir: Path, cache_dir: Path, generator: 'CLaMP3EmbeddingGen
             to_process.append(fpath)
         else:
             existing = manifest.get(cache_key)
-            if isinstance(existing, str):
-                manifest[cache_key] = {'path': existing, 'precision': 'fp32'}
+            if isinstance(existing, dict):
+                manifest[cache_key] = existing['path']
             elif existing is None:
-                manifest[cache_key] = {'path': str(fpath), 'precision': 'fp32'}
+                manifest[cache_key] = str(fpath)
 
     with open(manifest_path, 'w') as f:
         json.dump(manifest, f, indent=0)
@@ -615,7 +614,7 @@ def scan_phase1(music_dir: Path, cache_dir: Path, generator: 'CLaMP3EmbeddingGen
             all_features = all_features.mean(dim=0, keepdim=True)
 
             np.save(str(npy_path), all_features.numpy())
-            manifest[cache_key] = {'path': str(fpath), 'precision': precision_str}
+            manifest[cache_key] = str(fpath)
             success += 1
             if verbose:
                 dur_s = num_samples / MERT_SR
@@ -679,7 +678,7 @@ def scan_phase2(music_dir: Path, cache_dir: Path, db, generator: 'CLaMP3Embeddin
         cache_key = npy_path.stem
         entry = manifest.get(cache_key)
         if entry:
-            original_path, _ = _read_manifest_entry(entry)
+            original_path = _read_manifest_entry(entry)
             if original_path not in existing:
                 to_process.append((npy_path, cache_key, original_path))
 

@@ -262,7 +262,7 @@ python3 desktop-indexer/scripts/validate_tflite_clamp3.py \
 
 ### Pairwise cosine collapse
 
-If device pairwise similarity rises much higher than desktop pairwise similarity across unrelated tracks, the model path is collapsing numerically. In practice this has been tied to precision mistakes rather than recommendation logic.
+If device pairwise similarity rises much higher than desktop pairwise similarity across unrelated tracks, the model path is collapsing numerically. In practice this usually points to precision mistakes in the model path.
 
 ### Window count overruns during indexing
 

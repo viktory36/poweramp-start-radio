@@ -59,19 +59,10 @@ def blob_to_float_list(blob):
 def load_all_embeddings(db_path):
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(embeddings_clamp3)")}
-    has_precision = 'precision' in cols
-    if has_precision:
-        rows = conn.execute(
-            "SELECT t.id, t.artist, t.album, t.title, t.file_path, "
-            "e.embedding, e.precision "
-            "FROM tracks t INNER JOIN embeddings_clamp3 e ON t.id = e.track_id"
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT t.id, t.artist, t.album, t.title, t.file_path, e.embedding "
-            "FROM tracks t INNER JOIN embeddings_clamp3 e ON t.id = e.track_id"
-        ).fetchall()
+    rows = conn.execute(
+        "SELECT t.id, t.artist, t.album, t.title, t.file_path, e.embedding "
+        "FROM tracks t INNER JOIN embeddings_clamp3 e ON t.id = e.track_id"
+    ).fetchall()
     conn.close()
 
     tracks = []

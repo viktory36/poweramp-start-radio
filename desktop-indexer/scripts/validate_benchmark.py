@@ -61,7 +61,7 @@ def main():
             ("LOWER(t.artist) = LOWER(?) AND LOWER(t.title) = LOWER(?)", (artist, title)),
         ]:
             cur.execute(
-                f"SELECT t.id, e.embedding, e.precision "
+                f"SELECT t.id, e.embedding "
                 f"FROM tracks t JOIN embeddings_clamp3 e ON t.id = e.track_id "
                 f"WHERE {query}", params
             )
@@ -74,7 +74,7 @@ def main():
             print(f"  NOT FOUND in desktop DB\n")
             continue
 
-        db_id, blob, precision = rows[0]
+        db_id, blob = rows[0]
         desktop_emb = load_embedding_from_blob(blob)
         assert len(desktop_emb) == 768
 
@@ -86,7 +86,7 @@ def main():
 
         timing = track.get("timing", {})
         print(f"Track {i+1}: {artist} - {title}")
-        print(f"  Album: {album} | DB id: {db_id} | precision: {precision}")
+        print(f"  Album: {album} | DB id: {db_id}")
         print(f"  Duration: {track.get('durationS', '?')}s")
         if timing:
             print(f"  Timing: decode {timing.get('decodingMs', '?')}ms, "

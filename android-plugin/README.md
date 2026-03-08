@@ -9,7 +9,7 @@ The app supports five main jobs:
 1. current-track radio from Poweramp
 2. text-to-audio search in the shared CLaMP3 embedding space
 3. multi-seed search and multi-seed radio
-4. on-device indexing for tracks that are missing from `embeddings.db`
+4. on-device indexing for tracks present on the phone but absent from `embeddings.db`
 5. benchmark and debug entry points used during development
 
 ## Build In WSL
@@ -76,18 +76,18 @@ The runtime integration points are:
 - `DPP`
   - re-scores each candidate against the chosen set as a whole
 - `Random Walk`
-  - follows a precomputed similarity graph instead of ranking directly from the seed embedding at runtime
+  - follows the precomputed similarity graph at runtime
 
 ### Drift
 
 - drift is meaningful on the sequential embedding-scan path
 - the engine disables drift when `DPP` is selected
-- the UI treats drift as not applicable to `Random Walk`
+- the UI hides drift when `Random Walk` is selected
 
 ### Text search
 
 - text and audio share the same `768d` CLaMP3 space
-- the text model currently falls back to CPU in practice because its graph uses INT64 ops that the GPU path does not handle cleanly
+- the text model currently runs on CPU because its graph uses INT64 ops that the GPU path does not handle cleanly
 
 ### On-device indexing
 
@@ -111,7 +111,7 @@ adb shell rm /data/local/tmp/embeddings.db
 
 ```bash
 for f in mert.tflite clamp3_audio.tflite; do
-  adb push "../desktop-indexer/models/$f" /data/local/tmp/
+  adb push "../models/$f" /data/local/tmp/
   adb shell run-as com.powerampstartradio cp "/data/local/tmp/$f" files/
   adb shell rm "/data/local/tmp/$f"
 done
@@ -121,7 +121,7 @@ done
 
 ```bash
 for f in clamp3_text.tflite xlm_roberta_vocab.json; do
-  adb push "../desktop-indexer/models/$f" /data/local/tmp/
+  adb push "../models/$f" /data/local/tmp/
   adb shell run-as com.powerampstartradio cp "/data/local/tmp/$f" files/
   adb shell rm "/data/local/tmp/$f"
 done
@@ -206,5 +206,5 @@ A good reading order for the Android app is:
 - stale or missing `graph.bin` after a desktop database update
 - missing `clamp3_text.tflite` or vocab for text search
 - missing audio models for on-device indexing
-- Poweramp metadata that does not line up with the desktop database
+- Poweramp metadata mismatches against the desktop database
 - comparing truncated benchmark audio against full-track desktop embeddings

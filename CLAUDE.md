@@ -21,7 +21,7 @@ The normal workflow is desktop-first:
 1. build `embeddings.db` on a desktop machine
 2. copy it to the phone
 3. let the Android app extract `clamp3.emb` and `graph.bin` for fast runtime access
-4. optionally let the phone index tracks that were not in the desktop database yet
+4. let the phone index tracks added directly on-device
 
 ## End-To-End Flow
 
@@ -81,7 +81,7 @@ If matching behavior changes, read `TrackMatcher` and `NewTrackDetector` togethe
 - MERT works on non-overlapping `5s` windows
 - CLaMP3 produces one `768d` embedding per track
 - embeddings are L2-normalized, so dot product equals cosine similarity
-- Android hot paths use mmap-backed indices rather than repeated SQLite reads
+- Android hot paths rely on mmap-backed indices for speed
 
 ### Recommendation modes
 
@@ -115,7 +115,7 @@ A few details matter here because they have caused real regressions.
 - decode chunk boundaries must not create extra MERT windows
 - only the final tail of the whole track may be zero-padded, and only if it is at least `1s`
 - chunked extraction preserves alignment by carrying leftover samples across chunks
-- the text model currently falls back to CPU in practice because its graph uses INT64 ops that the GPU path does not handle cleanly
+- the text model currently runs on CPU in practice because its graph uses INT64 ops that the GPU path does not handle cleanly
 
 ### Native and packaging notes
 
