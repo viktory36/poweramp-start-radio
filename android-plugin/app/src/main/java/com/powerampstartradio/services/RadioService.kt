@@ -249,7 +249,7 @@ class RadioService : Service() {
         }
     }
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var embeddingDb: EmbeddingDatabase? = null
     private var engine: RecommendationEngine? = null
     private var showToasts: Boolean = false
@@ -425,7 +425,9 @@ class RadioService : Service() {
                     Log.d(TAG, "Found match (${matchResult.matchType}): ${matchResult.embeddedTrack.title}")
                 }
 
-                updateNotification("Finding similar tracks to: ${seedDisplayTrack.title}")
+                val searchPhaseMessage = buildSearchPhaseMessage(config, seedDisplayTrack.title)
+                _uiState.value = RadioUiState.Searching(searchPhaseMessage)
+                updateNotification(searchPhaseMessage)
                 Log.d(TAG, "Config: ${config.selectionMode.name}" +
                     (if (config.driftEnabled) " drift(${config.driftMode.name})" else "") +
                     " lambda=${config.diversityLambda}")
@@ -445,7 +447,8 @@ class RadioService : Service() {
                     config.copy(candidatePoolSize = autoPool)
                 } else config
 
-                updateNotification("Searching for similar tracks...")
+                _uiState.value = RadioUiState.Searching(searchPhaseMessage)
+                updateNotification(searchPhaseMessage)
 
                 // DPP+drift is degenerate (forced to batch in RecommendationEngine),
                 // so use batch path here too to avoid streaming/return-value mismatch.
@@ -589,11 +592,11 @@ class RadioService : Service() {
                     val totalMs = (System.nanoTime() - radioStart) / 1_000_000
                     Log.i(TAG, "TIMING: radio_drift total=${totalMs}ms, " +
                         "${finalResult.queuedCount} queued / ${finalResult.failedCount} failed / $notFound not found")
-                    Toast.makeText(this@RadioService, message, Toast.LENGTH_SHORT).show()
+                    toast(message)
 
                 } else {
                     // Non-drift path: batch search
-                    _uiState.value = RadioUiState.Searching("Searching...")
+                    _uiState.value = RadioUiState.Searching(searchPhaseMessage)
 
                     val similarTracks = eng.generatePlaylist(
                         seedTrackId = seedTrackId,
@@ -696,7 +699,7 @@ class RadioService : Service() {
                     val totalMs = (System.nanoTime() - radioStart) / 1_000_000
                     Log.i(TAG, "TIMING: radio_batch total=${totalMs}ms, " +
                         "${radioResult.queuedCount} queued / ${radioResult.failedCount} failed / $notFound not found")
-                    Toast.makeText(this@RadioService, message, Toast.LENGTH_SHORT).show()
+                    toast(message)
                 }
 
                 stopSelfDelayed()
@@ -836,7 +839,7 @@ class RadioService : Service() {
                 val totalMs = (System.nanoTime() - radioStart) / 1_000_000
                 Log.i(TAG, "TIMING: radio_multiseed total=${totalMs}ms, " +
                     "${radioResult.queuedCount} queued / ${radioResult.failedCount} failed / $notFound not found")
-                Toast.makeText(this@RadioService, message, Toast.LENGTH_SHORT).show()
+                toast(message)
 
                 stopSelfDelayed()
             } catch (e: CancellationException) {
@@ -942,7 +945,7 @@ class RadioService : Service() {
                     radioResult.tracks.count { it.status == QueueStatus.NOT_IN_LIBRARY }
                 )
                 updateNotification(message)
-                Toast.makeText(this@RadioService, message, Toast.LENGTH_SHORT).show()
+                toast(message)
                 _uiState.value = RadioUiState.Success(radioResult)
                 stopSelfDelayed()
             } catch (e: CancellationException) {
@@ -986,9 +989,25 @@ class RadioService : Service() {
         return if (notFoundCount > 0) "$base ($notFoundCount not found)" else base
     }
 
-    private fun toast(message: String) {
+    private fun buildSearchPhaseMessage(config: RadioConfig, seedTitle: String): String {
+        val action = when {
+            config.driftEnabled && config.selectionMode != SelectionMode.DPP ->
+                "Exploring from"
+            config.selectionMode == SelectionMode.RANDOM_WALK ->
+                "Walking similarity graph from"
+            config.selectionMode == SelectionMode.DPP ->
+                "Selecting a diverse set from"
+            else ->
+                "Finding similar tracks to"
+        }
+        return "$action: $seedTitle"
+    }
+
+    private suspend fun toast(message: String) {
         if (showToasts) {
-            Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+            withContext(Dispatchers.Main.immediate) {
+                Toast.makeText(this@RadioService, message, Toast.LENGTH_SHORT).show()
+            }
         }
     }
 

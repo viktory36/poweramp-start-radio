@@ -182,6 +182,8 @@ fun MainScreen(
         if (showTextSearch) {
             showTextSearch = false
             viewModel.clearTextSearchResult()
+            viewModel.clearMultiSeedResult()
+            viewModel.clearSongSeeds()
         } else if (showSettings) showSettings = false
         else {
             viewingSession = null
@@ -249,7 +251,12 @@ fun MainScreen(
                     onClearAndReset = { viewModel.resetRadioState() },
                     onRequestPermission = { viewModel.requestPermission() },
                     onOpenSettings = { showSettings = true },
-                    onOpenTextSearch = { showTextSearch = true },
+                    onOpenTextSearch = {
+                        viewModel.clearTextSearchResult()
+                        viewModel.clearMultiSeedResult()
+                        viewModel.clearSongSeeds()
+                        showTextSearch = true
+                    },
                     onOpenDrawer = { scope.launch { drawerState.open() } },
                     viewingSession = viewingSession,
                     onViewSession = { viewingSession = it }
@@ -896,7 +903,7 @@ fun TextSearchScreen(
                     )
                 } else {
                     // "+" button to add first song seed (only when no seeds yet)
-                    IconButton(onClick = { viewModel.addSongSeed() }) {
+                    IconButton(onClick = { viewModel.addSongSeed(query.text.isNotBlank()) }) {
                         Icon(Icons.Default.Add, contentDescription = "Add song seed")
                     }
                 }
@@ -915,7 +922,7 @@ fun TextSearchScreen(
                         dropdownResults = if (activeSeedSearchIndex == index) songSeedSearchResults else null,
                         onQueryChange = { viewModel.updateSongSeedQuery(index, it) },
                         onRemove = { viewModel.removeSongSeed(index) },
-                        onAdd = { viewModel.addSongSeed() },
+                        onAdd = { viewModel.addSongSeed(query.text.isNotBlank()) },
                         onLookup = { viewModel.searchSongSeed(index) },
                         onConfirm = { viewModel.confirmSongSeed(index, it) },
                         onSubmitSearch = { doSearch(query.text) },

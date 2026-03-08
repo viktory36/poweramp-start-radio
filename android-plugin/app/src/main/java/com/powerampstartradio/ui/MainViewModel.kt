@@ -567,9 +567,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun saveRecentSearch(search: RecentSearch) {
-        // Deduplicate by display label
-        val label = search.displayLabel
-        val updated = (listOf(search) + _recentSearches.value.filter { it.displayLabel != label }).take(10)
+        // Deduplicate by exact search state, not by human-facing label.
+        val stateKey = search.stateKey
+        val updated = (listOf(search) + _recentSearches.value.filter { it.stateKey != stateKey }).take(10)
         _recentSearches.value = updated
         prefs.edit().putString("recent_searches_v2", RecentSearch.toJsonArray(updated)).apply()
     }
@@ -616,7 +616,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
             // Renormalize weights if some tracks were lost
             if (restoredSeeds.size < search.songSeeds.size) {
-                val totalWeight = (if (search.textQuery.isNotBlank()) _textSeedWeight.value else 0f) +
+                val totalWeight = (if (search.textQuery.isNotBlank()) search.textWeight else 0f) +
                     restoredSeeds.sumOf { it.weight.toDouble() }.toFloat()
                 if (totalWeight > 0f) {
                     val scale = 1f / totalWeight
@@ -628,8 +628,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
             kotlinx.coroutines.withContext(Dispatchers.Main) {
                 _songSeeds.value = restoredSeeds
+                _textSeedWeight.value = when {
+                    search.textQuery.isNotBlank() -> search.textWeight
+                    restoredSeeds.isNotEmpty() -> 0f
+                    else -> 1.0f
+                }
                 _textSeedLocked.value = false
-                _textSeedNegative.value = false
+                _textSeedNegative.value = search.textNegative
             }
 
             // Run the search
@@ -874,11 +879,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _textSeedNegative.value = false
     }
 
-    fun addSongSeed() {
+    fun addSongSeed(hasTextSeed: Boolean) {
         val isFirst = _songSeeds.value.isEmpty()
         if (isFirst && !_textSeedLocked.value) {
-            // First song seed: text defaults to 0%, song gets 100%
-            _textSeedWeight.value = 0f
+            // First song seed:
+            // - blank text box => song-only mode (0/100)
+            // - non-blank text box => split evenly (50/50)
+            _textSeedWeight.value = if (hasTextSeed) 0.5f else 0f
         }
         val budget = unlockedBudget()
         // Don't count text at 0% in budget split — it doesn't participate
@@ -1130,17 +1137,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 Log.d("MultiSeed", "  spec[$i]: type=${spec.type} label='${spec.label}' weight=${spec.weight}")
             }
 
+            val seedVectors = seedSpecs.map { it.embedding to it.weight }
             val ranking = com.powerampstartradio.similarity.algorithms.GeoMeanSelector.computeRanking(
                 index,
-                seedSpecs.map { it.embedding to it.weight },
+                seedVectors,
                 topK,
                 excludeIds,
             )
+            val displaySims = com.powerampstartradio.similarity.algorithms.GeoMeanSelector
+                .computeDisplaySimilarities(index, seedVectors)
 
             // Resolve track metadata
             val db3 = EmbeddingDatabase.open(dbFile)
             val matches = ranking.mapNotNull { (trackId, score) ->
-                db3.getTrackById(trackId)?.let { TextSearchMatch(it, score) }
+                db3.getTrackById(trackId)?.let { track ->
+                    TextSearchMatch(
+                        track = track,
+                        similarity = index.getSimFromPrecomputed(displaySims, trackId),
+                        rankingScore = score,
+                    )
+                }
             }
             db3.close()
 
@@ -1177,25 +1193,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     put("track_id", m.track.id)
                     m.track.artist?.let { put("artist", it) }
                     m.track.title?.let { put("title", it) }
-                    put("score", m.similarity.toDouble())
+                    put("score", m.rankingScore.toDouble())
+                    put("display_similarity", m.similarity.toDouble())
                 })
             }
             Log.i("MultiSeed", "MULTISEED_RESULTS: $resultsJson")
 
-            val queryLabel = buildList {
-                if (hasText) add("$textQuery (${(textWeight * 100).roundToInt()}%)")
-                for (s in confirmedSeeds) {
-                    val prefix = if (s.negative) "\u2212 " else "+ "
-                    val pct = (s.weight * 100).roundToInt()
-                    add("$prefix${s.confirmedTrack!!.title} ($pct%)")
+            val queryLabel = formatSearchLabel(
+                textQuery = textQuery.takeIf { hasText }?.let {
+                    val label = "$it (${(textWeight * 100).roundToInt()}%)"
+                    if (textNegative) "- $label" else label
+                },
+                songSeeds = confirmedSeeds.map { s ->
+                    SearchLabelPart(
+                        text = "${s.confirmedTrack!!.title} (${(s.weight * 100).roundToInt()}%)",
+                        negative = s.negative
+                    )
                 }
-            }.joinToString(" \u00b7 ")
+            )
 
             _multiSeedResult.value = TextSearchResult(query = queryLabel, matches = matches)
 
             // Save full multi-seed state to recent searches
             saveRecentSearch(RecentSearch(
                 textQuery = if (hasText) textQuery else "",
+                textWeight = if (hasText) textWeight else 0f,
+                textNegative = if (hasText) textNegative else false,
                 songSeeds = confirmedSeeds.map { s ->
                     RecentSongSeed(
                         trackId = s.confirmedTrack!!.id,
@@ -1638,6 +1661,7 @@ data class AppFileStatus(
 data class TextSearchMatch(
     val track: EmbeddedTrack,
     val similarity: Float,
+    val rankingScore: Float = similarity,
 )
 
 data class TextSearchResult(
@@ -1677,17 +1701,41 @@ data class RecentSongSeed(
  */
 data class RecentSearch(
     val textQuery: String,
+    val textWeight: Float = 1.0f,
+    val textNegative: Boolean = false,
     val songSeeds: List<RecentSongSeed> = emptyList(),
 ) {
-    /** Composite display label: "sufi music · +Ragini · −Ektaal" */
+    /** Composite display label: "sufi music + Ragini - Ektaal" */
     val displayLabel: String
-        get() = buildList {
-            if (textQuery.isNotBlank()) add(textQuery)
-            for (s in songSeeds) {
-                val prefix = if (s.negative) "\u2212" else "+"
-                add("$prefix${s.title ?: "?"}")
+        get() = formatSearchLabel(
+            textQuery = textQuery.takeIf { it.isNotBlank() }?.let {
+                if (textNegative) "- $it" else it
+            },
+            songSeeds = songSeeds.map { s ->
+                SearchLabelPart(
+                    text = s.title ?: "?",
+                    negative = s.negative,
+                )
             }
-        }.joinToString(" \u00b7 ")
+        )
+
+    /** Stable identity for deduping exact recent-search state. */
+    val stateKey: String
+        get() = buildString {
+            append(textQuery)
+            append('|')
+            append(textWeight)
+            append('|')
+            append(textNegative)
+            for (s in songSeeds) {
+                append('|')
+                append(s.trackId)
+                append(':')
+                append(s.weight)
+                append(':')
+                append(s.negative)
+            }
+        }
 
     companion object {
         fun toJsonArray(list: List<RecentSearch>): String {
@@ -1695,6 +1743,8 @@ data class RecentSearch(
             for (search in list) {
                 val obj = JSONObject()
                 obj.put("text", search.textQuery)
+                obj.put("text_weight", search.textWeight.toDouble())
+                obj.put("text_negative", search.textNegative)
                 if (search.songSeeds.isNotEmpty()) {
                     val seedArr = JSONArray()
                     for (s in search.songSeeds) {
@@ -1733,10 +1783,59 @@ data class RecentSearch(
                 } else emptyList()
                 result.add(RecentSearch(
                     textQuery = obj.optString("text", ""),
+                    textWeight = when {
+                        obj.has("text_weight") -> obj.getDouble("text_weight").toFloat()
+                        obj.optString("text", "").isBlank() -> 0f
+                        else -> 1.0f
+                    },
+                    textNegative = obj.optBoolean("text_negative", false),
                     songSeeds = seeds,
                 ))
             }
             return result
+        }
+    }
+}
+
+private data class SearchLabelPart(
+    val text: String,
+    val negative: Boolean,
+)
+
+private fun formatSearchLabel(
+    textQuery: String?,
+    songSeeds: List<SearchLabelPart>,
+): String {
+    val parts = mutableListOf<String>()
+
+    textQuery?.takeIf { it.isNotBlank() }?.let { parts += it }
+
+    for ((index, seed) in songSeeds.withIndex()) {
+        val isFirstVisiblePart = parts.isEmpty()
+        val seedText = when {
+            seed.negative -> "- ${seed.text}"
+            isFirstVisiblePart && index == 0 -> seed.text
+            else -> "+ ${seed.text}"
+        }
+        parts += seedText
+    }
+
+    if (parts.isEmpty()) return ""
+
+    return buildString {
+        append(parts.first())
+        for (i in 1 until parts.size) {
+            val part = parts[i]
+            if (part.startsWith("- ")) {
+                append(" - ")
+                append(part.removePrefix("- "))
+            } else if (part.startsWith("+ ")) {
+                append(" + ")
+                append(part.removePrefix("+ "))
+            } else {
+                append(" ")
+                append(part)
+            }
         }
     }
 }

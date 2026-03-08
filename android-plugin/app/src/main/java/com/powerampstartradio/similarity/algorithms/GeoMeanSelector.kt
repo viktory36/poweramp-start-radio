@@ -114,4 +114,39 @@ object GeoMeanSelector {
 
         return topResults.map { index.getTrackId(it.index) to it.score }
     }
+
+    /**
+     * Compute a signed blended-query cosine for UI display.
+     *
+     * This is not the ranking objective. It gives multi-seed results a score in the
+     * same family as single-seed text/audio cosine so the displayed percentage
+     * remains interpretable across search modes.
+     */
+    fun computeDisplaySimilarities(
+        index: EmbeddingIndex,
+        seeds: List<Pair<FloatArray, Float>>,
+    ): FloatArray {
+        if (seeds.isEmpty()) return FloatArray(index.numTracks)
+
+        val dim = seeds.first().first.size
+        val blended = FloatArray(dim)
+        for ((embedding, weight) in seeds) {
+            for (i in 0 until dim) {
+                blended[i] += embedding[i] * weight
+            }
+        }
+
+        var normSq = 0f
+        for (v in blended) normSq += v * v
+        if (normSq < 1e-12f) return FloatArray(index.numTracks)
+
+        val invNorm = 1f / kotlin.math.sqrt(normSq)
+        for (i in blended.indices) blended[i] *= invNorm
+
+        val sims = index.computeAllSimilarities(blended)
+        for (i in sims.indices) {
+            sims[i] = sims[i].coerceIn(-1f, 1f)
+        }
+        return sims
+    }
 }

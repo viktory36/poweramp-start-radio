@@ -545,20 +545,23 @@ class RecommendationEngine(
 
         // Over-request to compensate for post-filter drops
         val requestK = (config.numTracks * 3).coerceAtMost(index.numTracks)
+        val seedVectors = validSeeds.map { it.embedding to it.weight }
         val ranking = GeoMeanSelector.computeRanking(
             index,
-            validSeeds.map { it.embedding to it.weight },
+            seedVectors,
             requestK,
             excludeIds,
         )
+        val displaySims = GeoMeanSelector.computeDisplaySimilarities(index, seedVectors)
 
         // Resolve track metadata
         val tracks = ranking.mapNotNull { (trackId, score) ->
             database.getTrackById(trackId)?.let { track ->
+                val displaySimilarity = index.getSimFromPrecomputed(displaySims, trackId)
                 SimilarTrack(
                     track = track,
-                    similarity = score,
-                    similarityToSeed = score,  // geo mean score used as similarity display
+                    similarity = displaySimilarity,
+                    similarityToSeed = displaySimilarity,
                 )
             }
         }
