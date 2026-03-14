@@ -742,7 +742,12 @@ fun IdleContent(
             Text(statusMessage, style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        if (isIdle && hasPermission && databaseInfo != null && statusMessage.isEmpty()) {
+        if (isIdle &&
+            hasPermission &&
+            databaseInfo != null &&
+            statusMessage.isEmpty() &&
+            (indexStatus == null || indexStatus == "Index ready")
+        ) {
             Text("Ready when you are!", style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.primary)
         }

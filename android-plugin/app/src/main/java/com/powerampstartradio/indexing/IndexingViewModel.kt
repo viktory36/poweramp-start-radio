@@ -8,6 +8,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.powerampstartradio.data.EmbeddedTrack
 import com.powerampstartradio.data.EmbeddingDatabase
+import com.powerampstartradio.indexing.GraphUpdater
 import com.powerampstartradio.poweramp.PowerampHelper
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
@@ -149,46 +150,28 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         val dbFingerprint = getDbFingerprint()
         val powerampCount = getPowerampTrackCount(app)
 
-        // Check if DB was replaced externally since we last saved dismissed IDs.
-        // Only check when cache is populated — if cache was invalidated (e.g. by our
-        // own startIndexing()), the DB change was from us, not an external replacement.
+        // DB fingerprint changes should invalidate detection cache, but they should not
+        // wipe the user's ignored / never-index choices. Those choices are keyed to the
+        // Poweramp library, not to a specific embeddings.db mtime.
         if (cachedTracks != null) {
             val currentFingerprint = if (dbFile.exists())
                 "${dbFile.length()}_${dbFile.lastModified()}" else ""
             val savedFingerprint = prefs.getString("dismissed_db_fingerprint", "") ?: ""
             if (currentFingerprint != savedFingerprint) {
-                // DB replaced externally — clear stale dismissed and ignored IDs
-                _dismissedIds.value = emptySet()
-                _ignoredIds.value = emptySet()
                 prefs.edit()
-                    .remove("dismissed_track_ids")
-                    .remove("ignored_track_ids")
                     .putString("dismissed_db_fingerprint", currentFingerprint)
                     .apply()
                 invalidateCache()
+                Log.i(TAG, "DB fingerprint changed; preserved hidden track choices and invalidated detection cache")
             }
-        }
-
-        // Use cached result if neither the DB nor the Poweramp library has changed
-        if (!forceRefresh && cachedTracks != null && dbFile.exists()
-            && dbFingerprint == cachedDbFingerprint
-            && powerampCount == cachedPowerampTrackCount
-            && System.currentTimeMillis() - cachedTracksCheckedAtMs <= RECENT_DETECTION_CACHE_MS) {
-            val tracks = cachedTracks!!
-            Log.i(
-                TAG,
-                "Reusing recent unindexed cache (${System.currentTimeMillis() - cachedTracksCheckedAtMs}ms old)"
-            )
-            _unindexedTracks.value = tracks
-            autoSelect(tracks)
-            return
         }
 
         // If MainViewModel is already running a detection, await its results
         val pending = pendingDetection
         if (pending != null && !forceRefresh) {
+            _isDetecting.value = true
+            _detectingStatus.value = detectionStatus.value ?: "Checking which tracks are unindexed..."
             viewModelScope.launch(Dispatchers.IO) {
-                _isDetecting.value = true
                 try {
                     // Mirror shared progress into our own status flow
                     val statusJob = launch {
@@ -206,6 +189,23 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
                     _isDetecting.value = false
                 }
             }
+            return
+        }
+
+        // Use cached result if neither the DB nor the Poweramp library has changed.
+        // This must come after pendingDetection so a settings-side refresh can hand off
+        // its in-flight job to Manage Tracks instead of showing the previous cached result.
+        if (!forceRefresh && cachedTracks != null && dbFile.exists()
+            && dbFingerprint == cachedDbFingerprint
+            && powerampCount == cachedPowerampTrackCount
+            && System.currentTimeMillis() - cachedTracksCheckedAtMs <= RECENT_DETECTION_CACHE_MS) {
+            val tracks = cachedTracks!!
+            Log.i(
+                TAG,
+                "Reusing recent unindexed cache (${System.currentTimeMillis() - cachedTracksCheckedAtMs}ms old)"
+            )
+            _unindexedTracks.value = tracks
+            autoSelect(tracks)
             return
         }
 
@@ -259,11 +259,18 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
             && powerampCount == cachedDatabaseOnlyPowerampTrackCount
             && System.currentTimeMillis() - cachedDatabaseOnlyCheckedAtMs <= RECENT_DETECTION_CACHE_MS) {
             _databaseOnlyTracks.value = cachedDatabaseOnlyTracks!!
+            _databaseOnlyStatus.value = "Found ${cachedDatabaseOnlyTracks!!.size} clean-up candidates"
+            Log.i(
+                TAG,
+                "Reusing recent clean-db cache (${System.currentTimeMillis() - cachedDatabaseOnlyCheckedAtMs}ms old, ${cachedDatabaseOnlyTracks!!.size} candidates)"
+            )
             return
         }
 
+        _isDetectingDatabaseOnly.value = true
+        _databaseOnlyStatus.value = "Checking database..."
+        Log.i(TAG, "Starting clean-db scan (forceRefresh=$forceRefresh)")
         viewModelScope.launch(Dispatchers.IO) {
-            _isDetectingDatabaseOnly.value = true
             var db: EmbeddingDatabase? = null
             try {
                 if (!dbFile.exists()) {
@@ -271,6 +278,8 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
                     cachedDatabaseOnlyTracks = emptyList()
                     cachedDatabaseOnlyDbFingerprint = ""
                     cachedDatabaseOnlyCheckedAtMs = 0L
+                    _databaseOnlyStatus.value = "No database loaded."
+                    Log.i(TAG, "Clean-db scan skipped: no embeddings.db")
                     return@launch
                 }
 
@@ -290,8 +299,11 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
                 cachedDatabaseOnlyPowerampTrackCount = powerampCount
                 cachedDatabaseOnlyCheckedAtMs = System.currentTimeMillis()
                 updateDismissedFingerprint()
-            } catch (_: Exception) {
+                Log.i(TAG, "Clean-db scan complete: ${tracks.size} candidates")
+            } catch (e: Exception) {
                 _databaseOnlyTracks.value = emptyList()
+                _databaseOnlyStatus.value = "Clean-up scan failed."
+                Log.e(TAG, "Clean-db scan failed", e)
             } finally {
                 db?.close()
                 _isDetectingDatabaseOnly.value = false
@@ -308,21 +320,42 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
             if (!dbFile.exists()) return@launch
 
             var db: EmbeddingDatabase? = null
+            var deletedTracks = 0
             try {
+                _isDetectingDatabaseOnly.value = true
+                _databaseOnlyStatus.value = "Deleting ${ids.size} tracks from the database..."
+                Log.i(TAG, "Deleting ${ids.size} clean-db track ids")
                 db = EmbeddingDatabase.openReadWrite(dbFile)
-                db.deleteTracks(ids)
-                db.deleteBinaryData("knn_graph")
-
-                File(app.filesDir, "clamp3.emb").delete()
-                File(app.filesDir, "graph.bin").delete()
-
-                _databaseOnlyTracks.value = _databaseOnlyTracks.value.filter { it.id !in ids }
-                invalidateCache()
+                deletedTracks = db.deleteTracks(ids)
+                Log.i(TAG, "Clean-db delete removed $deletedTracks track rows")
+                if (deletedTracks != ids.size) {
+                    Log.w(TAG, "Clean-db requested ${ids.size} deletions but removed $deletedTracks rows")
+                }
+                if (deletedTracks > 0) {
+                    db.deleteBinaryData("knn_graph")
+                    File(app.filesDir, "clamp3.emb").delete()
+                    File(app.filesDir, "graph.bin").delete()
+                    invalidateCache()
+                    Log.i(TAG, "Rebuilding derived search files after clean-db delete")
+                    _databaseOnlyStatus.value = "Rebuilding search files..."
+                    GraphUpdater(db, app.filesDir).rebuildIndices { status ->
+                        _databaseOnlyStatus.value = status
+                    }
+                    Log.i(TAG, "Finished rebuilding search files after clean-db delete")
+                } else {
+                    _databaseOnlyStatus.value = "No database rows were deleted."
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Clean-db delete failed", e)
+                _databaseOnlyStatus.value = "Delete failed. Please try again."
             } finally {
                 db?.close()
                 refreshAppFiles()
                 updateDismissedFingerprint()
+                _isDetectingDatabaseOnly.value = false
             }
+
+            detectDatabaseOnlyTracks(forceRefresh = true)
         }
     }
 
@@ -576,10 +609,6 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         } catch (_: Exception) { -1 }
     }
 
-    /**
-     * Load dismissed IDs, but clear them if the database has changed
-     * (e.g. user replaced embeddings.db with a fresh copy).
-     */
     private fun loadDismissedIdsWithDbCheck(app: Application): Set<Long> {
         val dbFile = File(app.filesDir, "embeddings.db")
         val currentFingerprint = if (dbFile.exists())
@@ -587,14 +616,11 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         val savedFingerprint = prefs.getString("dismissed_db_fingerprint", "") ?: ""
 
         if (currentFingerprint != savedFingerprint) {
-            // DB has changed — clear stale dismissed and ignored IDs and detection cache
             prefs.edit()
-                .remove("dismissed_track_ids")
-                .remove("ignored_track_ids")
                 .putString("dismissed_db_fingerprint", currentFingerprint)
                 .apply()
             invalidateCache()
-            return emptySet()
+            Log.i(TAG, "DB fingerprint changed during load; preserved hidden track choices")
         }
         return loadDismissedIds()
     }
@@ -606,8 +632,7 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         val savedFingerprint = prefs.getString("dismissed_db_fingerprint", "") ?: ""
 
         if (currentFingerprint != savedFingerprint) {
-            // Already cleared by loadDismissedIdsWithDbCheck
-            return emptySet()
+            prefs.edit().putString("dismissed_db_fingerprint", currentFingerprint).apply()
         }
         return loadIgnoredIds()
     }

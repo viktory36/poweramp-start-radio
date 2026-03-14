@@ -32,6 +32,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.state.ToggleableState
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
@@ -1054,15 +1055,18 @@ private fun CleanDatabaseScreen(
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text(
-                            "Database is in sync",
+                            "No clean-up candidates",
                             style = MaterialTheme.typography.headlineSmall,
                             color = MaterialTheme.colorScheme.primary,
+                            textAlign = TextAlign.Center,
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
                             "No tracks were found in the database without a matching Poweramp library entry.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(horizontal = 24.dp),
                         )
                     }
                 }

@@ -213,7 +213,12 @@ class NewTrackDetector(
         context: Context,
         onProgress: (String) -> Unit = {},
     ): List<EmbeddedTrack> {
-        val report = buildLibrarySyncReport(context, onProgress)
+        val report = buildLibrarySyncReport(
+            context = context,
+            onProgress = onProgress,
+            includeArtistTitlePass = false,
+            includeFuzzyArtistTitlePass = false,
+        )
         val musicRoots = collectMusicRoots(report.powerampEntries)
         val (stillPresentOnDevice, missingFromDevice) = report.unmatchedEmbedded.partition { entry ->
             existsOnDeviceStorage(entry.track, musicRoots)
@@ -307,6 +312,8 @@ class NewTrackDetector(
     private fun buildLibrarySyncReport(
         context: Context,
         onProgress: (String) -> Unit = {},
+        includeArtistTitlePass: Boolean = true,
+        includeFuzzyArtistTitlePass: Boolean = true,
     ): LibrarySyncReport {
         onProgress("Querying Poweramp library...")
         val powerampEntries = getAllPowerampEntriesWithPaths(context)
@@ -366,24 +373,28 @@ class NewTrackDetector(
             embeddedKey = { "${it.artist}\u0000${it.album}\u0000${it.title}" },
         )
 
-        onProgress("Matching artist and title...")
-        pairByGroupedDuration(
-            remainingPoweramp,
-            remainingEmbedded,
-            MatchPass.ARTIST_TITLE,
-            passCounts,
-            sink = pairs,
-            powerampKey = { "${it.artist}\u0000${it.title}" },
-            embeddedKey = { "${it.artist}\u0000${it.title}" },
-        )
+        if (includeArtistTitlePass) {
+            onProgress("Matching artist and title...")
+            pairByGroupedDuration(
+                remainingPoweramp,
+                remainingEmbedded,
+                MatchPass.ARTIST_TITLE,
+                passCounts,
+                sink = pairs,
+                powerampKey = { "${it.artist}\u0000${it.title}" },
+                embeddedKey = { "${it.artist}\u0000${it.title}" },
+            )
+        }
 
-        onProgress("Matching fuzzy title leftovers...")
-        pairByFuzzyArtistTitle(
-            remainingPoweramp,
-            remainingEmbedded,
-            passCounts,
-            pairs,
-        )
+        if (includeFuzzyArtistTitlePass) {
+            onProgress("Matching fuzzy title leftovers...")
+            pairByFuzzyArtistTitle(
+                remainingPoweramp,
+                remainingEmbedded,
+                passCounts,
+                pairs,
+            )
+        }
 
         val unmatchedPoweramp = remainingPoweramp.values.toList()
         val unmatchedEmbedded = remainingEmbedded.values.toList()

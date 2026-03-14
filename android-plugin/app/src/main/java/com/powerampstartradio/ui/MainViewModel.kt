@@ -178,7 +178,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         RadioService.initHistory(application.filesDir)
         refreshDatabaseInfo()
         checkPermission()
-        prepareIndices()
         checkModels()
         PowerampReceiver.addTrackChangeListener(trackChangeListener)
 
@@ -189,6 +188,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (state is IndexingService.IndexingState.Complete) wasComplete = true
                 if (wasComplete && state is IndexingService.IndexingState.Idle) {
                     wasComplete = false
+                    syncIndexingDbFingerprint()
                     checkUnindexedTracks()
                 }
             }
@@ -1368,17 +1368,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             try {
                 val result = deferred.await()
-                // Check if DB changed — clear stale dismissed IDs if so
+                // DB fingerprint changes should not wipe ignored / never-index choices.
+                // Those are Poweramp-library choices, not DB-specific state.
                 val indexingPrefs = app.getSharedPreferences("indexing", Context.MODE_PRIVATE)
                 val currentFingerprint = if (dbFile.exists())
                     "${dbFile.length()}_${dbFile.lastModified()}" else ""
                 val savedFingerprint = indexingPrefs.getString("dismissed_db_fingerprint", "") ?: ""
                 if (currentFingerprint != savedFingerprint) {
                     indexingPrefs.edit()
-                        .remove("dismissed_track_ids")
-                        .remove("ignored_track_ids")
                         .putString("dismissed_db_fingerprint", currentFingerprint)
                         .apply()
+                    Log.i("MainViewModel", "DB fingerprint changed during unindexed recount; preserved hidden track choices")
                 }
                 // Exclude dismissed and ignored tracks from the count
                 val dismissedJson = indexingPrefs.getString("dismissed_track_ids", null)
@@ -1395,7 +1395,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         (0 until arr.length()).map { arr.getLong(it) }.toSet()
                     } catch (_: Exception) { emptySet() }
                 } else emptySet<Long>()
-                val visible = result.count { it.powerampFileId !in dismissed && it.powerampFileId !in ignored }
+                val visible = result.count {
+                    it.durationMs > 0 &&
+                        it.powerampFileId !in dismissed &&
+                        it.powerampFileId !in ignored
+                }
                 setUnindexedCount(visible)
                 Log.i("MainViewModel", "Unindexed track check complete: $visible visible tracks")
             } catch (_: Exception) {
@@ -1442,6 +1446,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             .putLong("unindexed_last_checked_ms", System.currentTimeMillis())
             .putString("unindexed_count_db_fingerprint", getDbFingerprint(dbFile))
             .apply()
+    }
+
+    private fun syncIndexingDbFingerprint() {
+        val app = getApplication<Application>()
+        val indexingPrefs = app.getSharedPreferences("indexing", Context.MODE_PRIVATE)
+        val dbFile = File(app.filesDir, "embeddings.db")
+        val fingerprint = getDbFingerprint(dbFile)
+        if (fingerprint.isNotEmpty()) {
+            indexingPrefs.edit()
+                .putString("dismissed_db_fingerprint", fingerprint)
+                .apply()
+            Log.i("MainViewModel", "Synced indexing DB fingerprint after app-owned DB update")
+        }
     }
 
     private fun getPowerampTrackCount(context: Context): Int {
@@ -1665,7 +1682,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     db.close()
                     _databaseInfo.value = info
-                    prepareIndices()
                     checkModels()
                 } catch (e: Exception) {
                     _databaseInfo.value = null
