@@ -760,14 +760,27 @@ class IndexingService : Service() {
     }
 
     private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == true) return
+
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PowerampStartRadio:indexing")
-        wakeLock?.acquire(60 * 60 * 1000L)  // 1 hour max
+        val lock = wakeLock ?: pm.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "PowerampStartRadio:indexing"
+        ).apply {
+            setReferenceCounted(false)
+        }
+
+        lock.acquire()
+        wakeLock = lock
+        Log.i(TAG, "Acquired partial wakelock for indexing")
     }
 
     private fun releaseWakeLock() {
         wakeLock?.let {
-            if (it.isHeld) it.release()
+            if (it.isHeld) {
+                it.release()
+                Log.i(TAG, "Released partial wakelock for indexing")
+            }
         }
         wakeLock = null
     }
