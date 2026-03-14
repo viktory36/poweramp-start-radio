@@ -2,8 +2,11 @@ package com.powerampstartradio.indexing
 
 import android.app.Application
 import android.content.Context
+import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.powerampstartradio.data.EmbeddedTrack
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.poweramp.PowerampHelper
 import kotlinx.coroutines.Deferred
@@ -13,7 +16,12 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import org.json.JSONArray
+import java.io.BufferedInputStream
 import java.io.File
+import java.io.FileInputStream
+import java.io.BufferedOutputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 /**
  * ViewModel for the IndexingActivity track selection and indexing UI.
@@ -23,8 +31,17 @@ import java.io.File
  * indexing to IndexingService.
  */
 class IndexingViewModel(application: Application) : AndroidViewModel(application) {
+    sealed class ExportState {
+        data object Idle : ExportState()
+        data class Exporting(val message: String) : ExportState()
+        data class Complete(val filename: String) : ExportState()
+        data class Error(val message: String) : ExportState()
+    }
 
     companion object {
+        private const val TAG = "IndexingViewModel"
+        private const val RECENT_DETECTION_CACHE_MS = 5L * 60L * 1000L
+
         /**
          * Cached detection result shared across ViewModel instances.
          * Avoids re-scanning 74K tracks when the user navigates away and back.
@@ -32,8 +49,13 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
          * or on explicit "Check Again".
          */
         private var cachedTracks: List<NewTrackDetector.UnindexedTrack>? = null
-        private var cachedDbLastModified: Long = 0L
+        private var cachedDbFingerprint: String = ""
         private var cachedPowerampTrackCount: Int = -1
+        private var cachedTracksCheckedAtMs: Long = 0L
+        private var cachedDatabaseOnlyTracks: List<EmbeddedTrack>? = null
+        private var cachedDatabaseOnlyDbFingerprint: String = ""
+        private var cachedDatabaseOnlyPowerampTrackCount: Int = -1
+        private var cachedDatabaseOnlyCheckedAtMs: Long = 0L
 
         /**
          * A pending detection started by MainViewModel. IndexingViewModel will
@@ -47,15 +69,25 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
         /** Clear the cached detection result (e.g. after DB import). */
         fun invalidateCache() {
             cachedTracks = null
-            cachedDbLastModified = 0L
+            cachedDbFingerprint = ""
             cachedPowerampTrackCount = -1
+            cachedTracksCheckedAtMs = 0L
+            cachedDatabaseOnlyTracks = null
+            cachedDatabaseOnlyDbFingerprint = ""
+            cachedDatabaseOnlyPowerampTrackCount = -1
+            cachedDatabaseOnlyCheckedAtMs = 0L
         }
 
         /** Store results from an external detection (e.g. MainViewModel's check). */
-        fun cacheResults(tracks: List<NewTrackDetector.UnindexedTrack>, dbMod: Long, paCount: Int) {
+        fun cacheResults(
+            tracks: List<NewTrackDetector.UnindexedTrack>,
+            dbFingerprint: String,
+            paCount: Int,
+        ) {
             cachedTracks = tracks
-            cachedDbLastModified = dbMod
+            cachedDbFingerprint = dbFingerprint
             cachedPowerampTrackCount = paCount
+            cachedTracksCheckedAtMs = System.currentTimeMillis()
         }
     }
 
@@ -81,10 +113,28 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
     private val _detectingStatus = MutableStateFlow("")
     val detectingStatus: StateFlow<String> = _detectingStatus.asStateFlow()
 
+    private val _hasModels = MutableStateFlow(false)
+    val hasModels: StateFlow<Boolean> = _hasModels.asStateFlow()
+
+    private val _hasDatabase = MutableStateFlow(File(application.filesDir, "embeddings.db").exists())
+    val hasDatabase: StateFlow<Boolean> = _hasDatabase.asStateFlow()
+
+    private val _databaseOnlyTracks = MutableStateFlow<List<EmbeddedTrack>>(emptyList())
+    val databaseOnlyTracks: StateFlow<List<EmbeddedTrack>> = _databaseOnlyTracks.asStateFlow()
+
+    private val _isDetectingDatabaseOnly = MutableStateFlow(false)
+    val isDetectingDatabaseOnly: StateFlow<Boolean> = _isDetectingDatabaseOnly.asStateFlow()
+
+    private val _databaseOnlyStatus = MutableStateFlow("")
+    val databaseOnlyStatus: StateFlow<String> = _databaseOnlyStatus.asStateFlow()
+
+    private val _exportState = MutableStateFlow<ExportState>(ExportState.Idle)
+    val exportState: StateFlow<ExportState> = _exportState.asStateFlow()
+
     val indexingState: StateFlow<IndexingService.IndexingState> = IndexingService.state
 
     init {
-        detectUnindexed()
+        refreshAppFiles()
     }
 
     fun detectUnindexed(forceRefresh: Boolean = false) {
@@ -92,9 +142,11 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
 
         // Reset service state from Complete/Error so UI shows detecting spinner
         IndexingService.resetState()
+        refreshAppFiles()
 
         val app = getApplication<Application>()
         val dbFile = File(app.filesDir, "embeddings.db")
+        val dbFingerprint = getDbFingerprint()
         val powerampCount = getPowerampTrackCount(app)
 
         // Check if DB was replaced externally since we last saved dismissed IDs.
@@ -119,9 +171,14 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
 
         // Use cached result if neither the DB nor the Poweramp library has changed
         if (!forceRefresh && cachedTracks != null && dbFile.exists()
-            && dbFile.lastModified() == cachedDbLastModified
-            && powerampCount == cachedPowerampTrackCount) {
+            && dbFingerprint == cachedDbFingerprint
+            && powerampCount == cachedPowerampTrackCount
+            && System.currentTimeMillis() - cachedTracksCheckedAtMs <= RECENT_DETECTION_CACHE_MS) {
             val tracks = cachedTracks!!
+            Log.i(
+                TAG,
+                "Reusing recent unindexed cache (${System.currentTimeMillis() - cachedTracksCheckedAtMs}ms old)"
+            )
             _unindexedTracks.value = tracks
             autoSelect(tracks)
             return
@@ -159,7 +216,8 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
                 if (!dbFile.exists()) {
                     _unindexedTracks.value = emptyList()
                     cachedTracks = emptyList()
-                    cachedDbLastModified = 0L
+                    cachedDbFingerprint = ""
+                    cachedTracksCheckedAtMs = 0L
                     return@launch
                 }
                 db = EmbeddingDatabase.open(dbFile)
@@ -173,8 +231,9 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
                 autoSelect(sorted)
                 // Cache for reuse
                 cachedTracks = sorted
-                cachedDbLastModified = dbFile.lastModified()
+                cachedDbFingerprint = getDbFingerprint()
                 cachedPowerampTrackCount = powerampCount
+                cachedTracksCheckedAtMs = System.currentTimeMillis()
                 // Sync dismissed fingerprint with current DB state
                 updateDismissedFingerprint()
             } catch (e: Exception) {
@@ -184,6 +243,160 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
                 _isDetecting.value = false
             }
         }
+    }
+
+    fun detectDatabaseOnlyTracks(forceRefresh: Boolean = false) {
+        if (_isDetectingDatabaseOnly.value) return
+
+        refreshAppFiles()
+        val app = getApplication<Application>()
+        val dbFile = File(app.filesDir, "embeddings.db")
+        val dbFingerprint = getDbFingerprint()
+        val powerampCount = getPowerampTrackCount(app)
+
+        if (!forceRefresh && cachedDatabaseOnlyTracks != null && dbFile.exists()
+            && dbFingerprint == cachedDatabaseOnlyDbFingerprint
+            && powerampCount == cachedDatabaseOnlyPowerampTrackCount
+            && System.currentTimeMillis() - cachedDatabaseOnlyCheckedAtMs <= RECENT_DETECTION_CACHE_MS) {
+            _databaseOnlyTracks.value = cachedDatabaseOnlyTracks!!
+            return
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            _isDetectingDatabaseOnly.value = true
+            var db: EmbeddingDatabase? = null
+            try {
+                if (!dbFile.exists()) {
+                    _databaseOnlyTracks.value = emptyList()
+                    cachedDatabaseOnlyTracks = emptyList()
+                    cachedDatabaseOnlyDbFingerprint = ""
+                    cachedDatabaseOnlyCheckedAtMs = 0L
+                    return@launch
+                }
+
+                db = EmbeddingDatabase.open(dbFile)
+                val detector = NewTrackDetector(db)
+                val tracks = detector.findDatabaseOnlyTracks(app) { status ->
+                    _databaseOnlyStatus.value = status
+                }.sortedWith(
+                    compareBy<EmbeddedTrack>({ it.artist.orEmpty().lowercase() },
+                        { it.album.orEmpty().lowercase() },
+                        { it.title.orEmpty().lowercase() })
+                )
+
+                _databaseOnlyTracks.value = tracks
+                cachedDatabaseOnlyTracks = tracks
+                cachedDatabaseOnlyDbFingerprint = getDbFingerprint()
+                cachedDatabaseOnlyPowerampTrackCount = powerampCount
+                cachedDatabaseOnlyCheckedAtMs = System.currentTimeMillis()
+                updateDismissedFingerprint()
+            } catch (_: Exception) {
+                _databaseOnlyTracks.value = emptyList()
+            } finally {
+                db?.close()
+                _isDetectingDatabaseOnly.value = false
+            }
+        }
+    }
+
+    fun deleteDatabaseOnlyTracks(ids: Set<Long>) {
+        if (ids.isEmpty()) return
+
+        viewModelScope.launch(Dispatchers.IO) {
+            val app = getApplication<Application>()
+            val dbFile = File(app.filesDir, "embeddings.db")
+            if (!dbFile.exists()) return@launch
+
+            var db: EmbeddingDatabase? = null
+            try {
+                db = EmbeddingDatabase.openReadWrite(dbFile)
+                db.deleteTracks(ids)
+                db.deleteBinaryData("knn_graph")
+
+                File(app.filesDir, "clamp3.emb").delete()
+                File(app.filesDir, "graph.bin").delete()
+
+                _databaseOnlyTracks.value = _databaseOnlyTracks.value.filter { it.id !in ids }
+                invalidateCache()
+            } finally {
+                db?.close()
+                refreshAppFiles()
+                updateDismissedFingerprint()
+            }
+        }
+    }
+
+    fun exportInstance(uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val app = getApplication<Application>()
+            val filesDir = app.filesDir
+            val dbFile = File(filesDir, "embeddings.db")
+            if (!dbFile.exists()) {
+                _exportState.value = ExportState.Error("No embeddings.db found to export")
+                return@launch
+            }
+
+            val tempGraph = File(app.cacheDir, "export-graph.bin")
+            tempGraph.delete()
+
+            try {
+                _exportState.value = ExportState.Exporting("Preparing export...")
+
+                val filesToZip = mutableListOf<Pair<String, File>>()
+                filesToZip += "embeddings.db" to dbFile
+
+                listOf(
+                    "clamp3.emb",
+                    "graph.bin",
+                    "mert.tflite",
+                    "mert_fp16.tflite",
+                    "clamp3_audio.tflite",
+                    "clamp3_audio_fp16.tflite",
+                    "clamp3_text.tflite",
+                    "clamp3_text_fp16.tflite",
+                    "xlm_roberta_vocab.json",
+                ).forEach { name ->
+                    val file = File(filesDir, name)
+                    if (file.exists()) filesToZip += name to file
+                }
+
+                if (filesToZip.none { it.first == "graph.bin" }) {
+                    val db = EmbeddingDatabase.open(dbFile)
+                    try {
+                        if (db.hasBinaryData("knn_graph") && db.extractBinaryToFile("knn_graph", tempGraph)) {
+                            filesToZip += "graph.bin" to tempGraph
+                        }
+                    } finally {
+                        db.close()
+                    }
+                }
+
+                app.contentResolver.openOutputStream(uri)?.use { output ->
+                    ZipOutputStream(BufferedOutputStream(output)).use { zip ->
+                        for ((index, entry) in filesToZip.withIndex()) {
+                            _exportState.value = ExportState.Exporting(
+                                "Packing ${index + 1}/${filesToZip.size}: ${entry.first}"
+                            )
+                            zip.putNextEntry(ZipEntry(entry.first))
+                            BufferedInputStream(FileInputStream(entry.second)).use { input ->
+                                input.copyTo(zip)
+                            }
+                            zip.closeEntry()
+                        }
+                    }
+                } ?: throw IllegalArgumentException("Cannot open export destination")
+
+                _exportState.value = ExportState.Complete(File(uri.lastPathSegment ?: "export.zip").name)
+            } catch (e: Exception) {
+                _exportState.value = ExportState.Error(e.message ?: "Export failed")
+            } finally {
+                tempGraph.delete()
+            }
+        }
+    }
+
+    fun clearExportState() {
+        _exportState.value = ExportState.Idle
     }
 
     /** Auto-select visible tracks, excluding 0-duration, dismissed, and ignored. */
@@ -311,6 +524,8 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
      */
     fun startIndexing(buildGraph: Boolean = false, autoDismissUnselected: Boolean = true,
                       onlyIds: Set<Long>? = null) {
+        refreshAppFiles()
+        if (!_hasModels.value) return
         val selected = if (onlyIds != null) _selectedIds.value.intersect(onlyIds) else _selectedIds.value
         if (selected.isEmpty()) return
         val dismissed = _dismissedIds.value
@@ -339,6 +554,13 @@ class IndexingViewModel(application: Application) : AndroidViewModel(application
 
     fun cancelIndexing() {
         IndexingService.cancelIndexing()
+    }
+
+    fun refreshAppFiles() {
+        val filesDir = getApplication<Application>().filesDir
+        _hasDatabase.value = File(filesDir, "embeddings.db").exists()
+        _hasModels.value = File(filesDir, "mert.tflite").exists() &&
+            File(filesDir, "clamp3_audio.tflite").exists()
     }
 
     /** Quick count of tracks in the Poweramp library (no full cursor scan). */

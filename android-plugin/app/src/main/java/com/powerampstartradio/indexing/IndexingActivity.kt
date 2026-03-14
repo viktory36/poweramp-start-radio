@@ -1,12 +1,17 @@
 package com.powerampstartradio.indexing
 
 import android.Manifest
+import android.app.Activity
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.view.WindowManager
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -15,25 +20,27 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.state.ToggleableState
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.powerampstartradio.data.EmbeddedTrack
 import com.powerampstartradio.ui.theme.PowerampStartRadioTheme
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class IndexingActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -70,18 +77,51 @@ fun IndexingScreen(
     viewModel: IndexingViewModel = viewModel(),
     onBack: () -> Unit,
 ) {
+    val context = LocalContext.current
     val unindexedTracks by viewModel.unindexedTracks.collectAsState()
     val selectedIds by viewModel.selectedIds.collectAsState()
     val dismissedIds by viewModel.dismissedIds.collectAsState()
     val ignoredIds by viewModel.ignoredIds.collectAsState()
     val isDetecting by viewModel.isDetecting.collectAsState()
     val detectingStatus by viewModel.detectingStatus.collectAsState()
+    val hasModels by viewModel.hasModels.collectAsState()
+    val hasDatabase by viewModel.hasDatabase.collectAsState()
+    val databaseOnlyTracks by viewModel.databaseOnlyTracks.collectAsState()
+    val isDetectingDatabaseOnly by viewModel.isDetectingDatabaseOnly.collectAsState()
+    val databaseOnlyStatus by viewModel.databaseOnlyStatus.collectAsState()
+    val exportState by viewModel.exportState.collectAsState()
     val indexingState by viewModel.indexingState.collectAsState()
 
-    // Re-detect when activity resumes (e.g. user replaced DB while app was backgrounded).
-    // detectUnindexed() has its own cache check so this is cheap when nothing changed.
+    val exportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/zip")
+    ) { uri ->
+        if (uri != null) {
+            viewModel.exportInstance(uri)
+        }
+    }
+
+    // Re-detect when the screen resumes, but reuse a very recent shared result so
+    // settings -> manage handoff and configuration changes do not trigger another full scan.
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        viewModel.refreshAppFiles()
         viewModel.detectUnindexed()
+    }
+
+    val keepScreenOn = indexingState is IndexingService.IndexingState.Starting ||
+        indexingState is IndexingService.IndexingState.Detecting ||
+        indexingState is IndexingService.IndexingState.Processing ||
+        indexingState is IndexingService.IndexingState.RebuildingIndices
+
+    DisposableEffect(context, keepScreenOn) {
+        val window = (context as? Activity)?.window
+        if (keepScreenOn) {
+            window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
     }
 
     val visibleTracks = remember(unindexedTracks, dismissedIds, ignoredIds) {
@@ -96,6 +136,7 @@ fun IndexingScreen(
     var showMenu by remember { mutableStateOf(false) }
     var showNeverIndex by remember { mutableStateOf(false) }
     var showPreviouslyIgnored by remember { mutableStateOf(false) }
+    var showCleanDatabase by remember { mutableStateOf(false) }
     var isSearchActive by remember { mutableStateOf(false) }
     var filteredTrackIds by remember { mutableStateOf<Set<Long>?>(null) }
 
@@ -105,6 +146,28 @@ fun IndexingScreen(
     }
     LaunchedEffect(showPreviouslyIgnored, hasIgnored) {
         if (showPreviouslyIgnored && !hasIgnored) showPreviouslyIgnored = false
+    }
+
+    LaunchedEffect(exportState) {
+        when (val state = exportState) {
+            is IndexingViewModel.ExportState.Complete -> {
+                Toast.makeText(
+                    context,
+                    "Exported ${state.filename}",
+                    Toast.LENGTH_SHORT
+                ).show()
+                viewModel.clearExportState()
+            }
+            is IndexingViewModel.ExportState.Error -> {
+                Toast.makeText(
+                    context,
+                    state.message,
+                    Toast.LENGTH_LONG
+                ).show()
+                viewModel.clearExportState()
+            }
+            else -> Unit
+        }
     }
 
     if (showNeverIndex) {
@@ -123,6 +186,18 @@ fun IndexingScreen(
         )
         return
     }
+    if (showCleanDatabase) {
+        BackHandler { showCleanDatabase = false }
+        CleanDatabaseScreen(
+            tracks = databaseOnlyTracks,
+            isDetecting = isDetectingDatabaseOnly,
+            status = databaseOnlyStatus,
+            onRefresh = { viewModel.detectDatabaseOnlyTracks(forceRefresh = true) },
+            onDelete = { ids -> viewModel.deleteDatabaseOnlyTracks(ids) },
+            onBack = { showCleanDatabase = false },
+        )
+        return
+    }
 
     Scaffold(
         topBar = {
@@ -134,9 +209,9 @@ fun IndexingScreen(
                     }
                 },
                 actions = {
-                    // Show overflow when idle with tracks or dismissed/ignored tracks available
+                    // Show overflow whenever the screen is idle and there is something useful to manage.
                     if (indexingState is IndexingService.IndexingState.Idle
-                        && (visibleTracks.isNotEmpty() || hasDismissed || hasIgnored) && !isDetecting) {
+                        && (hasDatabase || visibleTracks.isNotEmpty() || hasDismissed || hasIgnored) && !isDetecting) {
                         Box {
                             IconButton(onClick = { showMenu = true }) {
                                 Icon(Icons.Default.MoreVert, contentDescription = "More")
@@ -145,6 +220,30 @@ fun IndexingScreen(
                                 expanded = showMenu,
                                 onDismissRequest = { showMenu = false },
                             ) {
+                                DropdownMenuItem(
+                                    text = { Text("Clean database") },
+                                    enabled = hasDatabase,
+                                    onClick = {
+                                        viewModel.detectDatabaseOnlyTracks(forceRefresh = true)
+                                        showCleanDatabase = true
+                                        showMenu = false
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Export instance") },
+                                    enabled = hasDatabase,
+                                    onClick = {
+                                        val timestamp = SimpleDateFormat(
+                                            "yyyyMMdd-HHmmss",
+                                            Locale.US
+                                        ).format(Date())
+                                        exportLauncher.launch("poweramp-start-radio-$timestamp.zip")
+                                        showMenu = false
+                                    }
+                                )
+                                if (visibleTracks.isNotEmpty() || hasDismissed || hasIgnored) {
+                                    HorizontalDivider()
+                                }
                                 if (selectedCount > 0) {
                                     DropdownMenuItem(
                                         text = { Text("Never index selected") },
@@ -189,6 +288,7 @@ fun IndexingScreen(
                 }
                 BottomBar(
                     selectedCount = buttonCount,
+                    hasModels = hasModels,
                     onStartIndexing = {
                         viewModel.startIndexing(
                             buildGraph = true,
@@ -201,68 +301,77 @@ fun IndexingScreen(
         }
     ) { padding ->
         Box(modifier = Modifier.fillMaxSize().padding(padding)) {
-            when (val state = indexingState) {
-                is IndexingService.IndexingState.Idle -> {
-                    if (isDetecting) {
-                        DetectingContent(status = detectingStatus)
-                    } else if (visibleTracks.isEmpty()) {
-                        AllIndexedContent()
-                    } else {
-                        TrackSelectionContent(
-                            tracks = visibleTracks,
-                            selectedIds = selectedIds,
-                            selectedCount = selectedCount,
-                            onToggle = { viewModel.toggleSelection(it) },
-                            onToggleAll = {
-                                if (selectedCount == visibleTracks.size) {
-                                    viewModel.deselectAll()
-                                } else {
-                                    viewModel.selectAll()
-                                }
-                            },
-                            onToggleFiltered = { filtered ->
-                                val filteredIds = filtered.map { it.powerampFileId }.toSet()
-                                val allFilteredSelected = filteredIds.all { it in selectedIds }
-                                if (allFilteredSelected) {
-                                    viewModel.deselectIds(filteredIds)
-                                } else {
-                                    viewModel.selectIds(filteredIds)
-                                }
-                            },
-                            onSearchActiveChanged = { isSearchActive = it },
-                            onFilteredIdsChanged = { filteredTrackIds = it },
-                            onDeselectAll = { viewModel.deselectAll() },
-                        )
-                    }
-                }
-                is IndexingService.IndexingState.Starting -> {
-                    DetectingContent(status = "Starting...")
-                }
-                is IndexingService.IndexingState.Detecting -> {
-                    DetectingContent(status = state.message)
-                }
-                is IndexingService.IndexingState.Processing -> {
-                    ProcessingContent(state = state, onCancel = { viewModel.cancelIndexing() })
-                }
-                is IndexingService.IndexingState.RebuildingIndices -> {
-                    RebuildingContent(state = state)
-                }
-                is IndexingService.IndexingState.Complete -> {
-                    CompleteContent(
-                        indexed = state.indexed,
-                        failed = state.failed,
-                        onDone = {
-                            IndexingService.resetState()
-                            onBack()
-                        },
+            when {
+                exportState is IndexingViewModel.ExportState.Exporting -> {
+                    DetectingContent(
+                        status = (exportState as IndexingViewModel.ExportState.Exporting).message
                     )
-                    // Also reset on back button press (top bar)
-                    DisposableEffect(Unit) {
-                        onDispose { IndexingService.resetState() }
-                    }
                 }
-                is IndexingService.IndexingState.Error -> {
-                    ErrorContent(message = state.message, onBack = onBack)
+                else -> {
+                    when (val state = indexingState) {
+                        is IndexingService.IndexingState.Idle -> {
+                            if (isDetecting) {
+                                DetectingContent(status = detectingStatus)
+                            } else if (visibleTracks.isEmpty()) {
+                                AllIndexedContent()
+                            } else {
+                                TrackSelectionContent(
+                                    tracks = visibleTracks,
+                                    selectedIds = selectedIds,
+                                    selectedCount = selectedCount,
+                                    onToggle = { viewModel.toggleSelection(it) },
+                                    onToggleAll = {
+                                        if (selectedCount == visibleTracks.size) {
+                                            viewModel.deselectAll()
+                                        } else {
+                                            viewModel.selectAll()
+                                        }
+                                    },
+                                    onToggleFiltered = { filtered ->
+                                        val filteredIds = filtered.map { it.powerampFileId }.toSet()
+                                        val allFilteredSelected = filteredIds.all { it in selectedIds }
+                                        if (allFilteredSelected) {
+                                            viewModel.deselectIds(filteredIds)
+                                        } else {
+                                            viewModel.selectIds(filteredIds)
+                                        }
+                                    },
+                                    onSearchActiveChanged = { isSearchActive = it },
+                                    onFilteredIdsChanged = { filteredTrackIds = it },
+                                    onDeselectAll = { viewModel.deselectAll() },
+                                )
+                            }
+                        }
+                        is IndexingService.IndexingState.Starting -> {
+                            DetectingContent(status = "Starting...")
+                        }
+                        is IndexingService.IndexingState.Detecting -> {
+                            DetectingContent(status = state.message)
+                        }
+                        is IndexingService.IndexingState.Processing -> {
+                            ProcessingContent(state = state, onCancel = { viewModel.cancelIndexing() })
+                        }
+                        is IndexingService.IndexingState.RebuildingIndices -> {
+                            RebuildingContent(state = state)
+                        }
+                        is IndexingService.IndexingState.Complete -> {
+                            CompleteContent(
+                                indexed = state.indexed,
+                                failed = state.failed,
+                                onDone = {
+                                    IndexingService.resetState()
+                                    onBack()
+                                },
+                            )
+                            // Also reset on back button press (top bar)
+                            DisposableEffect(Unit) {
+                                onDispose { IndexingService.resetState() }
+                            }
+                        }
+                        is IndexingService.IndexingState.Error -> {
+                            ErrorContent(message = state.message, onBack = onBack)
+                        }
+                    }
                 }
             }
         }
@@ -875,29 +984,233 @@ private fun PreviouslyIgnoredScreen(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CleanDatabaseScreen(
+    tracks: List<EmbeddedTrack>,
+    isDetecting: Boolean,
+    status: String,
+    onRefresh: () -> Unit,
+    onDelete: (Set<Long>) -> Unit,
+    onBack: () -> Unit,
+) {
+    var localSelected by remember { mutableStateOf(emptySet<Long>()) }
+
+    LaunchedEffect(tracks) {
+        val validIds = tracks.map { it.id }.toSet()
+        localSelected = localSelected.intersect(validIds)
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Clean Database") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                actions = {
+                    IconButton(onClick = onRefresh, enabled = !isDetecting) {
+                        Icon(Icons.Default.Refresh, contentDescription = "Refresh")
+                    }
+                }
+            )
+        },
+        bottomBar = {
+            if (!isDetecting && localSelected.isNotEmpty()) {
+                Surface(tonalElevation = 3.dp) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "${localSelected.size} selected",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(modifier = Modifier.weight(1f))
+                        Button(
+                            onClick = {
+                                onDelete(localSelected)
+                                localSelected = emptySet()
+                            }
+                        ) {
+                            Text("Delete from DB")
+                        }
+                    }
+                }
+            }
+        }
+    ) { padding ->
+        when {
+            isDetecting -> DetectingContent(status = status.ifEmpty { "Checking database..." })
+            tracks.isEmpty() -> {
+                Box(
+                    modifier = Modifier.fillMaxSize().padding(padding),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            "Database is in sync",
+                            style = MaterialTheme.typography.headlineSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            "No tracks were found in the database without a matching Poweramp library entry.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+            else -> {
+                val allIds = remember(tracks) { tracks.map { it.id }.toSet() }
+                val allSelected = localSelected.size == tracks.size
+                val toggleAll = {
+                    localSelected = if (allSelected) emptySet() else allIds
+                }
+
+                Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+                    if (status.isNotBlank()) {
+                        Text(
+                            text = status,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                        )
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(onClick = toggleAll)
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        TriStateCheckbox(
+                            state = when {
+                                tracks.isEmpty() -> ToggleableState.Off
+                                allSelected -> ToggleableState.On
+                                localSelected.isEmpty() -> ToggleableState.Off
+                                else -> ToggleableState.Indeterminate
+                            },
+                            onClick = toggleAll,
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            "${tracks.size} tracks only in the database" +
+                                if (localSelected.isNotEmpty()) " (${localSelected.size} selected)" else "",
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                    }
+                    HorizontalDivider()
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(vertical = 4.dp),
+                    ) {
+                        items(tracks, key = { it.id }) { track ->
+                            EmbeddedTrackRow(
+                                track = track,
+                                isSelected = track.id in localSelected,
+                                onToggle = {
+                                    localSelected = if (track.id in localSelected) {
+                                        localSelected - track.id
+                                    } else {
+                                        localSelected + track.id
+                                    }
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun EmbeddedTrackRow(
+    track: EmbeddedTrack,
+    isSelected: Boolean,
+    onToggle: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onToggle)
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Checkbox(checked = isSelected, onCheckedChange = null)
+        Spacer(modifier = Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = track.title?.takeIf { it.isNotBlank() } ?: "Unknown",
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.basicMarquee(iterations = 1, initialDelayMillis = 1500),
+                maxLines = 1,
+            )
+            val subtitle = buildString {
+                if (!track.artist.isNullOrBlank()) append(track.artist)
+                if (!track.album.isNullOrBlank()) {
+                    if (isNotEmpty()) append(" · ")
+                    append(track.album)
+                }
+                if (track.source != "desktop") {
+                    if (isNotEmpty()) append(" · ")
+                    append(track.source)
+                }
+            }
+            if (subtitle.isNotBlank()) {
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.basicMarquee(iterations = 1, initialDelayMillis = 1500),
+                    maxLines = 1,
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun BottomBar(
     selectedCount: Int,
+    hasModels: Boolean,
     onStartIndexing: () -> Unit,
 ) {
     Surface(tonalElevation = 3.dp) {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(
-                "CLaMP3 indexing",
-                style = MaterialTheme.typography.titleSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.weight(1f),
-            )
-            FilledTonalButton(
-                onClick = onStartIndexing,
-                enabled = selectedCount > 0,
-            ) {
-                Text("Start ($selectedCount)")
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "CLaMP3 indexing",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+                FilledTonalButton(
+                    onClick = onStartIndexing,
+                    enabled = selectedCount > 0 && hasModels,
+                ) {
+                    Text("Start ($selectedCount)")
+                }
+            }
+            if (!hasModels) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    "Transfer mert.tflite and clamp3_audio.tflite to enable indexing on this device.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }

@@ -10,8 +10,6 @@ import android.database.Cursor
 import android.net.Uri
 import android.os.Build
 import android.util.Log
-import java.text.Normalizer
-
 /**
  * Helper for interacting with Poweramp via its public API.
  *
@@ -252,13 +250,32 @@ object PowerampHelper {
         val result = mutableListOf<PowerampFileEntry>()
 
         try {
-            val cursor = context.contentResolver.query(
-                filesUri,
-                arrayOf("folder_files._id", "artist", "album", "title_tag", "folder_files.duration"),
-                null,
-                null,
-                null
-            )
+            val cursor = try {
+                context.contentResolver.query(
+                    filesUri,
+                    arrayOf(
+                        "folder_files._id",
+                        "artist",
+                        "album",
+                        "title_tag",
+                        "folder_files.duration",
+                        "path",
+                        "folder_files.name"
+                    ),
+                    null,
+                    null,
+                    null
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "path+name columns not available, querying without file paths", e)
+                context.contentResolver.query(
+                    filesUri,
+                    arrayOf("folder_files._id", "artist", "album", "title_tag", "folder_files.duration"),
+                    null,
+                    null,
+                    null
+                )
+            }
 
             cursor?.use {
                 val idIdx = it.getColumnIndex("_id")
@@ -266,16 +283,36 @@ object PowerampHelper {
                 val albumIdx = it.getColumnIndex("album")
                 val titleIdx = it.getColumnIndex("title_tag")
                 val durationIdx = it.getColumnIndex("duration")
+                val pathIdx = it.getColumnIndex("path")
+                val nameIdx = it.getColumnIndex("name")
 
                 while (it.moveToNext()) {
-                    val rawArtist = (it.getString(artistIdx) ?: "").lowercase().trim()
-                    val rawTitle = (it.getString(titleIdx) ?: "").lowercase().trim()
+                    val artist = TrackNormalization.normalizeArtist(it.getString(artistIdx))
+                    val album = TrackNormalization.normalizeAlbum(it.getString(albumIdx))
+                    val title = TrackNormalization.normalizeTitle(it.getString(titleIdx))
+                    val durationMs = it.getInt(durationIdx)
+                    val fileName = if (nameIdx >= 0) it.getString(nameIdx) else null
+                    val path = when {
+                        pathIdx >= 0 && nameIdx >= 0 -> {
+                            val folder = it.getString(pathIdx) ?: ""
+                            val name = it.getString(nameIdx) ?: ""
+                            TrackNormalization.normalizePath(if (name.isNotEmpty()) "$folder$name" else null)
+                        }
+                        else -> null
+                    }
                     result.add(PowerampFileEntry(
                         id = it.getLong(idIdx),
-                        artist = normalizeNfc(normalizePowerampArtist(rawArtist)),
-                        album = normalizeNfc((it.getString(albumIdx) ?: "").lowercase().trim()),
-                        title = normalizeNfc(stripAudioExtension(rawTitle)),
-                        durationMs = it.getInt(durationIdx)
+                        artist = artist,
+                        album = album,
+                        title = title,
+                        durationMs = durationMs,
+                        path = path,
+                        metadataKey = TrackNormalization.buildMetadataKey(artist, album, title, durationMs),
+                        filenameKeys = TrackNormalization.buildFilenameKeys(
+                            artist,
+                            title,
+                            fileName?.substringBeforeLast('.', fileName),
+                        ),
                     ))
                 }
             }
@@ -285,31 +322,6 @@ object PowerampHelper {
 
         return result
     }
-
-    private fun normalizeNfc(s: String): String {
-        return Normalizer.normalize(s, Normalizer.Form.NFC)
-    }
-
-    /** Poweramp uses "unknown artist" for untagged files; normalize to empty. */
-    private fun normalizePowerampArtist(artist: String): String {
-        return if (artist == "unknown artist") "" else artist
-    }
-
-    /** Poweramp sometimes includes the file extension in title_tag for untagged files. */
-    private fun stripAudioExtension(title: String): String {
-        val idx = title.lastIndexOf('.')
-        if (idx > 0) {
-            val ext = title.substring(idx)
-            if (ext in AUDIO_EXTENSIONS) return title.substring(0, idx)
-        }
-        return title
-    }
-
-    private val AUDIO_EXTENSIONS = setOf(
-        ".mp3", ".flac", ".opus", ".ogg", ".m4a", ".aac", ".wav",
-        ".wma", ".ape", ".wv", ".alac", ".aiff", ".aif"
-    )
-
     /**
      * Clear the Poweramp queue.
      */
@@ -482,14 +494,12 @@ data class PowerampTrack(
      */
     val metadataKey: String
         get() {
-            // Replace | with / to match desktop indexer key format.
-            // Pipe is the metadata key delimiter; titles like "d|lp 1.1" would
-            // corrupt key parsing without this replacement.
-            val a = (artist ?: "").lowercase().trim().replace('|', '/')
-            val al = (album ?: "").lowercase().trim().replace('|', '/')
-            val t = title.lowercase().trim().replace('|', '/')
-            val d = (durationMs / 100) * 100
-            return "$a|$al|$t|$d"
+            return TrackNormalization.buildMetadataKey(
+                TrackNormalization.normalizeArtist(artist),
+                TrackNormalization.normalizeAlbum(album),
+                TrackNormalization.normalizeTitle(title),
+                durationMs,
+            )
         }
 }
 
@@ -502,5 +512,8 @@ data class PowerampFileEntry(
     val artist: String,
     val album: String,
     val title: String,
-    val durationMs: Int
+    val durationMs: Int,
+    val path: String?,
+    val metadataKey: String,
+    val filenameKeys: Set<String>,
 )

@@ -5,15 +5,13 @@ import android.util.Log
 import com.powerampstartradio.data.EmbeddedTrack
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.similarity.SimilarTrack
-import java.text.Normalizer
 
 /**
- * Matches Poweramp tracks to embedded tracks in the database.
+ * Matches Poweramp tracks to embedded tracks and resolves embedded tracks back to
+ * Poweramp file IDs.
  *
- * Uses multiple strategies:
- * 1. Primary: Exact metadata key match (artist|album|title|duration)
- * 2. Fallback: Filename key match
- * 3. Fuzzy: Artist + title only (for compilations)
+ * The same normalization and duration rules are used across both directions so the
+ * app has one consistent view of library state.
  */
 class TrackMatcher(
     private val embeddingDb: EmbeddingDatabase
@@ -21,14 +19,19 @@ class TrackMatcher(
     companion object {
         private const val TAG = "TrackMatcher"
 
-        // Cache the Poweramp lookup indexes across invocations (same app session)
-        private var cachedByArtistAlbumTitle: Map<String, Long>? = null
-        private var cachedByArtistTitle: Map<String, Long>? = null
-        private var cachedByTitle: Map<String, Map<String, Long>>? = null
-        private var cachedByFilenameKey: Map<String, Long>? = null
+        private var cachedEntries: List<PowerampFileEntry>? = null
+        private var cachedByPath: Map<String, List<PowerampFileEntry>>? = null
+        private var cachedByMetadataKey: Map<String, List<PowerampFileEntry>>? = null
+        private var cachedByArtistAlbumTitle: Map<String, List<PowerampFileEntry>>? = null
+        private var cachedByArtistTitle: Map<String, List<PowerampFileEntry>>? = null
+        private var cachedByTitle: Map<String, List<PowerampFileEntry>>? = null
+        private var cachedByFilenameKey: Map<String, List<PowerampFileEntry>>? = null
         private var cachedEntryCount: Int = 0
 
         fun invalidateCache() {
+            cachedEntries = null
+            cachedByPath = null
+            cachedByMetadataKey = null
             cachedByArtistAlbumTitle = null
             cachedByArtistTitle = null
             cachedByTitle = null
@@ -37,262 +40,140 @@ class TrackMatcher(
         }
     }
 
-    /**
-     * Result of matching a Poweramp track to an embedded track.
-     */
     data class MatchResult(
         val embeddedTrack: EmbeddedTrack,
         val matchType: MatchType
     )
 
     enum class MatchType {
-        METADATA_EXACT,   // Full metadata key match
-        FILENAME,         // Filename-based match
-        ARTIST_TITLE,     // Artist + title only (fuzzy)
+        PATH_EXACT,
+        METADATA_EXACT,
+        ARTIST_ALBUM_TITLE,
+        FILENAME,
+        ARTIST_TITLE,
+        ARTIST_TITLE_FUZZY,
         NOT_FOUND
     }
 
-    /**
-     * Result of mapping a similar track to Poweramp.
-     */
     data class MappedTrack(
         val similarTrack: SimilarTrack,
-        val fileId: Long?   // null if not found in Poweramp library
+        val fileId: Long?
     )
 
-    /**
-     * Find the best matching embedded track for a Poweramp track.
-     */
+    data class QueueAudit(
+        val totalTracks: Int,
+        val matchedTracks: Int,
+        val unmatchedTracks: Int,
+        val matchCounts: Map<String, Int>,
+        val unmatchedSample: List<String>,
+    )
+
+    private data class EmbeddedCandidate(
+        val track: EmbeddedTrack,
+        val artist: String,
+        val album: String,
+        val title: String,
+        val path: String?,
+        val metadataKey: String,
+        val metadataPrefix: String,
+        val filenameKeys: Set<String>,
+    )
+
+    private data class MatchScore(
+        val pathPenalty: Int,
+        val metadataPenalty: Int,
+        val artistPenalty: Int,
+        val titlePenalty: Int,
+        val albumPenalty: Int,
+        val durationPenaltyMs: Int,
+    ) : Comparable<MatchScore> {
+        override fun compareTo(other: MatchScore): Int {
+            return compareValuesBy(
+                this,
+                other,
+                MatchScore::pathPenalty,
+                MatchScore::metadataPenalty,
+                MatchScore::artistPenalty,
+                MatchScore::titlePenalty,
+                MatchScore::albumPenalty,
+                MatchScore::durationPenaltyMs,
+            )
+        }
+    }
+
     fun findMatch(powerampTrack: PowerampTrack): MatchResult? {
-        Log.d(TAG, "Finding match for: ${powerampTrack.title} by ${powerampTrack.artist}")
+        val lookup = powerampTrack.asLookup()
+        Log.d(TAG, "Finding match for: ${lookup.artist} - ${lookup.title}")
 
-        // Try metadata match (artist + title)
-        val metadataKey = powerampTrack.metadataKey
-        Log.d(TAG, "Looking for: ${powerampTrack.artist} - ${powerampTrack.title}")
-
-        embeddingDb.findTrackByMetadataKey(metadataKey)?.let { track ->
-            Log.d(TAG, "Found match: ${track.title}")
-            return MatchResult(track, MatchType.METADATA_EXACT)
-        }
-
-        // Try filename-based match (include artist for better precision)
-        powerampTrack.path?.let { path ->
-            val filename = path.substringAfterLast("/").substringBeforeLast(".")
-                .lowercase()
-                .replace(Regex("\\s*[\\(\\[].*?[\\)\\]]"), "") // Remove parentheticals
-                .replace(Regex("^\\d+[.\\-\\s]+"), "") // Remove track numbers
-                .trim()
-
-            // Try with artist prefix first for more precise matching
-            val artist = powerampTrack.artist?.lowercase()?.trim()
-            if (!artist.isNullOrEmpty()) {
-                val artistFilename = "$artist - ${powerampTrack.title.lowercase().trim()}"
-                Log.d(TAG, "Trying filename key with artist: $artistFilename")
-                embeddingDb.findTrackByFilenameKey(artistFilename)?.let { track ->
-                    Log.d(TAG, "Found filename match with artist: ${track.title}")
-                    return MatchResult(track, MatchType.FILENAME)
-                }
-            }
-
-            Log.d(TAG, "Trying filename key: $filename")
-
-            embeddingDb.findTrackByFilenameKey(filename)?.let { track ->
-                Log.d(TAG, "Found filename match: ${track.title}")
-                return MatchResult(track, MatchType.FILENAME)
+        lookup.path?.let { path ->
+            chooseBestEmbedded(lookup, embeddingDb.findTracksByPath(path).map { it.asLookup() })?.let {
+                return MatchResult(it.track, MatchType.PATH_EXACT)
             }
         }
 
-        // Try fuzzy match with just artist + title
-        val artist = powerampTrack.artist
-        val title = powerampTrack.title
+        chooseBestEmbedded(lookup, embeddingDb.findTracksByMetadataPrefix(lookup.metadataPrefix).map { it.asLookup() })?.let {
+            return MatchResult(
+                it.track,
+                if (it.metadataKey == lookup.metadataKey) MatchType.METADATA_EXACT else MatchType.ARTIST_ALBUM_TITLE,
+            )
+        }
 
-        if (!artist.isNullOrEmpty() && title.isNotEmpty()) {
-            Log.d(TAG, "Trying artist+title match: $artist - $title")
+        val filenameMatches = lookup.filenameKeys
+            .flatMap { key -> embeddingDb.findTracksByFilenameKey(key) }
+            .distinctBy { it.id }
+            .map { it.asLookup() }
+        chooseBestEmbedded(lookup, filenameMatches)?.let {
+            return MatchResult(it.track, MatchType.FILENAME)
+        }
 
-            val matches = embeddingDb.findTracksByArtistAndTitle(artist, title)
-            if (matches.isNotEmpty()) {
-                // If multiple matches, prefer one with similar duration
-                val bestMatch = matches.minByOrNull { track ->
-                    kotlin.math.abs(track.durationMs - powerampTrack.durationMs)
-                }
-                bestMatch?.let { track ->
-                    Log.d(TAG, "Found artist+title match: ${track.title}")
-                    return MatchResult(track, MatchType.ARTIST_TITLE)
-                }
+        if (lookup.artist.isNotEmpty() && lookup.title.isNotEmpty()) {
+            chooseBestEmbedded(lookup, embeddingDb.findTracksByArtistAndTitle(lookup.artist, lookup.title).map { it.asLookup() })?.let {
+                return MatchResult(it.track, MatchType.ARTIST_TITLE)
             }
         }
 
-        Log.d(TAG, "No match found")
+        val fuzzyCandidates = embeddingDb.findTracksByTitle(lookup.title)
+            .map { it.asLookup() }
+            .filter { candidate ->
+                artistOverlaps(lookup.artist, candidate.artist) &&
+                    TrackNormalization.durationCompatible(lookup.track.durationMs, candidate.track.durationMs)
+            }
+        chooseBestEmbedded(lookup, fuzzyCandidates)?.let {
+            return MatchResult(it.track, MatchType.ARTIST_TITLE_FUZZY)
+        }
+
+        Log.d(TAG, "No match found for ${lookup.metadataKey}")
         return null
     }
 
-    /**
-     * Ensure all Poweramp lookup indexes are built. No-op if already cached.
-     *
-     * Builds indexes from individual Poweramp fields (not pipe-delimited keys),
-     * so pipes in artist/album/title don't corrupt matching.
-     */
     private fun ensureCache(context: Context) {
-        if (cachedByArtistAlbumTitle != null) return
+        if (cachedEntries != null) return
 
         val entries = PowerampHelper.getAllFileEntries(context)
+        cachedEntries = entries
+        cachedByPath = entries.groupByTo(HashMap()) { it.path ?: "" }.filterKeys { it.isNotBlank() }
+        cachedByMetadataKey = entries.groupByTo(HashMap()) { it.metadataKey }
+        cachedByArtistAlbumTitle = entries.groupByTo(HashMap()) { "${it.artist}\u0000${it.album}\u0000${it.title}" }
+        cachedByArtistTitle = entries.groupByTo(HashMap()) { "${it.artist}\u0000${it.title}" }
+        cachedByTitle = entries.groupByTo(HashMap()) { it.title }
 
-        val byArtistAlbumTitle = HashMap<String, Long>(entries.size)
-        val byArtistTitle = HashMap<String, Long>(entries.size)
-        val byTitle = HashMap<String, MutableMap<String, Long>>()
-        val byFilenameKey = HashMap<String, Long>(entries.size * 2)
-
+        val byFilenameKey = HashMap<String, MutableList<PowerampFileEntry>>(entries.size * 2)
         for (entry in entries) {
-            // Indexes keyed on individual NFC-normalized fields — immune to pipe corruption
-            byArtistAlbumTitle["${entry.artist}\u0000${entry.album}\u0000${entry.title}"] = entry.id
-            byArtistTitle["${entry.artist}\u0000${entry.title}"] = entry.id
-            byTitle.getOrPut(entry.title) { mutableMapOf() }[entry.artist] = entry.id
-
-            // Filename-key index: normalize Poweramp title as a filename for fallback matching.
-            // Catches cases where desktop used filename-as-title but Poweramp has the same text.
-            val normalizedTitle = normalizeAsFilename(entry.title)
-            if (normalizedTitle.isNotEmpty()) {
-                byFilenameKey[normalizedTitle] = entry.id
-            }
-            // Also index "artist - title" combined, for when the desktop filename was
-            // "Artist - Title.ext" but Poweramp split it into separate fields.
-            if (entry.artist.isNotEmpty()) {
-                val combined = normalizeAsFilename("${entry.artist} - ${entry.title}")
-                if (combined.isNotEmpty()) {
-                    byFilenameKey[combined] = entry.id
-                }
+            for (key in entry.filenameKeys) {
+                byFilenameKey.getOrPut(key) { mutableListOf() }.add(entry)
             }
         }
-
-        Log.d(TAG, "Indexed ${entries.size} Poweramp tracks " +
-            "(${byFilenameKey.size} filename keys)")
-
-        cachedByArtistAlbumTitle = byArtistAlbumTitle
-        cachedByArtistTitle = byArtistTitle
-        cachedByTitle = byTitle
         cachedByFilenameKey = byFilenameKey
         cachedEntryCount = entries.size
+
+        Log.d(TAG, "Indexed ${entries.size} Poweramp tracks (${byFilenameKey.size} filename keys)")
     }
 
-    /**
-     * Resolve a single embedded track to its Poweramp file ID.
-     * Ensures the cache is built first. Returns null if no match found.
-     */
     fun findFileId(context: Context, track: EmbeddedTrack): Long? {
         ensureCache(context)
-        return resolveFileId(track)
+        return resolveEntry(track)?.id
     }
 
-    /**
-     * Resolve an embedded track to its Poweramp file ID using all matching strategies.
-     * Returns null if no match found.
-     */
-    private fun resolveFileId(track: EmbeddedTrack): Long? {
-        val byArtistAlbumTitle = cachedByArtistAlbumTitle!!
-        val byArtistTitle = cachedByArtistTitle!!
-        val byTitle = cachedByTitle!!
-        val byFilenameKey = cachedByFilenameKey!!
-
-        // Use individual fields (NFC normalized) — immune to pipes in metadata
-        val embeddedArtist = normalizeNfc((track.artist ?: "").lowercase().trim())
-        val embeddedAlbum = normalizeNfc((track.album ?: "").lowercase().trim())
-        val embeddedTitle = normalizeNfc((track.title ?: "").lowercase().trim())
-
-        // 1. Exact artist + album + title
-        var fileId = byArtistAlbumTitle["$embeddedArtist\u0000$embeddedAlbum\u0000$embeddedTitle"]
-
-        // 2. artist + title (any album)
-        if (fileId == null) {
-            fileId = byArtistTitle["$embeddedArtist\u0000$embeddedTitle"]
-        }
-
-        // 3. Fuzzy: find by title, check artist overlap
-        if (fileId == null) {
-            val candidates = byTitle[embeddedTitle]
-            if (candidates != null) {
-                if (embeddedArtist.isNotEmpty()) {
-                    candidates.entries.find { (powerampArtist, _) ->
-                        powerampArtist.contains(embeddedArtist) ||
-                            embeddedArtist.contains(powerampArtist)
-                    }?.let { (_, id) -> fileId = id }
-                } else {
-                    // No artist info — accept any match for this title
-                    candidates.values.firstOrNull()?.let { id -> fileId = id }
-                }
-            }
-        }
-
-        // 4. Filename key fallback: match embedded filenameKey against normalized
-        //    Poweramp titles (and combined "artist - title" keys).
-        if (fileId == null && track.filenameKey.isNotEmpty()) {
-            val normalizedFnKey = normalizeNfc(track.filenameKey)
-            fileId = byFilenameKey[normalizedFnKey]
-        }
-
-        if (fileId == null) {
-            logMissDiagnostics(track, embeddedArtist, embeddedTitle)
-        }
-
-        return fileId
-    }
-
-    /**
-     * Log diagnostic info on a miss: show what we tried and what Poweramp entries
-     * contain similar text, so the metadata mismatch can be identified.
-     */
-    private fun logMissDiagnostics(track: EmbeddedTrack, embeddedArtist: String, embeddedTitle: String) {
-        val byTitle = cachedByTitle!!
-        val byFilenameKey = cachedByFilenameKey!!
-
-        // Extract distinctive words from the title for substring search
-        val words = embeddedTitle.split(Regex("\\s+"))
-            .filter { it.length >= 4 }
-            .take(3)
-
-        val fnKey = normalizeNfc(track.filenameKey)
-        val fnWords = fnKey.split(Regex("\\s+"))
-            .filter { it.length >= 4 }
-            .take(3)
-
-        // Search Poweramp titles for substring matches
-        val nearTitles = byTitle.keys
-            .filter { paTitle -> words.isNotEmpty() && words.all { w -> paTitle.contains(w) } }
-            .take(5)
-
-        // Search filename key index for substring matches
-        val nearFnKeys = byFilenameKey.keys
-            .filter { paFnKey -> fnWords.isNotEmpty() && fnWords.all { w -> paFnKey.contains(w) } }
-            .take(5)
-
-        Log.w(TAG, "MISS DIAGNOSTICS for track ${track.id}:")
-        Log.w(TAG, "  embedded: artist='$embeddedArtist' title='$embeddedTitle'")
-        Log.w(TAG, "  fnKey='$fnKey'")
-        Log.w(TAG, "  search words: $words / fnWords: $fnWords")
-        if (nearTitles.isNotEmpty()) {
-            for (t in nearTitles) {
-                val artists = byTitle[t]?.keys?.joinToString(", ") ?: "?"
-                Log.w(TAG, "  ~title: '$t' (artists: $artists)")
-            }
-        } else {
-            Log.w(TAG, "  ~title: (no Poweramp titles contain all of: $words)")
-        }
-        if (nearFnKeys.isNotEmpty()) {
-            for (k in nearFnKeys) {
-                Log.w(TAG, "  ~fnKey: '$k' → id=${byFilenameKey[k]}")
-            }
-        } else {
-            Log.w(TAG, "  ~fnKey: (no Poweramp fnKeys contain all of: $fnWords)")
-        }
-    }
-
-    /**
-     * Map a single similar track to its Poweramp file ID.
-     *
-     * Used by the streaming path to map tracks one at a time as they arrive.
-     * The [seen] set is managed by the caller for cross-track dedup.
-     *
-     * @return the file ID, or null if not found or duplicate
-     */
     fun mapSingleTrackToFileId(
         context: Context,
         similarTrack: SimilarTrack,
@@ -300,28 +181,18 @@ class TrackMatcher(
     ): Long? {
         ensureCache(context)
 
-        val fileId = resolveFileId(similarTrack.track)
-
-        if (fileId == null) {
-            Log.w(TAG, "MISS: '${similarTrack.track.artist ?: ""}' - '${similarTrack.track.title ?: ""}' " +
-                "(fnKey='${similarTrack.track.filenameKey}')")
+        val entry = resolveEntry(similarTrack.track)
+        if (entry == null) {
+            Log.w(TAG, "MISS: '${similarTrack.track.artist ?: ""}' - '${similarTrack.track.title ?: ""}' (fnKey='${similarTrack.track.filenameKey}')")
             return null
         }
-
-        if (fileId in seen) {
-            Log.d(TAG, "DUPE: '${similarTrack.track.artist ?: ""}' - '${similarTrack.track.title ?: ""}' " +
-                "→ fileId=$fileId already queued, skipping")
+        if (!seen.add(entry.id)) {
+            Log.d(TAG, "DUPE: '${similarTrack.track.artist ?: ""}' - '${similarTrack.track.title ?: ""}' → fileId=${entry.id} already queued, skipping")
             return null
         }
-
-        seen.add(fileId)
-        return fileId
+        return entry.id
     }
 
-    /**
-     * Map similar tracks to Poweramp file IDs, preserving similarity scores.
-     * Returns all tracks with their mapping status (fileId is null if not found).
-     */
     fun mapSimilarTracksToFileIds(
         context: Context,
         similarTracks: List<SimilarTrack>
@@ -336,12 +207,8 @@ class TrackMatcher(
             if (fileId != null) {
                 result.add(MappedTrack(similarTrack, fileId))
             } else {
-                // Distinguish not-found from dupe: resolve again without dedup
-                val resolvedId = resolveFileId(similarTrack.track)
-                if (resolvedId != null && resolvedId in seen) {
-                    // Dupe — skip entirely
-                    continue
-                }
+                val resolved = resolveEntry(similarTrack.track)
+                if (resolved != null && resolved.id in seen) continue
                 result.add(MappedTrack(similarTrack, null))
             }
         }
@@ -351,22 +218,228 @@ class TrackMatcher(
         return result
     }
 
-    /** NFC-normalize a string for consistent matching across platforms. */
-    private fun normalizeNfc(s: String): String {
-        return Normalizer.normalize(s, Normalizer.Form.NFC)
+    fun auditQueueResolution(context: Context, tracks: List<EmbeddedTrack>): QueueAudit {
+        ensureCache(context)
+
+        val counts = linkedMapOf<MatchType, Int>()
+        val misses = mutableListOf<String>()
+        var matched = 0
+
+        for (track in tracks) {
+            val resolution = resolveWithType(track)
+            if (resolution == null) {
+                if (misses.size < 50) misses += track.metadataKey
+                continue
+            }
+            matched++
+            counts[resolution.second] = (counts[resolution.second] ?: 0) + 1
+        }
+
+        return QueueAudit(
+            totalTracks = tracks.size,
+            matchedTracks = matched,
+            unmatchedTracks = tracks.size - matched,
+            matchCounts = counts.mapKeys { it.key.name },
+            unmatchedSample = misses,
+        )
     }
 
-    /**
-     * Normalize a string the same way the desktop indexer normalizes filenames:
-     * lowercase, strip parentheticals, strip track numbers, collapse whitespace.
-     */
-    private fun normalizeAsFilename(s: String): String {
-        return normalizeNfc(
-            s.lowercase()
-                .replace(Regex("\\s*[\\(\\[].*?[\\)\\]]"), "")
-                .replace(Regex("^\\d+[.\\-\\s]+"), "")
-                .replace(Regex("\\s+"), " ")
-                .trim()
+    private fun resolveWithType(track: EmbeddedTrack): Pair<PowerampFileEntry, MatchType>? {
+        val lookup = track.asLookup()
+        val byPath = cachedByPath!!
+        val byMetadataKey = cachedByMetadataKey!!
+        val byArtistAlbumTitle = cachedByArtistAlbumTitle!!
+        val byArtistTitle = cachedByArtistTitle!!
+        val byTitle = cachedByTitle!!
+        val byFilenameKey = cachedByFilenameKey!!
+
+        lookup.path?.let { path ->
+            chooseBestPoweramp(lookup, byPath[path].orEmpty())?.let {
+                return it to MatchType.PATH_EXACT
+            }
+        }
+
+        chooseBestPoweramp(lookup, byMetadataKey[lookup.metadataKey].orEmpty())?.let {
+            return it to MatchType.METADATA_EXACT
+        }
+
+        chooseBestPoweramp(lookup, byArtistAlbumTitle["${lookup.artist}\u0000${lookup.album}\u0000${lookup.title}"].orEmpty())?.let {
+            return it to MatchType.ARTIST_ALBUM_TITLE
+        }
+
+        val filenameCandidates = lookup.filenameKeys
+            .flatMap { key -> byFilenameKey[key].orEmpty() }
+            .distinctBy { it.id }
+        chooseBestPoweramp(lookup, filenameCandidates)?.let {
+            return it to MatchType.FILENAME
+        }
+
+        chooseBestPoweramp(lookup, byArtistTitle["${lookup.artist}\u0000${lookup.title}"].orEmpty())?.let {
+            return it to MatchType.ARTIST_TITLE
+        }
+
+        val fuzzyCandidates = byTitle[lookup.title].orEmpty().filter { candidate ->
+            artistOverlaps(lookup.artist, candidate.artist) &&
+                TrackNormalization.durationCompatible(lookup.track.durationMs, candidate.durationMs)
+        }
+        chooseBestPoweramp(lookup, fuzzyCandidates)?.let {
+            return it to MatchType.ARTIST_TITLE_FUZZY
+        }
+
+        logMissDiagnostics(lookup)
+        return null
+    }
+
+    private fun resolveEntry(track: EmbeddedTrack): PowerampFileEntry? =
+        resolveWithType(track)?.first
+
+    private fun chooseBestEmbedded(
+        lookup: EmbeddedCandidate,
+        candidates: List<EmbeddedCandidate>,
+    ): EmbeddedCandidate? {
+        if (candidates.isEmpty()) return null
+        val liveCandidates = candidates.filter {
+            TrackNormalization.durationCompatible(lookup.track.durationMs, it.track.durationMs)
+        }
+        if (liveCandidates.isEmpty()) return null
+        val scored = liveCandidates.map { candidate ->
+            candidate to embeddedScore(lookup, candidate)
+        }.sortedWith(compareBy<Pair<EmbeddedCandidate, MatchScore>> { it.second })
+        return scored.first().first
+    }
+
+    private fun chooseBestPoweramp(
+        lookup: EmbeddedCandidate,
+        candidates: List<PowerampFileEntry>,
+    ): PowerampFileEntry? {
+        if (candidates.isEmpty()) return null
+        val liveCandidates = candidates.filter {
+            TrackNormalization.durationCompatible(lookup.track.durationMs, it.durationMs)
+        }
+        if (liveCandidates.isEmpty()) return null
+        val scored = liveCandidates.map { candidate ->
+            candidate to powerampScore(lookup, candidate)
+        }.sortedWith(compareBy<Pair<PowerampFileEntry, MatchScore>> { it.second })
+        return scored.first().first
+    }
+
+    private fun embeddedScore(lookup: EmbeddedCandidate, candidate: EmbeddedCandidate): MatchScore {
+        return MatchScore(
+            pathPenalty = if (lookup.path != null && lookup.path == candidate.path) 0 else 1,
+            metadataPenalty = if (lookup.metadataKey == candidate.metadataKey) 0 else 1,
+            artistPenalty = if (lookup.artist == candidate.artist) 0 else 1,
+            titlePenalty = if (lookup.title == candidate.title) 0 else 1,
+            albumPenalty = if (lookup.album == candidate.album) 0 else 1,
+            durationPenaltyMs = TrackNormalization.durationPenalty(lookup.track.durationMs, candidate.track.durationMs),
         )
+    }
+
+    private fun powerampScore(lookup: EmbeddedCandidate, candidate: PowerampFileEntry): MatchScore {
+        return MatchScore(
+            pathPenalty = if (lookup.path != null && lookup.path == candidate.path) 0 else 1,
+            metadataPenalty = if (lookup.metadataKey == candidate.metadataKey) 0 else 1,
+            artistPenalty = if (lookup.artist == candidate.artist) 0 else 1,
+            titlePenalty = if (lookup.title == candidate.title) 0 else 1,
+            albumPenalty = if (lookup.album == candidate.album) 0 else 1,
+            durationPenaltyMs = TrackNormalization.durationPenalty(lookup.track.durationMs, candidate.durationMs),
+        )
+    }
+
+    private fun logMissDiagnostics(lookup: EmbeddedCandidate) {
+        val byTitle = cachedByTitle!!
+        val byFilenameKey = cachedByFilenameKey!!
+        val words = lookup.title.split(Regex("\\s+"))
+            .filter { it.length >= 4 }
+            .take(3)
+        val fnWords = lookup.filenameKeys
+            .flatMap { it.split(Regex("\\s+")) }
+            .filter { it.length >= 4 }
+            .take(3)
+
+        val nearTitles = byTitle.keys
+            .filter { title -> words.isNotEmpty() && words.all { word -> title.contains(word) } }
+            .take(5)
+        val nearFnKeys = byFilenameKey.keys
+            .filter { key -> fnWords.isNotEmpty() && fnWords.all { word -> key.contains(word) } }
+            .take(5)
+
+        Log.w(TAG, "MISS DIAGNOSTICS for track ${lookup.track.id}:")
+        Log.w(TAG, "  embedded: artist='${lookup.artist}' title='${lookup.title}' album='${lookup.album}'")
+        Log.w(TAG, "  fnKeys='${lookup.filenameKeys.joinToString()} '")
+        if (nearTitles.isNotEmpty()) {
+            for (title in nearTitles) {
+                val artists = byTitle[title]?.joinToString(", ") { it.artist } ?: "?"
+                Log.w(TAG, "  ~title: '$title' (artists: $artists)")
+            }
+        }
+        if (nearFnKeys.isNotEmpty()) {
+            for (key in nearFnKeys) {
+                val ids = byFilenameKey[key]?.joinToString(", ") { it.id.toString() } ?: "?"
+                Log.w(TAG, "  ~fnKey: '$key' → ids=$ids")
+            }
+        }
+    }
+
+    private fun PowerampTrack.asLookup(): EmbeddedCandidate {
+        val artist = TrackNormalization.normalizeArtist(artist)
+        val album = TrackNormalization.normalizeAlbum(album)
+        val title = TrackNormalization.normalizeTitle(title)
+        val path = TrackNormalization.normalizePath(path)
+        val metadataKey = TrackNormalization.buildMetadataKey(artist, album, title, durationMs)
+        return EmbeddedCandidate(
+            track = EmbeddedTrack(
+                id = realId,
+                metadataKey = metadataKey,
+                filenameKey = path
+                    ?.substringAfterLast('/')
+                    ?.substringBeforeLast('.', missingDelimiterValue = title)
+                    ?.let(TrackNormalization::normalizeAsFilename)
+                    ?: TrackNormalization.normalizeAsFilename(title),
+                artist = artist,
+                album = album,
+                title = title,
+                durationMs = durationMs,
+                filePath = path.orEmpty(),
+                source = "poweramp",
+            ),
+            artist = artist,
+            album = album,
+            title = title,
+            path = path,
+            metadataKey = metadataKey,
+            metadataPrefix = metadataPrefix(metadataKey),
+            filenameKeys = TrackNormalization.buildFilenameKeys(
+                artist,
+                title,
+                path?.substringAfterLast('/')?.substringBeforeLast('.', missingDelimiterValue = title),
+            ),
+        )
+    }
+
+    private fun EmbeddedTrack.asLookup(): EmbeddedCandidate {
+        val artist = TrackNormalization.normalizeArtist(artist)
+        val album = TrackNormalization.normalizeAlbum(album)
+        val title = TrackNormalization.normalizeTitle(title)
+        val path = TrackNormalization.normalizePath(filePath)
+        val metadataKey = TrackNormalization.buildMetadataKey(artist, album, title, durationMs)
+        return EmbeddedCandidate(
+            track = this,
+            artist = artist,
+            album = album,
+            title = title,
+            path = path,
+            metadataKey = metadataKey,
+            metadataPrefix = metadataPrefix(metadataKey),
+            filenameKeys = TrackNormalization.buildFilenameKeys(artist, title, filenameKey),
+        )
+    }
+
+    private fun metadataPrefix(metadataKey: String): String =
+        metadataKey.substringBeforeLast('|') + "|"
+
+    private fun artistOverlaps(a: String, b: String): Boolean {
+        if (a.isBlank() || b.isBlank()) return a.isBlank() && b.isBlank()
+        if (a == b) return true
+        return a.contains(b) || b.contains(a)
     }
 }

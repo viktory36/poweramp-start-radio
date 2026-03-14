@@ -251,6 +251,30 @@ class EmbeddingDatabase private constructor(
         return null
     }
 
+    fun findTracksByPath(path: String): List<EmbeddedTrack> {
+        val cursor = db.rawQuery(
+            "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE file_path = ?",
+            arrayOf(path)
+        )
+        return cursor.use { cursorToTrackList(it) }
+    }
+
+    fun findTracksByMetadataPrefix(prefix: String): List<EmbeddedTrack> {
+        val cursor = db.rawQuery(
+            "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE metadata_key >= ? AND metadata_key < ?",
+            arrayOf(prefix, prefix + "\uffff")
+        )
+        return cursor.use { cursorToTrackList(it) }
+    }
+
+    fun findTracksByArtistAlbumTitle(artist: String, album: String, title: String): List<EmbeddedTrack> {
+        val cursor = db.rawQuery(
+            "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE LOWER(artist) = ? AND LOWER(album) = ? AND LOWER(title) = ?",
+            arrayOf(artist.lowercase(), album.lowercase(), title.lowercase())
+        )
+        return cursor.use { cursorToTrackList(it) }
+    }
+
     /**
      * Get a track by its filename key (fallback matching).
      */
@@ -262,6 +286,14 @@ class EmbeddingDatabase private constructor(
         return cursor.use { cursorToTrack(it) }
     }
 
+    fun findTracksByFilenameKey(key: String): List<EmbeddedTrack> {
+        val cursor = db.rawQuery(
+            "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE filename_key = ?",
+            arrayOf(key)
+        )
+        return cursor.use { cursorToTrackList(it) }
+    }
+
     /**
      * Find tracks by artist and title only (fuzzy fallback).
      */
@@ -269,6 +301,14 @@ class EmbeddingDatabase private constructor(
         val cursor = db.rawQuery(
             "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE LOWER(artist) = ? AND LOWER(title) = ?",
             arrayOf(artist.lowercase(), title.lowercase())
+        )
+        return cursor.use { cursorToTrackList(it) }
+    }
+
+    fun findTracksByTitle(title: String): List<EmbeddedTrack> {
+        val cursor = db.rawQuery(
+            "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE LOWER(title) = ?",
+            arrayOf(title.lowercase())
         )
         return cursor.use { cursorToTrackList(it) }
     }
@@ -361,6 +401,18 @@ class EmbeddingDatabase private constructor(
             arrayOf(id.toString())
         )
         return cursor.use { cursorToTrack(it) }
+    }
+
+    /**
+     * Get all tracks in the database.
+     */
+    fun getAllTracks(): List<EmbeddedTrack> {
+        val cursor = db.rawQuery(
+            "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path " +
+                "FROM tracks ORDER BY LOWER(COALESCE(artist, '')), LOWER(COALESCE(album, '')), LOWER(COALESCE(title, ''))",
+            null
+        )
+        return cursor.use { cursorToTrackList(it) }
     }
 
     /**
@@ -538,6 +590,39 @@ class EmbeddingDatabase private constructor(
         }
         db.insertWithOnConflict("binary_data", null, values,
             android.database.sqlite.SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    /**
+     * Delete a binary blob from the binary_data table.
+     */
+    fun deleteBinaryData(key: String) {
+        db.delete("binary_data", "key = ?", arrayOf(key))
+    }
+
+    /**
+     * Delete tracks and any embeddings attached to them.
+     *
+     * Returns the number of rows removed from the tracks table.
+     */
+    fun deleteTracks(trackIds: Set<Long>): Int {
+        if (trackIds.isEmpty()) return 0
+        val idArgs = trackIds.map(Long::toString).toTypedArray()
+        val placeholders = trackIds.joinToString(",") { "?" }
+        val embeddingTables = getTableNames().filter { it.startsWith("embeddings_") }
+        var deletedTracks = 0
+
+        db.beginTransaction()
+        try {
+            for (table in embeddingTables) {
+                db.delete(table, "track_id IN ($placeholders)", idArgs)
+            }
+            deletedTracks = db.delete("tracks", "id IN ($placeholders)", idArgs)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+
+        return deletedTracks
     }
 
     /**

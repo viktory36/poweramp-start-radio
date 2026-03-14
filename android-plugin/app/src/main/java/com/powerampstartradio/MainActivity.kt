@@ -162,6 +162,15 @@ fun MainScreen(
         onRegisterResumeCallback?.invoke {
             viewModel.checkPermission()
             viewModel.refreshDatabaseInfo()
+            if (showSettings) {
+                viewModel.maybeRefreshUnindexedTracks()
+            }
+        }
+    }
+
+    LaunchedEffect(showSettings) {
+        if (showSettings) {
+            viewModel.maybeRefreshUnindexedTracks()
         }
     }
 
@@ -1888,9 +1897,12 @@ private fun FileStatusRow(file: AppFileStatus) {
 // ---- Human-friendly label helpers ----
 
 private fun humanMatchType(matchType: TrackMatcher.MatchType): String = when (matchType) {
+    TrackMatcher.MatchType.PATH_EXACT -> "matched by file path"
     TrackMatcher.MatchType.METADATA_EXACT -> "matched by tags"
+    TrackMatcher.MatchType.ARTIST_ALBUM_TITLE -> "matched by tags"
     TrackMatcher.MatchType.FILENAME -> "matched by filename"
     TrackMatcher.MatchType.ARTIST_TITLE -> "fuzzy match"
+    TrackMatcher.MatchType.ARTIST_TITLE_FUZZY -> "fuzzy match"
     TrackMatcher.MatchType.NOT_FOUND -> "not found"
 }
 

@@ -25,6 +25,7 @@ import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.data.EmbeddingIndex
 import com.powerampstartradio.indexing.*
 import com.powerampstartradio.poweramp.PowerampHelper
+import com.powerampstartradio.poweramp.TrackMatcher
 import kotlinx.coroutines.*
 import java.io.File
 
@@ -716,17 +717,64 @@ class BenchmarkActivity : ComponentActivity() {
             log("")
             log("=== Results (${elapsedMs}ms) ===")
             log("Poweramp tracks:  ${result.powerampCount}")
+            log("Embedded tracks:  ${result.embeddedTrackCount}")
             log("Embedded keys:    ${result.embeddedKeyCount}")
             log("Embedded paths:   ${result.embeddedPathCount}")
+            log("")
+            log("--- Match passes ---")
+            for ((pass, count) in result.matchPassCounts.entries.sortedByDescending { it.value }) {
+                log("  $pass: $count")
+            }
             log("")
             log("Exact key match:  ${result.exactKeyMatches}")
             log("Partial match:    ${result.partialMatches}")
             log("Path match:       ${result.pathMatches}")
-            log("UNMATCHED:        ${result.unmatchedCount}")
+            log("Poweramp only:    ${result.unmatchedCount}")
+            log("DB only:          ${result.dbOnlyCount}")
+            log("  still on device: ${result.dbOnlyOnDeviceCount}")
+            log("  missing on device: ${result.dbOnlyMissingCount}")
             log("")
             log("--- Failure categories ---")
             for ((reason, count) in result.failureCategories.entries.sortedByDescending { it.value }) {
                 log("  $reason: $count")
+            }
+
+            val queueAudit = TrackMatcher(embeddingDb).auditQueueResolution(
+                this@BenchmarkActivity,
+                embeddingDb.getAllTracks(),
+            )
+            log("")
+            log("--- Queue resolution audit ---")
+            log("Matched:          ${queueAudit.matchedTracks}/${queueAudit.totalTracks}")
+            log("Unmatched:        ${queueAudit.unmatchedTracks}")
+            for ((matchType, count) in queueAudit.matchCounts.entries.sortedByDescending { it.value }) {
+                log("  $matchType: $count")
+            }
+            if (queueAudit.unmatchedSample.isNotEmpty()) {
+                log("  sample misses:")
+                queueAudit.unmatchedSample.take(10).forEach { log("    $it") }
+            }
+
+            val unindexed = detector.findUnindexedTracks(this@BenchmarkActivity)
+            log("")
+            log("--- Manage Tracks audit ---")
+            log("Unindexed shown:  ${unindexed.size}")
+            unindexed.take(10).forEach { track ->
+                log("  ${track.metadataKey}")
+            }
+            log("  battery:")
+            val shownKeys = unindexed.map { it.metadataKey }.toSet()
+            listOf(
+                "tipper cloaked title track" to ("tipper|cloaked|cloaked|212800" to true),
+                "soundgarden superunknown" to ("soundgarden|superunknown|superunknown|306500" to true),
+                "asha puthli space talk" to ("asha puthli|the essential asha puthli|space talk|326000" to false),
+                "shamoon na toon" to ("shamoon ismail; haider mustehsan; mooroo|cookie|na toon|208000" to false),
+                "shamoon tuntuna" to ("shamoon ismail|tuntuna|tuntuna|266300" to false),
+                "lsd thunderclouds" to ("lsd; sia; diplo; labrinth|labrinth, sia & diplo present... lsd (feat. sia, diplo & labrinth)|thunderclouds (feat. sia, diplo & labrinth)|187000" to false),
+            ).forEach { (label, expectation) ->
+                val (key, shouldBePresent) = expectation
+                val actual = key in shownKeys
+                log("    ${if (actual == shouldBePresent) "PASS" else "FAIL"}: $label (shown=$actual)")
             }
 
             if (result.unmatchedSample.isNotEmpty()) {
@@ -737,6 +785,14 @@ class BenchmarkActivity : ComponentActivity() {
                     if (u.closestEmbeddedKey != null) {
                         log("    closest: ${u.closestEmbeddedKey}")
                     }
+                }
+            }
+
+            if (result.dbOnlySample.isNotEmpty()) {
+                log("")
+                log("--- DB-only samples (first ${result.dbOnlySample.size}) ---")
+                for (entry in result.dbOnlySample.take(10)) {
+                    log("  [${entry.source}] ${entry.metadataKey}")
                 }
             }
 

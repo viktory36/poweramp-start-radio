@@ -37,7 +37,6 @@ import kotlin.math.roundToInt
  * ViewModel for the main screen.
  */
 class MainViewModel(application: Application) : AndroidViewModel(application) {
-
     private val prefs = application.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
     // --- RadioConfig settings ---
@@ -114,12 +113,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun initUnindexedCount(): Int {
         val app = getApplication<Application>()
         val dbFile = File(app.filesDir, "embeddings.db")
-        val currentFp = if (dbFile.exists()) "${dbFile.length()}_${dbFile.lastModified()}" else ""
-        val savedFp = app.getSharedPreferences("indexing", Context.MODE_PRIVATE)
-            .getString("dismissed_db_fingerprint", "") ?: ""
+        val currentFp = getDbFingerprint(dbFile)
+        val savedFp = prefs.getString("unindexed_count_db_fingerprint", "") ?: ""
         if (currentFp != savedFp) {
             // DB changed — stale count, force re-check
-            prefs.edit().remove("unindexed_count").apply()
+            prefs.edit()
+                .remove("unindexed_count")
+                .remove("unindexed_last_checked_ms")
+                .remove("unindexed_count_db_fingerprint")
+                .apply()
             return -2
         }
         return prefs.getInt("unindexed_count", -2)
@@ -682,6 +684,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     companion object {
         /** Minimum weight per seed — prevents any seed from being zeroed out. */
         private const val MIN_WEIGHT = 0.01f
+        private const val UNINDEXED_AUTO_REFRESH_MS = 24L * 60L * 60L * 1000L
     }
 
     /**
@@ -1338,6 +1341,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // --- Indexing actions ---
 
     fun checkUnindexedTracks() {
+        if (_unindexedCount.value == -1) return
+        Log.i("MainViewModel", "Starting unindexed track check")
         _unindexedCount.value = -1 // signal "checking" to UI
         val app = getApplication<Application>()
         val dbFile = File(app.filesDir, "embeddings.db")
@@ -1354,7 +1359,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             db.close()
             // Cache in IndexingViewModel so Manage Tracks can reuse
             val powerampCount = getPowerampTrackCount(app)
-            IndexingViewModel.cacheResults(sorted, dbFile.lastModified(), powerampCount)
+            IndexingViewModel.cacheResults(sorted, getDbFingerprint(dbFile), powerampCount)
             sorted
         }
         // Expose so IndexingViewModel can await if user opens Manage Tracks mid-check
@@ -1392,6 +1397,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 } else emptySet<Long>()
                 val visible = result.count { it.powerampFileId !in dismissed && it.powerampFileId !in ignored }
                 setUnindexedCount(visible)
+                Log.i("MainViewModel", "Unindexed track check complete: $visible visible tracks")
             } catch (_: Exception) {
                 setUnindexedCount(0)
             } finally {
@@ -1402,9 +1408,40 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun maybeRefreshUnindexedTracks() {
+        val app = getApplication<Application>()
+        val dbFile = File(app.filesDir, "embeddings.db")
+        if (!dbFile.exists() || !_hasPermission.value) return
+        if (IndexingService.state.value !is IndexingService.IndexingState.Idle) return
+
+        val currentFp = getDbFingerprint(dbFile)
+        val savedFp = prefs.getString("unindexed_count_db_fingerprint", "") ?: ""
+        val lastCheckedMs = prefs.getLong("unindexed_last_checked_ms", 0L)
+        val now = System.currentTimeMillis()
+
+        val refreshReason = when {
+            _unindexedCount.value == -1 -> null
+            _unindexedCount.value == -2 -> "count not checked yet"
+            currentFp != savedFp -> "database fingerprint changed"
+            lastCheckedMs <= 0L -> "missing freshness timestamp"
+            now - lastCheckedMs >= UNINDEXED_AUTO_REFRESH_MS -> "stale after ${UNINDEXED_AUTO_REFRESH_MS / (60L * 60L * 1000L)}h"
+            else -> null
+        }
+
+        if (refreshReason != null) {
+            Log.i("MainViewModel", "Auto-refreshing unindexed count: $refreshReason")
+            checkUnindexedTracks()
+        }
+    }
+
     private fun setUnindexedCount(count: Int) {
         _unindexedCount.value = count
-        prefs.edit().putInt("unindexed_count", count).apply()
+        val dbFile = File(getApplication<Application>().filesDir, "embeddings.db")
+        prefs.edit()
+            .putInt("unindexed_count", count)
+            .putLong("unindexed_last_checked_ms", System.currentTimeMillis())
+            .putString("unindexed_count_db_fingerprint", getDbFingerprint(dbFile))
+            .apply()
     }
 
     private fun getPowerampTrackCount(context: Context): Int {
@@ -1418,6 +1455,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } ?: -1
         } catch (_: Exception) { -1 }
     }
+
+    private fun getDbFingerprint(dbFile: File): String =
+        if (dbFile.exists()) "${dbFile.length()}_${dbFile.lastModified()}" else ""
 
     fun checkModels() {
         val filesDir = getApplication<Application>().filesDir
