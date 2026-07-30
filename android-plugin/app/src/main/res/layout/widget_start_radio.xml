@@ -4,20 +4,26 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="@drawable/widget_background"
+    android:baselineAligned="false"
+    android:contentDescription="@string/widget_open_app_action"
     android:gravity="center_vertical"
     android:orientation="horizontal"
-    android:padding="2dp">
+    android:paddingStart="2dp"
+    android:paddingEnd="2dp">
 
     <FrameLayout
         android:id="@+id/widget_start_button"
-        android:layout_width="32dp"
-        android:layout_height="32dp"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
         android:background="@drawable/widget_badge_background"
-        android:padding="8dp">
+        android:contentDescription="@string/widget_start_radio_action"
+        android:padding="12dp">
 
         <ImageView
+            android:id="@+id/widget_action_icon"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
+            android:importantForAccessibility="no"
             android:src="@drawable/ic_radio_waves"
             android:tint="#FFFFFFFF" />
     </FrameLayout>
@@ -34,10 +40,11 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:ellipsize="end"
+            android:includeFontPadding="false"
             android:maxLines="1"
-            android:text="Current track title"
+            android:text="@string/widget_preview_title"
             android:textColor="#FFF5F7FA"
-            android:textSize="11sp"
+            android:textSize="12sp"
             android:textStyle="bold" />
 
         <TextView
@@ -45,9 +52,10 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:ellipsize="end"
+            android:includeFontPadding="false"
             android:maxLines="1"
-            android:text="Artist · Album"
+            android:text="@string/widget_preview_subtitle"
             android:textColor="#B3F5F7FA"
-            android:textSize="9sp" />
+            android:textSize="11sp" />
     </LinearLayout>
 </LinearLayout>

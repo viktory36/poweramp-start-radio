@@ -1,7 +1,8 @@
 """Command-line interface for the Poweramp indexer (CLaMP3)."""
 
+import json
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -9,7 +10,6 @@ from tqdm import tqdm
 
 from . import __version__
 from .database import EmbeddingDatabase
-from .embeddings_clamp3 import CLaMP3EmbeddingGenerator
 from .fingerprint import extract_metadata
 from .scanner import scan_music_directory
 
@@ -29,6 +29,316 @@ def cli():
     Scan your music library and generate CLaMP3 embeddings for similarity search.
     """
     pass
+
+
+# ─── Persistent server indexer ───────────────────────────────────────────────
+
+@cli.group("server")
+def server_cli():
+    """Watch download folders and publish a graphless phone-merge database."""
+
+
+def _server_config(path: Path):
+    from .server_config import load_server_config
+
+    try:
+        return load_server_config(path)
+    except Exception as error:
+        raise click.ClickException(str(error)) from error
+
+
+@server_cli.command("init")
+@click.option("--config", "config_path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--baseline-existing",
+    is_flag=True,
+    help="Record every current audio file as already indexed without generating embeddings.",
+)
+def server_init(config_path: Path, baseline_existing: bool):
+    """Create the private ledger and explicit initial baseline."""
+    if not baseline_existing:
+        raise click.UsageError("server init requires --baseline-existing")
+    from .server_indexer import ServerIndexer, server_instance_lock
+
+    config = _server_config(config_path)
+    try:
+        with server_instance_lock(config.state_db), ServerIndexer(config) as indexer:
+            result = indexer.baseline_existing()
+    except Exception as error:
+        raise click.ClickException(str(error)) from error
+    click.echo(
+        f"Baseline recorded: {result.baseline_files} existing, "
+        f"{result.settling_files} changed during scan"
+    )
+    click.echo(f"Published empty merge bundle: {config.bundle_db}")
+
+
+@server_cli.command("once")
+@click.option("--config", "config_path", required=True, type=click.Path(exists=True, path_type=Path))
+def server_once(config_path: Path):
+    """Run exactly one discovery, indexing, and publication cycle."""
+    from .server_indexer import ServerIndexer, server_instance_lock
+
+    config = _server_config(config_path)
+    try:
+        with server_instance_lock(config.state_db), ServerIndexer(config) as indexer:
+            report = indexer.cycle()
+    except Exception as error:
+        raise click.ClickException(str(error)) from error
+    click.echo(
+        f"Observed {report.observed_files}; new {report.new_files}; changed {report.changed_files}; "
+        f"ready {report.ready_files}; indexed {report.indexed_files}; "
+        f"reused {report.reused_embeddings}; failed {report.failed_files}; "
+        f"blocked {report.blocked_files}"
+    )
+    if report.publication:
+        click.echo(
+            f"Published {report.publication.track_count} tracks as {report.publication.bundle_id}"
+        )
+
+
+@server_cli.command("run")
+@click.option("--config", "config_path", required=True, type=click.Path(exists=True, path_type=Path))
+def server_run(config_path: Path):
+    """Poll forever in the foreground; intended to run under systemd."""
+    import signal
+    import threading
+
+    from .server_indexer import ServerIndexer, server_instance_lock
+
+    config = _server_config(config_path)
+    stopped = threading.Event()
+    previous_handlers = {}
+
+    def request_stop(_signum, _frame):
+        stopped.set()
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.signal(signum, request_stop)
+    try:
+        with server_instance_lock(config.state_db), ServerIndexer(config) as indexer:
+            indexer.run_forever(stopped.is_set)
+    except Exception as error:
+        raise click.ClickException(str(error)) from error
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+
+@server_cli.command("status")
+@click.option("--config", "config_path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--json", "as_json", is_flag=True, help="Emit the complete machine-readable status.")
+def server_status(config_path: Path, as_json: bool):
+    """Show queue, activity, throughput, ETA, and publication status."""
+
+    from .server_indexer import read_server_status
+
+    config = _server_config(config_path)
+    try:
+        status = read_server_status(config)
+    except Exception as error:
+        raise click.ClickException(str(error)) from error
+    if as_json:
+        click.echo(json.dumps(status, indent=2, sort_keys=True))
+    else:
+        click.echo(_format_server_status(status))
+
+
+def _format_duration(seconds: float) -> str:
+    rounded = max(0, round(seconds))
+    if rounded < 60:
+        return f"{rounded}s"
+    minutes, remaining_seconds = divmod(rounded, 60)
+    if minutes < 60:
+        return f"{minutes}m {remaining_seconds:02d}s"
+    hours, remaining_minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {remaining_minutes:02d}m"
+    days, remaining_hours = divmod(hours, 24)
+    return f"{days}d {remaining_hours:02d}h"
+
+
+def _format_bytes(size_bytes: int) -> str:
+    value = float(size_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or unit == "TiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024.0
+    raise AssertionError("unreachable")
+
+
+def _format_timestamp(timestamp_ns: int) -> str:
+    return datetime.fromtimestamp(
+        timestamp_ns / 1_000_000_000
+    ).astimezone().isoformat(timespec="seconds")
+
+
+def _format_server_status(status: dict[str, object]) -> str:
+    runtime = status["runtime"]
+    library = status["library"]
+    queue = library["queue"]
+    bundle = status["bundle"]
+    timing = status["timing"]
+    publication = bundle["last_publication"]
+    captured_at_ns = int(status["captured_at_ns"])
+
+    phase = str(runtime["phase"]).replace("_", " ")
+    writer_active = bool(status["writer_active"])
+    process = "running" if writer_active else "stopped"
+    lines = [
+        "Poweramp server indexer",
+        "",
+        f"Process: {process}",
+    ]
+
+    current_relative = runtime["current_relative_path"]
+    current_root = runtime["current_root_id"]
+    phase_started_at_ns = runtime["phase_started_at_ns"]
+    phase_age = (
+        _format_duration(
+            (captured_at_ns - int(phase_started_at_ns)) / 1_000_000_000
+        )
+        if phase_started_at_ns is not None
+        else None
+    )
+    if current_relative:
+        current = (
+            f"{current_root}/{current_relative}"
+            if current_root
+            else str(current_relative)
+        )
+        suffix = f" ({phase_age})" if phase_age else ""
+        lines.append(f"Activity: {phase} - {current}{suffix}")
+    elif writer_active:
+        suffix = f" ({phase_age})" if phase_age else ""
+        lines.append(f"Activity: {phase}{suffix}")
+    else:
+        lines.append(f"Last activity: {phase}")
+
+    next_poll_at_ns = runtime["next_poll_at_ns"]
+    if writer_active and next_poll_at_ns is not None:
+        remaining = (int(next_poll_at_ns) - captured_at_ns) / 1_000_000_000
+        lines.append(f"Next scan: in {_format_duration(remaining)}")
+    if runtime["last_error"]:
+        lines.append(f"Last cycle error: {runtime['last_error']}")
+
+    lines.extend(["", "Watch roots:"])
+    for root in status["roots"]:
+        baseline = "baseline recorded" if root["baselined"] else "not baselined"
+        lines.append(f"  {root['id']}: {root['path']} ({baseline})")
+    lines.extend([
+        f"State: {status['state']['path']}",
+        "",
+        f"Library: {int(library['present']):,} present",
+        f"Done by server: {int(library['embedded']):,} embedded",
+        f"Baseline: {int(library['baseline']):,} skipped at initial setup",
+    ])
+    pending = (
+        int(queue["ready"])
+        + int(queue["settling"])
+        + int(queue["active"])
+        + int(queue["retrying"])
+    )
+    if pending == 0:
+        lines.append("Queue: empty")
+    else:
+        lines.append(
+            f"Queue: {pending:,} pending - "
+            f"{int(queue['ready']):,} ready, "
+            f"{int(queue['settling']):,} settling, "
+            f"{int(queue['active']):,} active, "
+            f"{int(queue['retrying']):,} retrying"
+        )
+    if int(queue["blocked"]) > 0:
+        lines.append(
+            f"Blocked: {int(queue['blocked']):,} "
+            "(requires an explicit server retry)"
+        )
+    if int(library["missing"]) > 0:
+        lines.append(f"Missing from watch roots: {int(library['missing']):,}")
+
+    lines.extend(["", f"Export: {bundle['path']}"])
+    if publication:
+        published = _format_timestamp(int(publication["published_at_ns"]))
+        size = (
+            _format_bytes(int(bundle["size_bytes"]))
+            if bundle["size_bytes"] is not None
+            else "file missing"
+        )
+        lines.append(
+            f"Published: {published} - {int(publication['track_count']):,} tracks - {size}"
+        )
+        lines.append(f"Bundle: {publication['generation_id']}")
+        lines.append(f"Published SHA-256: {publication['bundle_sha256']}")
+    elif bundle["exists"]:
+        lines.append(
+            "Published: no durable publication receipt "
+            f"- {_format_bytes(int(bundle['size_bytes']))}"
+        )
+    else:
+        lines.append("Published: no export file")
+
+    track_sample_count = int(timing["non_reused_sample_count"])
+    publication_sample_count = int(timing["publication_batch_sample_count"])
+    median_seconds = timing["median_seconds_per_track"]
+    p90_seconds = timing["p90_seconds_per_track"]
+    if track_sample_count > 0 and median_seconds is not None and p90_seconds is not None:
+        lines.append(
+            "Speed: "
+            f"{float(median_seconds):.1f}s median, "
+            f"{float(p90_seconds):.1f}s p90 "
+            f"({track_sample_count} recent embedded tracks)"
+        )
+    elif (
+        publication_sample_count > 0
+        and median_seconds is not None
+        and p90_seconds is not None
+    ):
+        lines.append(
+            "Historical speed: "
+            f"{float(median_seconds):.1f}s median, "
+            f"{float(p90_seconds):.1f}s p90 per track "
+            f"({publication_sample_count} completed full batches)"
+        )
+    else:
+        lines.append("Speed: no completed non-reused timing samples yet")
+
+    estimated_tracks = int(timing["estimated_pending_tracks"])
+    estimated_seconds = timing["estimated_remaining_seconds"]
+    if estimated_tracks == 0:
+        lines.append("ETA: queue empty")
+    elif estimated_seconds is None:
+        lines.append("ETA: unavailable until a non-reused track finishes")
+    else:
+        lines.append(
+            f"ETA: about {_format_duration(float(estimated_seconds))} "
+            f"of compute for {estimated_tracks:,} pending tracks"
+        )
+
+    failures = status["failures"]
+    if failures:
+        lines.extend(["", f"Current failures: {len(failures)}"])
+        for failure in failures[:3]:
+            path = f"{failure['root_id']}/{failure['relative_path']}"
+            lines.append(
+                f"  {path}: {failure['error_code']}: {failure['error_message']}"
+            )
+    return "\n".join(lines)
+
+
+@server_cli.command("retry")
+@click.option("--config", "config_path", required=True, type=click.Path(exists=True, path_type=Path))
+def server_retry(config_path: Path):
+    """Retry every present file currently waiting or blocked after a failure."""
+    from .server_indexer import ServerIndexer, server_instance_lock
+
+    config = _server_config(config_path)
+    try:
+        with server_instance_lock(config.state_db), ServerIndexer(config) as indexer:
+            count = indexer.retry_failed()
+    except Exception as error:
+        raise click.ClickException(str(error)) from error
+    click.echo(f"Queued {count} failed tracks for retry")
 
 
 # ─── Scan ─────────────────────────────────────────────────────────────────────
@@ -53,14 +363,19 @@ def cli():
     help="Run MERT in FP16 (default) or force FP32"
 )
 @click.option("--batch-size", type=int, default=8, help="MERT batch size for GPU (default: 8)")
-@click.option("--max-duration", type=int, default=600,
-              help="Max audio duration in seconds (default: 600)")
+@click.option(
+    "--max-duration",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Optional MERT extraction cap in seconds (default: complete track)",
+)
 @click.option("--cache-dir", type=click.Path(path_type=Path), default=None,
               help="MERT feature cache directory (default: mert_cache/ next to output)")
 @click.option("--phase", type=click.Choice(["1", "2", "both"]), default="both",
               help="Phase to run: 1=MERT extraction, 2=CLaMP3 encoding, both")
 def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool,
-         fp16: bool, batch_size: int, max_duration: int, cache_dir: Path, phase: str):
+         fp16: bool, batch_size: int, max_duration: int | None,
+         cache_dir: Path | None, phase: str):
     """Scan a music directory and generate CLaMP3 embeddings.
 
     MUSIC_PATH: Path to your music library folder
@@ -76,7 +391,7 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool,
       poweramp-indexer scan /path/to/music -o embeddings.db --fp32
       poweramp-indexer scan /path/to/music -o embeddings.db --phase 1
     """
-    from .embeddings_clamp3 import scan_phase1, scan_phase2
+    from .embeddings_clamp3 import CLaMP3EmbeddingGenerator, scan_phase1, scan_phase2
 
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -91,7 +406,10 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool,
     click.echo(f"Music directory: {music_path}")
     click.echo(f"Output database: {output}")
     click.echo(f"Cache directory: {cache_dir}")
-    click.echo(f"Max duration: {max_duration}s, Batch size: {batch_size}")
+    extraction_span = (
+        "complete track" if max_duration is None else f"first {max_duration}s"
+    )
+    click.echo(f"MERT extraction: {extraction_span}, Batch size: {batch_size}")
     click.echo()
 
     generator = CLaMP3EmbeddingGenerator(
@@ -105,7 +423,7 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool,
         db = EmbeddingDatabase(output)
         scan_phase2(music_path, cache_dir, db, generator, verbose=verbose)
 
-        # Build kNN graph for Random Walk mode
+        # Build the kNN graph used by Graph Explorer.
         from .graph import build_index
         click.echo()
         result = build_index(
@@ -135,7 +453,12 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool,
     help="Run MERT in FP16 (default) or force FP32"
 )
 @click.option("--batch-size", type=int, default=8, help="MERT batch size")
-@click.option("--max-duration", type=int, default=600, help="Max audio duration in seconds")
+@click.option(
+    "--max-duration",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Optional MERT extraction cap in seconds (default: complete track)",
+)
 @click.option("--rebuild-graph/--no-rebuild-graph", default=True,
               help="Refresh clusters and the kNN graph after updating (default: on)")
 @click.option("--graph-clusters", type=int, default=None,
@@ -143,17 +466,19 @@ def scan(music_path: Path, output: Path, skip_existing: bool, verbose: bool,
 @click.option("--graph-knn", type=int, default=None,
               help="Neighbor count for graph rebuild (default: reuse stored value or 5)")
 def update(music_path: Path, database: Path, remove_missing: bool, verbose: bool,
-           fp16: bool, batch_size: int, max_duration: int,
+           fp16: bool, batch_size: int, max_duration: int | None,
            rebuild_graph: bool, graph_clusters: int | None, graph_knn: int | None):
     """Incrementally update an existing database.
 
     Adds new files, optionally removes missing ones, and refreshes the
-    Random Walk graph unless disabled.
+    Graph Explorer graph unless disabled.
 
     MUSIC_PATH: Path to your music library folder
     """
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    from .embeddings_clamp3 import CLaMP3EmbeddingGenerator
 
     click.echo(f"Updating database: {database}")
     click.echo(f"Scanning: {music_path}")
@@ -233,13 +558,16 @@ def update(music_path: Path, database: Path, remove_missing: bool, verbose: bool
             )
             click.echo(f"  Graph refreshed: K={result['knn_k']} ({result['graph_size_mb']:.1f} MB)")
     elif not rebuild_graph and (removed > 0 or successful > 0):
-        click.echo("Skipped graph rebuild; Random Walk will not reflect these changes until `poweramp-indexer graph` is run.")
+        click.echo(
+            "Skipped graph rebuild; Graph Explorer will not reflect these "
+            "changes until `poweramp-indexer graph` is run."
+        )
     elif rebuild_graph and not graph_needs_refresh:
         click.echo("Graph already matches the current database; no rebuild needed.")
 
     db.vacuum()
     total_tracks = db.count_tracks()
-    click.echo(f"\nUpdate complete!")
+    click.echo("\nUpdate complete!")
     click.echo(f"  Total tracks in database: {total_tracks}")
     click.echo(f"  Database size: {database.stat().st_size / 1024 / 1024:.1f} MB")
 
@@ -280,7 +608,7 @@ def _process_files(audio_files, generator, store_fn, desc):
 def graph(database: Path, clusters: int, knn: int, verbose: bool):
     """Build k-means clusters and kNN graph from embeddings.
 
-    The kNN graph enables Random Walk exploration on Android.
+    The kNN graph enables Graph Explorer on Android.
 
     DATABASE: Path to embeddings database with CLaMP3 embeddings
 
@@ -310,7 +638,7 @@ def graph(database: Path, clusters: int, knn: int, verbose: bool):
     db.set_metadata("version", __version__)
     db.close()
 
-    click.echo(f"\nIndex complete!")
+    click.echo("\nIndex complete!")
     click.echo(f"  Tracks: {result['n_tracks']}")
     click.echo(f"  Embedding dim: {result['embedding_dim']}")
     click.echo(f"  Clusters: {result['n_clusters']}")
@@ -474,6 +802,8 @@ def similar(database: Path, query: str, audio_file: Path, use_random: bool, top:
         seed_embedding = db.get_embedding_by_id(exclude_id)
 
     elif audio_file:
+        from .embeddings_clamp3 import CLaMP3EmbeddingGenerator
+
         click.echo("Generating CLaMP3 embedding for file...")
         generator = CLaMP3EmbeddingGenerator()
         seed_embedding = generator.generate_embedding(audio_file)
@@ -527,6 +857,8 @@ def search(database: Path, query: str, top: int):
       poweramp-indexer search embeddings.db "upbeat electronic dance"
       poweramp-indexer search embeddings.db "sad piano ballad"
     """
+    from .embeddings_clamp3 import CLaMP3EmbeddingGenerator
+
     db = EmbeddingDatabase(database)
 
     if db.count_embeddings() == 0:

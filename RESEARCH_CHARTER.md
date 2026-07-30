@@ -1,94 +1,133 @@
-# Poweramp Start Radio Improvement Charter
+# Evidence-First Improvement Charter
 
-This is the durable brief for future research. It records the product target and the
-rules for evidence; it deliberately does not choose a model or algorithm in advance.
+This charter governs changes to the intelligence and embedding-to-queue behavior of Poweramp Start
+Radio. It is deliberately stricter than ordinary feature ideation: a recommendation option earns
+its place only when its exact promise, implementation, measured effect, and listening utility agree.
 
-## Product Target
+## Product North Star
 
-Poweramp Start Radio should make queues that a serious music listener repeatedly wants
-to keep playing. Improvements must be visible in real use, not merely in a paper metric.
+The app should help a listener discover remarkable recordings already present in their library.
+It should let them express the sound they want through:
 
-The central quality goals are:
+- one current recording;
+- one text description;
+- several text or explicitly confirmed recording ingredients;
+- a small set of controls with predictable musical effects.
 
-- preserve the particular character of the seed instead of falling back to its broad
-  genre neighborhood;
-- work especially well for niche electronic music, non-English music, culturally
-  specific forms, unusual production, and tracks that cross common genre boundaries;
-- make text-to-song retrieval precise enough for specific musical intent;
-- produce coherent queues without flattening the library into safe, generic choices;
-- remain deterministic: identical libraries, models, settings, and requests must produce
-  identical results; and
-- keep indexing and runtime behavior robust, resumable, measurable, and fast enough for
-  daily use without trading away recommendation quality merely to save compute.
+Musical intelligence comes from the shared embedding space and declared algorithms. Poweramp
+metadata may define identity, artist limits, library age, and display, but must not become hidden
+taste intelligence.
 
-## Intelligence Boundary
+## Acceptance Standard
 
-Core recommendation intelligence comes from raw audio and text model embeddings plus
-deterministic algorithms operating on those embeddings.
+For every serious recommendation idea:
 
-Poweramp metadata, filenames, tags, play history, ratings, scraped labels, and personal
-listening statistics must not silently enter similarity or relevance scores. Metadata may
-still be used for identity, display, explicit user constraints, duplicate/version handling,
-and blinded evaluation labels. Those uses must remain separate and inspectable.
+1. State the musical request it is intended to satisfy.
+2. Define exactly how embeddings become an ordered queue.
+3. Bind the experiment to one immutable database and active-library generation.
+4. Compare it only with existing behavior that serves the same request.
+5. Measure relevance, redundancy, coverage, anchor satisfaction, determinism, domain correctness,
+   duplicate exposure, and runtime.
+6. Inspect real ordered results across mainstream, niche, non-English, electronic, ambient,
+   acoustic, dense, and sparse neighborhoods.
+7. Stress filters, queue sizes, artist constraints, duplicate versions, small domains, and
+   incomplete graphs.
+8. Reject it, refine it, use it to improve an existing promise, or promote it for device listening.
 
-Universal musical similarity and queue construction are separate problems. Research must
-therefore keep two independently measurable lanes:
+The ledger for a candidate records:
 
-1. **Model intelligence:** raw text-to-song and song-to-song retrieval from a fixed,
-   aligned candidate pool.
-2. **Queue intelligence:** ordering, diversity, drift, graph traversal, repetition control,
-   and multi-seed behavior while holding the embeddings fixed.
+- database, embedding, graph, and active-library identities;
+- hypothesis and exact formula;
+- ordered track identities and aggregate metrics;
+- timing and repeat fingerprints;
+- qualitative observations;
+- final retain, replace, merge, or reject decision.
 
-## Production Baseline
+## Mode Curation
 
-The starting point is the database actually used by the connected phone, not an assumed
-desktop state:
+Every visible option must complete this sentence:
 
-- snapshot: `desktop-indexer/audit_raw_data/phone-snapshots/2026-07-07T223308+0300_qv7706c3mq/embeddings.db`
-- source device: Sony XQ-EC72
-- source modification time: `2026-07-07T22:33:08+03:00`
-- SHA-256: `08dfcec60f7c2e9de4bc6b923d601bd824f80b6251769f6c7bcd8062ce6aa504`
-- tracks and CLaMP3 embeddings: `80,421`
-- embedded graph: `80,421` nodes, `K=5`
+> I would choose this when I want...
 
-The adjacent ignored `snapshot-manifest.json` records acquisition provenance and integrity,
-embedding, and graph checks. The snapshot is immutable; experiments work on copies.
+Apply these rules:
 
-Existing measured behavior in `EVALUATION.md` and controls in `MODES_AND_KNOBS.md` are the
-baseline until a fresh measurement supersedes them.
+- If two algorithms answer the same request, keep the consistently stronger one.
+- If a new algorithm improves an existing promise, improve that mode instead of adding a synonym.
+- If behavior differs only in degree, prefer one measured control over two mode names.
+- If an option mostly reorders the same recordings without changing utility, do not expose it.
+- If a distinction needs a long mathematical explanation before it can be chosen, keep it
+  internal unless listening establishes unusual value.
+- Contextual result-set planners remain inside Find Music rather than becoming global radio modes.
+- Do not suppress a genuinely distinct capability merely to meet a numerical mode cap.
 
-## Experiment Discipline
+The target is the smallest complete musical vocabulary, not the fewest possible algorithms.
 
-Every experiment must follow these rules:
+## Control Standard
 
-1. State the observed product problem, hypothesis, expected user-visible improvement, and
-   rejection criterion before implementation.
-2. Freeze cohorts and prompts without consulting candidate-model rankings.
-3. Compare the exact same tracks, exclusions, queries, seeds, and retrieval depth.
-4. Change one intelligence layer at a time. Report raw retrieval separately from queue
-   algorithms, filters, metadata constraints, and presentation.
-5. Keep checkpoints, preprocessing, sampling, aggregation, precision, hashes, and runtime
-   configuration reproducible.
-6. Use quantitative diagnostics to find differences, then judge musical quality blindly.
-   Direct listening and the user's judgment decide ambiguous or product-critical cases.
-7. Include ordinary tracks as the primary population. Report long-form, niche,
-   multilingual, and other important slices separately so no stress cohort dominates the
-   conclusion.
-8. Measure recommendation quality, determinism, latency, throughput, storage, memory,
-   crash recovery, and resume behavior. Quality remains the gate.
-9. Treat public benchmarks as candidate-screening evidence only. A replacement or new
-   algorithm must win on this library and this product task.
-10. Archive failed experiments cleanly and return to the production baseline.
+A visible knob must:
 
-## Reset Procedure
+- be a stable semantic input to the stated algorithm;
+- have at least two applicable values in the current context;
+- cause a significant, predictable, and verified change in its declared tradeoff;
+- preserve exact request persistence and replay.
 
-The next investigation starts from the production snapshot and works outward:
+Do not expose cache sizes, scheduler intervals, certificate prefixes, normalization constants,
+mathematical aliases, or other implementation parameters as fake agency. A fixed measured
+parameter may remain part of a versioned algorithm contract without becoming a user control.
 
-1. reproduce current raw retrieval and queue behavior from the phone database;
-2. assemble a small golden set of real seeds, prompts, successes, and recurring failures;
-3. turn those failures into measurable, blinded tests;
-4. identify whether each failure belongs to the model or queue lane; and
-5. investigate the smallest defensible change that can beat the frozen baseline.
+## Correctness Invariants
 
-No replacement model, fine-tuning plan, enrichment scheme, or queue algorithm is presumed
-to be the answer.
+- Same embedding generation plus the same complete request produces the same ordered identities.
+- The displayed candidate domain is the domain the selector actually uses.
+- Global nearest-rank evidence retains one consistent meaning across filters and modes.
+- Preview and benchmark work never changes the Poweramp queue.
+- Find Music queues the displayed result order, not a silent rerun.
+- Seed and proven full-file copies are conditioned out where identity evidence justifies it.
+- Similar embeddings alone never prove duplicate file identity.
+- Greedy DPP claims equality only to the complete-domain greedy sequence, not global MAP
+  optimality.
+- Persisted requests fail closed when generation or evidence bindings no longer match.
+
+## Performance And Reliability
+
+Quality and correctness outrank startup or one-time cost. Performance work is accepted when it
+preserves the exact output contract or makes an explicit domain tradeoff visible to the user.
+
+On-device indexing additionally requires:
+
+- complete-span audio policy;
+- exact progress stage naming and evidence-based ETA;
+- durable pause, resume, crash recovery, retry, and exclusion state;
+- atomic generation publication;
+- no repeated hashing of unchanged multi-gigabyte model files;
+- measured device/host embedding parity;
+- a graph update whose proof matches the published bytes.
+
+Server indexing requires a durable private ledger, explicit baseline semantics, atomic cumulative
+publication, readable status/ETA, and an overlap-safe phone merge.
+
+## Evidence Versioning
+
+`EVALUATION.md` is the public summary of the latest accepted evidence. A dated local report may
+contain detailed queues, hashes, screenshots, or device logs, but public claims must be recomputed
+from its machine-readable payloads and stripped of personal-library rows.
+
+The July 30, 2026 V2 conclusion used 89,737 CLaMP3 embeddings and retained:
+
+- All-of Ranked and contextual Varied;
+- Refine with four measured primary-neighborhood widths;
+- Like/Avoid;
+- the visible single-seed mode set documented in `MODES_AND_KNOBS.md`;
+- the identity-correct Graph Explorer topology.
+
+That snapshot is a baseline, not a permanent benchmark. Future work must declare a new generation
+identity and compare only the behavior it changes.
+
+## Completion Rule
+
+An investigation is complete when major plausible families have been considered and further work
+no longer produces a distinct improvement in specificity, relevance, breadth, freshness,
+expressive control, reliability, or listening utility.
+
+The production UI receives only the winners. Rejected candidates, calibration machinery, raw
+evidence, and experiment labels remain outside the listener-facing app.

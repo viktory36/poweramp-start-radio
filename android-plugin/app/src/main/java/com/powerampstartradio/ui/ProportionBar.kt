@@ -45,12 +45,17 @@ fun ProportionBar(
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .height(36.dp)
-            .clip(RoundedCornerShape(8.dp))
+            .height(48.dp)
             .onSizeChanged { barWidthPx = it.width }
     ) {
         // Draw segments
-        Row(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(36.dp)
+                .align(Alignment.Center)
+                .clip(RoundedCornerShape(8.dp)),
+        ) {
             for (i in segments.indices) {
                 val seg = segments[i]
                 Box(
@@ -93,10 +98,10 @@ fun ProportionBar(
             Box(
                 modifier = Modifier
                     .fillMaxHeight()
-                    .width(24.dp) // touch target
+                    .width(48.dp)
                     .offset(
                         x = with(density) {
-                            (barWidthPx * dividerFraction).toDp() - 12.dp
+                            (barWidthPx * dividerFraction).toDp() - 24.dp
                         }
                     )
                     .pointerInput(i) {

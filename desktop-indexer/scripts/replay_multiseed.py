@@ -210,7 +210,7 @@ def replay_query(query_json, track_ids, tracks, emb_matrix, id_to_index, top_k=3
     if has_text:
         if skip_text:
             print(f"  TEXT SKIPPED (--no-text): '{query_json['text']}' (weight={text_weight:.4f})")
-            print(f"  Comparing song-seed-only ranking (text influence excluded)")
+            print("  Comparing song-seed-only ranking (text influence excluded)")
             labels.append(f"[TEXT SKIPPED] \"{query_json['text']}\"")
             text_skipped = True
         else:
@@ -352,7 +352,7 @@ def main():
         if qi in results_map:
             compare_results(ranking, results_map[qi], tracks, has_text)
         else:
-            print(f"\n  Desktop results (no app results to compare):")
+            print("\n  Desktop results (no app results to compare):")
             for i, (tid, score) in enumerate(ranking):
                 t = tracks.get(tid, {})
                 print(f"  {i:<4} {score:.4f}  {t.get('artist', '?')} - {t.get('title', '?')}")

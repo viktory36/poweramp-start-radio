@@ -1,210 +1,194 @@
 # Android App
 
-This directory contains the Android app for Poweramp Start Radio.
+This directory contains the Android application for Poweramp Start Radio. It is the offline
+recommendation and indexing client: CLaMP3 embeddings supply musical relevance, explicit
+algorithms turn them into ordered result sets, and Poweramp supplies the current library and queue
+boundary.
 
-## What The App Does
+The current build uses application ID `com.powerampstartradio.v2`.
 
-The app supports five main jobs:
+## User Workflows
 
-1. current-track radio from Poweramp
-2. text-to-audio search in the shared CLaMP3 embedding space
-3. multi-seed search and multi-seed radio
-4. on-device indexing for tracks present on the phone but absent from `embeddings.db`
-5. benchmark and debug entry points used during development
+- **Radio from Now Playing** builds a queue from Poweramp's current track, whether it is playing or
+  paused.
+- **Find Music** retrieves recordings from text and confirmed song ingredients. `All of` can return
+  the strongest joint matches or a less redundant DPP-selected set. `Refine` holds one ingredient
+  as a hard neighborhood and orders inside it with a second ingredient.
+- **Queue delivery** either replaces Poweramp's upcoming queue or appends after it, then reads the
+  queue back before reporting success.
+- **History and widget** use the same durable request and verified delivery path. Saved sessions can
+  be requeued in their recorded order.
+- **On-device indexing** finds Poweramp tracks absent from the active index, embeds selected tracks,
+  and atomically publishes a new index generation.
+- **Server merge** accepts a compatible graphless export from the desktop server indexer and merges
+  only rows that can be bound to the current Poweramp library.
 
-## Build In WSL
+Poweramp metadata is used for identity, CUE spans, dates, display, explicit artist-credit limits,
+and queue delivery. It is not a hidden musical relevance signal.
 
-### One-time setup
+## Recommendation Surface
+
+Radio from one seed exposes five distinct choices:
+
+- **Closest to seed**: cosine order from the fixed seed.
+- **MMR**: seed or evolving-direction relevance minus resemblance to earlier picks.
+- **DPP**: quality-weighted, set-wide diversity over either all eligible recordings or a declared
+  nearest subset.
+- **Graph Explorer**: terminal probabilities from deterministic non-backtracking paths over the
+  validated similarity graph.
+- **Uniform shuffle**: a reproducible uniform permutation without similarity ranking.
+
+MMR alone supports an evolving direction. DPP, MMR, queue length, date scope, and artist limits
+expose only controls that enter the recorded request. Results retain exact configuration and domain
+evidence, including true seed-nearest rank over the full active library.
+
+Find Music uses tie-aware corpus percentiles so ingredients with different raw cosine
+distributions remain comparable:
+
+- **All of / Ranked** orders by the weighted geometric mean of ingredient percentiles.
+- **All of / Varied** uses that same objective as DPP quality to reduce result-set redundancy.
+- **Refine** selects an exact primary neighborhood and ranks it by the secondary ingredient.
+- **Like / Avoid** controls the sign of an ingredient instead of inferring intent from text.
+
+All requests are deterministic for the same validated index generation and recorded settings.
+
+## Build
+
+One-time WSL setup:
 
 ```bash
 cd android-plugin
 ./scripts/setup-wsl-android-env.sh
 ```
 
-The script installs a local Android toolchain under `~/.local/share/poweramp-start-radio/` and writes the project files needed for Gradle builds inside WSL.
-
-### Build and install
+Build the debug app:
 
 ```bash
-cd android-plugin
-./scripts/build-wsl.sh
+./gradlew --no-daemon :app:assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-`build-wsl.sh` assembles a debug APK and installs it automatically if a device is connected over `adb`.
+Run the maintained host checks:
 
-## Runtime Files In `filesDir`
+```bash
+./gradlew --no-daemon \
+  :app:testDebugUnitTest \
+  :app:assembleDebug \
+  :app:assembleDebugAndroidTest \
+  :app:externalNativeBuildDebug \
+  :app:lintDebug
+```
 
-### Required
+Avoid `connectedDebugAndroidTest` on a phone whose private app data matters; Android's connected
+test lifecycle may uninstall the target package. The acceptance scripts install fixed APKs and run
+individual instrumentation classes instead.
 
-- `embeddings.db`
-  - canonical database produced on desktop and consumed on Android
+## Required Private Assets
 
-### Derived on the phone
-
-- `clamp3.emb`
-  - mmap dump extracted from `embeddings.db` for fast embedding scans
-- `graph.bin`
-  - mmap dump of the kNN graph used by Random Walk
-
-### Optional
+The app expects one exact model bundle at its private `filesDir` root:
 
 - `mert.tflite`
-  - required for on-device indexing
 - `clamp3_audio.tflite`
-  - required for on-device indexing
 - `clamp3_text.tflite`
-  - required for text search on the phone
-- `xlm_roberta_vocab.json`
-  - required for text search on the phone
+- `sentencepiece.bpe.model`
 
-## Poweramp Integration
-
-The app reads from Poweramp through its content provider and asks Poweramp for data access when needed.
-
-The runtime integration points are:
-
-- content provider: `content://com.maxmpz.audioplayer.data`
-- permission request action: `com.maxmpz.audioplayer.ACTION_ASK_FOR_DATA_PERMISSION`
-- broadcast-based debug entry points in `DebugRadioReceiver` and `DebugMultiSeedReceiver`
-
-## Recommendation And Indexing
-
-### Recommendation modes
-
-- `MMR`
-  - stays close to the current query while penalizing overlap with the single most-similar chosen result
-- `DPP`
-  - re-scores each candidate against the chosen set as a whole
-- `Random Walk`
-  - follows the precomputed similarity graph at runtime
-
-### Drift
-
-- drift is meaningful on the sequential embedding-scan path
-- the engine disables drift when `DPP` is selected
-- the UI hides drift when `Random Walk` is selected
-
-### Text search
-
-- text and audio share the same `768d` CLaMP3 space
-- the text model currently runs on CPU because its graph uses INT64 ops that the GPU path does not handle cleanly
-
-### On-device indexing
-
-- indexing runs in two GPU phases because the device cannot keep both audio models active in the way the app needs
-- MERT uses non-overlapping `5s` windows
-- chunked decoding preserves window alignment across decode boundaries
-- only the final tail of the whole track may become a padded partial window
-- FP32 audio model files are required on Android
-
-## Getting Data Into The App
-
-### Push the desktop database
+Export these with `poweramp-indexer export all`. They are not bundled in the APK, and the current UI
+does not install them. A debug build can be provisioned with `run-as`:
 
 ```bash
-adb push embeddings.db /data/local/tmp/
-adb shell run-as com.powerampstartradio cp /data/local/tmp/embeddings.db files/
-adb shell rm /data/local/tmp/embeddings.db
-```
-
-### Push on-device indexing models
-
-```bash
-for f in mert.tflite clamp3_audio.tflite; do
-  adb push "../models/$f" /data/local/tmp/
-  adb shell run-as com.powerampstartradio cp "/data/local/tmp/$f" files/
-  adb shell rm "/data/local/tmp/$f"
+for file in mert.tflite clamp3_audio.tflite clamp3_text.tflite sentencepiece.bpe.model; do
+  adb push "../models/$file" "/data/local/tmp/$file"
+  adb shell run-as com.powerampstartradio.v2 \
+    cp "/data/local/tmp/$file" "files/$file"
+  adb shell rm -f "/data/local/tmp/$file"
 done
 ```
 
-### Push text-search assets
+Use **Settings > Import a music index** for the initial desktop `embeddings.db`. The importer
+validates the SQLite rows, model identity, and embedding policy before publishing an immutable
+generation. Do not overwrite files inside an active generation with ADB.
+
+Each generation binds:
+
+- the canonical SQLite database;
+- the ordered packed CLaMP3 embedding file;
+- the optional Graph Explorer graph and its proof;
+- the ordered track and visible-identity sets;
+- model and preprocessing contracts; and
+- content hashes and activation identity.
+
+On-device indexing and server merge stage their work privately and change the active pointer only
+after the replacement generation reopens and validates.
+
+## On-Device Indexing
+
+The visible execution profile is **Full speed**. It embeds the complete logical track; ordinary
+files end at physical EOS and CUE entries use their exact half-open Poweramp span. The native-rate
+decoder, TorchAudio-Hann resampling policy, MERT windows, and CLaMP3 projection are bound by the
+generation contract.
+
+Before work begins, the app persists the exact selected occurrences and base generation. The
+foreground service then maintains a durable ledger with:
+
+- truthful stage progress and evidence-based ETA;
+- pause and resume across activity or process loss;
+- retryable and permanently blocked failure states;
+- explicit Never-index choices;
+- recoverable checksummed intermediate artifacts; and
+- atomic database, embedding, graph, and receipt publication.
+
+Android can stop `mediaProcessing` foreground work when its platform time budget is exhausted. The
+service checkpoints and exposes a resumable state; it does not claim to bypass that limit.
+
+## Permissions And Poweramp
+
+`READ_MEDIA_AUDIO` is requested on first launch for source verification and decoding.
+`POST_NOTIFICATIONS` is requested by the indexing workflow for foreground progress. Poweramp
+content-provider access is a separate Poweramp-owned consent flow available from the app.
+
+Current-track input is revalidated against Poweramp's provider before recommendation work. Queue
+delivery pins exact provider occurrences, preserves playback state, and verifies the resulting
+queue. The widget follows the same path.
+
+## Current Limits
+
+- Cross-encode, alternate-master, and live/studio duplicates are collapsed only when the app has
+  proof that they share a stable recording identity. Similar metadata plus a close embedding is not
+  treated as proof, so some apparent duplicates can remain.
+- A completed current queue exposes a radio icon on each confirmed row. The service accepts that
+  seed only while the saved index generation, Poweramp provider snapshot, embedded row, and stable
+  span identity still match. Historical rows remain evidence/requeue surfaces.
+- A clean install still needs the manual model provisioning step above. Find Music now checks for
+  its index, text encoder, and tokenizer before opening, but the app does not yet install them.
+
+## Validation
+
+The curated concluding record is in [`../EVALUATION.md`](../EVALUATION.md), with PR-ready evidence
+and limitations in [`../V2_RELEASE_NOTES.md`](../V2_RELEASE_NOTES.md). It covers the visible
+selector/knob matrix, repeated composed searches, real queue delivery, a server-merge overlap,
+full-span indexing, pause/resume, activation, and cleanup.
+
+Useful scripts:
 
 ```bash
-for f in clamp3_text.tflite xlm_roberta_vocab.json; do
-  adb push "../models/$f" /data/local/tmp/
-  adb shell run-as com.powerampstartradio cp "/data/local/tmp/$f" files/
-  adb shell rm "/data/local/tmp/$f"
-done
+scripts/snapshot_device_acceptance.sh /tmp/pasr-before
+scripts/snapshot_device_acceptance.sh /tmp/pasr-after
+scripts/compare_device_acceptance.sh /tmp/pasr-before /tmp/pasr-after
 ```
 
-## Benchmarks And Debugging
-
-### Audio benchmark
-
-The benchmark activity can run the same chunk-stitched extraction path used by on-device indexing.
-
-```bash
-adb shell am start -n com.powerampstartradio/.benchmark.BenchmarkActivity \
-  --ez auto_start true --ei max_duration_s 0
-```
-
-Pull the result JSON:
-
-```bash
-adb shell run-as com.powerampstartradio cat files/benchmark_results.json > /tmp/benchmark_results.json
-```
-
-### Text benchmark
-
-```bash
-adb shell am start -n com.powerampstartradio/.benchmark.BenchmarkActivity \
-  --ez auto_start true --es benchmark_type text
-```
-
-### Matching diagnostics
-
-```bash
-adb shell am start -n com.powerampstartradio/.benchmark.BenchmarkActivity \
-  --ez auto_start true --es benchmark_type diagnose
-```
-
-### Debug radio receiver
-
-```bash
-adb shell am broadcast -a com.powerampstartradio.DEBUG_START_RADIO \
-  -n com.powerampstartradio/.debug.DebugRadioReceiver \
-  --es selection_mode MMR --ef diversity_lambda 0.4 --ei num_tracks 30
-```
-
-### Debug multi-seed receiver
-
-```bash
-adb shell am broadcast -a com.powerampstartradio.DEBUG_MULTI_SEED \
-  -n com.powerampstartradio/.debug.DebugMultiSeedReceiver \
-  --es song1 "artist title" --ef weight1 1.0 --ei top_k 10
-```
-
-Lookup-only mode for finding seed names:
-
-```bash
-adb shell am broadcast -a com.powerampstartradio.DEBUG_MULTI_SEED \
-  -n com.powerampstartradio/.debug.DebugMultiSeedReceiver \
-  --es lookup "partial artist or title"
-```
+`run_feature_acceptance.sh` exercises the selector matrix, while
+`run_production_indexing_acceptance.sh` drives explicitly confirmed indexing cohorts. Debug-only
+activities and receivers live in the debug manifest. They may change the Poweramp queue; use the
+read-only snapshot scripts around any device experiment.
 
 ## Code Map
 
-A good reading order for the Android app is:
-
-- `app/src/main/java/com/powerampstartradio/MainActivity.kt`
-  - main Compose UI
-- `app/src/main/java/com/powerampstartradio/ui/MainViewModel.kt`
-  - app state, settings, text search, and multi-seed flow
-- `app/src/main/java/com/powerampstartradio/services/RadioService.kt`
-  - foreground service that orchestrates radio startup, queueing, and session history
-- `app/src/main/java/com/powerampstartradio/similarity/RecommendationEngine.kt`
-  - recommendation core
-- `app/src/main/java/com/powerampstartradio/poweramp/TrackMatcher.kt`
-  - resolves Poweramp tracks against the embedding database
-- `app/src/main/java/com/powerampstartradio/indexing/IndexingService.kt`
-  - on-device indexing pipeline
-- `app/src/main/java/com/powerampstartradio/benchmark/BenchmarkActivity.kt`
-  - audio, text, and matching benchmarks
-
-## Common Failure Modes
-
-- stale or missing `graph.bin` after a desktop database update
-- missing `clamp3_text.tflite` or vocab for text search
-- missing audio models for on-device indexing
-- Poweramp metadata mismatches against the desktop database
-- comparing truncated benchmark audio against full-track desktop embeddings
+- `MainActivity.kt`, `ui/` - Compose UI, settings, Find Music, evidence, and persistence.
+- `services/RadioService.kt` - durable recommendation requests, history, and verified queue
+  delivery.
+- `similarity/` - active identity domain, selectors, graph traversal, and result reduction.
+- `indexing/IndexingService.kt`, `indexing/v2/` - durable indexing, merge, receipts, and immutable
+  generations.
+- `poweramp/` - current-track, provider, and queue integration.
+- `widget/` - RemoteViews widget and private action ingress.
+- `benchmark/`, `debug/` - debug-only measurement entry points.

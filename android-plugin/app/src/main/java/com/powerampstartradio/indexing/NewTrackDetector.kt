@@ -4,9 +4,14 @@ import android.content.Context
 import android.util.Log
 import com.powerampstartradio.data.EmbeddedTrack
 import com.powerampstartradio.data.EmbeddingDatabase
-import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampFileEntry
 import com.powerampstartradio.poweramp.TrackNormalization
+import com.powerampstartradio.indexing.v2.V2PowerampProviderSnapshotAcquirer
+import com.powerampstartradio.indexing.v2.V2CommittedProviderSpan
+import com.powerampstartradio.indexing.v2.V2ProviderDurationEvidencePolicy
+import com.powerampstartradio.indexing.v2.V2ProviderPathGroupSnapshot
+import com.powerampstartradio.indexing.v2.V2ProviderSpanReceiptReader
+import com.powerampstartradio.indexing.v2.V2StableProviderLexicalPathNormalizer
 import java.io.File
 import java.text.Normalizer
 
@@ -15,8 +20,9 @@ private typealias PowerampEntryWithPath = PowerampFileEntry
 /**
  * Detects Poweramp tracks that are not yet in the embedding database.
  *
- * Compares the Poweramp library (via content provider) against the embedding DB
- * using the same matching strategies as TrackMatcher (metadata key, artist+title, filename).
+ * Exact V2 provider-span receipts decide what is already represented. Imported rows may also be
+ * reconciled by reciprocal-unique path and timing evidence. Tags, filenames, and approximate
+ * durations never suppress an indexing candidate because they cannot identify a recording.
  */
 class NewTrackDetector(
     private val embeddingDb: EmbeddingDatabase,
@@ -114,15 +120,6 @@ class NewTrackDetector(
         val unmatchedEmbedded: List<ComparableEmbeddedTrack>,
     )
 
-    private data class RepresentationIndex(
-        val byPath: Map<String, List<ComparableEmbeddedTrack>>,
-        val byMetadataKey: Map<String, List<ComparableEmbeddedTrack>>,
-        val byArtistAlbumTitle: Map<String, List<ComparableEmbeddedTrack>>,
-        val byArtistTitle: Map<String, List<ComparableEmbeddedTrack>>,
-        val byFilenameKey: Map<String, List<ComparableEmbeddedTrack>>,
-        val byArtist: Map<String, List<ComparableEmbeddedTrack>>,
-    )
-
     /**
      * A Poweramp track that needs to be indexed.
      */
@@ -133,6 +130,18 @@ class NewTrackDetector(
         val title: String,
         val durationMs: Int,
         val path: String?,
+        val detectionKind: V2UnindexedDetectionKind =
+            V2UnindexedDetectionKind.DEFINITELY_UNINDEXED,
+        /** Logical start within [path], from Poweramp's folder_files.offset_ms. */
+        val offsetMs: Long = 0L,
+        /** Identifies a raw CUE source row when Poweramp exposes one. */
+        val cueFolderId: Long? = null,
+        /** Number of provider rows which reference this normalized physical path. */
+        val sourceReferenceCount: Int = 1,
+        /** True when any playable sibling on this physical path has a non-zero CUE offset. */
+        val sourceHasLogicalOffsets: Boolean = offsetMs > 0L,
+        /** True when the provider group includes an uncut CUE source-image row. */
+        val sourceHasCueImageRow: Boolean = cueFolderId != null,
     ) {
         /** Desktop-format metadata key for insertion into the embedding DB. */
         val metadataKey: String
@@ -169,20 +178,237 @@ class NewTrackDetector(
         context: Context,
         onProgress: (String) -> Unit = {},
     ): List<UnindexedTrack> {
-        onProgress("Querying Poweramp library...")
-        val powerampEntries = getAllPowerampEntriesWithPaths(context)
-        onProgress("Reading embedded tracks...")
+        onProgress("Reading the Poweramp library...")
+        val snapshot = V2PowerampProviderSnapshotAcquirer(context).acquireBlocking()
+        return findUnindexedTracks(snapshot, onProgress)
+    }
+
+    /** Reuses one already-completed provider snapshot without querying Poweramp twice. */
+    fun findUnindexedTracks(
+        snapshot: V2ProviderPathGroupSnapshot,
+        onProgress: (String) -> Unit = {},
+    ): List<UnindexedTrack> = findUnindexedTracks(
+        snapshot = snapshot,
+        activeCatalog = null,
+        onProgress = onProgress,
+    )
+
+    /**
+     * Reuses the durable exact-generation binding catalog when it describes this same complete
+     * Poweramp snapshot. A changed provider generation falls through to full reconciliation.
+     */
+    internal fun findUnindexedTracks(
+        snapshot: V2ProviderPathGroupSnapshot,
+        activeCatalog: V2ActiveLibraryCatalog?,
+        onProgress: (String) -> Unit = {},
+    ): List<UnindexedTrack> {
+        val catalog = activeCatalog?.takeIf {
+            it.generationBinding.providerGenerationId == snapshot.libraryGeneration
+        }
+        if (catalog != null) {
+            return findFromActiveCatalog(snapshot, catalog, onProgress)
+        }
+
+        val powerampEntries = getAllPowerampEntriesWithPaths(snapshot)
+        val sourceGroups = powerampEntries
+            .filter { !it.path.isNullOrBlank() }
+            .groupBy { it.path!! }
+
+        onProgress("Reading indexed tracks and exact source-span receipts...")
         val embeddedTracks = embeddingDb.getAllTracks().map { it.asComparableEntry() }
-        val representationIndex = buildRepresentationIndex(embeddedTracks)
+        val receiptSnapshot = V2ProviderSpanReceiptReader.read(embeddingDb.databaseFile)
+        val occurrences = powerampEntries.map { entry ->
+            V2ProviderOccurrence(
+                powerampFileId = entry.id,
+                providerSpan = entry.providerSpan(),
+                isRawCueSourceImage = entry.cueFolderId != null,
+            )
+        }
 
-        onProgress("Checking which tracks are already represented...")
-        val unmatched = powerampEntries.filterNot { isRepresentedInDatabase(it, representationIndex) }
+        onProgress(
+            "Matching ${powerampEntries.size} Poweramp tracks to exact indexed source spans...",
+        )
+        val unrepresented = V2UnindexedDetectionPolicy.classify(
+            providerOccurrences = occurrences,
+            receipts = receiptSnapshot.receipts,
+        )
+        val unrepresentedIds = unrepresented.mapTo(hashSetOf()) { it.powerampFileId }
+        val candidateEntries = powerampEntries.filter { it.id in unrepresentedIds }
+        val receiptedTrackIds = receiptSnapshot.receipts.mapTo(hashSetOf()) { it.trackId }
+        val legacyTracks = embeddedTracks.filter { it.track.id !in receiptedTrackIds }
 
-        // Collapse duplicate Poweramp rows that describe the same track representation so
-        // Manage Tracks does not surface the same song multiple times.
-        val unindexed = unmatched
-            .distinctBy { it.metadataKey }
-            .map { entry ->
+        onProgress(
+            "Resolving older imported rows by path, duration, artist, album, and title...",
+        )
+        val compatibility = V2LegacyCompatibilityResolver.resolve(
+            provider = candidateEntries.map { entry ->
+                val sourceGroup = entry.path?.let(sourceGroups::get).orEmpty()
+                val hasLogicalOffsets = sourceGroup.any { it.offsetMs > 0L }
+                val hasCueSourceRow = sourceGroup.any { it.cueFolderId != null }
+                V2LegacyProviderCandidate(
+                    powerampFileId = entry.id,
+                    normalizedPhysicalPath = requireNotNull(entry.path),
+                    offsetMs = entry.offsetMs,
+                    durationMs = entry.durationMs,
+                    metadataKey = entry.metadataKey,
+                    // Imported CUE embeddings do not prove which logical span was decoded.
+                    compatibilityEligible = !hasLogicalOffsets && !hasCueSourceRow &&
+                        entry.cueFolderId == null,
+                    requiresSpanSpecificRebuild = hasLogicalOffsets || hasCueSourceRow,
+                )
+            },
+            database = legacyTracks.map { track ->
+                V2LegacyDatabaseCandidate(
+                    trackId = track.track.id,
+                    normalizedPath = track.path,
+                    durationMs = track.durationMs,
+                    metadataKey = track.metadataKey,
+                )
+            },
+        )
+        val compatibilityCoveredIds = compatibility.bindings
+            .mapTo(hashSetOf()) { it.powerampFileId }
+        val classified = V2UnindexedDetectionPolicy.classify(
+            providerOccurrences = occurrences,
+            receipts = receiptSnapshot.receipts,
+            compatibilityCoveredIds = compatibilityCoveredIds,
+        )
+        val distinctOccurrenceCount = occurrences.distinctBy(V2ProviderOccurrence::providerSpan).size
+        val duplicateProviderRows = occurrences.size - distinctOccurrenceCount
+        val unindexed = buildUnindexedTracks(powerampEntries, sourceGroups, classified)
+        val attention = unindexed.count {
+            it.detectionKind == V2UnindexedDetectionKind.SOURCE_ATTENTION &&
+                !V2IndexingSelectionPolicy.isReadyTrack(it)
+        }
+        val ready = unindexed.count(V2IndexingSelectionPolicy::isReadyTrack)
+        val representedSpans = receiptSnapshot.receipts.mapTo(hashSetOf()) { it.providerSpan }
+        val exactRepresented = occurrences.asSequence()
+            .map(V2ProviderOccurrence::providerSpan)
+            .distinct()
+            .count { it in representedSpans }
+        val compatibilityCounts = compatibility.bindings.groupingBy { it.evidence }.eachCount()
+        onProgress(
+            buildString {
+                append("Found ${formatIndexingTrackCount(ready)} tracks not yet indexed")
+                if (attention > 0) {
+                    append(", ${formatIndexingTrackCount(attention)} files needing attention")
+                }
+                if (duplicateProviderRows > 0) {
+                    append(
+                        "; ${formatIndexingTrackCount(duplicateProviderRows)} duplicate Poweramp " +
+                            "entries counted once",
+                    )
+                }
+                if (receiptSnapshot.invalidReceiptCount > 0) {
+                    append(
+                        "; ${formatIndexingTrackCount(receiptSnapshot.invalidReceiptCount)} saved " +
+                            "indexing records unreadable",
+                    )
+                }
+            }
+        )
+        Log.i(
+            TAG,
+            "Detection: ready=$ready attention=$attention " +
+                "compatibilityCovered=${compatibilityCoveredIds.size} " +
+                "compatibilityEvidence=$compatibilityCounts exactRepresented=$exactRepresented " +
+                "duplicateProviderRows=$duplicateProviderRows " +
+                "validReceipts=${receiptSnapshot.receipts.size} " +
+                "invalidReceipts=${receiptSnapshot.invalidReceiptCount}",
+        )
+        return unindexed
+    }
+
+    private fun findFromActiveCatalog(
+        snapshot: V2ProviderPathGroupSnapshot,
+        catalog: V2ActiveLibraryCatalog,
+        onProgress: (String) -> Unit,
+    ): List<UnindexedTrack> {
+        val acquisition = requireNotNull(snapshot.acquisitionEvidence) {
+            "Poweramp snapshot has no cursor-completion evidence"
+        }
+        require(acquisition.cursorExhaustedNormally &&
+            acquisition.rowCount == snapshot.groups.sumOf { it.rows.size }
+        ) { "Poweramp snapshot is not complete" }
+        onProgress("Applying saved exact matches for this unchanged Poweramp library...")
+        val representedProviderIds = catalog.bindings
+            .mapTo(hashSetOf()) { it.powerampFileId }
+        val classifiedIds = V2UnindexedDetectionPolicy.classify(
+            providerOccurrences = snapshot.groups.flatMap { group ->
+                group.rows.map { row ->
+                    V2ProviderOccurrence(
+                        powerampFileId = row.powerampFileId,
+                        providerSpan = V2CommittedProviderSpan(
+                            normalizedPhysicalPath = row.physicalPath,
+                            offsetMs = row.offsetMs,
+                            durationMs = row.durationMs,
+                        ),
+                        isRawCueSourceImage = row.cueSourceImageFolderId != null,
+                    )
+                }
+            },
+            receipts = emptyList(),
+            compatibilityCoveredIds = representedProviderIds,
+        ).mapTo(hashSetOf()) { it.powerampFileId }
+        val unindexed = snapshot.groups.flatMap { group ->
+            group.rows.mapNotNull { row ->
+                if (row.powerampFileId !in classifiedIds) return@mapNotNull null
+                val durationMs = Math.toIntExact(row.durationMs)
+                UnindexedTrack(
+                    powerampFileId = row.powerampFileId,
+                    artist = TrackNormalization.normalizeArtist(row.artist),
+                    album = TrackNormalization.normalizeAlbum(row.album),
+                    title = TrackNormalization.normalizeTitle(row.title),
+                    durationMs = durationMs,
+                    path = TrackNormalization.normalizePath(row.providerPhysicalPath),
+                    detectionKind = if (durationMs <= 0) {
+                        V2UnindexedDetectionKind.SOURCE_ATTENTION
+                    } else {
+                        V2UnindexedDetectionKind.DEFINITELY_UNINDEXED
+                    },
+                    offsetMs = row.offsetMs,
+                    cueFolderId = row.cueSourceImageFolderId,
+                    sourceReferenceCount = maxOf(group.rows.size, 1),
+                    sourceHasLogicalOffsets = group.rows.any { it.offsetMs > 0L },
+                    sourceHasCueImageRow = group.rows.any {
+                        it.cueSourceImageFolderId != null
+                    },
+                )
+            }
+        }
+        val ready = unindexed.count(V2IndexingSelectionPolicy::isReadyTrack)
+        val attention = unindexed.size - ready
+        onProgress(
+            buildString {
+                append("Found ${formatIndexingTrackCount(ready)} tracks not yet indexed")
+                if (attention > 0) {
+                    append(", ${formatIndexingTrackCount(attention)} files needing attention")
+                }
+            },
+        )
+        Log.i(
+            TAG,
+            "Detection cache hit: ready=$ready attention=$attention " +
+                "activeBindings=${catalog.bindings.size} " +
+                "providerGeneration=${catalog.generationBinding.providerGenerationId}",
+        )
+        return unindexed
+    }
+
+    private fun buildUnindexedTracks(
+        powerampEntries: List<PowerampEntryWithPath>,
+        sourceGroups: Map<String, List<PowerampEntryWithPath>>,
+        classified: List<V2UnindexedOccurrence>,
+    ): List<UnindexedTrack> {
+        val classificationById = classified.associateBy(V2UnindexedOccurrence::powerampFileId)
+        return powerampEntries.mapNotNull { entry ->
+            val classification = classificationById[entry.id] ?: return@mapNotNull null
+            val sourceGroup = entry.path?.let(sourceGroups::get).orEmpty()
+            val kind = if (entry.durationMs <= 0) {
+                V2UnindexedDetectionKind.SOURCE_ATTENTION
+            } else {
+                classification.kind
+            }
             UnindexedTrack(
                 powerampFileId = entry.id,
                 artist = entry.artist,
@@ -190,48 +416,59 @@ class NewTrackDetector(
                 title = entry.title,
                 durationMs = entry.durationMs,
                 path = entry.path,
+                detectionKind = kind,
+                offsetMs = entry.offsetMs,
+                cueFolderId = entry.cueFolderId,
+                sourceReferenceCount = maxOf(sourceGroup.size, 1),
+                sourceHasLogicalOffsets = sourceGroup.any { it.offsetMs > 0L },
+                sourceHasCueImageRow = sourceGroup.any { it.cueFolderId != null },
             )
         }
-        val collapsed = unmatched.size - unindexed.size
-        onProgress(
-            buildString {
-                append("Found ${unindexed.size} unindexed tracks")
-                if (collapsed > 0) append(" ($collapsed duplicate rows collapsed)")
-            }
-        )
-        Log.i(TAG, "Found ${unindexed.size} unindexed tracks")
-        return unindexed
     }
 
     /**
      * Find tracks that exist in the embedding DB but are no longer present in Poweramp.
      *
-     * Uses the same matching rules as on-device indexing detection so "clean db" reflects
-     * the app's actual notion of which records are still represented in the library.
+     * Only an exact V2 commit receipt can become a cleanup candidate. Legacy rows and heuristic
+     * matches are never deleted because absence cannot be proved for them.
      */
     fun findDatabaseOnlyTracks(
         context: Context,
         onProgress: (String) -> Unit = {},
     ): List<EmbeddedTrack> {
-        val report = buildLibrarySyncReport(
-            context = context,
-            onProgress = onProgress,
-            includeArtistTitlePass = false,
-            includeFuzzyArtistTitlePass = false,
+        onProgress("Reading the current Poweramp library...")
+        val snapshot = V2PowerampProviderSnapshotAcquirer(context).acquireBlocking()
+        return findDatabaseOnlyTracks(snapshot, onProgress)
+    }
+
+    /** Reuses one already-completed provider snapshot without querying Poweramp twice. */
+    fun findDatabaseOnlyTracks(
+        snapshot: V2ProviderPathGroupSnapshot,
+        onProgress: (String) -> Unit = {},
+    ): List<EmbeddedTrack> {
+        val powerampEntries = getAllPowerampEntriesWithPaths(snapshot)
+        onProgress(
+            "Comparing exact indexed source spans with ${powerampEntries.size} Poweramp tracks...",
         )
-        val musicRoots = collectMusicRoots(report.powerampEntries)
-        val (stillPresentOnDevice, missingFromDevice) = report.unmatchedEmbedded.partition { entry ->
-            existsOnDeviceStorage(entry.track, musicRoots)
-        }
+        val receiptSnapshot = V2ProviderSpanReceiptReader.read(embeddingDb.databaseFile)
+        val currentSpans = powerampEntries.mapTo(hashSetOf()) { it.providerSpan() }
+        val absentIds = V2UnindexedDetectionPolicy.provablyAbsentTrackIds(
+            receipts = receiptSnapshot.receipts,
+            currentProviderSpans = currentSpans,
+        )
+        val candidates = embeddingDb.getAllTracks().filter { it.id in absentIds }
         onProgress(
             buildString {
-                append("Found ${missingFromDevice.size} clean-up candidates")
-                if (stillPresentOnDevice.isNotEmpty()) {
-                    append(" (${stillPresentOnDevice.size} more still exist on device)")
+                append("Found ${candidates.size} indexed tracks no longer in Poweramp")
+                if (!receiptSnapshot.compatibleSchema) {
+                    append("; older imported entries are kept")
+                }
+                if (receiptSnapshot.invalidReceiptCount > 0) {
+                    append("; ${receiptSnapshot.invalidReceiptCount} unreadable indexing records kept")
                 }
             }
         )
-        return missingFromDevice.map { it.track }
+        return candidates
     }
 
     /**
@@ -322,7 +559,7 @@ class NewTrackDetector(
             return LibrarySyncReport(emptyList(), emptyList(), emptyList(), emptyMap(), emptyList(), emptyList())
         }
 
-        onProgress("Reading embedded tracks...")
+        onProgress("Reading the music index...")
         val embeddedTracks = embeddingDb.getAllTracks().map { it.asComparableEntry() }
 
         val remainingPoweramp = LinkedHashMap<Long, PowerampEntryWithPath>(powerampEntries.size)
@@ -408,73 +645,6 @@ class NewTrackDetector(
             unmatchedPoweramp = unmatchedPoweramp,
             unmatchedEmbedded = unmatchedEmbedded,
         )
-    }
-
-    private fun buildRepresentationIndex(embeddedTracks: List<ComparableEmbeddedTrack>): RepresentationIndex {
-        val byPath = embeddedTracks.mapNotNull { track ->
-            track.path?.takeIf { it.isNotBlank() }?.let { it to track }
-        }.groupBy({ it.first }, { it.second })
-
-        val byMetadataKey = embeddedTracks.groupBy { it.metadataKey }
-        val byArtistAlbumTitle = embeddedTracks.groupBy { "${it.artist}\u0000${it.album}\u0000${it.title}" }
-        val byArtistTitle = embeddedTracks.groupBy { "${it.artist}\u0000${it.title}" }
-        val byArtist = embeddedTracks.groupBy { it.artist }
-
-        val byFilenameKey = HashMap<String, MutableList<ComparableEmbeddedTrack>>(embeddedTracks.size * 2)
-        for (track in embeddedTracks) {
-            for (key in track.filenameKeys) {
-                byFilenameKey.getOrPut(key) { mutableListOf() }.add(track)
-            }
-        }
-
-        return RepresentationIndex(
-            byPath = byPath,
-            byMetadataKey = byMetadataKey,
-            byArtistAlbumTitle = byArtistAlbumTitle,
-            byArtistTitle = byArtistTitle,
-            byFilenameKey = byFilenameKey,
-            byArtist = byArtist,
-        )
-    }
-
-    private fun isRepresentedInDatabase(
-        entry: PowerampEntryWithPath,
-        index: RepresentationIndex,
-    ): Boolean {
-        entry.path?.let { path ->
-            if (index.byPath[path].orEmpty().any { durationCompatible(it.durationMs, entry.durationMs) }) {
-                return true
-            }
-        }
-
-        if (index.byMetadataKey[entry.metadataKey].orEmpty().isNotEmpty()) return true
-
-        val artistAlbumTitleKey = "${entry.artist}\u0000${entry.album}\u0000${entry.title}"
-        if (index.byArtistAlbumTitle[artistAlbumTitleKey].orEmpty()
-                .any { durationCompatible(it.durationMs, entry.durationMs) }
-        ) {
-            return true
-        }
-
-        val artistTitleKey = "${entry.artist}\u0000${entry.title}"
-        if (index.byArtistTitle[artistTitleKey].orEmpty()
-                .any { durationCompatible(it.durationMs, entry.durationMs) }
-        ) {
-            return true
-        }
-
-        val filenameMatches = entry.filenameKeys
-            .flatMap { key -> index.byFilenameKey[key].orEmpty() }
-            .distinctBy { it.track.id }
-        if (filenameMatches.any { durationCompatible(it.durationMs, entry.durationMs) }) {
-            return true
-        }
-
-        return resolveArtistTrackCandidates(entry.artist, index.byArtist)
-            .any { candidate ->
-                fuzzyTitlePair(entry.title, candidate.title) &&
-                    durationCompatible(entry.durationMs, candidate.durationMs)
-            }
     }
 
     private fun pairByExactKey(
@@ -1006,12 +1176,52 @@ class NewTrackDetector(
         return ""
     }
 
-    /**
-     * Get all Poweramp file entries including file paths.
-     * Extends PowerampHelper.getAllFileEntries with the path column.
-     */
+    /** Complete, fail-closed provider snapshot shared by detection, diagnostics, and cleanup. */
     private fun getAllPowerampEntriesWithPaths(context: Context): List<PowerampEntryWithPath> {
-        return PowerampHelper.getAllFileEntries(context)
+        val snapshot = V2PowerampProviderSnapshotAcquirer(context).acquireBlocking()
+        return getAllPowerampEntriesWithPaths(snapshot)
+    }
+
+    private fun getAllPowerampEntriesWithPaths(
+        snapshot: V2ProviderPathGroupSnapshot,
+    ): List<PowerampEntryWithPath> {
+        val acquisition = requireNotNull(snapshot.acquisitionEvidence) {
+            "Poweramp snapshot has no cursor-completion evidence"
+        }
+        require(acquisition.cursorExhaustedNormally &&
+            acquisition.rowCount == snapshot.groups.sumOf { it.rows.size }
+        ) { "Poweramp snapshot is not complete" }
+        return snapshot.groups.flatMap { group ->
+            group.rows.map { row ->
+                val artist = TrackNormalization.normalizeArtist(row.artist)
+                val album = TrackNormalization.normalizeAlbum(row.album)
+                val title = TrackNormalization.normalizeTitle(row.title)
+                val durationMs = Math.toIntExact(row.durationMs)
+                val filename = File(row.providerPhysicalPath).name
+                PowerampFileEntry(
+                    id = row.powerampFileId,
+                    artist = artist,
+                    album = album,
+                    title = title,
+                    durationMs = durationMs,
+                    path = TrackNormalization.normalizePath(row.providerPhysicalPath),
+                    offsetMs = row.offsetMs,
+                    offsetWasNull = row.offsetWasNull,
+                    cueFolderId = row.cueSourceImageFolderId,
+                    metadataKey = TrackNormalization.buildMetadataKey(
+                        artist,
+                        album,
+                        title,
+                        durationMs,
+                    ),
+                    filenameKeys = TrackNormalization.buildFilenameKeys(
+                        artist,
+                        title,
+                        filename.substringBeforeLast('.', filename),
+                    ),
+                )
+            }
+        }
     }
 
     private fun EmbeddedTrack.asComparableEntry(): ComparableEmbeddedTrack {
@@ -1032,6 +1242,18 @@ class NewTrackDetector(
         )
     }
 
+    private fun PowerampEntryWithPath.providerSpan(): V2CommittedProviderSpan {
+        val physicalPath = requireNotNull(path) {
+            "Complete Poweramp snapshot row $id has no provider path"
+        }
+        return V2CommittedProviderSpan(
+            normalizedPhysicalPath =
+                V2StableProviderLexicalPathNormalizer.normalizeAbsolute(physicalPath),
+            offsetMs = offsetMs,
+            durationMs = V2ProviderDurationEvidencePolicy.canonicalMs(durationMs.toLong()),
+        )
+    }
+
     private fun collectMusicRoots(entries: List<PowerampEntryWithPath>): List<String> {
         val roots = linkedSetOf<String>()
         for (entry in entries) {
@@ -1046,8 +1268,11 @@ class NewTrackDetector(
     }
 
     private fun existsOnDeviceStorage(track: EmbeddedTrack, musicRoots: List<String>): Boolean {
-        val exactPath = TrackNormalization.normalizePath(track.filePath)
-        if (!exactPath.isNullOrBlank() && exactPath.startsWith("/storage/") && File(exactPath).exists()) {
+        val exactPath = track.filePath
+            ?.replace('\\', '/')
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+        if (exactPath != null && exactPath.startsWith("/storage/") && File(exactPath).exists()) {
             return true
         }
 

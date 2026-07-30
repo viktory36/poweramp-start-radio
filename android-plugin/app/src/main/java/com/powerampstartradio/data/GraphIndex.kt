@@ -8,7 +8,7 @@ import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 
 /**
- * Memory-mapped kNN graph for random walk exploration.
+ * Memory-mapped kNN graph for deterministic graph exploration.
  *
  * Binary format (graph.bin):
  * ```
@@ -84,15 +84,75 @@ class GraphIndex private constructor(
          */
         fun extractFromDatabase(db: EmbeddingDatabase, outFile: File): Boolean {
             if (!db.hasBinaryData("knn_graph")) return false
-            val ok = db.extractBinaryToFile("knn_graph", outFile)
-            if (ok) Log.i(TAG, "Extracted graph: ${outFile.length() / 1024 / 1024} MB")
-            else Log.w(TAG, "Failed to extract graph from database")
-            return ok
+            val destination = outFile.absoluteFile
+            destination.parentFile?.mkdirs()
+            val temporary = File.createTempFile(
+                ".${destination.name}.",
+                ".tmp",
+                destination.parentFile,
+            )
+            return try {
+                if (!db.extractBinaryToFile("knn_graph", temporary)) {
+                    Log.w(TAG, "Failed to extract graph from database")
+                    false
+                } else {
+                    // Reopen and validate the complete binary before publication.
+                    mmap(temporary)
+                    EmbeddingIndex.replaceAtomically(temporary, destination)
+                    Log.i(TAG, "Extracted graph: ${destination.length() / 1024 / 1024} MB")
+                    true
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Rejected extracted graph: ${e.message}")
+                false
+            } finally {
+                temporary.delete()
+            }
         }
     }
 
     // Offset where graph data starts (after header + ID map)
     private val graphOffset = HEADER_SIZE.toLong() + numNodes.toLong() * 8
+
+    @Volatile
+    private var uniformGraphSnapshot: UniformGraphSnapshot? = null
+
+    /**
+     * Decode the mmap once into a compact immutable topology for deterministic traversal.
+     *
+     * The snapshot is about `N * K * 4` bytes (roughly 1.6 MB at 80,421 x 5) and is
+     * cached for the lifetime of this graph generation. A graph slot is valid under the
+     * same rules as [getNeighbors]: its index is in range and its stored weight is
+     * positive. Traversal remains uniform over valid slots.
+     */
+    fun uniformTopology(): UniformGraphSnapshot {
+        uniformGraphSnapshot?.let { return it }
+        return synchronized(this) {
+            uniformGraphSnapshot?.let { return@synchronized it }
+
+            val neighbors = IntArray(numNodes * k) { -1 }
+            for (node in 0 until numNodes) {
+                val entryOffset = graphOffset + node.toLong() * k * 8
+                val rowOffset = node * k
+                for (slot in 0 until k) {
+                    val offset = (entryOffset + slot * 8).toInt()
+                    val neighborIndex = buffer.getInt(offset)
+                    val weight = buffer.getFloat(offset + 4)
+                    if (neighborIndex in 0 until numNodes && weight > 0f) {
+                        neighbors[rowOffset + slot] = neighborIndex
+                    }
+                }
+            }
+
+            UniformGraphSnapshot(
+                trackIds = indexToTrackId,
+                neighborIndices = neighbors,
+                neighborsPerNode = k,
+                trackIdToIndex = trackIdToIndex,
+                copyArrays = false,
+            ).also { uniformGraphSnapshot = it }
+        }
+    }
 
     /**
      * Get the K nearest neighbors for a track, with transition probabilities.
@@ -120,41 +180,18 @@ class GraphIndex private constructor(
     }
 
     /**
-     * Sample a uniformly random neighbor for Monte Carlo random walks.
-     *
-     * Uniform selection lets the graph *topology* drive exploration.
-     * Non-backtracking: [excludeId] prevents the walk from immediately
-     * reversing direction (A→B→A oscillation wastes steps).
-     *
-     * Single-pass reservoir sampling: O(K) time, zero allocations.
-     *
-     * @param excludeId track ID to skip (previous node), or -1 to allow all
-     * @return neighbor track ID, or -1 if the node has no valid neighbors
-     */
-    fun sampleNeighbor(trackId: Long, rand: java.util.Random, excludeId: Long = -1L): Long {
-        val nodeIndex = trackIdToIndex[trackId] ?: return -1L
-        val entryOffset = graphOffset + nodeIndex.toLong() * k * 8
-        var selected = -1L
-        var validCount = 0
-        for (j in 0 until k) {
-            val offset = (entryOffset + j * 8).toInt()
-            val neighborIndex = buffer.getInt(offset)
-            val weight = buffer.getFloat(offset + 4)
-            if (neighborIndex !in 0 until numNodes || weight <= 0f) continue
-            val neighborId = indexToTrackId[neighborIndex]
-            if (neighborId == excludeId) continue
-            validCount++
-            if (rand.nextInt(validCount) == 0) {
-                selected = neighborId
-            }
-        }
-        return selected
-    }
-
-    /**
      * Check if a track exists in the graph.
      */
     fun hasTrack(trackId: Long): Boolean = trackId in trackIdToIndex
+
+    /** Proves this graph uses the exact canonical row order of an embedding index. */
+    fun hasSameOrderedTrackIds(embeddingIndex: EmbeddingIndex): Boolean =
+        GraphEmbeddingIdAlignment.firstMismatch(
+            graphCount = numNodes,
+            graphTrackIdAt = indexToTrackId::get,
+            embeddingCount = embeddingIndex.numTracks,
+            embeddingTrackIdAt = embeddingIndex::getTrackId,
+        ) == null
 
     /**
      * Compute shortest hop distance from a seed track to all reachable nodes via BFS.

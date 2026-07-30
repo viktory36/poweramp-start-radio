@@ -1,269 +1,211 @@
-# Evaluation Notes
+# V2 Evaluation
 
-This document collects measured results for recommendation behavior, text search, on-device indexing, and track matching. It also includes the commands used to rerun the targeted checks that are most useful during development.
+This document summarizes the latest complete recommendation, delivery, indexing, and server-merge
+review. It is evidence for the current implementation, not a universal benchmark of musical taste.
 
-## Test Context
+## Evidence Boundary
 
-The broad product audit in this file was measured on:
+The concluding review used one frozen personal-library generation on July 30, 2026:
 
-- Sony XQ-EC72
-- Snapdragon 8 Gen 3 / Adreno 740
-- Android 16 (SDK 36)
-- `75,035` indexed tracks total
-- `74,288` desktop-built + `747` on-device indexed
+| Item | Value |
+| --- | ---: |
+| CLaMP3 embeddings | 89,737 |
+| Embedding dimensions | 768 |
+| Active Poweramp occurrences | 89,669 |
+| Active visible identities before one seed exclusion | 89,528 |
+| Proven duplicate occurrences collapsed in host reconstruction | 198 |
 
-The latest targeted audio-path validation in this file was run on March 7, 2026.
+The database-content, embedding, and graph hashes were fixed across the review. Saved evidence
+payload checksums passed. The corpus is large and musically broad, but it is still one person's
+library; measured retrieval behavior should not be presented as universal listening superiority.
 
-## Latest Targeted Validation
+## Recommendation Contracts
 
-### Full-track on-device audio benchmark
+V2 exposes five single-seed radio selectors:
 
-Recent full-track validation against the desktop database passed with:
+- Closest
+- Uniform shuffle
+- MMR
+- DPP
+- Graph Explorer
 
-- mean cosine vs desktop: `0.995522`
-- min cosine: `0.990923`
-- max cosine: `0.998122`
-- device mean pairwise cosine: `0.2451`
-- desktop mean pairwise cosine: `0.2438`
+Find Music adds contextual All-of Ranked, All-of Varied, and Refine planners. Their formulas and
+controls are documented in `MODES_AND_KNOBS.md`.
 
-This indicates that the current on-device embedding path remains closely aligned with the desktop reference and is not showing the numerical-collapse pattern associated with precision mistakes.
+### All-of Ranked versus Varied
 
-### Multi-chunk windowing alignment
+The host review used 13 curated requests: 12 with two ingredients and one with three. Ranked and
+Varied were each run twice for every request, and every repeat returned the same ordered IDs.
 
-The full-track benchmark also confirmed that chunked extraction is following the desktop windowing rule on sampled long tracks:
+Across the 13 top-30 comparisons, Varied changed the Ranked result as follows:
 
-- `282s -> 57 windows`
-- `164s -> 33 windows`
-- `350s -> 70 windows`
-- `603s -> 121 windows`
-- `411s -> 83 windows`
+| Measure | Mean change |
+| --- | ---: |
+| Weighted All-of objective | -0.000640 |
+| Mean pairwise queue cosine | -0.048865 |
+| Unique artist credits | +3.46 |
+| Ranked/Varied membership overlap | 22.15 of 30 |
 
-These all match the intended rule:
+The farthest All-of objective rank selected by Varied had median 46 and range 37 to 329. In this
+corpus, the fixed DPP quality exponent of 64 reduced within-set redundancy while retaining almost
+all joint-objective strength. This supports Varied as a contextual result-set choice, not as a
+replacement for Ranked.
 
-- full `5s` windows
-- one final padded partial window only if the whole-track tail is at least `1s`
+### Refine
 
-## Recommendation Modes
+Seven primary/secondary requests were evaluated at all four visible primary-neighborhood widths:
 
-Controlled experiments used the same seed track, requested `30` tracks, and changed one parameter at a time.
+| Width | Exact candidates | Median primary floor | Median secondary gain |
+| --- | ---: | ---: | ---: |
+| 0.25% | 224 | 0.99754 | 0.2444 |
+| 0.5% | 448 | 0.99512 | 0.2907 |
+| 1% | 896 | 0.99024 | 0.2987 |
+| 2% | 1,791 | 0.98075 | 0.3029 |
 
-Seed used for the snapshot below:
+Every case moved monotonically in the promised direction: widening the primary neighborhood
+relaxed primary fidelity and improved the secondary ordering opportunity. Refine top-30 overlap
+with the corresponding Ranked All-of result ranged from 1 to 25, confirming that it is not a
+cosmetic reorder. One percent remains the measured default.
 
-- My Terrible Friend - Almost Gone
+### Weights And Avoid
 
-### MMR (Maximal Marginal Relevance)
+For two-ingredient All-of requests, own-ingredient satisfaction correlated with the requested
+weight at 0.965 to 0.980 for Ranked and 0.908 to 0.954 for Varied. Three-ingredient one-point
+sweeps produced correlations from 0.929 to 0.966. Small changes often moved order rather than
+membership, which is the intended meaning of a fine weight adjustment.
 
-`lambda` controls the relevance/diversity tradeoff. Higher `lambda` keeps the list tighter around the seed. Lower `lambda` spends more of the list on diversity.
+Like/Avoid materially changed score and membership in all three curated probes. This establishes
+that the visible controls affect their declared objective; it does not prove that every possible
+query is understood equally well by CLaMP3.
 
-| Lambda | Tracks | Artists | Sim Range | Mean Sim |
-|--------|--------|---------|-----------|----------|
-| 0.3    | 30     | 30      | 62-88%    | 66.1%    |
-| 0.6    | 28     | 22      | 75-88%    | 82.3%    |
-| 0.9    | 28     | 20      | 81-88%    | 83.3%    |
+### Graph Identity Repair
 
-Highlights:
+Constructing the graph over visible identities removed 198 duplicate occurrence nodes. Repair was
+needed for 343 retained rows and 520 of 447,695 neighbor slots. At the default stop chance:
 
-- `lambda=0.3` produced `30` unique artists out of `30` tracks
-- `lambda=0.9` produced the tightest cluster around the seed
-- the slider gave a smooth gradient between exploration and focus
+- 9 of 11 cases remained unchanged full-length 30-result queues;
+- a previously broken sparse Tool case expanded from 2 to 30 results;
+- one Brian Regan case remained a truthful one-result component exhaustion.
 
-### DPP (Determinantal Point Process)
+Graph Explorer may therefore return fewer than the requested count when its eligible reachable
+component is genuinely too small.
 
-| Tracks | Artists | Sim Range | Mean Sim |
-|--------|---------|-----------|----------|
-| 30     | 29      | 62-88%    | 69.8%    |
+## Device Recommendation Validation
 
-Highlights:
+The broad selector and knob matrix contained 660 executions:
 
-- artist spread was close to low-`lambda` `MMR`
-- the quality floor stayed stronger than `MMR` at `lambda=0.3`, with fewer low-similarity outliers
-- selection time in this snapshot was about `263ms` vs `127ms` for `MMR`
+- 11 seeds;
+- 30 configurations per seed;
+- one exact repeat of every case;
+- 330 matching repeat groups;
+- zero request failures;
+- zero inactive results;
+- zero repeated embedded IDs;
+- zero Poweramp queue mutations.
 
-### Random Walk
+Six runs were the same sparse Graph Explorer seed across three stop settings and their repeats;
+those correctly returned one result rather than fabricating a full queue.
 
-The measured configuration used `10,000` walks on a `K=5` kNN graph with terminal-only counting and non-backtracking.
+That matrix preceded the final Closest, DPP, and graph repairs. The repaired selector build then
+received a focused 40-execution check across five seeds and four cases, again with exact repeats,
+no inactive or duplicate IDs, and an unchanged Poweramp queue.
 
-| Alpha | Tracks | Artists | Sim Range | Mean Sim | Hop Distribution |
-|-------|--------|---------|-----------|----------|-----------------|
-| 0.95  | 22     | 16      | 73-88%    | 81.2%    | 1:4, 2:11, 3:7  |
-| 0.50  | 30     | 21      | 69-88%    | 80.4%    | 1:4, 2:11, 3:15 |
-| 0.05  | 29     | 21      | 43-88%    | 78.3%    | 1:4, 2:8, 3:8, 4:6, 6:2, 9:1 |
+The final composed-mode acceptance covered 14 executions: seven All-of/Refine cases and their exact
+repeats. Every case returned 30 results, reproduced its ordered fingerprint, restored settings,
+and left the Poweramp queue byte-identical.
 
-Highlights:
+Representative warm device timings:
 
-- lower `alpha` explored farther from the seed neighborhood
-- the low-`alpha` run reached hop `9` and dropped the similarity floor to `43%`
-- high `alpha` stayed much closer to the seed and returned fewer unique terminals on the narrow graph
-- walk computation itself stayed under `10ms`
+| Request | Results ready | Queue plan ready |
+| --- | ---: | ---: |
+| Full-domain All-of Ranked | 339-356 ms | approximately 350 ms |
+| Full-domain All-of Varied | 524-567 ms | approximately 550 ms |
+| Refine 1% | approximately 347 ms | approximately 355 ms |
+| 14-day, four-text Varied over 9,079 identities | approximately 208 ms | under 220 ms |
 
-### Drift Mode
-
-Drift modifies the query after each pick, so the playlist progressively moves away from the initial seed.
-
-| Drift Mode | Tracks | Artists | Sim Range | Mean Sim |
-|-----------|--------|---------|-----------|----------|
-| Seed Interpolation | 30 | 30 | 60-88% | 74.3% |
-| Momentum | 30 | 29 | 57-88% | 72.1% |
-
-Highlights:
-
-- seed interpolation produced the more controlled drift
-- momentum pushed farther and widened the similarity range more aggressively
-- both variants reduced artist clustering naturally
-- sequential drift cost much more than batch selection: about `2.5s` for `30` steps in this snapshot
-
-### Post-filter (artist constraints)
-
-| Setting | Tracks | Artists | Mean Sim |
-|---------|--------|---------|----------|
-| `maxPerArtist=8, minSpacing=3` | 28-30 | 20-30 | varies |
-| `maxPerArtist=100` (off) | 30 | 27 | 77.6% |
-
-Highlights:
-
-- the post-filter removed repeated artists that the selector alone would allow through
-- its effect depended on the seed and library composition
-- turning it off reduced artist spread in the measured example
-
-## Text Search
-
-CLaMP3's shared audio-text space produced coherent semantic retrieval in the large-library audit.
-
-### Genre queries
-
-| Query | Mean Score | Top Artist |
-|-------|------------|------------|
-| psychedelic trance | 0.317 | Hallucinogen |
-| jazz fusion | 0.310 | John McLaughlin |
-| progressive metal | 0.282 | Tool, Opeth |
-| ambient electronic | 0.282 | Gas |
-| dark minimal techno | 0.264 | Plastikman |
-| shoegaze dream pop | 0.263 | My Bloody Valentine |
-| 90s boom bap hip hop | 0.243 | A Tribe Called Quest |
-| brazilian mpb bossa nova | 0.236 | Elis Regina |
-| sufi devotional music | 0.203 | Nusrat Fateh Ali Khan |
-| indian classical raga | 0.198 | L. Subramaniam |
-
-### Mood and texture queries
-
-| Query | Mean Score | Example Results |
-|-------|------------|-----------------|
-| melancholy atmospheric | 0.306 | Burial, Radiohead |
-| energetic upbeat dance | 0.281 | Underworld |
-| calm meditation peaceful | 0.269 | Brian Eno |
-| aggressive heavy distorted | 0.268 | Melvins, Unsane |
-| romantic strings orchestral | 0.276 | Ravel, Debussy |
-
-Highlights:
-
-- results clustered coherently by genre and mood rather than returning arbitrary near neighbors
-- score ranges around `0.19-0.33` were already enough to surface useful semantic groupings
-- warm-query inference was about `23ms`, with a slower first query due to model warmup
+Single-seed full-domain DPP is intentionally heavier. In the repaired five-seed check it ranged
+from 2.540 to 19.568 seconds, with an 8.227-second mean. Do not describe all recommendation paths
+as subsecond.
 
 ## On-Device Indexing
 
-Two-phase GPU pipeline on Adreno 740 with FP32 precision.
+The production Android path indexes the complete decoded span using Full speed mode. Real FLAC
+excerpts and a pause/resume case were compared with the host reference:
 
-### Performance snapshot
+| Measure | Result |
+| --- | ---: |
+| Device/host embedding cosine, track 1 | 0.99903 |
+| Device/host embedding cosine, track 2 | 0.99709 |
+| MERT GPU inference | 196-198 ms per 5-second window |
+| CLaMP3 audio stage | 23-24 ms per track segment |
+| Exact incremental graph tail | 13.4-13.8 s |
 
-| Metric | Value |
-|--------|-------|
-| MERT inference | ~`200ms` per `5s` window |
-| Typical `3`-minute track | ~`12-15s` total |
-| CLaMP3 audio encode | ~`50ms` per track |
-| Per-track cache | resume-friendly |
-| Graph rebuild | automatic when the on-device graph needs refreshing |
+Pause/resume persisted and reproduced the same device audio vector. A final controlled 25-second
+track proved the Settings lifecycle from exactly one ready track, through completion, to no tracks
+ready, followed by visible cleanup and restoration of the prior 89,737-row semantic state.
 
-### Quality snapshot
+The lifecycle also exposed an avoidable 14 minute 39 second full graph rebuild caused by discarding
+an otherwise exact graph proof. Proof propagation was corrected, and the final generation is
+eligible for the incremental path. The evidence does not claim that another subsequent real
+addition exercised that corrected path on the final APK.
 
-The current full-track benchmark result is:
+## Server Indexer And Merge
 
-- mean cosine vs desktop: `0.995522`
-- min cosine vs desktop: `0.990923`
-- max cosine vs desktop: `0.998122`
+The real server publication contained 8,832 embeddings in a 43.3 MiB graphless database. Across 31
+complete publication batches, observed server embedding time had:
 
-This is consistent with a healthy FP32 Android audio path.
+- median 30.907 seconds per track;
+- p90 42.342 seconds per track.
 
-## Track Matching
+These are batch-derived rates, not 8,832 independent per-track timing samples.
 
-Matching between the Poweramp library and the embedding database was audited with these strategies:
+On Android, a merge started while the Settings library comparison was active. The two operations
+serialized instead of racing or crashing. The merge validated all 8,832 rows and completed in
+42.8 seconds with:
 
-| Strategy | Method |
-|----------|--------|
-| 1 | exact metadata key (`artist|album|title|duration`) |
-| 2 | prefix match / looser duration handling |
-| 3 | artist + title without album |
-| 4 | fuzzy artist normalization and related fallbacks |
+- 0 added;
+- 8,832 already indexed;
+- no active-generation corruption;
+- no Poweramp queue change.
 
-Measured result:
+This proves overlap-safe no-op behavior. The concluding live run did not prove a positive-add
+server merge.
 
-- `74,265` matched
-- `718` genuinely unmatched
-- zero false matching failures observed in the audit
+## Known Limits
 
-This matters because strong retrieval quality still depends on landing on the correct Poweramp file at runtime.
+- Musical quality still inherits CLaMP3's strengths and blind spots.
+- Duplicate recording identity is not solved generally. A safe proof-grade rule collapsed exact
+  copies, but seven obvious duplicate slots remained across six of 54 reviewed new-mode queues.
+  More aggressive metadata grouping also false-merged distinct recordings, so it was rejected.
+- Greedy DPP is certified against the complete-domain greedy sequence. It is not a proof of the
+  globally optimal DPP MAP set.
+- Determinism is proven for the same validated embedding generation and complete saved request.
+  Independently generated embeddings on different hardware are parity-gated, not promised
+  byte-identical.
+- The current Android artifact is an experimental, side-by-side build rather than a signed store
+  release.
 
-## Performance Summary
+## Reproducing Repository Checks
 
-Representative timings from the large-library snapshot:
-
-| Operation | Time |
-|-----------|------|
-| embedding retrieval (`1500` candidates) | `9ms` |
-| `MMR` selection (`30` tracks) | `127ms` |
-| `DPP` selection (`30` tracks) | `263ms` |
-| Random Walk (`10K` walks, `K=5` graph) | `<10ms` |
-| drift playlist (`30` steps) | `2500ms` |
-| track mapping, first run | `8000ms` |
-| track mapping, cached | `1ms` |
-| full radio pipeline, batch path | `300-500ms` |
-| text search query | `23-70ms` |
-| on-device MERT, per window | `200ms` |
-
-These numbers are best read as a healthy reference point on similar hardware, not as universal promises.
-
-## Reproducing The Key Checks
-
-### Full-track Android benchmark
+Desktop:
 
 ```bash
-adb shell am start -n com.powerampstartradio/.benchmark.BenchmarkActivity \
-  --ez auto_start true --ei max_duration_s 0
+cd desktop-indexer
+uv sync --extra dev --extra export
+uv run --extra dev ruff check .
+uv run --extra dev pytest tests experiments -q
 ```
 
-### Pull benchmark JSON
+Android host checks:
 
 ```bash
-adb shell run-as com.powerampstartradio cat files/benchmark_results.json > /tmp/benchmark_results.json
+cd android-plugin
+./gradlew :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease \
+  :app:assembleDebugAndroidTest --no-daemon
+./gradlew :app:lintDebug --no-daemon
 ```
 
-### Compare with the desktop database
-
-```bash
-python3 desktop-indexer/scripts/validate_benchmark.py \
-  /tmp/benchmark_results.json \
-  desktop-indexer/audit_raw_data/embeddings_clamp3.db
-```
-
-### Desktop TFLite validation
-
-```bash
-python3 desktop-indexer/scripts/validate_tflite_clamp3.py \
-  --db desktop-indexer/audit_raw_data/embeddings_clamp3.db \
-  --music /path/to/music_subset --n 20
-```
-
-## Interpreting Results
-
-### Low cosine in `validate_benchmark.py`
-
-- if the Android benchmark was capped to `120s` while the desktop DB stores full-track embeddings, the comparison is not meaningful
-- if both sides used the full track and cosine drops well below the current `~0.995` range, inspect the audio path closely
-
-### Pairwise cosine collapse
-
-If device pairwise similarity rises much higher than desktop pairwise similarity across unrelated tracks, the model path is collapsing numerically. In practice this usually points to precision mistakes in the model path.
-
-### Window count overruns during indexing
-
-If logs show progress such as `67/55`, the extractor is creating extra windows at chunk boundaries. The intended behavior is full `5s` windows plus at most one final padded partial window for the whole track.
+The complete corpus evaluation requires a compatible local snapshot and is intentionally not
+bundled with the repository. Evaluators live under `desktop-indexer/experiments/`; aggregate
+results, formulas, caveats, and the evidence boundary are preserved here so public documentation
+does not expose personal-library rows or device dumps.

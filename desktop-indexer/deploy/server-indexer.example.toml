@@ -1,0 +1,14 @@
+[server]
+state_db = "/var/lib/poweramp-server-indexer/server-state.db"
+bundle_db = "/var/lib/poweramp-server-indexer/export/server-embeddings.db"
+cache_dir = "/var/cache/poweramp-server-indexer"
+poll_interval_seconds = 60
+settle_seconds = 120
+max_files_per_cycle = 64
+max_attempts = 3
+retry_delays_seconds = [300, 1800, 7200]
+mert_batch_size = 8
+
+[[listen_roots]]
+id = "music"
+path = "/srv/music"

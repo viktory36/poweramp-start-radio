@@ -5,8 +5,13 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.FloatBuffer
+import java.nio.LongBuffer
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import com.powerampstartradio.indexing.NativeMath
 
 /**
@@ -39,30 +44,37 @@ class EmbeddingIndex private constructor(
         /**
          * Memory-map an existing .emb file.
          */
-        fun mmap(file: File): EmbeddingIndex {
+        fun mmap(file: File, preload: Boolean = true): EmbeddingIndex {
             RandomAccessFile(file, "r").use { raf ->
-                val channel = raf.channel
-                val buf = channel.map(FileChannel.MapMode.READ_ONLY, 0, raf.length())
-                buf.order(ByteOrder.LITTLE_ENDIAN)
+                val length = raf.length()
+                require(length in HEADER_SIZE.toLong()..Int.MAX_VALUE.toLong()) {
+                    "Embedding index length is unsupported: $length"
+                }
+                val headerBytes = ByteArray(HEADER_SIZE)
+                raf.readFully(headerBytes)
+                val header = ByteBuffer.wrap(headerBytes).order(ByteOrder.LITTLE_ENDIAN)
 
-                val magic = buf.getInt(0)
+                val magic = header.getInt(0)
                 require(magic == MAGIC) { "Invalid magic: ${Integer.toHexString(magic)}" }
 
-                val version = buf.getInt(4)
+                val version = header.getInt(4)
                 require(version == VERSION) { "Unsupported version: $version" }
 
-                val numTracks = buf.getInt(8)
-                val dim = buf.getInt(12)
-
-                val expectedSize = HEADER_SIZE.toLong() + numTracks.toLong() * 8 + numTracks.toLong() * dim * 4
-                require(raf.length() == expectedSize) {
-                    "File size mismatch: expected $expectedSize, got ${raf.length()}"
+                val numTracks = header.getInt(8)
+                val dim = header.getInt(12)
+                val expectedSize = expectedFileSize(numTracks, dim)
+                require(expectedSize != null && length == expectedSize) {
+                    "Invalid index shape or file size: tracks=$numTracks, dim=$dim, " +
+                        "expected=$expectedSize, actual=$length"
                 }
 
-                // Async page-cache warming: madvise(MADV_WILLNEED) tells the kernel
-                // to prefetch all pages in background. Returns in ~1ms; actual I/O
-                // happens asynchronously so pages are warm by the time findTopK() runs.
-                buf.load()
+                val channel = raf.channel
+                val buf = channel.map(FileChannel.MapMode.READ_ONLY, 0, length)
+                buf.order(ByteOrder.LITTLE_ENDIAN)
+
+                // A retrieval scans every embedding. Synchronous prefaulting is substantially
+                // faster than taking one minor fault per 4 KiB page inside the dot-product loop.
+                if (preload) buf.load()
 
                 return EmbeddingIndex(buf, numTracks, dim)
             }
@@ -80,9 +92,26 @@ class EmbeddingIndex private constructor(
                     raf.readFully(buf)
                     val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
                     if (bb.getInt(0) != MAGIC) return -1
-                    bb.getInt(8)  // numTracks
+                    if (bb.getInt(4) != VERSION) return -1
+                    val numTracks = bb.getInt(8)
+                    val dim = bb.getInt(12)
+                    val expectedSize = expectedFileSize(numTracks, dim) ?: return -1
+                    if (raf.length() != expectedSize) return -1
+                    numTracks
                 }
             } catch (_: Exception) { -1 }
+        }
+
+        private fun expectedFileSize(numTracks: Int, dim: Int): Long? {
+            if (numTracks < 0 || dim <= 0) return null
+            return try {
+                val idsBytes = Math.multiplyExact(numTracks.toLong(), Long.SIZE_BYTES.toLong())
+                val values = Math.multiplyExact(numTracks.toLong(), dim.toLong())
+                val embeddingBytes = Math.multiplyExact(values, Float.SIZE_BYTES.toLong())
+                Math.addExact(HEADER_SIZE.toLong(), Math.addExact(idsBytes, embeddingBytes))
+            } catch (_: ArithmeticException) {
+                null
+            }
         }
 
         /**
@@ -118,93 +147,157 @@ class EmbeddingIndex private constructor(
             val totalSize = HEADER_SIZE.toLong() + numTracks.toLong() * 8 + numTracks.toLong() * actualDim * 4
             val embeddingsStart = HEADER_SIZE.toLong() + numTracks.toLong() * 8
 
-            RandomAccessFile(outFile, "rw").use { raf ->
-                raf.setLength(totalSize)
-                val channel = raf.channel
-                val buf = channel.map(FileChannel.MapMode.READ_WRITE, 0, totalSize)
-                buf.order(ByteOrder.LITTLE_ENDIAN)
+            val destination = outFile.absoluteFile
+            destination.parentFile?.mkdirs()
+            val temporary = File.createTempFile(
+                ".${destination.name}.",
+                ".tmp",
+                destination.parentFile,
+            )
+            try {
+                RandomAccessFile(temporary, "rw").use { raf ->
+                    raf.setLength(totalSize)
+                    val channel = raf.channel
+                    val buf = channel.map(FileChannel.MapMode.READ_WRITE, 0, totalSize)
+                    buf.order(ByteOrder.LITTLE_ENDIAN)
 
-                // Write header
-                buf.putInt(0, MAGIC)
-                buf.putInt(4, VERSION)
-                buf.putInt(8, numTracks)
-                buf.putInt(12, actualDim)
+                    // Write header
+                    buf.putInt(0, MAGIC)
+                    buf.putInt(4, VERSION)
+                    buf.putInt(8, numTracks)
+                    buf.putInt(12, actualDim)
 
-                // Stream rows: write track ID and embedding blob at computed offsets
-                var i = 0
-                var skipped = 0
-                val progressInterval = maxOf(numTracks / 20, 1)  // ~5% increments
-                db.forEachEmbeddingRaw(tableName) { trackId, blob ->
-                    if (blob.size != expectedBlobSize) {
-                        skipped++
-                        return@forEachEmbeddingRaw
+                    // Stream rows: write track ID and embedding blob at computed offsets
+                    var i = 0
+                    val progressInterval = maxOf(numTracks / 20, 1)  // ~5% increments
+                    db.forEachEmbeddingRaw(tableName) { trackId, blob ->
+                        if (blob.size != expectedBlobSize) {
+                            throw IllegalStateException(
+                                "Track $trackId has ${blob.size} embedding bytes; " +
+                                    "expected $expectedBlobSize"
+                            )
+                        }
+                        check(i < numTracks) {
+                            "Embedding table changed during extraction: more than $numTracks rows"
+                        }
+
+                        // Write track ID
+                        val idOffset = HEADER_SIZE + i * 8
+                        buf.putLong(idOffset, trackId)
+
+                        // Write embedding blob bytes directly (already little-endian float32)
+                        val embOffset = (embeddingsStart + i.toLong() * expectedBlobSize).toInt()
+                        buf.position(embOffset)
+                        buf.put(blob)
+
+                        i++
+
+                        if (i % progressInterval == 0) {
+                            val pct = i * 100 / numTracks
+                            Log.d(TAG, "Extract: $i / $numTracks ($pct%)")
+                            onProgress?.invoke(i, numTracks)
+                        }
                     }
-                    if (i >= numTracks) return@forEachEmbeddingRaw
 
-                    // Write track ID
-                    val idOffset = HEADER_SIZE + i * 8
-                    buf.putLong(idOffset, trackId)
-
-                    // Write embedding blob bytes directly (already little-endian float32)
-                    val embOffset = (embeddingsStart + i.toLong() * expectedBlobSize).toInt()
-                    buf.position(embOffset)
-                    buf.put(blob)
-
-                    i++
-
-                    if (i % progressInterval == 0) {
-                        val pct = i * 100 / numTracks
-                        Log.d(TAG, "Extract: $i / $numTracks ($pct%)")
-                        onProgress?.invoke(i, numTracks)
+                    check(i == numTracks) {
+                        "Embedding table changed during extraction: expected $numTracks rows, read $i"
                     }
+                    onProgress?.invoke(i, numTracks)
+
+                    buf.force()
                 }
-
-                onProgress?.invoke(i, numTracks)
-
-                // Update header with actual count if some were skipped
-                if (skipped > 0) {
-                    Log.w(TAG, "Skipped $skipped embeddings with wrong dimension")
-                    buf.putInt(8, i)
-                    val actualSize = HEADER_SIZE.toLong() + i.toLong() * 8 + i.toLong() * expectedBlobSize
-                    raf.setLength(actualSize)
+                replaceAtomically(temporary, destination)
+                if (destination.name == "clamp3.emb") {
+                    TextEmbeddingIndexGeneration.invalidate()
                 }
-
-                buf.force()
+            } finally {
+                temporary.delete()
             }
 
             val extractMs = (System.nanoTime() - t0) / 1_000_000
-            Log.i(TAG, "Wrote ${outFile.length() / 1024 / 1024} MB to ${outFile.name} in ${extractMs}ms")
+            Log.i(TAG, "Wrote ${destination.length() / 1024 / 1024} MB to ${destination.name} in ${extractMs}ms")
+        }
+
+        internal fun replaceAtomically(source: File, destination: File) {
+            try {
+                Files.move(
+                    source.toPath(),
+                    destination.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(
+                    source.toPath(),
+                    destination.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            }
         }
     }
 
     // Precomputed offsets
     private val trackIdsOffset = HEADER_SIZE
     private val embeddingsOffset = HEADER_SIZE + numTracks.toLong() * 8
-
-    /**
-     * Build a lookup map from track ID to index for fast getEmbeddingByTrackId.
-     * Lazily initialized on first use.
-     */
-    private val trackIdToIndex: Map<Long, Int> by lazy {
-        val map = HashMap<Long, Int>(numTracks)
-        for (i in 0 until numTracks) {
-            map[getTrackId(i)] = i
+    private val trackIdLongs: LongBuffer = buffer.duplicate()
+        .order(ByteOrder.LITTLE_ENDIAN)
+        .apply {
+            position(trackIdsOffset)
+            limit(embeddingsOffset.toInt())
         }
-        map
+        .slice()
+        .order(ByteOrder.LITTLE_ENDIAN)
+        .asLongBuffer()
+    private val trackIdSnapshot: LongArray by lazy {
+        LongArray(numTracks).also { trackIdLongs.duplicate().get(it) }
     }
+    private val embeddingFloats: FloatBuffer = buffer.duplicate()
+        .order(ByteOrder.LITTLE_ENDIAN)
+        .apply { position(embeddingsOffset.toInt()) }
+        .slice()
+        .order(ByteOrder.LITTLE_ENDIAN)
+        .asFloatBuffer()
 
     /**
      * Get the track ID at a given index.
      */
     fun getTrackId(index: Int): Long {
-        return buffer.getLong(trackIdsOffset + index * 8)
+        require(index in 0 until numTracks) { "Index out of range: $index" }
+        return trackIdAt(index)
     }
+
+    private fun trackIdAt(index: Int): Long = trackIdSnapshot[index]
+
+    internal fun findTrackIndex(trackId: Long): Int? {
+        val ids = trackIdSnapshot
+        var low = 0
+        var high = numTracks - 1
+        while (low <= high) {
+            val middle = (low + high).ushr(1)
+            val candidate = ids[middle]
+            when {
+                candidate < trackId -> low = middle + 1
+                candidate > trackId -> high = middle - 1
+                else -> return middle
+            }
+        }
+        // Published V2 and extracted legacy files are ordered. Retain exact support for
+        // hand-authored/old unsorted PEMB artifacts without paying a boxed HashMap cost.
+        val legacyIndex = ids.indexOf(trackId)
+        return legacyIndex.takeIf { it >= 0 }
+    }
+
+    /** Resolve IDs once for algorithms that repeatedly score rows from the mmap'd index. */
+    internal fun findTrackIndices(trackIds: LongArray): IntArray =
+        IntArray(trackIds.size) { position -> findTrackIndex(trackIds[position]) ?: -1 }
 
     /**
      * Compute dot product between a query vector and the embedding at the given index.
      * Since embeddings are L2-normalized, this equals cosine similarity.
      */
     fun dotProduct(query: FloatArray, index: Int): Float {
+        require(query.size == dim) { "Query dimension ${query.size} != index dimension $dim" }
+        require(index in 0 until numTracks) { "Index out of range: $index" }
         val offset = (embeddingsOffset + index.toLong() * dim * 4).toInt()
         var dot = 0f
         for (d in 0 until dim) {
@@ -216,41 +309,34 @@ class EmbeddingIndex private constructor(
     /**
      * Find the single most similar track to a query embedding.
      *
-     * @param cancellationCheck called every 10K tracks to allow coroutine cancellation
+     * @param cancellationCheck called at bounded intervals by the native scan
      */
     fun findTop1(
         query: FloatArray,
         excludeIds: Set<Long> = emptySet(),
         cancellationCheck: (() -> Unit)? = null
-    ): Pair<Long, Float>? {
-        var bestId = -1L
-        var bestScore = Float.NEGATIVE_INFINITY
-        for (i in 0 until numTracks) {
-            if (i % 10000 == 0) cancellationCheck?.invoke()
-            val trackId = getTrackId(i)
-            if (trackId in excludeIds) continue
-            val score = dotProduct(query, i)
-            if (score > bestScore) {
-                bestScore = score
-                bestId = trackId
-            }
-        }
-        return if (bestId >= 0) bestId to bestScore else null
-    }
+    ): Pair<Long, Float>? = findTopK(
+        query = query,
+        topK = 1,
+        excludeIds = excludeIds,
+        cancellationCheck = cancellationCheck,
+    ).firstOrNull()
 
     /**
      * Find the top-K most similar tracks to a query embedding.
      *
      * Uses NEON-accelerated dot products via JNI for ~30x speedup over scalar Kotlin.
      *
-     * @param cancellationCheck called every 10K tracks to allow coroutine cancellation (unused in native path)
+     * @param cancellationCheck called at bounded intervals by the native scan
      */
     fun findTopK(
         query: FloatArray,
         topK: Int,
         excludeIds: Set<Long> = emptySet(),
-        @Suppress("UNUSED_PARAMETER") cancellationCheck: (() -> Unit)? = null
+        cancellationCheck: (() -> Unit)? = null
     ): List<Pair<Long, Float>> {
+        require(query.size == dim) { "Query dimension ${query.size} != index dimension $dim" }
+        if (topK <= 0 || numTracks == 0) return emptyList()
         val k = topK.coerceAtMost(numTracks)
         val outTrackIds = LongArray(k)
         val outScores = FloatArray(k)
@@ -259,7 +345,7 @@ class EmbeddingIndex private constructor(
         val count = NativeMath.findTopK(
             buffer, trackIdsOffset.toLong(), embeddingsOffset,
             query, numTracks, dim, k,
-            excludeArray, outTrackIds, outScores
+            excludeArray, outTrackIds, outScores, cancellationCheck
         )
 
         return (0 until count).map { i -> outTrackIds[i] to outScores[i] }
@@ -273,9 +359,107 @@ class EmbeddingIndex private constructor(
      * Uses NEON-accelerated dot products via JNI.
      */
     fun computeAllSimilarities(reference: FloatArray): FloatArray {
-        val sims = FloatArray(numTracks)
-        NativeMath.allSimilarities(buffer, embeddingsOffset, reference, numTracks, dim, sims)
-        return sims
+        return FloatArray(numTracks).also { similarities ->
+            computeAllSimilaritiesInto(reference, similarities)
+        }
+    }
+
+    /** Write a full sequential similarity scan into caller-owned storage. */
+    internal fun computeAllSimilaritiesInto(
+        reference: FloatArray,
+        outSimilarities: FloatArray,
+        cancellationCheck: (() -> Unit)? = null,
+    ) {
+        require(reference.size == dim) {
+            "Reference dimension ${reference.size} != index dimension $dim"
+        }
+        require(outSimilarities.size == numTracks) {
+            "Similarity count ${outSimilarities.size} != index track count $numTracks"
+        }
+        cancellationCheck?.invoke()
+        if (System.getProperty("java.vm.name") == "Dalvik") {
+            NativeMath.allSimilarities(
+                buffer,
+                embeddingsOffset,
+                reference,
+                numTracks,
+                dim,
+                outSimilarities,
+            )
+        } else {
+            for (row in 0 until numTracks) {
+                if ((row and 1023) == 0) cancellationCheck?.invoke()
+                outSimilarities[row] = dotProduct(reference, row)
+            }
+        }
+        cancellationCheck?.invoke()
+    }
+
+    /** Batch exact row-pair scores using the same native reduction as full top-K scans. */
+    fun computePairSimilarities(
+        leftIndices: IntArray,
+        rightIndices: IntArray,
+        cancellationCheck: (() -> Unit)? = null,
+    ): FloatArray = FloatArray(leftIndices.size).also { scores ->
+        computePairSimilaritiesInto(
+            leftIndices = leftIndices,
+            rightIndices = rightIndices,
+            outScores = scores,
+            cancellationCheck = cancellationCheck,
+        )
+    }
+
+    /**
+     * Write pair scores into caller-owned storage.
+     *
+     * Android uses the canonical NEON reduction shared with retrieval. Local JVM tests use the
+     * scalar-order reference because Android native libraries cannot be loaded by the host JVM.
+     */
+    internal fun computePairSimilaritiesInto(
+        leftIndices: IntArray,
+        rightIndices: IntArray,
+        outScores: FloatArray,
+        pairCount: Int = leftIndices.size,
+        cancellationCheck: (() -> Unit)? = null,
+    ) {
+        require(pairCount in 0..leftIndices.size &&
+            pairCount <= rightIndices.size && pairCount <= outScores.size
+        ) { "pair count exceeds a pair score buffer" }
+        require((0 until pairCount).all { position ->
+            leftIndices[position] in 0 until numTracks &&
+                rightIndices[position] in 0 until numTracks
+        }
+        ) { "pair index is outside the embedding index" }
+
+        if (pairCount == 0) return
+
+        if (System.getProperty("java.vm.name") == "Dalvik") {
+            NativeMath.pairSimilarities(
+                buffer = buffer,
+                embeddingsOffset = embeddingsOffset,
+                leftIndices = leftIndices,
+                rightIndices = rightIndices,
+                numTracks = numTracks,
+                dim = dim,
+                outScores = outScores,
+                pairCount = pairCount,
+                cancellationCheck = cancellationCheck,
+            )
+            return
+        }
+
+        for (position in 0 until pairCount) {
+            if ((position and 1023) == 0) cancellationCheck?.invoke()
+            val leftOffset = (embeddingsOffset + leftIndices[position].toLong() * dim * 4).toInt()
+            val rightOffset = (embeddingsOffset + rightIndices[position].toLong() * dim * 4).toInt()
+            var score = 0f
+            for (column in 0 until dim) {
+                score += buffer.getFloat(leftOffset + column * 4) *
+                    buffer.getFloat(rightOffset + column * 4)
+            }
+            outScores[position] = score
+        }
+        cancellationCheck?.invoke()
     }
 
     /**
@@ -283,13 +467,17 @@ class EmbeddingIndex private constructor(
      * Rank 1 = most similar in the corpus. Returns -1 if track not found.
      */
     fun rankFromSimilarities(sims: FloatArray, targetTrackId: Long): Int {
-        val targetIdx = trackIdToIndex[targetTrackId] ?: return -1
-        val targetSim = sims[targetIdx]
-        var rank = 1
-        for (i in sims.indices) {
-            if (i != targetIdx && sims[i] > targetSim) rank++
+        require(sims.size == numTracks) {
+            "Similarity count ${sims.size} != index track count $numTracks"
         }
-        return rank
+        val targetIdx = findTrackIndex(targetTrackId) ?: return -1
+        return NativeMath.rankFromSimilarities(
+            buffer = buffer,
+            trackIdsOffset = trackIdsOffset.toLong(),
+            similarities = sims,
+            numTracks = numTracks,
+            targetIndex = targetIdx,
+        )
     }
 
     /**
@@ -297,7 +485,10 @@ class EmbeddingIndex private constructor(
      * Returns 0f if the track ID is not found in the index.
      */
     fun getSimFromPrecomputed(sims: FloatArray, trackId: Long): Float {
-        val idx = trackIdToIndex[trackId] ?: return 0f
+        require(sims.size == numTracks) {
+            "Similarity count ${sims.size} != index track count $numTracks"
+        }
+        val idx = findTrackIndex(trackId) ?: return 0f
         return sims[idx]
     }
 
@@ -308,10 +499,9 @@ class EmbeddingIndex private constructor(
         require(index in 0 until numTracks) { "Index out of range: $index" }
         require(out.size >= dim) { "Output buffer too small: ${out.size} < $dim" }
 
-        val offset = (embeddingsOffset + index.toLong() * dim * 4).toInt()
-        for (d in 0 until dim) {
-            out[d] = buffer.getFloat(offset + d * 4)
-        }
+        embeddingFloats.duplicate()
+            .apply { position(index * dim) }
+            .get(out, 0, dim)
     }
 
     /**
@@ -323,11 +513,62 @@ class EmbeddingIndex private constructor(
         return result
     }
 
+    /** Exact cross-generation row comparison used to prove graph-delta eligibility. */
+    internal fun hasBitIdenticalEmbedding(
+        index: Int,
+        other: EmbeddingIndex,
+        otherIndex: Int,
+    ): Boolean {
+        require(index in 0 until numTracks && otherIndex in 0 until other.numTracks) {
+            "Embedding index is outside its generation"
+        }
+        if (dim != other.dim) return false
+        val leftOffset = embeddingsOffset + index.toLong() * dim * Float.SIZE_BYTES
+        val rightOffset = other.embeddingsOffset + otherIndex.toLong() * dim * Float.SIZE_BYTES
+        for (column in 0 until dim) {
+            val byteOffset = column.toLong() * Float.SIZE_BYTES
+            if (buffer.getInt((leftOffset + byteOffset).toInt()) !=
+                other.buffer.getInt((rightOffset + byteOffset).toInt())
+            ) {
+                return false
+            }
+        }
+        return true
+    }
+
     /**
      * Get the embedding for a specific track ID, or null if not found.
      */
     fun getEmbeddingByTrackId(trackId: Long): FloatArray? {
-        val index = trackIdToIndex[trackId] ?: return null
+        val index = findTrackIndex(trackId) ?: return null
         return getEmbedding(index)
+    }
+
+    /** Strict generation-local vector equivalence without allocating either embedding. */
+    internal fun hasEmbeddingWithinMaxAbsoluteDelta(
+        leftIndex: Int,
+        rightIndex: Int,
+        maxAbsoluteDelta: Float,
+    ): Boolean {
+        require(leftIndex in 0 until numTracks && rightIndex in 0 until numTracks) {
+            "Embedding index is outside the active generation"
+        }
+        require(maxAbsoluteDelta >= 0f && maxAbsoluteDelta.isFinite()) {
+            "Embedding delta must be finite and non-negative"
+        }
+        if (leftIndex == rightIndex) return true
+        val leftOffset = embeddingsOffset + leftIndex.toLong() * dim * Float.SIZE_BYTES
+        val rightOffset = embeddingsOffset + rightIndex.toLong() * dim * Float.SIZE_BYTES
+        for (column in 0 until dim) {
+            val byteOffset = column.toLong() * Float.SIZE_BYTES
+            val left = buffer.getFloat((leftOffset + byteOffset).toInt())
+            val right = buffer.getFloat((rightOffset + byteOffset).toInt())
+            if (!left.isFinite() || !right.isFinite() ||
+                kotlin.math.abs(left - right) > maxAbsoluteDelta
+            ) {
+                return false
+            }
+        }
+        return true
     }
 }

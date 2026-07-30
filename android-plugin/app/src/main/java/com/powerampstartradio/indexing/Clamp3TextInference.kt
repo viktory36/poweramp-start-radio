@@ -21,13 +21,15 @@ import java.nio.ByteOrder
  * Uses the same XLM-RoBERTa Unigram tokenizer as the audio encoder.
  *
  * @param modelFile Path to the clamp3_text .tflite model file
- * @param vocabFile Path to the xlm_roberta_vocab.json file
+ * @param tokenizerModelFile Path to the checkpoint's serialized SentencePiece model
  * @param accelerator Hardware accelerator to use (GPU or CPU)
+ * @param strictAccelerator Refuse backend/precision fallback when deterministic replay requires it
  */
 class Clamp3TextInference(
     modelFile: File,
-    vocabFile: File,
+    tokenizerModelFile: File,
     accelerator: Accelerator = Accelerator.GPU,
+    strictAccelerator: Boolean = false,
 ) {
     companion object {
         private const val TAG = "Clamp3TextInference"
@@ -36,7 +38,7 @@ class Clamp3TextInference(
     }
 
     private val model: com.google.ai.edge.litert.CompiledModel
-    private val tokenizer: SentencePieceTokenizer
+    private val tokenizer: OfficialSentencePieceTokenizer
     private val inputBuffers: List<com.google.ai.edge.litert.TensorBuffer>
     private val outputBuffers: List<com.google.ai.edge.litert.TensorBuffer>
     val activeAccelerator: Accelerator
@@ -45,13 +47,18 @@ class Clamp3TextInference(
     private val longBuffer = LongArray(SEQ_LEN)
 
     init {
-        tokenizer = SentencePieceTokenizer(vocabFile, seqLen = SEQ_LEN)
+        tokenizer = OfficialSentencePieceTokenizer(tokenizerModelFile, seqLen = SEQ_LEN)
 
         // Text model fallback chain:
         // 1. GPU with FP32 precision (best quality, may fail on FP16-converted models)
         // 2. GPU with default/FP16 precision (single forward pass, FP16 acceptable)
         // 3. CPU (always works)
-        val result = loadWithFallback(modelFile.absolutePath, accelerator)
+        val result = try {
+            loadWithFallback(modelFile.absolutePath, accelerator, strictAccelerator)
+        } catch (failure: Throwable) {
+            tokenizer.close()
+            throw failure
+        }
         model = result.model
         activeAccelerator = result.accelerator
         inputBuffers = result.inputBuffers
@@ -61,7 +68,12 @@ class Clamp3TextInference(
                 "(${modelFile.length() / 1024 / 1024}MB), accelerator=$activeAccelerator")
     }
 
-    private fun loadWithFallback(path: String, preferred: Accelerator): ReadyModel {
+    private fun loadWithFallback(
+        path: String,
+        preferred: Accelerator,
+        strictAccelerator: Boolean,
+    ): ReadyModel {
+        if (strictAccelerator) return createReadyModel(path, preferred)
         if (preferred == Accelerator.GPU) {
             // Try GPU with FP32 first
             try {
@@ -115,38 +127,43 @@ class Clamp3TextInference(
         return try {
             val t0 = System.nanoTime()
 
-            // Tokenize: text -> (input_ids[128], attention_mask[128])
-            val (inputIds, attentionMask) = tokenizer.encode(query)
+            val segments = tokenizer.encodeSegments(query)
 
             val tokenMs = (System.nanoTime() - t0) / 1_000_000
-            Log.i(TAG, "Tokens: ${inputIds.take(attentionMask.count { it == 1 })}")
-
-            // Write input_ids as INT64
-            writeInt64Tensor(inputBuffers[0], inputIds)
-
-            // Write attention_mask as INT64
-            writeInt64Tensor(inputBuffers[1], attentionMask)
-
-            // Run inference
             val inferStart = System.nanoTime()
-            model.run(inputBuffers, outputBuffers)
-
-            // Read output [1, 768]
-            val output = outputBuffers[0].readFloat()
+            val weighted = FloatArray(EMBEDDING_DIM)
+            var totalContributionTokens = 0
+            segments.forEach { segment ->
+                writeInt64Tensor(inputBuffers[0], segment.inputIds)
+                writeInt64Tensor(inputBuffers[1], segment.attentionMask)
+                model.run(inputBuffers, outputBuffers)
+                val output = outputBuffers[0].readFloat()
+                require(output.size >= EMBEDDING_DIM) {
+                    "Unexpected text output size: ${output.size}"
+                }
+                val weight = segment.contributionTokenCount.toFloat()
+                for (index in 0 until EMBEDDING_DIM) {
+                    weighted[index] += output[index] * weight
+                }
+                totalContributionTokens += segment.contributionTokenCount
+            }
             val inferMs = (System.nanoTime() - inferStart) / 1_000_000
 
-            Log.i(TAG, "Text inference: tokenize=${tokenMs}ms, inference=${inferMs}ms, " +
-                    "total=${tokenMs + inferMs}ms, query='$query'")
+            Log.i(
+                TAG,
+                "Text inference: tokenize=${tokenMs}ms, inference=${inferMs}ms, " +
+                    "windows=${segments.size}, contributionTokens=$totalContributionTokens, " +
+                    "total=${tokenMs + inferMs}ms, query='$query'",
+            )
 
-            val embedding = if (output.size >= EMBEDDING_DIM) {
-                output.copyOf(EMBEDDING_DIM).also { l2Normalize(it) }
-            } else {
-                Log.w(TAG, "Unexpected output size: ${output.size}")
-                null
+            require(totalContributionTokens > 0)
+            for (index in weighted.indices) {
+                weighted[index] /= totalContributionTokens.toFloat()
             }
+            val embedding = weighted.also { l2Normalize(it) }
 
             // Save embedding to file for quality comparison (adb pull)
-            if (embedding != null && debugDir != null) {
+            if (debugDir != null) {
                 try {
                     debugDir.mkdirs()
                     val safeName = query.replace(Regex("[^a-zA-Z0-9_-]"), "_").take(50)
@@ -178,9 +195,16 @@ class Clamp3TextInference(
         buffer.writeLong(longBuffer)
     }
 
+    @Synchronized
     fun close() {
+        if (closed) return
+        closed = true
+        tokenizer.close()
         inputBuffers.forEach { it.close() }
         outputBuffers.forEach { it.close() }
         model.close()
     }
+
+    @Volatile
+    private var closed = false
 }

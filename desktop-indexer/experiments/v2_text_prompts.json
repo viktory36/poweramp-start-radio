@@ -1,0 +1,212 @@
+{
+  "version": 1,
+  "frozen_before_ranking": "2026-07-12",
+  "described_tracks": [
+    {
+      "id": "hallucinogen_demention",
+      "prompt": "late 1990s Goa trance with rapid rolling bass, psychedelic acid synths, alien sound design and a dark hypnotic atmosphere",
+      "target_track_ids": [13384]
+    },
+    {
+      "id": "nusrat_allah_hoo",
+      "prompt": "ecstatic Pakistani Sufi qawwali with powerful male devotional vocals, harmonium, tabla and accelerating handclaps",
+      "target_track_ids": [209]
+    },
+    {
+      "id": "seedhe_maut_anthem",
+      "prompt": "Hindi underground hip hop with two forceful male rappers trading lines over a hard sparse beat",
+      "target_track_ids": [26499]
+    },
+    {
+      "id": "aphex_twin_4",
+      "prompt": "fast playful 1990s IDM with skittering breakbeats and a bright childlike synthesizer melody",
+      "target_track_ids": [2682]
+    },
+    {
+      "id": "daft_punk_da_funk",
+      "prompt": "midtempo 1990s French house instrumental with a distorted squelchy synthesizer bass riff and dry drum machine",
+      "target_track_ids": [7876]
+    },
+    {
+      "id": "burial_archangel",
+      "prompt": "dark rainy UK garage with chopped ghostly vocals, vinyl crackle, deep sub bass and shuffling two-step drums",
+      "target_track_ids": [5831]
+    },
+    {
+      "id": "bicep_glue",
+      "prompt": "euphoric nostalgic breakbeat electronic music with an airy female vocal sample, warm trance pads and bittersweet rave emotion",
+      "target_track_ids": [3982, 37907, 41459]
+    },
+    {
+      "id": "tool_schism",
+      "prompt": "progressive metal in shifting odd meters with an intricate prominent bass riff, heavy guitars and intense male vocals",
+      "target_track_ids": [31830]
+    },
+    {
+      "id": "nicola_cruz_cumbia",
+      "prompt": "Andean electronic cumbia with organic hand percussion, wooden flutes, ritual atmosphere and deep downtempo bass",
+      "target_track_ids": [21972]
+    },
+    {
+      "id": "raf_saperra_modern_mirza",
+      "prompt": "Punjabi bhangra singing over modern UK garage, bassline and soundsystem production",
+      "target_track_ids": [25130]
+    },
+    {
+      "id": "takeo_moriyama_watarase",
+      "prompt": "spiritual Japanese jazz with an intense open modal melody, powerful drums, piano and searching saxophone improvisation",
+      "target_track_ids": [57301, 74859]
+    },
+    {
+      "id": "technical_hitch_my_pain",
+      "prompt": "extremely fast dark hi-tech psytrance with dramatic orchestral samples and a relentless kick bass pattern",
+      "target_track_ids": [28891]
+    },
+    {
+      "id": "foals_milk_black_spiders",
+      "prompt": "gradually building emotional indie rock with chiming guitars, strings, male vocals and an explosive final climax",
+      "target_track_ids": [11725]
+    },
+    {
+      "id": "dgary_tiambaly",
+      "prompt": "virtuosic Malagasy acoustic guitar with intricate fingerpicked polyrhythms and earthy male vocals",
+      "target_track_ids": [7838]
+    },
+    {
+      "id": "sierra_ferrell_fox_hunt",
+      "prompt": "up-tempo old-time Appalachian string band song with fiddle, acoustic guitar and expressive female country vocals",
+      "target_track_ids": [56439]
+    }
+  ],
+  "open_queries": [
+    {
+      "id": "forest_psy",
+      "prompt": "dark forest psytrance with organic percussion, insect-like textures and a dense nocturnal atmosphere"
+    },
+    {
+      "id": "microhouse",
+      "prompt": "minimal microhouse with tiny clipped vocal fragments, dry clicks and a warm restrained bass groove"
+    },
+    {
+      "id": "gqom",
+      "prompt": "South African gqom with sparse broken club rhythms, menacing bass and raw repetitive chants"
+    },
+    {
+      "id": "maqam_oud",
+      "prompt": "unaccompanied Arabic oud taqsim improvisation in a deeply ornamented maqam"
+    },
+    {
+      "id": "carnatic_violin",
+      "prompt": "Carnatic violin raga performance with mridangam and a fast virtuosic tani avartanam"
+    },
+    {
+      "id": "ethiopian_jazz",
+      "prompt": "1970s Ethiopian jazz with pentatonic horn melodies, electric organ and a loping hypnotic groove"
+    },
+    {
+      "id": "maracatu",
+      "prompt": "Brazilian maracatu with massive alfaia drums, call and response singing and carnival procession energy"
+    },
+    {
+      "id": "japanese_environmental",
+      "prompt": "Japanese environmental ambient with quiet water sounds, sparse bells and slowly changing synthesizer tones"
+    },
+    {
+      "id": "industrial_dub_techno",
+      "prompt": "industrial dub techno with corroded metallic noise, cavernous delay and a distant four-on-the-floor pulse"
+    },
+    {
+      "id": "footwork_jazz",
+      "prompt": "Chicago footwork rhythms with chopped jazz samples, frantic syncopation and deep sub bass"
+    },
+    {
+      "id": "no_drums_drone",
+      "prompt": "slowly evolving granular drone without drums, vocals or a steady beat"
+    },
+    {
+      "id": "dry_rhythm_section",
+      "prompt": "dry close-miked drums and distorted electric bass with no vocals and almost no reverb"
+    },
+    {
+      "id": "odd_meter_clean_guitar",
+      "prompt": "odd-meter math rock with interlocking clean guitars, crisp live drums and no screaming"
+    },
+    {
+      "id": "analog_arpeggio",
+      "prompt": "warm analog synthesizer arpeggio around 120 BPM with a steady motorik pulse and no vocals"
+    },
+    {
+      "id": "acoustic_to_noise_arc",
+      "prompt": "begins as intimate quiet acoustic music and gradually erupts into overwhelming distorted noise"
+    },
+    {
+      "id": "false_ending",
+      "prompt": "a song with a long silence or false ending before a hidden final section"
+    },
+    {
+      "id": "joyful_complex",
+      "prompt": "rhythmically complex and harmonically adventurous but joyful rather than tense"
+    },
+    {
+      "id": "dark_not_heavy",
+      "prompt": "dark and threatening without distorted guitars, loud drums or cinematic orchestra"
+    },
+    {
+      "id": "human_loose_dance",
+      "prompt": "loose human dance groove with audible timing imperfections, hand percussion and live bass"
+    },
+    {
+      "id": "synthetic_precise_dance",
+      "prompt": "extremely precise synthetic dance rhythm with sharp transients, no acoustic instruments and no vocals"
+    }
+  ],
+  "language_groups": [
+    {
+      "id": "qawwali",
+      "prompts": {
+        "en": "ecstatic Sufi qawwali with powerful devotional singing, harmonium, tabla and handclaps",
+        "ar": "قوّالي صوفية وجدانية مع غناء ديني قوي وهارمونيوم وطبلة وتصفيق",
+        "hi": "जोशीली सूफ़ी क़व्वाली जिसमें शक्तिशाली भक्ति गायन, हारमोनियम, तबला और तालियाँ हों"
+      }
+    },
+    {
+      "id": "goa_trance",
+      "prompts": {
+        "en": "fast psychedelic Goa trance with acid synthesizers and rolling bass",
+        "es": "trance Goa psicodélico rápido con sintetizadores ácidos y bajo rodante",
+        "ja": "アシッドシンセとローリングベースを使った高速でサイケデリックなゴアトランス"
+      }
+    },
+    {
+      "id": "andean_cumbia",
+      "prompts": {
+        "en": "Andean electronic cumbia with flutes, hand percussion and deep bass",
+        "es": "cumbia electrónica andina con flautas, percusión de mano y bajo profundo"
+      }
+    },
+    {
+      "id": "japanese_ambient",
+      "prompts": {
+        "en": "quiet Japanese environmental ambient with water, bells and slowly changing synthesizers",
+        "ja": "水の音、鐘、ゆっくり変化するシンセサイザーによる静かな日本の環境音楽"
+      }
+    },
+    {
+      "id": "punjabi_garage",
+      "prompts": {
+        "en": "Punjabi bhangra vocals with UK garage drums and heavy bass",
+        "pa": "ਪੰਜਾਬੀ ਭੰਗੜਾ ਗਾਇਕੀ, ਯੂਕੇ ਗੈਰਾਜ ਡਰਮਾਂ ਅਤੇ ਭਾਰੀ ਬੇਸ ਨਾਲ"
+      }
+    }
+  ],
+  "operator_anchors": [
+    "dark ambient",
+    "ecstatic devotional singing",
+    "distorted electric guitar",
+    "intricate acoustic percussion",
+    "fast broken beat",
+    "warm analog synthesizer",
+    "female vocals",
+    "instrumental without vocals"
+  ]
+}

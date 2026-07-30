@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import re
@@ -260,9 +261,12 @@ def discover_audio_files(music_dir):
 
 
 def make_cache_key(file_path, music_dir):
-    """Create a flat cache key from a file path relative to music_dir."""
-    relative = str(file_path.relative_to(music_dir)).replace("\\", "/")
-    return relative.replace("/", "__")
+    """Create a fixed-length cache key for an exact relative path."""
+    relative = file_path.relative_to(music_dir).as_posix()
+    digest = hashlib.sha256(
+        relative.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+    return f"mert2_{digest}"
 
 
 def _read_manifest_entry(entry):
@@ -270,6 +274,152 @@ def _read_manifest_entry(entry):
     if isinstance(entry, str):
         return entry
     return entry['path']
+
+
+MERT_CACHE_MANIFEST_VERSION = 2
+
+
+def _collect_cache_sources(music_dir, files):
+    sources = {}
+    for file_path in files:
+        relative_path = file_path.relative_to(music_dir).as_posix()
+        cache_key = make_cache_key(file_path, music_dir)
+        previous = sources.get(cache_key)
+        if previous is not None and previous["relative_path"] != relative_path:
+            raise RuntimeError(
+                "MERT cache key collision between "
+                f"{previous['relative_path']!r} and {relative_path!r}"
+            )
+        stat = file_path.stat()
+        sources[cache_key] = {
+            "path": file_path,
+            "relative_path": relative_path,
+            "source_size": stat.st_size,
+            "source_mtime_ns": stat.st_mtime_ns,
+            "cache_key": cache_key,
+        }
+    return sources
+
+
+def _source_manifest_entry(source, max_duration):
+    return {
+        "path": str(source["path"]),
+        "relative_path": source["relative_path"],
+        "source_size": source["source_size"],
+        "source_mtime_ns": source["source_mtime_ns"],
+        "max_duration_seconds": max_duration,
+    }
+
+
+def _load_cache_manifest(manifest_path):
+    if not manifest_path.exists():
+        return {}
+    try:
+        with manifest_path.open(encoding="utf-8") as manifest_file:
+            payload = json.load(manifest_file)
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"WARNING: Ignoring unreadable MERT cache manifest: {error}")
+        return {}
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != MERT_CACHE_MANIFEST_VERSION
+        or not isinstance(payload.get("entries"), dict)
+    ):
+        print("Invalidating legacy MERT cache manifest")
+        return {}
+    return {
+        key: dict(entry)
+        for key, entry in payload["entries"].items()
+        if isinstance(key, str) and isinstance(entry, dict)
+    }
+
+
+def _write_cache_manifest(manifest_path, entries):
+    payload = {
+        "schema_version": MERT_CACHE_MANIFEST_VERSION,
+        "entries": entries,
+    }
+    temporary_path = manifest_path.with_name(f".{manifest_path.name}.tmp")
+    try:
+        with temporary_path.open("w", encoding="utf-8") as manifest_file:
+            json.dump(payload, manifest_file, ensure_ascii=True, sort_keys=True)
+            manifest_file.write("\n")
+        temporary_path.replace(manifest_path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _cache_entry_matches(entry, source, max_duration):
+    return (
+        entry.get("relative_path") == source["relative_path"]
+        and entry.get("source_size") == source["source_size"]
+        and entry.get("source_mtime_ns") == source["source_mtime_ns"]
+        and entry.get("max_duration_seconds") == max_duration
+    )
+
+
+def _remove_cache_file(path):
+    if path.is_file() or path.is_symlink():
+        path.unlink()
+
+
+def _synchronize_mert_cache(music_dir, cache_dir, files, max_duration):
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = cache_dir / "manifest.json"
+    old_entries = _load_cache_manifest(manifest_path)
+    sources = _collect_cache_sources(music_dir, files)
+    valid_entries = {}
+    for cache_key, source in sources.items():
+        npy_path = cache_dir / f"{cache_key}.npy"
+        entry = old_entries.get(cache_key)
+        if (
+            entry is not None
+            and npy_path.is_file()
+            and _cache_entry_matches(entry, source, max_duration)
+        ):
+            valid_entries[cache_key] = _source_manifest_entry(
+                source, max_duration
+            )
+        else:
+            _remove_cache_file(npy_path)
+
+    valid_keys = set(valid_entries)
+    for npy_path in cache_dir.glob("*.npy"):
+        if npy_path.stem not in valid_keys:
+            _remove_cache_file(npy_path)
+    for temporary_path in cache_dir.glob("*.npy.tmp"):
+        _remove_cache_file(temporary_path)
+
+    _write_cache_manifest(manifest_path, valid_entries)
+    return sources, valid_entries
+
+
+def _source_is_unchanged(source):
+    try:
+        stat = source["path"].stat()
+    except OSError:
+        return False
+    return (
+        stat.st_size == source["source_size"]
+        and stat.st_mtime_ns == source["source_mtime_ns"]
+    )
+
+
+def _save_cache_array(npy_path, features):
+    temporary_path = npy_path.with_name(f".{npy_path.name}.tmp")
+    try:
+        with temporary_path.open("wb") as cache_file:
+            np.save(cache_file, features)
+        temporary_path.replace(npy_path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _discard_cache_entry(cache_dir, cache_key, manifest):
+    _remove_cache_file(cache_dir / f"{cache_key}.npy")
+    manifest.pop(cache_key, None)
 
 
 # ─── Phase 1: MERT feature extraction ────────────────────────────────────────
@@ -305,7 +455,7 @@ def _load_audio_chunks(fpath, processor, max_duration):
     if sr != MERT_SR:
         waveform = torchaudio.transforms.Resample(sr, MERT_SR)(waveform)
 
-    if max_duration > 0:
+    if max_duration is not None:
         max_samples = max_duration * MERT_SR
         if waveform.shape[-1] > max_samples:
             waveform = waveform[:, :max_samples]
@@ -355,34 +505,17 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False,
     music_dir = Path(music_dir)
 
     # Discover all audio files
-    all_files = discover_audio_files(music_dir)
+    all_files = sorted(discover_audio_files(music_dir))
     print(f"Found {len(all_files)} audio files")
 
-    # Load or create manifest (maps cache_key → original absolute path)
     manifest_path = cache_dir / "manifest.json"
-    if manifest_path.exists():
-        with open(manifest_path) as f:
-            manifest = json.load(f)
-    else:
-        manifest = {}
-
-    # Find files needing processing
-    to_process = []
-    for fpath in all_files:
-        cache_key = make_cache_key(fpath, music_dir)
-        npy_path = cache_dir / (cache_key + ".npy")
-        if not npy_path.exists():
-            to_process.append(fpath)
-        else:
-            existing = manifest.get(cache_key)
-            if isinstance(existing, dict):
-                manifest[cache_key] = existing['path']
-            elif existing is None:
-                manifest[cache_key] = str(fpath)
-
-    # Save manifest (even if nothing to process — captures format upgrades)
-    with open(manifest_path, 'w') as f:
-        json.dump(manifest, f, indent=0)
+    sources, manifest = _synchronize_mert_cache(
+        music_dir, cache_dir, all_files, max_duration
+    )
+    to_process = [
+        source for cache_key, source in sources.items()
+        if cache_key not in manifest
+    ]
 
     if not to_process:
         print(f"All {len(all_files)} files already cached. Skipping Phase 1.")
@@ -417,9 +550,10 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False,
     # Prefetch audio decoding on CPU while GPU runs MERT on previous track
     pool = ThreadPoolExecutor(max_workers=2)
     prefetch = pool.submit(_load_audio_chunks,
-                           to_process[0], processor, max_duration)
+                           to_process[0]["path"], processor, max_duration)
 
-    for i, fpath in enumerate(to_process):
+    for i, source in enumerate(to_process):
+        fpath = source["path"]
         if i > 0 and i % 50 == 0:
             elapsed = time.time() - t0
             rate = elapsed / i
@@ -427,7 +561,7 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False,
             print(f"  [{i}/{len(to_process)}] {success} ok, {fail} fail, "
                   f"{rate:.1f}s/track, ETA {eta:.0f}min")
 
-        cache_key = make_cache_key(fpath, music_dir)
+        cache_key = source["cache_key"]
         npy_path = cache_dir / (cache_key + ".npy")
 
         # Get prefetched audio (or wait for it)
@@ -440,14 +574,15 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False,
             # Submit next prefetch before continuing
             if i + 1 < len(to_process):
                 prefetch = pool.submit(_load_audio_chunks,
-                                       to_process[i + 1], processor,
+                                       to_process[i + 1]["path"], processor,
                                        max_duration)
             continue
 
         # Submit next track's audio decode NOW (overlaps with GPU below)
         if i + 1 < len(to_process):
             prefetch = pool.submit(_load_audio_chunks,
-                                   to_process[i + 1], processor, max_duration)
+                                   to_process[i + 1]["path"], processor,
+                                   max_duration)
 
         try:
             if not chunks:
@@ -475,8 +610,13 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False,
             # Mean over layers (matching CLaMP3 --mean_features)
             all_features = all_features.mean(dim=0, keepdim=True)  # [1, chunks, H]
 
-            np.save(str(npy_path), all_features.numpy())
-            manifest[cache_key] = str(fpath)
+            if not _source_is_unchanged(source):
+                raise RuntimeError("source file changed during MERT extraction")
+            _save_cache_array(npy_path, all_features.numpy())
+            if not _source_is_unchanged(source):
+                _remove_cache_file(npy_path)
+                raise RuntimeError("source file changed while publishing MERT cache")
+            manifest[cache_key] = _source_manifest_entry(source, max_duration)
             success += 1
             if verbose:
                 dur_s = num_samples / MERT_SR
@@ -490,9 +630,7 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False,
 
     pool.shutdown(wait=False)
 
-    # Save manifest for new files
-    with open(manifest_path, 'w') as f:
-        json.dump(manifest, f, indent=0)
+    _write_cache_manifest(manifest_path, manifest)
 
     elapsed = time.time() - t0
     print(f"\nPhase 1 complete: {success} ok, {fail} fail in {elapsed:.0f}s "
@@ -506,7 +644,13 @@ def phase1_mert(music_dir, cache_dir, max_duration, batch_size, verbose=False,
 
 # ─── Phase 2: CLaMP3 encoding + DB storage ───────────────────────────────────
 
-def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False):
+def phase2_clamp3(
+    music_dir,
+    cache_dir,
+    db_path,
+    max_duration=None,
+    verbose=False,
+):
     """Encode cached MERT features with CLaMP3 and store in SQLite.
 
     Pipeline (matches official CLaMP3 exactly):
@@ -525,19 +669,19 @@ def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False):
     music_dir = Path(music_dir)
     db_path = Path(db_path)
 
-    # Load manifest
     manifest_path = cache_dir / "manifest.json"
     if not manifest_path.exists():
         print("ERROR: No manifest.json found in cache dir. Run Phase 1 first.")
         return
-    with open(manifest_path) as f:
-        manifest = json.load(f)
 
-    # Find all cached .npy files
-    npy_files = sorted(cache_dir.glob("*.npy"))
-    print(f"Found {len(npy_files)} cached MERT feature files")
+    all_files = sorted(discover_audio_files(music_dir))
+    sources, manifest = _synchronize_mert_cache(
+        music_dir, cache_dir, all_files, max_duration
+    )
+    cached_keys = sorted(manifest)
+    print(f"Found {len(cached_keys)} valid cached MERT feature files")
 
-    if not npy_files:
+    if not cached_keys:
         print("No .npy files found. Run Phase 1 first.")
         return
 
@@ -555,16 +699,18 @@ def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False):
 
     # Filter to files needing processing
     to_process = []
-    for npy_path in npy_files:
-        cache_key = npy_path.stem
-        entry = manifest.get(cache_key)
-        if entry:
-            original_path = _read_manifest_entry(entry)
-            if original_path not in existing:
-                to_process.append((npy_path, cache_key, original_path))
+    for cache_key in cached_keys:
+        source = sources[cache_key]
+        original_path = str(source["path"])
+        if original_path not in existing:
+            to_process.append((
+                cache_dir / f"{cache_key}.npy",
+                cache_key,
+                source,
+            ))
 
     print(f"Need to encode {len(to_process)} tracks "
-          f"({len(npy_files) - len(to_process)} already in DB)")
+          f"({len(cached_keys) - len(to_process)} already in DB)")
 
     if not to_process:
         print("All tracks already have embeddings. Done.")
@@ -596,7 +742,7 @@ def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False):
     success = 0
     fail = 0
 
-    for i, (npy_path, cache_key, original_path) in enumerate(to_process):
+    for i, (npy_path, cache_key, source) in enumerate(to_process):
         if i > 0 and i % 500 == 0:
             elapsed = time.time() - t0
             rate = elapsed / i
@@ -605,9 +751,29 @@ def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False):
                   f"{rate:.3f}s/track, ETA {eta:.0f}min")
             conn.commit()
 
+        if not _source_is_unchanged(source):
+            _discard_cache_entry(cache_dir, cache_key, manifest)
+            fail += 1
+            if fail <= 20 or verbose:
+                print(
+                    f"  FAIL [{i+1}/{len(to_process)}] "
+                    f"{source['path'].name[:60]}: source changed after Phase 1"
+                )
+            continue
+
         try:
-            # Load MERT features
-            input_data = np.load(str(npy_path))
+            input_data = np.load(str(npy_path), allow_pickle=False)
+        except Exception as e:
+            _discard_cache_entry(cache_dir, cache_key, manifest)
+            fail += 1
+            if fail <= 20 or verbose:
+                print(
+                    f"  FAIL [{i+1}/{len(to_process)}] "
+                    f"{cache_key[:60]}: invalid MERT cache: {e}"
+                )
+            continue
+
+        try:
             input_data = torch.tensor(input_data, dtype=torch.float32)
             input_data = input_data.reshape(-1, input_data.size(-1))  # [chunks, 768]
 
@@ -658,8 +824,17 @@ def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False):
             emb = emb / emb.norm()  # L2 normalize
             emb_list = emb.cpu().tolist()
 
-            # Extract metadata from original file
+            original_path = str(source["path"])
             artist, album, title, duration_ms = extract_metadata(original_path)
+            if not _source_is_unchanged(source):
+                _discard_cache_entry(cache_dir, cache_key, manifest)
+                fail += 1
+                if fail <= 20 or verbose:
+                    print(
+                        f"  FAIL [{i+1}/{len(to_process)}] "
+                        f"{source['path'].name[:60]}: source changed during Phase 2"
+                    )
+                continue
             metadata_key = make_metadata_key(artist, album, title, duration_ms)
             filename_key = make_filename_key(original_path)
 
@@ -692,6 +867,7 @@ def phase2_clamp3(music_dir, cache_dir, db_path, verbose=False):
                 print(f"  FAIL [{i+1}/{len(to_process)}] {cache_key[:60]}: {e}")
 
     conn.commit()
+    _write_cache_manifest(manifest_path, manifest)
     elapsed = time.time() - t0
 
     # Report
@@ -808,13 +984,20 @@ def build_knn_graph(db_path, k=5):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+def _positive_int(value):
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate CLaMP3 audio embeddings for a music library.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-  python generate_clamp3_embeddings.py C:\\backups\\Music -o embeddings_clamp3.db
+  python generate_clamp3_embeddings.py C:\\Music -o embeddings_clamp3.db
   python generate_clamp3_embeddings.py /path/to/music -o emb.db --phase 1
   python generate_clamp3_embeddings.py /path/to/music -o emb.db --phase 2
   python generate_clamp3_embeddings.py /path/to/music -o emb.db --max-duration 600 --batch-size 8
@@ -834,8 +1017,9 @@ Examples:
         "--phase", choices=["1", "2", "3", "both"], default="both",
         help="Which phase to run: 1=MERT, 2=CLaMP3, 3=kNN graph (default: both=all)")
     parser.add_argument(
-        "--max-duration", type=int, default=0,
-        help="Max audio duration in seconds (0 = no limit, processes full track)")
+        "--max-duration", type=_positive_int, default=None,
+        help="Optional MERT extraction cap in seconds "
+             "(default: process the complete track)")
     parser.add_argument(
         "--batch-size", type=int, default=8,
         help="MERT chunk batch size for GPU throughput (default: 8)")
@@ -875,7 +1059,12 @@ Examples:
     print(f"Music directory: {music_dir}")
     print(f"Output database: {db_path}")
     print(f"Cache directory: {cache_dir}")
-    print(f"Max duration: {args.max_duration}s, Batch size: {args.batch_size}")
+    extraction_span = (
+        "complete track"
+        if args.max_duration is None
+        else f"first {args.max_duration}s"
+    )
+    print(f"MERT extraction: {extraction_span}, Batch size: {args.batch_size}")
     print()
 
     use_fp16 = not args.fp32
@@ -885,7 +1074,13 @@ Examples:
                     verbose=args.verbose, fp16=use_fp16)
 
     if args.phase in ("2", "both"):
-        phase2_clamp3(music_dir, cache_dir, db_path, verbose=args.verbose)
+        phase2_clamp3(
+            music_dir,
+            cache_dir,
+            db_path,
+            max_duration=args.max_duration,
+            verbose=args.verbose,
+        )
 
     if args.phase == "both":
         build_knn_graph(db_path)
