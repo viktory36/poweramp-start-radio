@@ -1,7 +1,8 @@
 # V2 Evaluation
 
-This document summarizes the latest complete recommendation, delivery, indexing, and server-merge
-review. It is evidence for the current implementation, not a universal benchmark of musical taste.
+This document summarizes the accepted July 30, 2026 recommendation, indexing, and server-merge
+review. Its device claims apply to that accepted build and to unchanged contracts; later source
+edits need their own evidence. It is not a universal benchmark of musical taste.
 
 ## Evidence Boundary
 
@@ -29,8 +30,9 @@ V2 exposes five single-seed radio selectors:
 - DPP
 - Graph Explorer
 
-Find Music adds contextual All-of Ranked, All-of Varied, and Refine planners. Their formulas and
-controls are documented in `MODES_AND_KNOBS.md`.
+For one positive description, Find Music offers Closest and Varied result sets. Structured requests
+add contextual All-of Ranked, All-of Varied, and Refine planners. Their formulas and controls are
+documented in `MODES_AND_KNOBS.md`.
 
 ### All-of Ranked versus Varied
 
@@ -67,25 +69,26 @@ relaxed primary fidelity and improved the secondary ordering opportunity. Refine
 with the corresponding Ranked All-of result ranged from 1 to 25, confirming that it is not a
 cosmetic reorder. One percent remains the measured default.
 
-### Weights And Avoid
+### Weights And Less Like
 
 For two-ingredient All-of requests, own-ingredient satisfaction correlated with the requested
 weight at 0.965 to 0.980 for Ranked and 0.908 to 0.954 for Varied. Three-ingredient one-point
 sweeps produced correlations from 0.929 to 0.966. Small changes often moved order rather than
 membership, which is the intended meaning of a fine weight adjustment.
 
-Like/Avoid materially changed score and membership in all three curated probes. This establishes
-that the visible controls affect their declared objective; it does not prove that every possible
-query is understood equally well by CLaMP3.
+Like/Less like materially changed score and membership in all three curated probes. This
+establishes that the visible controls affect their declared objective; it does not prove that every
+possible query is understood equally well by CLaMP3.
 
 ### Graph Identity Repair
 
 Constructing the graph over visible identities removed 198 duplicate occurrence nodes. Repair was
-needed for 343 retained rows and 520 of 447,695 neighbor slots. At the default stop chance:
+needed for 343 retained rows and 520 of 447,695 neighbor slots. Host construction took 2.248
+seconds, including a 2.049-second exact repair scan. At the default stop chance:
 
 - 9 of 11 cases remained unchanged full-length 30-result queues;
-- a previously broken sparse Tool case expanded from 2 to 30 results;
-- one Brian Regan case remained a truthful one-result component exhaustion.
+- a previously broken two-result case expanded to 30 results;
+- one genuinely sparse case remained a truthful one-result component exhaustion.
 
 Graph Explorer may therefore return fewer than the requested count when its eligible reachable
 component is genuinely too small.
@@ -114,7 +117,20 @@ The final composed-mode acceptance covered 14 executions: seven All-of/Refine ca
 repeats. Every case returned 30 results, reproduced its ordered fingerprint, restored settings,
 and left the Poweramp queue byte-identical.
 
-Representative warm device timings:
+Representative warm single-seed timings on the accepted device:
+
+| Selector | Results ready |
+| --- | ---: |
+| Closest | 304-382 ms |
+| MMR at maximum relevance | 805-1,088 ms |
+| DPP | 2.7-19.6 s, seed dependent |
+| Graph Explorer, full queue | 877-976 ms |
+| Graph Explorer, sparse one-result case | 110-114 ms |
+
+The broad matrix's most expensive full-domain, extreme-control case took 46.498 seconds. These
+measurements are why the app does not describe every quality-first request as instant.
+
+Representative warm Find Music timings:
 
 | Request | Results ready | Queue plan ready |
 | --- | ---: | ---: |
@@ -123,9 +139,8 @@ Representative warm device timings:
 | Refine 1% | approximately 347 ms | approximately 355 ms |
 | 14-day, four-text Varied over 9,079 identities | approximately 208 ms | under 220 ms |
 
-Single-seed full-domain DPP is intentionally heavier. In the repaired five-seed check it ranged
-from 2.540 to 19.568 seconds, with an 8.227-second mean. Do not describe all recommendation paths
-as subsecond.
+Single-seed full-domain DPP is intentionally heavier. In the repaired five-seed check it had an
+8.227-second mean.
 
 ## On-Device Indexing
 
@@ -148,6 +163,8 @@ The lifecycle also exposed an avoidable 14 minute 39 second full graph rebuild c
 an otherwise exact graph proof. Proof propagation was corrected, and the final generation is
 eligible for the incremental path. The evidence does not claim that another subsequent real
 addition exercised that corrected path on the final APK.
+
+The accepted build's Home launch measured 676 ms cold and 715 ms warm.
 
 ## Server Indexer And Merge
 
@@ -179,31 +196,16 @@ server merge.
   More aggressive metadata grouping also false-merged distinct recordings, so it was rejected.
 - Greedy DPP is certified against the complete-domain greedy sequence. It is not a proof of the
   globally optimal DPP MAP set.
-- Determinism is proven for the same validated embedding generation and complete saved request.
-  Independently generated embeddings on different hardware are parity-gated, not promised
-  byte-identical.
-- The current Android artifact is an experimental, side-by-side build rather than a signed store
-  release.
+- Determinism is proven for the same validated embedding generation, active-library binding, and
+  complete saved request. Independently generated embeddings on different hardware are
+  parity-gated, not promised byte-identical.
 
-## Reproducing Repository Checks
+## Reproducing Evidence
 
-Desktop:
-
-```bash
-cd desktop-indexer
-uv sync --extra dev --extra export
-uv run --extra dev ruff check .
-uv run --extra dev pytest tests experiments -q
-```
-
-Android host checks:
-
-```bash
-cd android-plugin
-./gradlew :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease \
-  :app:assembleDebugAndroidTest --no-daemon
-./gradlew :app:lintDebug --no-daemon
-```
+Build and repository-check commands live in [`desktop-indexer/README.md`](desktop-indexer/README.md)
+and [`android-plugin/README.md`](android-plugin/README.md). Experiment entry points and their safety
+rules live in
+[`desktop-indexer/experiments/README.md`](desktop-indexer/experiments/README.md).
 
 The complete corpus evaluation requires a compatible local snapshot and is intentionally not
 bundled with the repository. Evaluators live under `desktop-indexer/experiments/`; aggregate

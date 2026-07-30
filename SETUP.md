@@ -3,15 +3,16 @@
 This guide builds a CLaMP3 music index, installs the Android app from source, and activates the
 index through the app. It also covers optional on-device and always-on-server indexing.
 
-## Current Distribution Status
+## Current Build
 
 The Android project currently builds an arm64 application with ID
-`com.powerampstartradio.v2` and version `2.0.0-experimental`. It is intentionally separate from
-the original app while V2 remains in active use and validation.
+`com.powerampstartradio.v2` and version `2.0.0-experimental`.
 
-The four model files are too large to bundle in the APK. This source setup installs a debug build
-and places the exported models in its private storage with `adb run-as`. A consumer release needs a
-separate model-delivery/onboarding decision before it can be distributed as a normal signed APK.
+The four model files are not bundled in the APK. This guide installs a debug build and places the
+exported models in its private storage with `adb run-as`.
+
+Run each section from the repository root unless a command names another absolute working
+directory.
 
 ## Requirements
 
@@ -39,7 +40,7 @@ works on CPU, but completes tracks much more slowly.
 With `uv`:
 
 ```bash
-cd desktop-indexer
+cd /path/to/poweramp-start-radio/desktop-indexer
 uv sync --extra dev --extra export
 uv run poweramp-indexer --help
 ```
@@ -47,7 +48,7 @@ uv run poweramp-indexer --help
 Or with a virtual environment:
 
 ```bash
-cd desktop-indexer
+cd /path/to/poweramp-start-radio/desktop-indexer
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -82,9 +83,6 @@ The scan has two resumable phases:
 2. encode those features with CLaMP3, write `embeddings.db`, and build the kNN graph used by Graph
    Explorer.
 
-Complete-track extraction is the default. Use `--max-duration SECONDS` only when an explicit cap
-is acceptable; capped and complete-track caches are treated as different extraction policies.
-
 Useful controls:
 
 ```bash
@@ -107,7 +105,7 @@ uv run poweramp-indexer similar /path/to/embeddings.db "artist title"
 uv run poweramp-indexer search /path/to/embeddings.db "slow psychedelic guitar"
 ```
 
-To add files later:
+Before the database has been imported into Android, update that desktop copy with:
 
 ```bash
 uv run poweramp-indexer update /path/to/music \
@@ -117,6 +115,11 @@ uv run poweramp-indexer update /path/to/music \
 `update` rebuilds the Graph Explorer graph when rows change. `--no-rebuild-graph` is a temporary
 escape hatch; Graph Explorer will not represent the changed database until `poweramp-indexer graph`
 runs.
+
+This command changes only the desktop database. Once a phone has an active index generation, grow
+it through On-device indexing or Merge server index. Initial import is available only when the app
+has no active generation; replacing app data with a later desktop database requires clearing the
+app's data and importing again.
 
 ## 3. Export The Android Models
 
@@ -133,15 +136,14 @@ models/clamp3_text.tflite
 models/sentencepiece.bpe.model
 ```
 
-Use the FP32 exports with the Android indexing path. Do not substitute the old
-`xlm_roberta_vocab.json` tokenizer or unrelated experimental model exports.
+Use the FP32 exports with the Android indexing path.
 
 ## 4. Build And Install Android
 
 From Linux:
 
 ```bash
-cd android-plugin
+cd /path/to/poweramp-start-radio/android-plugin
 ./gradlew :app:assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
@@ -149,7 +151,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 From WSL, initialize the local Android toolchain if needed:
 
 ```bash
-cd android-plugin
+cd /path/to/poweramp-start-radio/android-plugin
 ./scripts/setup-wsl-android-env.sh
 ./scripts/build-wsl.sh
 ```
@@ -178,9 +180,9 @@ for file in mert.tflite clamp3_audio.tflite clamp3_text.tflite sentencepiece.bpe
 done
 ```
 
-Open Settings in the app and expand `Index and model files`. Every model capability must report
-ready before the first music-index import. The app records the exact hashes and reuses that receipt;
-it does not rehash unchanged multi-gigabyte files for every indexing run.
+In Settings, find `Index and model files` and tap `Show file details`. Every model capability must
+report ready before the first music-index import. The app records the exact hashes and reuses that
+receipt; it does not rehash unchanged multi-gigabyte files for every indexing run.
 
 ## 6. Grant Permissions
 
@@ -234,6 +236,10 @@ The app does not need Poweramp playback to be active. A paused current track is 
 
 Use Settings -> `On-device indexing` after Poweramp has scanned newly copied music.
 
+The Settings summary shows the last completed library comparison. Tap its Refresh action for a
+current count, or open Manage Tracks to perform and inspect the comparison; merely opening Settings
+does not rescan the full Poweramp library.
+
 The app:
 
 - compares the current Poweramp provider snapshot with the active immutable generation;
@@ -250,7 +256,7 @@ an external screen-awake utility is not required for correctness.
 The optional server mode turns idle server time into cumulative graphless embeddings for later
 phone merge.
 
-Copy and edit the example:
+From the repository root, copy and edit the example:
 
 ```bash
 sudo install -d /var/lib/poweramp-server-indexer /var/cache/poweramp-server-indexer
@@ -281,11 +287,16 @@ For unattended use, adapt `desktop-indexer/deploy/poweramp-server-indexer.servic
 must run as a user that can read every listen root and write the state, cache, and export
 directories.
 
-Copy the configured `bundle_db` file to the phone after it reports an idle queue. In Android
-Settings, choose `Merge server index` and select that file. The phone validates model/source-span
-compatibility, matches rows against the current Poweramp library, and publishes a new immutable
-generation only when compatible new rows exist. Re-merging the same cumulative bundle is safe and
-becomes a validated no-op.
+Copy the configured `bundle_db` file only when `server status` reports:
+
+- `Queue: empty`;
+- no `Blocked:` or `Last cycle error:` line; and
+- a current `Published:` receipt at the configured path with the expected completed-track count.
+
+In Android Settings, choose `Merge server index` and select that file. The phone validates
+model/source-span compatibility, matches rows against the current Poweramp library, and publishes a
+new immutable generation only when compatible new rows exist. Re-merging the same cumulative bundle
+is safe and becomes a validated no-op.
 
 ## Troubleshooting
 
@@ -325,7 +336,7 @@ recommendation work are serialized so they cannot publish competing generations.
 Run through the managed project environment:
 
 ```bash
-cd desktop-indexer
+cd /path/to/poweramp-start-radio/desktop-indexer
 uv sync --extra dev --extra export
 uv run --extra dev pytest -q
 ```

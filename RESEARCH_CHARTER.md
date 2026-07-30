@@ -112,22 +112,14 @@ publication, readable status/ETA, and an overlap-safe phone merge.
 contain detailed queues, hashes, screenshots, or device logs, but public claims must be recomputed
 from its machine-readable payloads and stripped of personal-library rows.
 
-The July 30, 2026 V2 conclusion used 89,737 CLaMP3 embeddings and retained:
-
-- All-of Ranked and contextual Varied;
-- Refine with four measured primary-neighborhood widths;
-- Like/Avoid;
-- the visible single-seed mode set documented in `MODES_AND_KNOBS.md`;
-- the identity-correct Graph Explorer topology.
-
-That snapshot is a baseline, not a permanent benchmark. Future work must declare a new generation
-identity and compare only the behavior it changes.
+`EVALUATION.md` defines the current accepted baseline. Future work must declare its database,
+embedding, graph, and active-library identities and compare only the behavior it changes.
 
 ## Completion Rule
 
-An investigation is complete when major plausible families have been considered and further work
-no longer produces a distinct improvement in specificity, relevance, breadth, freshness,
-expressive control, reliability, or listening utility.
+An investigation is complete when its stated hypothesis has enough evidence for a retain, replace,
+merge, or reject decision under the acceptance standard above. Record promising unrelated ideas as
+separate hypotheses rather than extending the current investigation without a testable end.
 
 The production UI receives only the winners. Rejected candidates, calibration machinery, raw
 evidence, and experiment labels remain outside the listener-facing app.

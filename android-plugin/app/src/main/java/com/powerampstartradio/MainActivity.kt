@@ -224,8 +224,6 @@ fun MainScreen(
     val permissionLoading by viewModel.permissionLoading.collectAsState()
     val sessionHistory by viewModel.sessionHistory.collectAsState()
     val sessionReplayEligibility by viewModel.sessionReplayEligibility.collectAsState()
-    val indexStatus by viewModel.indexStatus.collectAsState()
-    val indexPreparing by viewModel.indexPreparing.collectAsState()
 
     val scope = rememberCoroutineScope()
     var currentTrack by remember { mutableStateOf(PowerampReceiver.currentTrack) }
@@ -401,8 +399,6 @@ fun MainScreen(
                     permissionLoading = permissionLoading,
                     sessionHistory = sessionHistory, statusMessage = statusMessage,
                     sessionReplayEligibility = sessionReplayEligibility,
-                    indexStatus = indexStatus,
-                    indexPreparing = indexPreparing,
                     onStartRadio = {
                         val prerequisite = homePrerequisiteStatus(
                             currentTrack = currentTrack,
@@ -439,7 +435,6 @@ fun MainScreen(
                     viewingSession = viewingSession,
                     onViewSession = { viewingSession = it },
                     onRequeueSession = { pendingHistoryReplay = it },
-                    onStartRadioFromTrack = viewModel::startRadioFromSessionTrack,
                 )
             }
         }
@@ -499,8 +494,6 @@ fun HomeScreen(
     sessionHistory: List<RadioResult>,
     sessionReplayEligibility: Map<String, SessionReplayEligibility>,
     statusMessage: String,
-    indexStatus: String?,
-    indexPreparing: Boolean,
     onStartRadio: () -> Unit,
     onCancelSearch: () -> Unit,
     onClearAndReset: () -> Unit,
@@ -511,7 +504,6 @@ fun HomeScreen(
     viewingSession: Int?,
     onViewSession: (Int?) -> Unit,
     onRequeueSession: (RadioResult) -> Unit,
-    onStartRadioFromTrack: (RadioResult, QueuedTrackResult) -> Unit,
 ) {
     val showResults = radioState is RadioUiState.Success
         || radioState is RadioUiState.Streaming
@@ -640,13 +632,6 @@ fun HomeScreen(
                             session = displaySession,
                             onRequeue = { onRequeueSession(displaySession) },
                             onShowDetails = { showQueueDetails = true },
-                            onStartRadioFromTrack = if (
-                                viewingSession == null && radioState is RadioUiState.Success
-                            ) {
-                                { track -> onStartRadioFromTrack(displaySession, track) }
-                            } else {
-                                null
-                            },
                             replayEligibility = replayEligibility,
                             modifier = Modifier.fillMaxSize(),
                         )
@@ -671,8 +656,7 @@ fun HomeScreen(
                                     databaseLoading = databaseLoading,
                                     databaseVerificationStatus = databaseVerificationStatus,
                                     permissionLoading = permissionLoading,
-                                    statusMessage = statusMessage, indexStatus = indexStatus,
-                                    indexPreparing = indexPreparing,
+                                    statusMessage = statusMessage,
                                     isIdle = radioState is RadioUiState.Idle,
                                     onRequestPermission = onRequestPermission, modifier = Modifier.fillMaxSize())
                             }
@@ -1290,7 +1274,6 @@ fun SessionPage(
     session: RadioResult,
     onRequeue: () -> Unit,
     onShowDetails: () -> Unit,
-    onStartRadioFromTrack: ((QueuedTrackResult) -> Unit)? = null,
     replayEligibility: SessionReplayEligibility,
     modifier: Modifier = Modifier,
 ) {
@@ -1334,7 +1317,6 @@ fun SessionPage(
                 TrackResultRow(
                     trackResult = session.tracks[index],
                     session = session,
-                    onStartRadio = onStartRadioFromTrack,
                 )
             }
             if (!session.isComplete) {
@@ -1423,7 +1405,6 @@ private fun StreamingProgressItem(selected: Int, total: Int) {
 fun TrackResultRow(
     trackResult: QueuedTrackResult,
     session: RadioResult? = null,
-    onStartRadio: ((QueuedTrackResult) -> Unit)? = null,
 ) {
     var expanded by remember { mutableStateOf(false) }
     val seedDistanceEvidence = SeedDistanceEvidencePolicy.evidenceOrNull(session, trackResult)
@@ -1461,18 +1442,6 @@ fun TrackResultRow(
                             )
                         }
                     }
-                }
-            }
-            if (onStartRadio != null && trackResult.status == QueueStatus.QUEUED) {
-                IconButton(
-                    onClick = { onStartRadio(trackResult) },
-                    modifier = Modifier.size(40.dp),
-                ) {
-                    Icon(
-                        painterResource(R.drawable.ic_radio_waves),
-                        contentDescription = "Start radio from ${trackResult.track.title ?: "this track"}",
-                        modifier = Modifier.size(18.dp),
-                    )
                 }
             }
         }
@@ -1754,7 +1723,7 @@ fun IdleContent(
     databaseVerificationStatus: String?,
     permissionLoading: Boolean,
     statusMessage: String,
-    indexStatus: String?, indexPreparing: Boolean, isIdle: Boolean = true,
+    isIdle: Boolean = true,
     onRequestPermission: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -1779,11 +1748,6 @@ fun IdleContent(
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        if (indexStatus != null) {
-            if (indexPreparing) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-            Text(indexStatus, style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
         if (statusMessage.isNotEmpty()) {
             Text(statusMessage, style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1793,7 +1757,7 @@ fun IdleContent(
             !permissionLoading &&
             databaseInfo != null &&
             !databaseLoading &&
-            statusMessage.isEmpty() && indexStatus == null
+            statusMessage.isEmpty()
         ) {
             val activeCount = databaseInfo.activeTrackCount ?: databaseInfo.embeddingCount
             Text(
@@ -5010,13 +4974,15 @@ fun SettingsScreen(
                                                     unindexedCount == -2 ->
                                                         "Library has not been compared yet"
                                                     unindexedCount > 0 ->
-                                                        "${formatIndexingTrackCount(unindexedCount)} " +
+                                                        "Last comparison: " +
+                                                            "${formatIndexingTrackCount(unindexedCount)} " +
                                                             if (unindexedCount == 1) {
                                                                 "track ready to index"
                                                             } else {
                                                                 "tracks ready to index"
                                                             }
-                                                    else -> "No tracks are ready to index"
+                                                    else ->
+                                                        "Last comparison: no tracks ready to index"
                                                 },
                                                 style = if (unindexedCount > 0) MaterialTheme.typography.bodyMedium
                                                     else MaterialTheme.typography.bodySmall,

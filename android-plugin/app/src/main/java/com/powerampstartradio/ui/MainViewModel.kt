@@ -199,7 +199,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val databaseLifecycleBusy = AtomicBoolean(false)
     private val databaseRefreshGate = V2DatabaseRefreshRequestGate()
     private val modelCheckRunning = AtomicBoolean(false)
-    private val unindexedRefreshEvaluationRunning = AtomicBoolean(false)
 
     private fun logMemoryPhase(phase: String) {
         val runtime = Runtime.getRuntime()
@@ -325,15 +324,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _permissionLoading = MutableStateFlow(true)
     val permissionLoading: StateFlow<Boolean> = _permissionLoading.asStateFlow()
 
-    private val _indexStatus = MutableStateFlow<String?>(null)
-    val indexStatus: StateFlow<String?> = _indexStatus.asStateFlow()
-    private val _indexPreparing = MutableStateFlow(false)
-    val indexPreparing: StateFlow<Boolean> = _indexPreparing.asStateFlow()
-
     // --- Indexing state ---
     // -3 = last check failed, -2 = never checked, -1 = checking now, 0+ = ready count
-    // A persisted count is only displayed after its exact library identity is revalidated.
-    private val _unindexedCount = MutableStateFlow(-2)
+    // The persisted value is explicitly labeled as the last completed comparison in Settings.
+    private val _unindexedCount = MutableStateFlow(
+        prefs.getInt("unindexed_count", -2).takeIf { it >= 0 } ?: -2,
+    )
     val unindexedCount: StateFlow<Int> = _unindexedCount.asStateFlow()
 
     private val _unindexedCheckStatus = MutableStateFlow<String?>(null)
@@ -382,12 +378,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val previewComparisonHistory = SettingsPeekComparisonHistory()
     private val previewStateLock = Any()
 
-    // Lazy drift rank computation (on-expand)
     private var rankIndexSnapshot: RankIndexSnapshot? = null
-    private val driftRankJobLock = Any()
-    private val driftRankJobs = mutableMapOf<Long, Job>()
-    private val _driftRanks = MutableStateFlow<Map<Long, Int>>(emptyMap())
-    val driftRanks: StateFlow<Map<Long, Int>> = _driftRanks.asStateFlow()
 
     val radioState: StateFlow<RadioUiState> = RadioService.uiState
     val sessionHistory: StateFlow<List<RadioResult>> = RadioService.sessionHistory
@@ -431,8 +422,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
-
-    private val indicesPreparing = AtomicBoolean(false)
 
     override fun onCleared() {
         cancelFindMusicRequest()
@@ -719,18 +708,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         RadioService.startRadio(getApplication(), buildConfig())
     }
 
-    fun startRadioFromSessionTrack(
-        session: RadioResult,
-        trackResult: QueuedTrackResult,
-    ) {
-        RadioService.startRadioFromSessionTrack(
-            context = getApplication(),
-            session = session,
-            trackResult = trackResult,
-            config = buildConfig(),
-        )
-    }
-
     fun cancelSearch() {
         RadioService.cancelSearch()
     }
@@ -741,7 +718,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearSessionHistory() {
         RadioService.clearHistory()
-        _driftRanks.value = emptyMap()
     }
 
     fun requeueSession(session: RadioResult, placement: DirectQueuePlacement) {
@@ -1076,47 +1052,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun requestDriftRank(trackId: Long) {
-        if (_driftRanks.value.containsKey(trackId)) return
-        val refEmb = RadioService.driftReferences.value[trackId] ?: return
-        lateinit var job: Job
-        job = viewModelScope.launch(
-            context = Dispatchers.IO,
-            start = CoroutineStart.LAZY,
-        ) {
-            try {
-                val index = getOrOpenRankIndex() ?: return@launch
-                val sims = index.computeAllSimilarities(refEmb)
-                val rank = index.rankFromSimilarities(sims, trackId)
-                currentCoroutineContext().ensureActive()
-                _driftRanks.update { it + (trackId to rank) }
-            } finally {
-                synchronized(driftRankJobLock) {
-                    if (driftRankJobs[trackId] === job) driftRankJobs.remove(trackId)
-                }
-            }
-        }
-        trackRetrievalJobUntilCompletion(job)
-        val admitted = synchronized(RETRIEVAL_RESOURCE_ADMISSION_LOCK) {
-            if (recommendationResourcesBlocked()) {
-                false
-            } else {
-                synchronized(driftRankJobLock) {
-                    if (_driftRanks.value.containsKey(trackId) ||
-                        driftRankJobs.containsKey(trackId)
-                    ) {
-                        false
-                    } else {
-                        activeRetrievalResourceJobs.add(job)
-                        driftRankJobs[trackId] = job
-                        true
-                    }
-                }
-            }
-        }
-        if (admitted) job.start() else job.cancel()
-    }
-
     private fun getOrOpenRankIndex(): EmbeddingIndex? {
         val filesDir = getApplication<Application>().filesDir
         val activeGeneration = runCatching {
@@ -1166,10 +1101,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val activationBindingId: String?,
         val embeddingSha256: String,
     )
-
-    fun clearPreview(mode: SelectionMode) {
-        invalidatePreview(mode)
-    }
 
     fun invalidatePreview(mode: SelectionMode) {
         val job = synchronized(previewStateLock) {
@@ -2673,36 +2604,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Start radio using a text search match as seed.
-     */
-    fun startRadioFromDisplayedResult(result: TextSearchResult, match: TextSearchMatch) {
-        val binding = result.libraryBinding
-        if (binding == null || result.querySpec?.libraryBinding != binding ||
-            !result.hasExactActiveDomainBinding() ||
-            result.matches.none { it === match }
-        ) {
-            Log.w("MainViewModel", "Refusing radio from an unbound or stale displayed result")
-            return
-        }
-        Log.i(
-            "MainViewModel",
-            "START_RADIO_FROM_RESULT: trackId=${match.identity.embeddedTrackId} " +
-                "generation=${binding.generationId}",
-        )
-        RadioService.startRadioFromDisplayedResult(
-            context = getApplication(),
-            track = match.track,
-            identity = match.identity,
-            displayedBinding = binding,
-            displayedProviderGenerationId = checkNotNull(result.providerGenerationId),
-            displayedOrderedActiveTrackIdsSha256 =
-                checkNotNull(result.orderedActiveTrackIdsSha256),
-            displayedActiveTrackCount = checkNotNull(result.activeTrackCount),
-            config = buildConfig(),
-        )
-    }
-
-    /**
      * Queue a specific search result list directly into Poweramp.
      * The caller passes the exact result being displayed — no ambiguity.
      */
@@ -2889,9 +2790,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 replayEligibilityRevision.incrementAndGet()
                 replayEligibilityRefreshRunning.set(false)
                 replayEligibilityRefreshRequested.set(sessionHistory.value.isNotEmpty())
-                synchronized(driftRankJobLock) {
-                    driftRankJobs.clear()
-                }
                 activeRetrievalResourceJobs.toList()
             }
 
@@ -3054,8 +2952,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             RadioService.kickDeferredRecovery(getApplication<Application>())
         }
     }
-
-    fun clearTextSearchResult() = clearFindMusicResults()
 
     private fun saveRecentSearch(search: RecentSearch) {
         // Deduplicate by exact search state, not by human-facing label.
@@ -4146,12 +4042,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** Compatibility entry point for callers that still own the first text field. */
-    fun performMultiSeedSearch(textQuery: String) {
-        updateTextIngredientQuery(0, textQuery)
-        performFindMusicSearch()
-    }
-
     private suspend fun executeComposedSearch(
         revision: Long,
         querySpec: FindMusicQuerySpec,
@@ -4572,35 +4462,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun validateQueryContract(querySpec: FindMusicQuerySpec): String? =
         validateFindMusicQueryContract(querySpec)
 
-    fun clearMultiSeedResult() {
-        clearFindMusicResults()
-    }
-
-    /** Start radio from the exact All-of result snapshot, never from mutable editor controls. */
-    fun startComposedAllOfRadio(result: TextSearchResult) {
-        val current = _multiSeedResult.value
-        val querySpec = result.querySpec
-        if (current !== result || result.kind != FindMusicResultKind.COMPOSED ||
-            querySpec?.operator != FindMusicOperator.ALL_OF ||
-            result.libraryBinding == null ||
-            querySpec.libraryBinding != result.libraryBinding ||
-            result.preparedSeeds.isEmpty() || !result.hasExactActiveDomainBinding()
-        ) {
-            Log.w("MainViewModel", "Refusing composed radio from a stale or non-All-of result")
-            return
-        }
-        RadioService.startComposedAllOfRadio(
-            context = getApplication(),
-            querySpec = querySpec,
-            seeds = result.preparedSeeds,
-            displayedProviderGenerationId = checkNotNull(result.providerGenerationId),
-            displayedOrderedActiveTrackIdsSha256 =
-                checkNotNull(result.orderedActiveTrackIdsSha256),
-            displayedActiveTrackCount = checkNotNull(result.activeTrackCount),
-            config = buildConfig(),
-        )
-    }
-
     // --- Indexing actions ---
 
     fun checkUnindexedTracks() {
@@ -4713,154 +4574,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         ).also { IndexingViewModel.offerCompletedDetectionHandoff(it) }
     }
 
-    private sealed interface UnindexedRefreshOutcome {
-        data class Reused(val count: Int) : UnindexedRefreshOutcome
-        data class Detection(
-            val result: IndexingViewModel.SharedDetectionResult,
-        ) : UnindexedRefreshOutcome
-    }
-
-    fun maybeRefreshUnindexedTracks() {
-        if (!unindexedRefreshEvaluationRunning.compareAndSet(false, true)) return
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val app = getApplication<Application>()
-                if (!_hasPermission.value) return@launch
-                if (IndexingService.state.value !is IndexingService.IndexingState.Idle) {
-                    return@launch
-                }
-                if (_unindexedCount.value == -1) return@launch
-
-                _unindexedCount.value = -1
-                _unindexedCheckStatus.value = "Opening the complete Poweramp library"
-                var ownedPending: CompletableDeferred<IndexingViewModel.SharedDetectionResult>? = null
-                val outcome = try {
-                    V2ProcessLibraryInspectionCoordinator.inspect {
-                        val active = V2LibraryDatabaseResolver.requirePublished(
-                            app.filesDir,
-                        ) { progress ->
-                            val status = activeMusicIndexHashStatus(progress)
-                            _unindexedCheckStatus.value = status
-                            IndexingViewModel.detectionStatus.value = status
-                        }
-                        val snapshot = V2PowerampProviderSnapshotAcquirer(app).acquireBlocking {
-                                completedRows,
-                                totalRows,
-                            ->
-                            val status = powerampLibraryReadProgressText(
-                                completedRows,
-                                totalRows,
-                            )
-                            _unindexedCheckStatus.value = status
-                            IndexingViewModel.detectionStatus.value = status
-                        }
-                        val providerGeneration = requireNotNull(snapshot.libraryGeneration) {
-                            "Poweramp snapshot has no complete library generation"
-                        }
-                        val current = V2UnindexedCountCacheIdentity(
-                            databaseGeneration = active.manifest.generationId,
-                            providerGeneration = providerGeneration,
-                            exclusionsFingerprint =
-                                V2TrackExclusionRepository(app).persistedFingerprint(),
-                            attentionFingerprint =
-                                V2IndexingAttentionHistorySource(app).load().fingerprint,
-                            detectionPolicyId = V2UnindexedCountCachePolicy.DETECTION_POLICY_ID,
-                        )
-                        val saved = savedUnindexedCountIdentity()
-                        val savedCount = prefs.getInt("unindexed_count", -1)
-                        if (savedCount >= 0 &&
-                            V2UnindexedCountCachePolicy.canReuse(saved, current)
-                        ) {
-                            UnindexedRefreshOutcome.Reused(savedCount)
-                        } else {
-                            val cached = IndexingViewModel.exactCachedResult(
-                                databaseGeneration = active.manifest.generationId,
-                                providerGeneration = providerGeneration,
-                            )
-                            if (cached != null) {
-                                Log.i(
-                                    "MainViewModel",
-                                    "Reusing exact-generation unindexed track detection",
-                                )
-                                IndexingViewModel.offerCompletedDetectionHandoff(cached)
-                                UnindexedRefreshOutcome.Detection(cached)
-                            } else {
-                                Log.i(
-                                    "MainViewModel",
-                                    "Recomputing unindexed count for a new exact identity",
-                                )
-                                val pending = CompletableDeferred<
-                                    IndexingViewModel.SharedDetectionResult
-                                >()
-                                ownedPending = pending
-                                IndexingViewModel.pendingDetection = pending
-                                try {
-                                    val result = performUnindexedTrackDetection(active, snapshot)
-                                    pending.complete(result)
-                                    UnindexedRefreshOutcome.Detection(result)
-                                } catch (error: Throwable) {
-                                    pending.completeExceptionally(error)
-                                    throw error
-                                }
-                            }
-                        }
-                    }
-                } finally {
-                    ownedPending?.let { pending ->
-                        if (IndexingViewModel.pendingDetection === pending) {
-                            IndexingViewModel.pendingDetection = null
-                        }
-                    }
-                }
-                when (outcome) {
-                    is UnindexedRefreshOutcome.Reused -> {
-                        _unindexedCount.value = outcome.count
-                        Log.i(
-                            "MainViewModel",
-                            "Reused exact-generation unindexed count: ${outcome.count}",
-                        )
-                    }
-                    is UnindexedRefreshOutcome.Detection -> {
-                        publishUnindexedTrackCount(app, outcome.result)
-                    }
-                }
-                _unindexedCheckStatus.value = null
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (e: Exception) {
-                _unindexedCount.value = -3
-                _unindexedCheckStatus.value = null
-                Log.e("MainViewModel", "Unindexed count validation failed", e)
-            } finally {
-                unindexedRefreshEvaluationRunning.set(false)
-            }
-        }
-    }
-
-    private fun savedUnindexedCountIdentity(): V2UnindexedCountCacheIdentity =
-        V2UnindexedCountCacheIdentity(
-            databaseGeneration = prefs.getString(
-                "unindexed_count_database_generation",
-                "",
-            ).orEmpty(),
-            providerGeneration = prefs.getString(
-                "unindexed_count_provider_generation",
-                "",
-            ).orEmpty(),
-            exclusionsFingerprint = prefs.getString(
-                "unindexed_count_exclusions_fingerprint",
-                "",
-            ).orEmpty(),
-            attentionFingerprint = prefs.getString(
-                "unindexed_count_attention_fingerprint",
-                "",
-            ).orEmpty(),
-            detectionPolicyId = prefs.getString(
-                "unindexed_count_detection_policy",
-                "",
-            ).orEmpty(),
-        )
-
     private fun setUnindexedCount(count: Int, identity: V2UnindexedCountCacheIdentity) {
         _unindexedCount.value = count
         prefs.edit()
@@ -4874,9 +4587,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             .remove("unindexed_count_db_fingerprint")
             .apply()
     }
-
-    private fun getDbFingerprint(dbFile: File?): String =
-        if (dbFile?.isFile == true) "${dbFile.length()}_${dbFile.lastModified()}" else ""
 
     fun checkModels() {
         if (!modelCheckRunning.compareAndSet(false, true)) return
@@ -4894,9 +4604,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun refreshSettingsStatus() {
-        if (!unindexedRefreshEvaluationRunning.get()) _unindexedCount.value = -2
         checkModels()
-        maybeRefreshUnindexedTracks()
     }
 
     private fun checkModelsOnWorker() {
@@ -5074,80 +4782,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _findMusicRefinePrimaryIngredientIndex.value = 0
         setFindMusicRefineNeighborhood(FindMusicRefineNeighborhood.TOP_1_PERCENT)
         persistFindMusicTextResultPlanner(FindMusicTextResultPlanner.CLOSEST)
-    }
-
-    fun prepareIndices() {
-        if (!indicesPreparing.compareAndSet(false, true)) return
-        _indexPreparing.value = true
-        lateinit var job: Job
-        job = viewModelScope.launch(
-            context = Dispatchers.IO,
-            start = CoroutineStart.LAZY,
-        ) {
-            try {
-                prepareIndicesWithProgress { message ->
-                    _indexStatus.value = message
-                }
-            } finally {
-                _indexPreparing.value = false
-                indicesPreparing.set(false)
-            }
-        }
-        trackRetrievalJobUntilCompletion(job)
-        job.invokeOnCompletion {
-            _indexPreparing.value = false
-            indicesPreparing.set(false)
-        }
-        val admitted = synchronized(RETRIEVAL_RESOURCE_ADMISSION_LOCK) {
-            if (recommendationResourcesBlocked()) {
-                false
-            } else {
-                activeRetrievalResourceJobs.add(job)
-                true
-            }
-        }
-        if (admitted) {
-            job.start()
-        } else {
-            _indexPreparing.value = false
-            indicesPreparing.set(false)
-            job.cancel(CancellationException("On-device indexing owns recommendation resources"))
-        }
-    }
-
-    private suspend fun prepareIndicesWithProgress(onProgress: (String) -> Unit) {
-        val filesDir = getApplication<Application>().filesDir
-        val active = runCatching {
-            V2LibraryDatabaseResolver.requirePublished(filesDir)
-        }.getOrElse {
-            _indexStatus.value = "Import a music index before preparing search files"
-            return
-        }
-        val dbFile = active.databaseFile
-        try {
-            val db = EmbeddingDatabase.open(dbFile)
-            try {
-                val assets = RecommendationAssetFiles(active.embeddingFile, active.graphFile)
-                val engine = RecommendationEngine(db, filesDir, assets)
-                engine.ensureIndices(onProgress = { message ->
-                    onProgress(message)
-                    _indexStatus.value = message
-                })
-                val status = if (assets.graphFile == null) {
-                    "Search index ready; similarity graph not published"
-                } else {
-                    "Search and graph indices ready"
-                }
-                _indexStatus.value = status
-                onProgress(status)
-            } finally {
-                db.close()
-            }
-        } catch (e: Exception) {
-            Log.e("MainViewModel", "Search index preparation failed", e)
-            _indexStatus.value =
-                "Search index could not be prepared. Reopen Start Radio to try again."
-        }
     }
 
     fun checkPermission() {

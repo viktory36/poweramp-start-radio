@@ -48,11 +48,9 @@ import com.powerampstartradio.similarity.SimilarTrack
 import com.powerampstartradio.ui.QueueStatus
 import com.powerampstartradio.ui.ComposedRadioContract
 import com.powerampstartradio.ui.DirectQueuePlacement
-import com.powerampstartradio.ui.FindMusicOperator
 import com.powerampstartradio.ui.FindMusicQuerySpec
 import com.powerampstartradio.ui.FindMusicSessionEvidence
 import com.powerampstartradio.ui.FindMusicTrackEvidence
-import com.powerampstartradio.ui.LibraryAddedRange
 import com.powerampstartradio.ui.QueueDeliverySummary
 import com.powerampstartradio.ui.QueueOrigin
 import com.powerampstartradio.ui.QueuedTrackResult
@@ -238,25 +236,6 @@ class RadioService : Service() {
         private const val TAG = "RadioService"
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "radio_service"
-
-        private data class DisplayedSeedSelection(
-            val track: EmbeddedTrack,
-            val identity: RadioSeedIdentity,
-            val libraryBinding: StableIdentityGenerationBinding? = null,
-            val recommendationDomain: DisplayedRecommendationDomain? = null,
-            val sessionGeneration: RadioGenerationToken? = null,
-            val sessionProviderGenerationId: String? = null,
-        ) {
-            init {
-                val findMusicBinding =
-                    libraryBinding != null && recommendationDomain != null
-                val sessionBinding =
-                    sessionGeneration != null && !sessionProviderGenerationId.isNullOrBlank()
-                require(findMusicBinding != sessionBinding) {
-                    "A displayed seed needs exactly one generation-binding source"
-                }
-            }
-        }
 
         private data class DisplayedRecommendationDomain(
             val providerGenerationId: String,
@@ -626,7 +605,6 @@ class RadioService : Service() {
                 buildPinnedRadioRequest(
                     context = appContext,
                     config = config,
-                    displayedSeed = null,
                     currentSeedReference = expectedSeed,
                     showToasts = showToasts,
                     origin = origin,
@@ -1027,115 +1005,6 @@ class RadioService : Service() {
             }
         }
 
-        /** Start radio from one exact, generation-bound row in the displayed Find Music result. */
-        fun startRadioFromDisplayedResult(
-            context: Context,
-            track: EmbeddedTrack,
-            identity: RadioSeedIdentity,
-            displayedBinding: StableIdentityGenerationBinding,
-            displayedProviderGenerationId: String,
-            displayedOrderedActiveTrackIdsSha256: String,
-            displayedActiveTrackCount: Int,
-            config: RadioConfig,
-        ) {
-            val selection = DisplayedSeedSelection(
-                track = track.copy(),
-                identity = identity.copy(),
-                libraryBinding = displayedBinding.copy(),
-                recommendationDomain = DisplayedRecommendationDomain(
-                    displayedProviderGenerationId,
-                    displayedOrderedActiveTrackIdsSha256,
-                    displayedActiveTrackCount,
-                ),
-            )
-            val submissionToken = reserveSubmission(replaceActive = false) ?: return
-            _uiState.value = RadioUiState.Searching("Starting radio...")
-            submitRequest(context, submissionToken) { appContext ->
-                buildPinnedRadioRequest(
-                    context = appContext,
-                    config = config,
-                    displayedSeed = selection,
-                    showToasts = true,
-                    origin = QueueOrigin.TEXT_RESULT_RADIO,
-                )
-            }
-        }
-
-        /** Start radio from one exact row in the currently displayed completed queue. */
-        fun startRadioFromSessionTrack(
-            context: Context,
-            session: RadioResult,
-            trackResult: QueuedTrackResult,
-            config: RadioConfig,
-        ) {
-            val generation = session.generation
-            val providerGenerationId = session.providerGenerationId
-            if (
-                generation == null ||
-                providerGenerationId.isNullOrBlank() ||
-                trackResult.status != QueueStatus.QUEUED ||
-                session.tracks.none { it === trackResult }
-            ) {
-                _uiState.value = RadioUiState.Error(
-                    "This queue row does not have a current exact library binding",
-                )
-                return
-            }
-            val selection = DisplayedSeedSelection(
-                track = trackResult.track.copy(),
-                identity = RadioSeedIdentity(
-                    embeddedTrackId = trackResult.track.id,
-                    stableTrackSpanId = trackResult.stableTrackSpanId,
-                ),
-                sessionGeneration = generation.copy(),
-                sessionProviderGenerationId = providerGenerationId,
-            )
-            val submissionToken = reserveSubmission(replaceActive = false) ?: return
-            _uiState.value = RadioUiState.Searching("Starting radio from this queue track...")
-            submitRequest(context, submissionToken) { appContext ->
-                buildPinnedRadioRequest(
-                    context = appContext,
-                    config = config,
-                    displayedSeed = selection,
-                    showToasts = true,
-                    origin = QueueOrigin.QUEUE_TRACK_RADIO,
-                )
-            }
-        }
-
-        /** Start radio from the exact displayed, generation-bound All-of result. */
-        fun startComposedAllOfRadio(
-            context: Context,
-            querySpec: FindMusicQuerySpec,
-            seeds: List<SeedSpec>,
-            displayedProviderGenerationId: String,
-            displayedOrderedActiveTrackIdsSha256: String,
-            displayedActiveTrackCount: Int,
-            config: RadioConfig,
-        ) {
-            val querySnapshot = querySpec.copy(songSeeds = querySpec.songSeeds.toList())
-            val seedSnapshot = seeds.map { seed ->
-                seed.copy(embedding = seed.embedding.copyOf())
-            }
-            val submissionToken = reserveSubmission(replaceActive = false) ?: return
-            _uiState.value = RadioUiState.Searching("Starting All-of radio...")
-            submitRequest(context, submissionToken) { appContext ->
-                buildPinnedMultiSeedRequest(
-                    context = appContext,
-                    seeds = seedSnapshot,
-                    querySpec = querySnapshot,
-                    displayedDomain = DisplayedRecommendationDomain(
-                        displayedProviderGenerationId,
-                        displayedOrderedActiveTrackIdsSha256,
-                        displayedActiveTrackCount,
-                    ),
-                    config = config,
-                    showToasts = true,
-                    origin = QueueOrigin.COMPOSED_RADIO,
-                )
-            }
-        }
-
         /**
          * Queue a pre-computed list of tracks directly into Poweramp.
          * No recommendation engine — just map and queue.
@@ -1378,100 +1247,44 @@ class RadioService : Service() {
         private fun buildPinnedRadioRequest(
             context: Context,
             config: RadioConfig,
-            displayedSeed: DisplayedSeedSelection?,
-            currentSeedReference: WidgetRadioSeedReference? = null,
+            currentSeedReference: WidgetRadioSeedReference,
             showToasts: Boolean,
             origin: QueueOrigin,
             requestId: String = UUID.randomUUID().toString(),
             requestCreatedAtEpochMs: Long = System.currentTimeMillis(),
         ): DurableRadioRequest {
-            require((displayedSeed == null) != (currentSeedReference == null)) {
-                "A radio request requires exactly one displayed or current-track seed"
-            }
             val library = requireActiveLibrary(context, currentSeedReference)
             val active = library.activeGeneration
             val generation = library.generation
             val activeCatalog = library.activeCatalog
             withEmbeddingDatabase(active.databaseFile) { database ->
-                val seed = if (displayedSeed != null) {
-                    val displayedDomain = displayedSeed.recommendationDomain
-                    val displayedBinding = displayedSeed.libraryBinding
-                    if (displayedDomain != null && displayedBinding != null) {
-                        requireDisplayedDomainBinding(library, displayedDomain)
-                        DisplayedResultBindingGuard.requireExactGeneration(
-                            displayedBinding,
-                            generation,
-                        )
-                    } else {
-                        require(displayedSeed.sessionGeneration == generation) {
-                            "The music-index generation changed after this queue was displayed"
-                        }
-                        require(
-                            displayedSeed.sessionProviderGenerationId ==
-                                library.providerGenerationId,
-                        ) {
-                            "The Poweramp library changed after this queue was displayed"
-                        }
-                    }
-                    val track = requireNotNull(
-                        database.getTrackById(displayedSeed.identity.embeddedTrackId),
-                    ) {
-                        "Seed track is not in the active generation"
-                    }
-                    DisplayedResultBindingGuard.requireExactTrackIdentity(
-                        displayedTrackId = displayedSeed.track.id,
-                        displayedIdentity = displayedSeed.identity,
-                        activeStableTrackSpanId = readStableTrackSpanId(
+                val providerBinding = requireNotNull(library.requiredSeedProviderBinding) {
+                    "The displayed Poweramp seed was not verified"
+                }
+                val provider = providerBinding.matchingEntry
+                require(currentSeedReference.matchesProvider(provider)) {
+                    "The displayed Poweramp seed changed before it could be pinned"
+                }
+                val trackId = requireNotNull(
+                    activeCatalog.trackIdForPowerampFile(provider.id),
+                ) {
+                    "The displayed Poweramp track is not in the active generation"
+                }
+                val track = requireNotNull(database.getTrackById(trackId)) {
+                    "The displayed Poweramp track has no active embedding row"
+                }
+                val seed = PinnedRadioSeed(
+                    identity = RadioSeedIdentity(
+                        embeddedTrackId = track.id,
+                        stableTrackSpanId = readStableTrackSpanId(
                             active.databaseFile,
                             track.id,
                             generation.embeddingSpecId,
                         ),
-                    )
-                    val fileId = requireNotNull(activeCatalog.powerampFileIdForTrack(track.id)) {
-                        "Seed track is not in the active Poweramp catalog"
-                    }
-                    PinnedRadioSeed(
-                        identity = displayedSeed.identity,
-                        displayTrack = PowerampTrack(
-                            realId = fileId,
-                            title = track.title ?: "Unknown",
-                            artist = track.artist,
-                            album = track.album,
-                            durationMs = track.durationMs,
-                            path = track.filePath,
-                        ),
-                        matchType = TrackMatcher.MatchType.ACTIVE_CATALOG_EXACT,
-                    )
-                } else {
-                    val reference = requireNotNull(currentSeedReference)
-                    val providerBinding = requireNotNull(library.requiredSeedProviderBinding) {
-                        "The displayed Poweramp seed was not verified"
-                    }
-                    val provider = providerBinding.matchingEntry
-                    require(reference.matchesProvider(provider)) {
-                        "The displayed Poweramp seed changed before it could be pinned"
-                    }
-                    val trackId = requireNotNull(
-                        activeCatalog.trackIdForPowerampFile(provider.id),
-                    ) {
-                        "The displayed Poweramp track is not in the active generation"
-                    }
-                    val track = requireNotNull(database.getTrackById(trackId)) {
-                        "The displayed Poweramp track has no active embedding row"
-                    }
-                    PinnedRadioSeed(
-                        identity = RadioSeedIdentity(
-                            embeddedTrackId = track.id,
-                            stableTrackSpanId = readStableTrackSpanId(
-                                active.databaseFile,
-                                track.id,
-                                generation.embeddingSpecId,
-                            ),
-                        ),
-                        displayTrack = providerBinding.toDisplayTrack(reference),
-                        matchType = TrackMatcher.MatchType.ACTIVE_CATALOG_EXACT,
-                    )
-                }
+                    ),
+                    displayTrack = providerBinding.toDisplayTrack(currentSeedReference),
+                    matchType = TrackMatcher.MatchType.ACTIVE_CATALOG_EXACT,
+                )
                 val embeddingIndex = EmbeddingIndex.mmap(active.embeddingFile, preload = false)
                 val identityCatalog = StableTrackIdentityCatalog.load(
                     filesDir = context.filesDir,
@@ -1502,68 +1315,6 @@ class RadioService : Service() {
                     origin = origin,
                     requestId = requestId,
                     createdAtEpochMs = requestCreatedAtEpochMs,
-                )
-            }
-        }
-
-        private fun buildPinnedMultiSeedRequest(
-            context: Context,
-            seeds: List<SeedSpec>,
-            querySpec: FindMusicQuerySpec,
-            displayedDomain: DisplayedRecommendationDomain,
-            config: RadioConfig,
-            showToasts: Boolean,
-            origin: QueueOrigin,
-        ): DurableRadioRequest {
-            val library = requireActiveLibrary(context)
-            val active = library.activeGeneration
-            val generation = library.generation
-            requireDisplayedDomainBinding(library, displayedDomain)
-            require(querySpec.operator == FindMusicOperator.ALL_OF) {
-                "Radio is available only for an All-of Find Music result"
-            }
-            val queryBinding = requireNotNull(querySpec.libraryBinding) {
-                "The displayed Find Music result is not bound to an exact library generation"
-            }
-            DisplayedResultBindingGuard.requireExactGeneration(queryBinding, generation)
-            withEmbeddingDatabase(active.databaseFile) { database ->
-                val identities = seeds.map { seed ->
-                    seed.trackId?.let { trackId ->
-                        require(library.activeCatalog.containsActiveTrack(trackId)) {
-                            "A song ingredient is not in the active Poweramp catalog"
-                        }
-                        requireNotNull(database.getTrackById(trackId)) {
-                            "A song ingredient is not in the active generation"
-                        }
-                        val committedEmbedding = requireNotNull(database.getEmbedding(trackId)) {
-                            "A song ingredient has no embedding in the active generation"
-                        }
-                        require(committedEmbedding.contentEquals(seed.embedding)) {
-                            "A song ingredient embedding differs from the active generation"
-                        }
-                        RadioSeedIdentity(
-                            embeddedTrackId = trackId,
-                            stableTrackSpanId = readStableTrackSpanId(
-                                active.databaseFile,
-                                trackId,
-                                generation.embeddingSpecId,
-                            ),
-                        )
-                    }
-                }
-                return DurableRadioRequest.multiSeed(
-                    generation = generation,
-                    providerGenerationId = library.providerGenerationId,
-                    seeds = seeds,
-                    seedIdentities = identities,
-                    querySpec = querySpec,
-                    config = normalizeComposedRadioConfig(config).copy(
-                        libraryAddedRange = LibraryAddedRange.ALL_DATES,
-                        libraryAddedDays = querySpec.effectiveLibraryAddedDays,
-                    ),
-                    composedContract = ComposedRadioContract(),
-                    showToasts = showToasts,
-                    origin = origin,
                 )
             }
         }
@@ -1996,10 +1747,6 @@ class RadioService : Service() {
             }
         }
 
-        private fun normalizeComposedRadioConfig(config: RadioConfig): RadioConfig = config.copy(
-            selectionMode = SelectionMode.CLOSEST,
-        ).forSelectionRequest()
-
         fun cancelSearch() {
             activeJob?.cancel()
             _uiState.value = RadioUiState.Searching("Cancelling safely...")
@@ -2326,7 +2073,6 @@ class RadioService : Service() {
             val request = buildPinnedRadioRequest(
                 context = this,
                 config = ingress.config,
-                displayedSeed = null,
                 currentSeedReference = ingress.expectedSeed,
                 showToasts = true,
                 origin = QueueOrigin.WIDGET_RADIO,

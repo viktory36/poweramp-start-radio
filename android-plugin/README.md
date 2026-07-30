@@ -45,12 +45,15 @@ evidence, including true seed-nearest rank over the full active library.
 Find Music uses tie-aware corpus percentiles so ingredients with different raw cosine
 distributions remain comparable:
 
+- **Single description / Closest** orders the complete eligible scope by text-to-audio cosine.
+- **Single description / Varied** uses that same relevance as DPP quality for a less redundant set.
 - **All of / Ranked** orders by the weighted geometric mean of ingredient percentiles.
 - **All of / Varied** uses that same objective as DPP quality to reduce result-set redundancy.
 - **Refine** selects an exact primary neighborhood and ranks it by the secondary ingredient.
-- **Like / Avoid** controls the sign of an ingredient instead of inferring intent from text.
+- **Like / Less like** explicitly controls an ingredient's ranking direction.
 
-All requests are deterministic for the same validated index generation and recorded settings.
+All requests are deterministic for the same validated index generation, active Poweramp library
+binding, and complete recorded request.
 
 ## Build
 
@@ -96,8 +99,10 @@ Export these with `poweramp-indexer export all`. They are not bundled in the APK
 does not install them. A debug build can be provisioned with `run-as`:
 
 ```bash
+MODEL_DIR=../desktop-indexer/models
+
 for file in mert.tflite clamp3_audio.tflite clamp3_text.tflite sentencepiece.bpe.model; do
-  adb push "../models/$file" "/data/local/tmp/$file"
+  adb push "$MODEL_DIR/$file" "/data/local/tmp/$file"
   adb shell run-as com.powerampstartradio.v2 \
     cp "/data/local/tmp/$file" "files/$file"
   adb shell rm -f "/data/local/tmp/$file"
@@ -108,17 +113,8 @@ Use **Settings > Import a music index** for the initial desktop `embeddings.db`.
 validates the SQLite rows, model identity, and embedding policy before publishing an immutable
 generation. Do not overwrite files inside an active generation with ADB.
 
-Each generation binds:
-
-- the canonical SQLite database;
-- the ordered packed CLaMP3 embedding file;
-- the optional Graph Explorer graph and its proof;
-- the ordered track and visible-identity sets;
-- model and preprocessing contracts; and
-- content hashes and activation identity.
-
-On-device indexing and server merge stage their work privately and change the active pointer only
-after the replacement generation reopens and validates.
+On-device indexing and server merge stage replacement generations privately. The active pointer
+changes atomically only after the complete replacement reopens and validates.
 
 ## On-Device Indexing
 
@@ -155,9 +151,6 @@ queue. The widget follows the same path.
 - Cross-encode, alternate-master, and live/studio duplicates are collapsed only when the app has
   proof that they share a stable recording identity. Similar metadata plus a close embedding is not
   treated as proof, so some apparent duplicates can remain.
-- A completed current queue exposes a radio icon on each confirmed row. The service accepts that
-  seed only while the saved index generation, Poweramp provider snapshot, embedded row, and stable
-  span identity still match. Historical rows remain evidence/requeue surfaces.
 - A clean install still needs the manual model provisioning step above. Find Music now checks for
   its index, text encoder, and tokenizer before opening, but the app does not yet install them.
 
@@ -165,8 +158,9 @@ queue. The widget follows the same path.
 
 The curated concluding record is in [`../EVALUATION.md`](../EVALUATION.md), with PR-ready evidence
 and limitations in [`../V2_RELEASE_NOTES.md`](../V2_RELEASE_NOTES.md). It covers the visible
-selector/knob matrix, repeated composed searches, real queue delivery, a server-merge overlap,
-full-span indexing, pause/resume, activation, and cleanup.
+selector/knob matrix, repeated composed searches, a server-merge overlap, full-span indexing,
+pause/resume, activation, and cleanup. Its device evidence is bound to the accepted build named
+there rather than every later source edit.
 
 Useful scripts:
 

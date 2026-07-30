@@ -8,7 +8,7 @@ Measured claims belong in `EVALUATION.md`.
 
 Poweramp Start Radio is an offline intelligence layer over a Poweramp library. It:
 
-- builds one CLaMP3 embedding per recording;
+- builds one CLaMP3 embedding per indexed track or logical span;
 - creates radio queues from Poweramp's current recording;
 - retrieves music from text and explicitly confirmed recording ingredients;
 - sends the resulting ordered identities to Poweramp's queue;
@@ -47,7 +47,7 @@ The active model path is CLaMP3:
 audio
   -> decode to mono
   -> resample to 24 kHz
-  -> complete-track 5 second MERT windows
+  -> complete indexed-span 5 second MERT windows
   -> CLaMP3 audio encoder
   -> normalized 768d embedding
 
@@ -77,14 +77,14 @@ cleanup, or indexing job:
 2. validates database, embedding, graph, model, and active-library bindings;
 3. fsyncs the generation;
 4. atomically publishes the active pointer;
-5. retains the previous valid generation until cleanup can remove it safely.
+5. prunes unreferenced generations after pointer commit while protecting nonterminal jobs.
 
 The main entry points are under:
 
 - `indexing/v2/V2IndexGenerationActivation.kt`
 - `indexing/v2/V2BootstrapGenerationImporter.kt`
 - `indexing/v2/V2ServerBundleMerger.kt`
-- `indexing/v2/V2IndexingJobRepository.kt`
+- `indexing/v2/V2IndexingRuntime.kt`
 
 Recommendation work and index mutation are serialized through:
 
@@ -170,7 +170,7 @@ Important invariants:
 - pause/resume and process recovery use the durable job, not an in-memory counter;
 - failed tracks retain an explicit retry/exclusion disposition;
 - progress names the current measured stage and ETA uses observed stage rates;
-- model hashes are received once and reused until the files change;
+- model hashes are computed once and reused until the files change;
 - decode may overlap later inference only when the persisted stage contract remains recoverable;
 - the app owns its wake lock and foreground-service lifetime during active work;
 - a stale graph proof must never be inherited into a new generation.
@@ -180,7 +180,7 @@ Start with:
 - `indexing/IndexingActivity.kt`
 - `indexing/IndexingService.kt`
 - `indexing/v2/V2IndexingJobPreflightPlanner.kt`
-- `indexing/v2/V2IndexingWorkPolicy.kt`
+- `indexing/v2/V2IndexingPreflightPrimitives.kt`
 - `indexing/GraphUpdater.kt`
 
 ## Server Indexer
@@ -219,11 +219,11 @@ cd android-plugin
 The current development application ID is `com.powerampstartradio.v2`. Debug-only receivers and
 acceptance activities live in `app/src/debug`; do not move them into the release manifest.
 
-For recommendation changes, validate formula, exact candidate domain, stable ordering, filters,
-copy reduction, and native/reference parity. For indexing changes, validate a real track lifecycle,
-complete source span, device/host embedding cosine, pause/resume, ETA evidence, and published
-generation hashes. Do not substitute a green isolated unit test for the corresponding runtime
-claim.
+Validate the contracts affected by the change. Recommendation changes may require formula, exact
+candidate domain, stable ordering, filters, copy reduction, and native/reference parity. Indexing
+changes may require a real track lifecycle, complete source span, device/host embedding cosine,
+pause/resume, ETA evidence, and published generation hashes. Do not rerun unrelated matrices, and
+do not substitute a green isolated unit test for the corresponding runtime claim.
 
 ## Change Discipline
 

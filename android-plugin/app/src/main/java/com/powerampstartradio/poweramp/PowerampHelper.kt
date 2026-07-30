@@ -1,12 +1,10 @@
 package com.powerampstartradio.poweramp
 
-import android.content.ComponentName
 import android.content.ContentProviderOperation
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.database.Cursor
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -336,8 +334,6 @@ object PowerampHelper {
 
     // Poweramp package and component names
     const val POWERAMP_PACKAGE = "com.maxmpz.audioplayer"
-    private const val API_ACTIVITY = "com.maxmpz.audioplayer.apiactivity.ApiActivity"
-
     // Poweramp content provider authority
     private const val AUTHORITY = "com.maxmpz.audioplayer.data"
     val ROOT_URI: Uri = Uri.parse("content://$AUTHORITY")
@@ -397,19 +393,6 @@ object PowerampHelper {
         val verified: Boolean,
         val error: String?,
     )
-
-    /**
-     * Send a command intent to Poweramp via its API Activity.
-     */
-    fun sendIntent(context: Context, intent: Intent) {
-        intent.setComponent(ComponentName(POWERAMP_PACKAGE, API_ACTIVITY))
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        try {
-            context.startActivity(intent)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to send intent to Poweramp", e)
-        }
-    }
 
     /**
      * Request permission from Poweramp to access its content provider.
@@ -523,114 +506,6 @@ object PowerampHelper {
         }
         return sticky?.takeIf { it.hasExtra(EXTRA_STATE) }?.getIntExtra(EXTRA_STATE, STATE_STOPPED)
     }
-
-    /**
-     * Query Poweramp's files table to find a file ID by metadata.
-     */
-    fun findFileIdByMetadata(
-        context: Context,
-        artist: String?,
-        album: String?,
-        title: String,
-        durationMs: Int
-    ): Long? {
-        val filesUri = ROOT_URI.buildUpon().appendEncodedPath("files").build()
-
-        // Build selection query
-        val selection = StringBuilder()
-        val selectionArgs = mutableListOf<String>()
-
-        selection.append("title_tag LIKE ?")
-        selectionArgs.add(title)
-
-        if (!artist.isNullOrEmpty()) {
-            selection.append(" AND (artist LIKE ? OR album_artist LIKE ?)")
-            selectionArgs.add(artist)
-            selectionArgs.add(artist)
-        }
-
-        if (!album.isNullOrEmpty()) {
-            selection.append(" AND album LIKE ?")
-            selectionArgs.add(album)
-        }
-
-        // Duration check with tolerance (within 5 seconds)
-        val durationSec = durationMs / 1000
-        selection.append(" AND duration BETWEEN ? AND ?")
-        selectionArgs.add((durationSec - 5).toString())
-        selectionArgs.add((durationSec + 5).toString())
-
-        try {
-            val cursor: Cursor? = context.contentResolver.query(
-                filesUri,
-                arrayOf("folder_files._id"),
-                selection.toString(),
-                selectionArgs.toTypedArray(),
-                null
-            )
-
-            cursor?.use {
-                if (it.moveToFirst()) {
-                    return it.getLong(0)
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error querying Poweramp files", e)
-        }
-
-        return null
-    }
-
-    /**
-     * Get all file IDs from Poweramp's library.
-     * Returns a map of metadata key to file ID.
-     */
-    fun getAllFileIds(context: Context): Map<String, Long> {
-        val filesUri = ROOT_URI.buildUpon().appendEncodedPath("files").build()
-        val result = mutableMapOf<String, Long>()
-
-        try {
-            val cursor = context.contentResolver.query(
-                filesUri,
-                arrayOf("folder_files._id", "artist", "album", "title_tag", "folder_files.duration"),
-                null,
-                null,
-                null
-            )
-
-            cursor?.use {
-                val idIdx = it.getColumnIndex("_id")
-                val artistIdx = it.getColumnIndex("artist")
-                val albumIdx = it.getColumnIndex("album")
-                val titleIdx = it.getColumnIndex("title_tag")
-                val durationIdx = it.getColumnIndex("duration")
-
-                while (it.moveToNext()) {
-                    val id = it.getLong(idIdx)
-                    val artist = (it.getString(artistIdx) ?: "").lowercase().trim()
-                    val album = (it.getString(albumIdx) ?: "").lowercase().trim()
-                    val title = (it.getString(titleIdx) ?: "").lowercase().trim()
-                    val durationMs = it.getInt(durationIdx)
-
-                    // Create metadata key matching desktop indexer format (rounds to 100ms)
-                    val durationRounded = (durationMs / 100) * 100
-                    val key = "$artist|$album|$title|$durationRounded"
-                    result[key] = id
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error getting all file IDs", e)
-        }
-
-        return result
-    }
-
-    /**
-     * Get all file entries from Poweramp's library with NFC-normalized individual fields.
-     * Used by TrackMatcher for robust matching that doesn't depend on pipe-delimited keys.
-     */
-    fun getAllFileEntries(context: Context): List<PowerampFileEntry> =
-        requireCompleteFileSnapshot(context).entries
 
     /** Read one exact provider-owned file identity without materializing the complete library. */
     fun requireFileEntryById(context: Context, fileId: Long): PowerampFileEntry =
@@ -842,18 +717,6 @@ object PowerampHelper {
 
         return PowerampLibrarySnapshot(entries = result.toList())
     }
-    /**
-     * Clear the Poweramp queue.
-     */
-    fun clearQueue(context: Context) {
-        val queueUri = ROOT_URI.buildUpon().appendEncodedPath("queue").build()
-        try {
-            context.contentResolver.delete(queueUri, null, null)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error clearing queue", e)
-        }
-    }
-
     /**
      * Append tracks and verify the newly observable queue entries by provider readback.
      */
@@ -1338,14 +1201,6 @@ object PowerampHelper {
             fallbackUsed = false,
             verificationError = verificationErrors.takeIf { it.isNotEmpty() }?.joinToString("; "),
         )
-    }
-
-    /**
-     * Check if a file is currently in the Poweramp queue.
-     */
-    fun isInQueue(context: Context, fileId: Long): Boolean {
-        val snapshot = readQueueSnapshot(context)
-        return snapshot.error == null && snapshot.entries.any { it.fileId == fileId }
     }
 
     /**

@@ -130,10 +130,6 @@ class V2ExactSourceFingerprinter : V2SourceFingerprintProvider {
     }
 }
 
-/** Kept source-compatible for older tests/callers; production semantics are now exact. */
-@Deprecated("Use V2ExactSourceFingerprinter")
-class V2FastSourceFingerprinter : V2SourceFingerprintProvider by V2ExactSourceFingerprinter()
-
 /** Reuses one physical-source fingerprint across logical CUE rows in the same preflight run. */
 class V2DeduplicatingSourceFingerprintProvider(
     private val delegate: V2SourceFingerprintProvider,

@@ -23,19 +23,19 @@ Current-track radio is shaped by:
 ### Find Music
 
 A single positive description uses raw text-to-audio cosine over the complete active indexed
-library scope selected in Settings. The result screen is the queue: it shows the exact ordered rows
-and can replace or append that displayed ranking in Poweramp.
+library scope selected in Settings. `Closest` returns that ranking directly; `Varied (DPP)` uses the
+same relevance as quality while selecting a less redundant set. The result screen is the queue: it
+shows the exact ordered rows and can replace or append that displayed result in Poweramp.
 
 Structured Find Music combines up to several text descriptions and recording ingredients. The
 request explicitly declares:
-- `All of`: a weighted geometric mean of tie-aware active-library percentiles; Like and Avoid
+- `All of`: a weighted geometric mean of tie-aware active-library percentiles; Like and Less like
   ingredients are supported
 - `Refine`: an exact nearest neighborhood around one positive primary ingredient, ordered by the
   other ingredient
 
-Final weights or Refine neighborhood, signs, operator, result count, exact recording anchors,
-active-library binding, ranking evidence, and copy reduction are saved with the result and its
-session history.
+The complete request, active-library binding, displayed result order, and its ranking evidence are
+saved so session history can replay what actually ran.
 
 ## Common Radio Controls
 
@@ -88,12 +88,12 @@ delivered.
 
 ### Uniform shuffle
 
-Uniform Shuffle assigns each eligible active indexed span one deterministic priority from the
-stored shuffle seed. Full-file copies proven equal by complete content identity and exact indexed
-span share one place; sampled, unproven, and legacy rows remain distinct.
+Uniform Shuffle assigns each eligible active indexed span one deterministic priority. Full-file
+copies proven equal by complete content identity and exact indexed span share one place; sampled,
+unproven, and legacy rows remain distinct.
 
-Its only selector input is the reproducible shuffle seed. Every eligible identity receives equal
-membership opportunity, preserving the distinct utility of ordinary shuffle.
+Every eligible identity receives equal membership opportunity. `New order` creates another
+reproducible permutation, and saved sessions retain their exact generated order.
 
 ### Maximum Marginal Relevance (MMR)
 
@@ -112,20 +112,22 @@ What it brings:
 - a direct relevance-versus-variety tradeoff
 
 Controls:
-- `Relevance weight`
-- `Neighborhood reach`
+- `Seed relevance ... · variety ...`, or `Current-direction relevance ... · variety ...` with drift
+- `Selection pool`
 
-How `Relevance weight` changes MMR:
+How the displayed relevance/variety balance changes MMR:
 - higher values keep more of the queue close to the seed
 - lower values let the diversity penalty bite harder
 - very high values approach straight nearest-neighbor retrieval
 - lower values still stay in the same neighborhood, but spend more of the queue covering different parts of it
 
-`Neighborhood reach` is the nearest fraction of the active indexed library that MMR may
-rerank. Without drift this is one fixed seed-nearest subset. With drift it is a nearest frontier
-retrieved again around the evolving query after every pick. The measured default is `2%`. A wider
-reach can expose farther directions, especially at low relevance weight; at high relevance weight
-it may produce the same queue because no farther candidate can overcome the relevance term.
+`Selection pool` is the nearest fraction of the eligible identity domain that MMR may rerank.
+Without drift this is one fixed seed-nearest subset. With drift it is a nearest frontier retrieved
+again around the evolving query after every pick. The candidate count is the selected fraction
+rounded down, with a minimum of 100 or the requested queue length, whichever is larger, and a
+maximum of the available domain. The measured default is `2%`. A wider pool can expose farther
+directions, especially at low relevance; at high relevance it may produce the same queue because no
+farther candidate can overcome the relevance term.
 
 ### Determinantal Point Process (DPP)
 
@@ -142,18 +144,20 @@ What it brings:
 - a more globally balanced set than MMR usually produces
 
 Controls:
-- `Seed pull exponent`
-- `All eligible` or `Nearest subset`
-- subset reach when `Nearest subset` is selected
+- `Selection pool`: `All eligible` or `Nearest subset`
+- `Subset size` when `Nearest subset` is selected
+- `Seed pull`
 
-`Seed pull exponent` raises non-negative seed relevance before DPP constructs its quality
-terms. Higher values favor seed relevance more strongly; lower values let determinant novelty
-carry more influence.
+Stronger `Seed pull` gives seed relevance more influence in DPP's quality term. Lighter values give
+the determinant's set diversity more influence. At the lightest setting the nearest candidate wins
+the first stable tie, then later picks are driven by set variety.
 
 The default `All eligible` option uses a bounded working set and widens it until every greedy
 choice is proven against every unseen eligible candidate. This reproduces the complete-domain
 greedy sequence; it does not claim global DPP MAP optimality. Turning it off intentionally
-changes the eligible domain to the chosen nearest fraction.
+changes the eligible domain to `Subset size`. Its candidate count follows the same rule as MMR:
+selected fraction rounded down, at least 100 or the requested queue length, and no more than the
+available domain.
 
 Useful contrast with MMR:
 - `MMR` compares a candidate to the single chosen track it most overlaps with
@@ -206,41 +210,43 @@ In the current app:
 
 Drift changes the query after each pick, so later selections are not based only on the original seed.
 
-### Seed interpolation
+### Seed + last pick
 
 Each step builds the next query as a weighted mix of:
 - the original seed
 - the most recently chosen track
 
 Controls:
-- `Seed weight`
-- decay schedule
+- `Starting seed pull`
+- `Seed-pull fade`
+- `Half-strength point`, `Half-life`, or `Drop point` when the chosen fade uses timing
 
-How `Seed weight` changes seed interpolation:
+How `Starting seed pull` changes this direction:
 - high values keep the original seed strongly present throughout the queue
 - low values let the latest pick steer the next search more aggressively
 
-Decay schedules:
+`Seed-pull fade` schedules:
 - `Hold`: the seed keeps the same strength throughout
-- `Linear`: the seed fades steadily over the queue
-- `Exponential`: the seed fades quickly at first, then more gently
-- `Step`: the seed holds, then drops more abruptly
+- `Linear`: seed pull reaches half strength at the selected point and zero after twice that many
+  picks
+- `Exponential`: seed pull halves after the selected number of picks, independently of requested
+  queue length
+- `Step`: seed pull holds for the selected number of picks, then falls to one fifth
 
-Step only offers drop points early enough to affect at least one remaining pick in the requested
-queue. Its label states the number of picks completed before the lower seed pull takes effect.
+Step offers only drop points early enough to affect at least one remaining pick.
 
 This is the more anchor-aware version of drift.
 
-### Momentum
+### Rolling direction (momentum)
 
 Momentum keeps a running average of where the queue has been heading.
 
 Instead of mixing only the seed and the latest pick, it blends each new pick into a continuing state that becomes the next query.
 
 Control:
-- `Carry-over`
+- `Prior-direction memory`
 
-How `Carry-over` changes momentum:
+How `Prior-direction memory` changes momentum:
 - high values make the running average change slowly
 - low values let new picks redirect the query quickly
 
@@ -257,8 +263,8 @@ A compact way to read the radio surface:
 Examples:
 - `MMR` + high relevance + no drift: tight neighborhood around the seed
 - `MMR` + lower relevance + drift: a wider local neighborhood with a changing query
-- `DPP` + full-library result: complete-domain greedy set coverage
-- `DPP` + fixed reach: set coverage inside an intentional relevance boundary
+- `DPP` + All eligible: complete-domain greedy set coverage
+- `DPP` + Nearest subset: set coverage inside an intentional relevance boundary
 - `Graph Explorer` + low stop chance: longer routes through the graph
 
 ## Search Controls
@@ -276,9 +282,9 @@ An ingredient is either:
 - one explicitly confirmed active-library recording embedding
 
 The app never silently picks the first title match for a recording ingredient. Every ingredient
-has an explicit Like/Avoid sign where that direction has a truthful interpretation. `All of`
-supports Like and Avoid ingredients. Refine requires a Like primary; its secondary ingredient may
-be Like or Avoid.
+has an explicit Like/Less like direction where that has a truthful interpretation. `All of`
+supports Like and Less like ingredients. Refine requires a Like primary; its secondary ingredient
+may be Like or Less like.
 
 ### Weight and Hold
 
@@ -296,7 +302,7 @@ one objective.
 
 For every active ingredient, the app computes exact cosine against the selected library/date scope
 and converts the tie-aware order into a scope percentile. Like ingredients reward high percentile;
-Avoid ingredients reverse their percentile. The weighted geometric mean ranks rows that satisfy
+Less like ingredients reverse their percentile. The weighted geometric mean ranks rows that satisfy
 the declared intersection.
 
 All-of has one contextual Result set choice:
@@ -320,7 +326,7 @@ Refine first takes the declared nearest 0.25%, 0.5%, 1%, or 2% of eligible non-s
 identities around its positive primary ingredient. The size is exactly the ceiling of the eligible
 identity count times that fraction. It then orders only those candidates by the secondary
 ingredient's effective percentile, followed by primary percentile and stable identity tie-breaks.
-The secondary ingredient may be Like or Avoid.
+The secondary ingredient may be Like or Less like.
 
 The app never widens the primary neighborhood to fill Results. If the chosen neighborhood contains
 fewer identities than the requested result count, it returns the available set. Result evidence
@@ -342,33 +348,4 @@ Its contextual Result set choice is:
 ### Direct queueing and history
 
 `Queue N` queues the rows already on screen, either replacing upcoming tracks or appending after
-them, as one exact result-list session. The durable session stores the query, library binding,
-ranking evidence, result order, and copy-reduction evidence so history and requeue preserve the
-request that actually ran.
-
-## Control Inclusion Rule
-
-A visible control must be a stable semantic input to the stated algorithm, have at least two
-distinct applicable values in the current context, and be capable of changing its declared plan.
-Mathematical aliases, current-library count aliases, scheduler tick sizes, derived buffer sizes,
-and unbenchmarked resource profiles are not user agency and stay out of the ordinary UI. Saved
-intent may be preserved while an inapplicable control is hidden or disabled.
-
-This rule does not require every value to change every queue. It requires the choice itself to be
-real, reproducible, and understandable from the promise of the feature.
-
-## Source of Truth
-
-Implementation lives in:
-- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/RecommendationEngine.kt`
-- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/ActiveRecommendationDomain.kt`
-- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/algorithms/ClosestSelector.kt`
-- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/algorithms/MmrSelector.kt`
-- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/algorithms/DppSelector.kt`
-- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/algorithms/GraphExplorerSelector.kt`
-- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/algorithms/UniformShuffleSelector.kt`
-- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/algorithms/DriftEngine.kt`
-- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/algorithms/GeoMeanSelector.kt`
-- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/FindMusicAllOfQueuePlanner.kt`
-- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/FindMusicTextQueuePlanner.kt`
-- `android-plugin/app/src/main/java/com/powerampstartradio/ui/MainViewModel.kt`
+them. The displayed order is saved and replayed exactly.

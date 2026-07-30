@@ -19,17 +19,19 @@ for export to Android. Production musical relevance comes from these embeddings,
 ## Install
 
 ```bash
-cd desktop-indexer
-python -m pip install -e '.[export,dev]'
+cd /path/to/poweramp-start-radio/desktop-indexer
+uv sync --extra dev --extra export
+uv run poweramp-indexer --help
 ```
 
 Install the PyTorch/Torchaudio build appropriate for the host first when GPU acceleration is
-required. `export` adds the LiteRT conversion dependencies; `dev` adds pytest and Ruff.
+required. `export` adds the LiteRT conversion dependencies; `dev` adds pytest and Ruff. The examples
+below run through this locked project environment.
 
 ## Build A Complete Library
 
 ```bash
-poweramp-indexer scan /path/to/music -o embeddings.db
+uv run poweramp-indexer scan /path/to/music -o embeddings.db
 ```
 
 `scan` has a resumable two-phase pipeline: cached MERT extraction followed by CLaMP3 encoding and
@@ -38,10 +40,10 @@ SQLite publication. It builds the cluster and kNN data used by Graph Explorer af
 Useful production controls:
 
 ```bash
-poweramp-indexer scan /path/to/music -o embeddings.db --batch-size 32
-poweramp-indexer scan /path/to/music -o embeddings.db --fp32
-poweramp-indexer scan /path/to/music -o embeddings.db --phase 1
-poweramp-indexer scan /path/to/music -o embeddings.db --phase 2
+uv run poweramp-indexer scan /path/to/music -o embeddings.db --batch-size 32
+uv run poweramp-indexer scan /path/to/music -o embeddings.db --fp32
+uv run poweramp-indexer scan /path/to/music -o embeddings.db --phase 1
+uv run poweramp-indexer scan /path/to/music -o embeddings.db --phase 2
 ```
 
 FP16 MERT is the desktop default. Use FP32 when matching the stricter phone/server policy or when
@@ -50,7 +52,7 @@ running parity work.
 Update an existing complete-library database:
 
 ```bash
-poweramp-indexer update /path/to/music --database embeddings.db
+uv run poweramp-indexer update /path/to/music --database embeddings.db
 ```
 
 By default, `update` adds new files, removes database rows whose files are missing, and refreshes
@@ -58,8 +60,12 @@ the Graph Explorer graph. Pass `--no-remove-missing` when the source root is tem
 Graph construction can also be run explicitly:
 
 ```bash
-poweramp-indexer graph embeddings.db --clusters 200 --knn 5
+uv run poweramp-indexer graph embeddings.db --clusters 200 --knn 5
 ```
+
+These commands change only the desktop database. Use them before the phone's initial import, or
+after deliberately clearing its app data for a replacement import. Grow an active phone index
+through On-device indexing or Merge server index.
 
 ## Always-On Server Indexing
 
@@ -74,7 +80,7 @@ For a root whose current contents are already represented on the phone, record t
 baseline without embedding it:
 
 ```bash
-poweramp-indexer server init \
+uv run poweramp-indexer server init \
   --config /etc/poweramp-server-indexer.toml \
   --baseline-existing
 ```
@@ -82,11 +88,11 @@ poweramp-indexer server init \
 Run and inspect the service:
 
 ```bash
-poweramp-indexer server once --config /etc/poweramp-server-indexer.toml
-poweramp-indexer server run --config /etc/poweramp-server-indexer.toml
-poweramp-indexer server status --config /etc/poweramp-server-indexer.toml
-poweramp-indexer server status --config /etc/poweramp-server-indexer.toml --json
-poweramp-indexer server retry --config /etc/poweramp-server-indexer.toml
+uv run poweramp-indexer server once --config /etc/poweramp-server-indexer.toml
+uv run poweramp-indexer server run --config /etc/poweramp-server-indexer.toml
+uv run poweramp-indexer server status --config /etc/poweramp-server-indexer.toml
+uv run poweramp-indexer server status --config /etc/poweramp-server-indexer.toml --json
+uv run poweramp-indexer server retry --config /etc/poweramp-server-indexer.toml
 ```
 
 `status` reads only the ledger and publication state. It reports completed, ready, active, retry,
@@ -112,11 +118,11 @@ provenance and source evidence let the phone skip rows already present in its ac
 ## Inspect And Query
 
 ```bash
-poweramp-indexer info embeddings.db
-poweramp-indexer similar embeddings.db "radiohead karma police"
-poweramp-indexer similar embeddings.db --file /path/to/song.flac
-poweramp-indexer similar embeddings.db --random
-poweramp-indexer search embeddings.db "slow psychedelic guitar"
+uv run poweramp-indexer info embeddings.db
+uv run poweramp-indexer similar embeddings.db "radiohead karma police"
+uv run poweramp-indexer similar embeddings.db --file /path/to/song.flac
+uv run poweramp-indexer similar embeddings.db --random
+uv run poweramp-indexer search embeddings.db "slow psychedelic guitar"
 ```
 
 These commands are diagnostic tools. Android runs its own native selectors over the validated
@@ -125,10 +131,10 @@ packed index.
 ## Export Android Models
 
 ```bash
-poweramp-indexer export all --output-dir ../models
+uv run poweramp-indexer export all --output-dir models
 ```
 
-The output bundle is:
+The output bundle is written under `desktop-indexer/models/`:
 
 - `mert.tflite`
 - `clamp3_audio.tflite`
