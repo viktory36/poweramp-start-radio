@@ -951,7 +951,7 @@ internal class V2ServerBundleMerger(
                 staging = staging,
                 onProgress = onProgress,
             )
-            requireSourcesUnchanged(resolved.accepted, onProgress)
+            requireAcceptedSourcesStillCurrent(resolved.accepted, onProgress)
             publish(
                 onProgress,
                 V2ServerMergeStage.PUBLISHING_GENERATION,
@@ -1520,62 +1520,29 @@ internal class V2ServerBundleMerger(
         return graphFile
     }
 
-    private fun requireSourcesUnchanged(
+    private fun requireAcceptedSourcesStillCurrent(
         rows: List<VerifiedCandidate>,
         onProgress: (V2ServerMergeProgress) -> Unit,
     ) {
+        val verifier = V2SourceIdentityVerifier(sourceFingerprinter)
         rows.forEachIndexed { index, accepted ->
-            publish(
-                onProgress,
-                V2ServerMergeStage.VERIFYING_SOURCE_BYTES,
-                "Confirming verified source ${index + 1} of ${rows.size} is unchanged",
-                index.toLong(),
-                rows.size.toLong(),
-            )
             val match = accepted.sourceMatch
-            val current = runCatching {
-                File(accepted.provider.providerPhysicalPath).canonicalFile
-            }.getOrElse { error ->
-                throw V2SourceIdentityChangedException(
-                    "unable to resolve source target for row " +
-                        "${accepted.provider.powerampFileId}: ${error.message}",
-                )
-            }
-            if (current.path != match.canonicalFile.path ||
-                !current.isFile ||
-                !current.canRead() ||
-                current.length() != match.observedSizeBytes
-            ) {
-                throw V2SourceIdentityChangedException(
-                    "source target or size changed for Poweramp row " +
-                        accepted.provider.powerampFileId,
-                )
-            }
-            val fingerprint = sourceFingerprinter.fingerprint(
-                current,
+            verifier.requireVerified(
+                providerPhysicalPath = accepted.provider.providerPhysicalPath,
+                canonicalPath = V2IndexingLedgerIds.canonicalPath(match.canonicalFile.path),
+                powerampFileId = accepted.provider.powerampFileId,
+                planned = match.exactFingerprint,
+                exactContent = false,
             ) { completedBytes, totalBytes ->
                 publish(
                     onProgress,
                     V2ServerMergeStage.VERIFYING_SOURCE_BYTES,
-                    "Re-verifying accepted source ${index + 1} of ${rows.size} before " +
-                        "publication: $completedBytes of $totalBytes bytes",
+                    "Source metadata changed; confirming accepted track ${index + 1} of " +
+                        "${rows.size}: $completedBytes of $totalBytes bytes",
                     completedBytes,
                     totalBytes,
                 )
             }
-            require(
-                fingerprint.sizeBytes == accepted.bundle.sourceSizeBytes &&
-                    fingerprint.fullContentSha256 == accepted.bundle.sourceSha256,
-            ) {
-                "Source bytes changed for Poweramp row ${accepted.provider.powerampFileId}"
-            }
-            publish(
-                onProgress,
-                V2ServerMergeStage.VERIFYING_SOURCE_BYTES,
-                "Confirmed ${index + 1} of ${rows.size} verified sources unchanged",
-                (index + 1).toLong(),
-                rows.size.toLong(),
-            )
         }
     }
 
