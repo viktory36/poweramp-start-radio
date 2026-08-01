@@ -64,6 +64,12 @@
             android:exported="false"
             android:foregroundServiceType="mediaProcessing" />
 
+        <!-- User-started server-index merge; intentionally non-durable after process death. -->
+        <service
+            android:name=".services.ServerMergeService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProcessing" />
+
         <receiver
             android:name=".indexing.V2IndexingBootReceiver"
             android:exported="false">

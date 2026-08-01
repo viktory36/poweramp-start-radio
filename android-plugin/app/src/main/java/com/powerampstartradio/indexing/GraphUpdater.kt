@@ -3,7 +3,13 @@ package com.powerampstartradio.indexing
 import android.util.Log
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.data.EmbeddingIndex
+import com.powerampstartradio.indexing.v2.V2EmbeddingGenerationFile
 import com.powerampstartradio.indexing.v2.V2FileSha256
+import com.powerampstartradio.indexing.v2.V2GraphGenerationFile
+import com.powerampstartradio.indexing.v2.V2IndexGenerationGraphBinding
+import com.powerampstartradio.indexing.v2.V2OrderedEmbeddingBinding
+import com.powerampstartradio.indexing.v2.V2OrderedEmbeddingConsumer
+import com.powerampstartradio.indexing.v2.V2OrderedEmbeddingSource
 import com.powerampstartradio.indexing.v2.V2ResolvedActiveIndexGeneration
 import java.io.File
 import java.io.FileOutputStream
@@ -59,6 +65,15 @@ data class V2GraphUpdaterProgress(
     val detail: String,
 )
 
+internal data class V2PreparedGraphUpdate(
+    val plan: V2GraphWorkPlan,
+    val databaseFile: File,
+    val embeddingFile: File,
+    val embeddingBinding: V2OrderedEmbeddingBinding,
+    val graphFile: File,
+    val graphBinding: V2IndexGenerationGraphBinding,
+)
+
 interface V2GraphUpdaterControl {
     fun onProgress(progress: V2GraphUpdaterProgress)
 
@@ -85,17 +100,21 @@ class V2ExactGraphIncrementalBase internal constructor(
     }
 
     internal fun requireManifestBoundAssets() {
-        require(embeddingFile.isFile &&
-            embeddingFile.length() == embeddingByteLength &&
-            graphFile.isFile &&
-            graphFile.length() == graphByteLength
-        ) { "exact base assets changed after manifest validation" }
+        requireManifestBoundLengths()
         require(V2FileSha256.digest(embeddingFile) == embeddingSha256) {
             "exact base embedding changed after manifest validation"
         }
         require(V2FileSha256.digest(graphFile) == graphSha256) {
             "exact base graph changed after manifest validation"
         }
+    }
+
+    internal fun requireManifestBoundLengths() {
+        require(embeddingFile.isFile &&
+            embeddingFile.length() == embeddingByteLength &&
+            graphFile.isFile &&
+            graphFile.length() == graphByteLength
+        ) { "exact base assets changed after manifest validation" }
     }
 
     companion object {
@@ -202,6 +221,7 @@ object V2GraphWorkPlanner {
         targetNodes: Int,
         embeddingDimension: Int,
         neighborsPerNode: Int = 5,
+        storeGraphInDatabase: Boolean = true,
         existingGraphNodes: Int? = null,
         existingGraphNeighborsPerNode: Int? = null,
         existingGraphByteLength: Long? = null,
@@ -250,8 +270,10 @@ object V2GraphWorkPlanner {
         val outputBytes = if (strategy == V2GraphUpdateStrategy.REUSE) {
             0L
         } else {
-            // The complete graph is committed to both the private SQLite DB and graph.bin.
-            Math.multiplyExact(2L, graphFileBytes(targetNodes, neighborsPerNode))
+            Math.multiplyExact(
+                if (storeGraphInDatabase) 2L else 1L,
+                graphFileBytes(targetNodes, neighborsPerNode),
+            )
         }
         return V2GraphWorkPlan(
             strategy = strategy,
@@ -297,6 +319,8 @@ class GraphUpdater(
     private val db: EmbeddingDatabase,
     private val filesDir: File,
     private val knnK: Int = 5,
+    private val checkpointsEnabled: Boolean = true,
+    private val storeGraphInDatabase: Boolean = true,
 ) {
     companion object {
         private const val TAG = "GraphUpdater"
@@ -318,7 +342,42 @@ class GraphUpdater(
     fun rebuildIndices(
         control: V2GraphUpdaterControl = NO_CONTROL,
         exactBase: V2ExactGraphIncrementalBase? = null,
-    ): V2GraphWorkPlan {
+    ): V2GraphWorkPlan = rebuildIndicesInternal(
+        control = control,
+        exactBase = exactBase,
+        prepareForPublication = false,
+        retainedEmbeddingsAreByteExactBase = false,
+    ).plan
+
+    internal fun rebuildAfterByteExactAppendForPublication(
+        control: V2GraphUpdaterControl = NO_CONTROL,
+        exactBase: V2ExactGraphIncrementalBase,
+    ): V2PreparedGraphUpdate {
+        val result = rebuildIndicesInternal(
+            control = control,
+            exactBase = exactBase,
+            prepareForPublication = true,
+            retainedEmbeddingsAreByteExactBase = true,
+        )
+        return V2PreparedGraphUpdate(
+            plan = result.plan,
+            databaseFile = db.databaseFile,
+            embeddingFile = result.embeddingFile,
+            embeddingBinding = checkNotNull(result.embeddingBinding),
+            graphFile = result.graphFile,
+            graphBinding = checkNotNull(result.graphBinding),
+        )
+    }
+
+    private fun rebuildIndicesInternal(
+        control: V2GraphUpdaterControl,
+        exactBase: V2ExactGraphIncrementalBase?,
+        prepareForPublication: Boolean,
+        retainedEmbeddingsAreByteExactBase: Boolean,
+    ): RebuildResult {
+        require(!retainedEmbeddingsAreByteExactBase ||
+            (prepareForPublication && exactBase != null)
+        ) { "byte-exact append trust requires a publication build and exact base" }
         val t0 = System.nanoTime()
         val targetNodes = db.getEmbeddingCount()
         val dimension = requireNotNull(db.getEmbeddingDim()) { "embedding dimension is unavailable" }
@@ -329,19 +388,39 @@ class GraphUpdater(
             targetNodes = targetNodes,
             embeddingDimension = dimension,
             neighborsPerNode = knnK,
+            storeGraphInDatabase = storeGraphInDatabase,
         )
         emit(control, provisional, V2GraphUpdaterStage.EMBEDDING_ROWS, 0L, targetNodes.toLong(),
             "Exporting the immutable embedding row set")
-        EmbeddingIndex.extractFromDatabase(db, embFile) { current, total ->
-            emit(
-                control,
-                provisional,
-                V2GraphUpdaterStage.EMBEDDING_ROWS,
-                current.toLong(),
-                total.toLong(),
-                "Exported $current/$total embedding rows",
+        val embeddingBinding = if (prepareForPublication) {
+            V2EmbeddingGenerationFile.write(
+                source = DatabaseEmbeddingSource(db, targetNodes, dimension),
+                target = embFile,
+                onRowProgress = { current, total ->
+                    emit(
+                        control,
+                        provisional,
+                        V2GraphUpdaterStage.EMBEDDING_ROWS,
+                        current.toLong(),
+                        total.toLong(),
+                        "Exported $current/$total embedding rows",
+                    )
+                    control.onControlPoint(V2GraphUpdaterStage.EMBEDDING_ROWS, current.toLong())
+                },
             )
-            control.onControlPoint(V2GraphUpdaterStage.EMBEDDING_ROWS, current.toLong())
+        } else {
+            EmbeddingIndex.extractFromDatabase(db, embFile) { current, total ->
+                emit(
+                    control,
+                    provisional,
+                    V2GraphUpdaterStage.EMBEDDING_ROWS,
+                    current.toLong(),
+                    total.toLong(),
+                    "Exported $current/$total embedding rows",
+                )
+                control.onControlPoint(V2GraphUpdaterStage.EMBEDDING_ROWS, current.toLong())
+            }
+            null
         }
         val index = EmbeddingIndex.mmap(embFile)
         require(index.numTracks == targetNodes && index.dim == dimension) {
@@ -352,11 +431,27 @@ class GraphUpdater(
         for (position in 0 until targetNodes) currentTrackIds += index.getTrackId(position)
         val graphFile = File(filesDir, "graph.bin")
         val oldGraph = exactBase?.let { base ->
-            runCatching { prepareExactBase(base, index, graphFile) }
-                .onFailure { error ->
-                    Log.w(TAG, "Exact base graph rejected; using full rebuild: ${error.message}")
+            if (retainedEmbeddingsAreByteExactBase) {
+                prepareExactBase(
+                    base = base,
+                    targetIndex = index,
+                    localGraphFile = graphFile,
+                    verifyRetainedEmbeddings = false,
+                )
+            } else {
+                runCatching {
+                    prepareExactBase(
+                        base = base,
+                        targetIndex = index,
+                        localGraphFile = graphFile,
+                        verifyRetainedEmbeddings = true,
+                    )
                 }
-                .getOrNull()
+                    .onFailure { error ->
+                        Log.w(TAG, "Exact base graph rejected; using full rebuild: ${error.message}")
+                    }
+                    .getOrNull()
+            }
         }
         val hasGraph = oldGraph != null
         val structurallyUsableOld = oldGraph?.takeIf { old ->
@@ -378,12 +473,17 @@ class GraphUpdater(
                 it.retainedBaseNodes > 0 &&
                     (it.newTrackIndices.isNotEmpty() || it.removedBaseNodes > 0)
             }
-        val inputBytes = if (hasGraph && graphFile.isFile) graphFile.length() else 0L
+        val inputBytes = if (hasGraph) {
+            exactBase?.graphFile?.length() ?: graphFile.takeIf(File::isFile)?.length() ?: 0L
+        } else {
+            0L
+        }
         val plan = when {
             exactReuse != null -> V2GraphWorkPlanner.plan(
                 targetNodes = targetNodes,
                 embeddingDimension = dimension,
                 neighborsPerNode = knnK,
+                storeGraphInDatabase = storeGraphInDatabase,
                 existingGraphNodes = targetNodes,
                 existingGraphNeighborsPerNode = knnK,
                 existingGraphByteLength = inputBytes,
@@ -392,6 +492,7 @@ class GraphUpdater(
                 targetNodes = targetNodes,
                 embeddingDimension = dimension,
                 neighborsPerNode = knnK,
+                storeGraphInDatabase = storeGraphInDatabase,
                 existingGraphNodes = mutation.oldGraph.trackIds.size,
                 existingGraphNeighborsPerNode = mutation.oldGraph.neighborsPerNode,
                 existingGraphByteLength = inputBytes,
@@ -406,6 +507,7 @@ class GraphUpdater(
                 targetNodes = targetNodes,
                 embeddingDimension = dimension,
                 neighborsPerNode = knnK,
+                storeGraphInDatabase = storeGraphInDatabase,
                 existingGraphByteLength = inputBytes.takeIf { it > 0L },
             )
         }
@@ -424,7 +526,7 @@ class GraphUpdater(
 
         when (plan.strategy) {
             V2GraphUpdateStrategy.REUSE -> {
-                checkpointFile().delete()
+                if (checkpointsEnabled) checkpointFile().delete()
                 Log.i(TAG, "Reused exact graph: $targetNodes nodes, K=$knnK")
             }
             V2GraphUpdateStrategy.INCREMENTAL -> incrementalUpdate(
@@ -433,56 +535,120 @@ class GraphUpdater(
                 mutation = checkNotNull(mutation),
                 plan = plan,
                 control = control,
+                embeddingSha256 = embeddingBinding?.fileSha256,
+                oldGraphSha256 = exactBase?.graphSha256,
             )
             V2GraphUpdateStrategy.FULL_REBUILD -> buildKnnGraph(
                 index = index,
                 graphFile = graphFile,
                 plan = plan,
                 control = control,
+                embeddingSha256 = embeddingBinding?.fileSha256,
             )
+        }
+        val graphBinding = if (prepareForPublication) {
+            V2GraphGenerationFile.inspect(graphFile)
+        } else {
+            null
         }
         db.setBinaryData(
             V2GraphExactProof.DATABASE_KEY,
-            V2GraphExactProof.create(graphFile = graphFile, embeddingFile = embFile),
+            if (embeddingBinding != null && graphBinding != null) {
+                V2GraphExactProof.createBoundHashes(
+                    graphSha256 = graphBinding.sha256,
+                    embeddingSha256 = embeddingBinding.fileSha256,
+                )
+            } else {
+                V2GraphExactProof.create(graphFile = graphFile, embeddingFile = embFile)
+            },
         )
 
         val totalMs = (System.nanoTime() - t0) / 1_000_000
         Log.i(TAG, "TIMING: graph tail ${plan.strategy} completed in ${totalMs}ms")
-        return plan
+        return RebuildResult(
+            plan = plan,
+            embeddingFile = embFile,
+            embeddingBinding = embeddingBinding,
+            graphFile = graphFile,
+            graphBinding = graphBinding,
+        )
+    }
+
+    private data class RebuildResult(
+        val plan: V2GraphWorkPlan,
+        val embeddingFile: File,
+        val embeddingBinding: V2OrderedEmbeddingBinding?,
+        val graphFile: File,
+        val graphBinding: V2IndexGenerationGraphBinding?,
+    )
+
+    private class DatabaseEmbeddingSource(
+        private val database: EmbeddingDatabase,
+        override val trackCount: Int,
+        override val dimension: Int,
+    ) : V2OrderedEmbeddingSource {
+        override fun forEachOrdered(consumer: V2OrderedEmbeddingConsumer) {
+            database.forEachEmbeddingRaw { trackId, embedding ->
+                consumer.accept(trackId, embedding)
+            }
+        }
     }
 
     private fun prepareExactBase(
         base: V2ExactGraphIncrementalBase,
         targetIndex: EmbeddingIndex,
         localGraphFile: File,
+        verifyRetainedEmbeddings: Boolean,
     ): OldGraph {
-        base.requireManifestBoundAssets()
+        if (verifyRetainedEmbeddings) {
+            base.requireManifestBoundAssets()
+        } else {
+            base.requireManifestBoundLengths()
+        }
         val baseIndex = EmbeddingIndex.mmap(base.embeddingFile, preload = false)
         require(baseIndex.numTracks == base.trackCount &&
             baseIndex.dim == base.embeddingDimension &&
             targetIndex.dim == base.embeddingDimension
         ) { "exact base embedding shape changed" }
 
-        val temporary = File(
-            localGraphFile.parentFile,
-            ".${localGraphFile.name}.base-${UUID.randomUUID()}",
-        )
-        try {
-            base.graphFile.inputStream().use { input ->
-                FileOutputStream(temporary).use { output ->
-                    input.copyTo(output)
-                    output.fd.sync()
+        val graphToParse = if (verifyRetainedEmbeddings) {
+            val temporary = File(
+                localGraphFile.parentFile,
+                ".${localGraphFile.name}.base-${UUID.randomUUID()}",
+            )
+            try {
+                val graphDigest = MessageDigest.getInstance("SHA-256")
+                base.graphFile.inputStream().use { input ->
+                    FileOutputStream(temporary).use { output ->
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            if (read == 0) continue
+                            output.write(buffer, 0, read)
+                            graphDigest.update(buffer, 0, read)
+                        }
+                        output.fd.sync()
+                    }
                 }
+                require(graphDigest.digest().joinToString("") { byte -> "%02x".format(byte) } ==
+                    base.graphSha256
+                ) {
+                    "exact base graph copy changed"
+                }
+                EmbeddingIndex.replaceAtomically(temporary, localGraphFile)
+            } finally {
+                temporary.delete()
             }
-            require(V2FileSha256.digest(temporary) == base.graphSha256) {
-                "exact base graph copy changed"
-            }
-            EmbeddingIndex.replaceAtomically(temporary, localGraphFile)
-        } finally {
-            temporary.delete()
+            localGraphFile
+        } else {
+            base.graphFile
         }
 
-        val graph = requireNotNull(parseOldGraph(localGraphFile)) {
+        val graph = requireNotNull(parseOldGraph(
+            graphFile = graphToParse,
+            expectedSha256 = if (verifyRetainedEmbeddings) null else base.graphSha256,
+        )) {
             "manifest-bound base graph is unreadable"
         }
         require(graph.trackIds.size == baseIndex.numTracks &&
@@ -497,14 +663,16 @@ class GraphUpdater(
         for (position in 0 until targetIndex.numTracks) {
             targetIndexById[targetIndex.getTrackId(position)] = position
         }
-        graph.trackIds.indices.forEach { basePosition ->
-            val targetPosition = targetIndexById[graph.trackIds[basePosition]]
-                ?: return@forEach
-            require(baseIndex.hasBitIdenticalEmbedding(
-                index = basePosition,
-                other = targetIndex,
-                otherIndex = targetPosition,
-            )) { "retained embedding ${graph.trackIds[basePosition]} changed from the exact base" }
+        if (verifyRetainedEmbeddings) {
+            graph.trackIds.indices.forEach { basePosition ->
+                val targetPosition = targetIndexById[graph.trackIds[basePosition]]
+                    ?: return@forEach
+                require(baseIndex.hasBitIdenticalEmbedding(
+                    index = basePosition,
+                    other = targetIndex,
+                    otherIndex = targetPosition,
+                )) { "retained embedding ${graph.trackIds[basePosition]} changed from the exact base" }
+            }
         }
         return graph
     }
@@ -550,6 +718,8 @@ class GraphUpdater(
         mutation: GraphMutation,
         plan: V2GraphWorkPlan,
         control: V2GraphUpdaterControl,
+        embeddingSha256: String?,
+        oldGraphSha256: String?,
     ) {
         val totalN = index.numTracks
         val k = knnK
@@ -577,8 +747,18 @@ class GraphUpdater(
         val newEmbs = Array(newTrackIndices.size) { position ->
             index.getEmbedding(newTrackIndices[position])
         }
-        val fingerprint = checkpointFingerprint(plan, File(filesDir, "clamp3.emb"), graphFile)
-        val restored = readCheckpoint(fingerprint, totalN, k)
+        val fingerprint = if (checkpointsEnabled) {
+            checkpointFingerprint(
+                plan = plan,
+                embeddingFile = File(filesDir, "clamp3.emb"),
+                oldGraphFile = graphFile,
+                embeddingSha256 = embeddingSha256,
+                oldGraphSha256 = oldGraphSha256,
+            )
+        } else {
+            null
+        }
+        val restored = fingerprint?.let { readCheckpoint(it, totalN, k) }
         val neighbors = restored?.neighbors ?: Array(totalN) { IntArray(k) }
         val weights = restored?.weights ?: Array(totalN) { FloatArray(k) }
         var phase = restored?.phase ?: PHASE_INCREMENTAL_RESCANS
@@ -636,13 +816,15 @@ class GraphUpdater(
                 preservedNeighborDots.toLong(),
                 "Prepared ${unaffectedBasePositions.size} preserved graph rows",
             )
-            writeCheckpoint(
-                fingerprint,
-                PHASE_INCREMENTAL_RESCANS,
-                0,
-                neighbors,
-                weights,
-            )
+            fingerprint?.let {
+                writeCheckpoint(
+                    it,
+                    PHASE_INCREMENTAL_RESCANS,
+                    0,
+                    neighbors,
+                    weights,
+                )
+            }
         }
 
         if (phase == PHASE_INCREMENTAL_RESCANS) {
@@ -691,9 +873,9 @@ class GraphUpdater(
                     weights,
                     completedDots,
                 )
-                if ((position + 1) % checkpointEvery == 0 ||
+                if (fingerprint != null && ((position + 1) % checkpointEvery == 0 ||
                     position == affectedBasePositions.lastIndex
-                ) {
+                )) {
                     writeCheckpoint(
                         fingerprint,
                         PHASE_INCREMENTAL_RESCANS,
@@ -703,13 +885,15 @@ class GraphUpdater(
                     )
                 }
             }
-            writeCheckpoint(
-                fingerprint,
-                PHASE_INCREMENTAL_NEW_ROWS,
-                0,
-                neighbors,
-                weights,
-            )
+            fingerprint?.let {
+                writeCheckpoint(
+                    it,
+                    PHASE_INCREMENTAL_NEW_ROWS,
+                    0,
+                    neighbors,
+                    weights,
+                )
+            }
             phase = PHASE_INCREMENTAL_NEW_ROWS
             cursor = 0
         }
@@ -788,7 +972,10 @@ class GraphUpdater(
                     weights,
                     completedDots,
                 )
-                if ((position + 1) % checkpointEvery == 0 || position == newTrackIndices.lastIndex) {
+                if (fingerprint != null &&
+                    ((position + 1) % checkpointEvery == 0 ||
+                        position == newTrackIndices.lastIndex)
+                ) {
                     writeCheckpoint(
                         fingerprint,
                         PHASE_INCREMENTAL_NEW_ROWS,
@@ -815,7 +1002,7 @@ class GraphUpdater(
             }
         }
         publishGraph(index, graphFile, neighbors, weights, plan, control)
-        checkpointFile().delete()
+        if (checkpointsEnabled) checkpointFile().delete()
     }
 
     private fun buildKnnGraph(
@@ -823,13 +1010,24 @@ class GraphUpdater(
         graphFile: File,
         plan: V2GraphWorkPlan,
         control: V2GraphUpdaterControl,
+        embeddingSha256: String?,
     ) {
         val n = index.numTracks
         val k = knnK
         val idToIndex = HashMap<Long, Int>(n * 2)
         for (i in 0 until n) idToIndex[index.getTrackId(i)] = i
-        val fingerprint = checkpointFingerprint(plan, File(filesDir, "clamp3.emb"), null)
-        val restored = readCheckpoint(fingerprint, n, k)
+        val fingerprint = if (checkpointsEnabled) {
+            checkpointFingerprint(
+                plan = plan,
+                embeddingFile = File(filesDir, "clamp3.emb"),
+                oldGraphFile = null,
+                embeddingSha256 = embeddingSha256,
+                oldGraphSha256 = null,
+            )
+        } else {
+            null
+        }
+        val restored = fingerprint?.let { readCheckpoint(it, n, k) }
             ?.takeIf { it.phase == PHASE_FULL_ROWS }
         val neighbors = restored?.neighbors ?: Array(n) { IntArray(k) }
         val weights = restored?.weights ?: Array(n) { FloatArray(k) }
@@ -872,7 +1070,7 @@ class GraphUpdater(
                 weights,
                 completedDots,
             )
-            if ((row + 1) % checkpointEvery == 0 || row == n - 1) {
+            if (fingerprint != null && ((row + 1) % checkpointEvery == 0 || row == n - 1)) {
                 writeCheckpoint(
                     fingerprint,
                     PHASE_FULL_ROWS,
@@ -886,7 +1084,7 @@ class GraphUpdater(
             "full graph dot-product count disagrees with its plan"
         }
         publishGraph(index, graphFile, neighbors, weights, plan, control)
-        checkpointFile().delete()
+        if (checkpointsEnabled) checkpointFile().delete()
     }
 
     private fun publishGraph(
@@ -899,17 +1097,23 @@ class GraphUpdater(
     ) {
         val blob = buildGraphBinary(index, neighbors, weights, knnK, control, plan)
         val graphBytes = blob.size.toLong()
-        require(plan.graphBinaryOutputBytes == graphBytes * 2L)
+        require(plan.graphBinaryOutputBytes ==
+            graphBytes * if (storeGraphInDatabase) 2L else 1L
+        )
         var completed = plan.graphBinaryInputBytes
         if (db.isReadWrite) {
-            db.setBinaryData("knn_graph", blob)
+            if (storeGraphInDatabase) {
+                db.setBinaryData("knn_graph", blob)
+                completed += graphBytes
+                emit(control, plan, V2GraphUpdaterStage.GRAPH_BINARY_BYTES, completed,
+                    plan.graphBinaryBytes, "Committed graph bytes to the private database")
+                control.onControlPoint(V2GraphUpdaterStage.GRAPH_BINARY_BYTES, completed)
+            } else {
+                db.deleteBinaryData("knn_graph")
+            }
         } else {
             throw IllegalStateException("graph publication requires a writable private database")
         }
-        completed += graphBytes
-        emit(control, plan, V2GraphUpdaterStage.GRAPH_BINARY_BYTES, completed,
-            plan.graphBinaryBytes, "Committed graph bytes to the private database")
-        control.onControlPoint(V2GraphUpdaterStage.GRAPH_BINARY_BYTES, completed)
 
         val temporary = File(graphFile.parentFile, ".${graphFile.name}.incomplete-${UUID.randomUUID()}")
         try {
@@ -927,12 +1131,14 @@ class GraphUpdater(
         control.onControlPoint(V2GraphUpdaterStage.GRAPH_BINARY_BYTES, completed)
     }
 
-    private fun parseOldGraph(graphFile: File): OldGraph? {
+    private fun parseOldGraph(graphFile: File, expectedSha256: String? = null): OldGraph? {
         if (!graphFile.isFile || graphFile.length() < 8L) return null
         return try {
             RandomAccessFile(graphFile, "r").use { raf ->
                 val headerBytes = ByteArray(8)
                 raf.readFully(headerBytes)
+                val fileDigest = expectedSha256?.let { MessageDigest.getInstance("SHA-256") }
+                    ?.apply { update(headerBytes) }
                 val header = ByteBuffer.wrap(headerBytes).order(ByteOrder.LITTLE_ENDIAN)
                 val n = header.int
                 val k = header.int
@@ -940,10 +1146,17 @@ class GraphUpdater(
                 require(raf.length() == V2GraphWorkPlanner.graphFileBytes(n, k))
                 val idBytes = ByteArray(Math.multiplyExact(n, 8))
                 raf.readFully(idBytes)
+                fileDigest?.update(idBytes)
                 val ids = ByteBuffer.wrap(idBytes).order(ByteOrder.LITTLE_ENDIAN)
                 val trackIds = LongArray(n) { ids.long }
                 val graphBytes = ByteArray(Math.multiplyExact(Math.multiplyExact(n, k), 8))
                 raf.readFully(graphBytes)
+                fileDigest?.let { digest ->
+                    digest.update(graphBytes)
+                    require(digest.digest().joinToString("") { byte -> "%02x".format(byte) } ==
+                        expectedSha256
+                    ) { "manifest-bound base graph hash changed" }
+                }
                 val graph = ByteBuffer.wrap(graphBytes).order(ByteOrder.LITTLE_ENDIAN)
                 var validNeighbors = 0
                 var validForExactUpdate = true
@@ -1095,7 +1308,7 @@ class GraphUpdater(
 
     private fun controlAfterCompletedUnit(
         control: V2GraphUpdaterControl,
-        fingerprint: String,
+        fingerprint: String?,
         phase: Int,
         cursor: Int,
         neighbors: Array<IntArray>,
@@ -1105,7 +1318,7 @@ class GraphUpdater(
         try {
             control.onControlPoint(V2GraphUpdaterStage.SIMILARITY_DOT_PRODUCTS, completedDots)
         } catch (error: Throwable) {
-            writeCheckpoint(fingerprint, phase, cursor, neighbors, weights)
+            fingerprint?.let { writeCheckpoint(it, phase, cursor, neighbors, weights) }
             throw error
         }
     }
@@ -1124,6 +1337,8 @@ class GraphUpdater(
         plan: V2GraphWorkPlan,
         embeddingFile: File,
         oldGraphFile: File?,
+        embeddingSha256: String? = null,
+        oldGraphSha256: String? = null,
     ): String {
         val digest = MessageDigest.getInstance("SHA-256")
         digest.update("v2-exact-graph-checkpoint-v2".toByteArray(StandardCharsets.UTF_8))
@@ -1140,9 +1355,15 @@ class GraphUpdater(
         ).forEach { value ->
             digest.update(ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(value).array())
         }
-        digest.update(V2FileSha256.digest(embeddingFile).toByteArray(StandardCharsets.US_ASCII))
+        digest.update(
+            (embeddingSha256 ?: V2FileSha256.digest(embeddingFile))
+                .toByteArray(StandardCharsets.US_ASCII),
+        )
         if (oldGraphFile != null && oldGraphFile.isFile) {
-            digest.update(V2FileSha256.digest(oldGraphFile).toByteArray(StandardCharsets.US_ASCII))
+            digest.update(
+                (oldGraphSha256 ?: V2FileSha256.digest(oldGraphFile))
+                    .toByteArray(StandardCharsets.US_ASCII),
+            )
         }
         return digest.digest().joinToString("") { byte -> "%02x".format(byte) }
     }

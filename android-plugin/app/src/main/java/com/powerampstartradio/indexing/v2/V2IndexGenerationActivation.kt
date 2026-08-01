@@ -8,8 +8,11 @@ import android.util.AtomicFile
 import android.util.Log
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
+import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.indexing.V2ExactGraphIncrementalBase
 import com.powerampstartradio.indexing.V2GraphExactProof
+import com.powerampstartradio.indexing.V2GraphUpdateStrategy
+import com.powerampstartradio.indexing.V2PreparedGraphUpdate
 import com.powerampstartradio.poweramp.TrackNormalization
 import java.io.File
 import java.io.FileInputStream
@@ -472,6 +475,7 @@ object V2GenerationPublicationCoordinator {
         )
         afterInstallBeforePointerPublication(manifest)
         if (next != current) writePointer(filesDir, next, gson)
+        V2IndexGenerationReader.rememberFreshlyPublished(next, resolved)
         pruneUnreferencedGenerations(
             filesDir,
             next,
@@ -767,7 +771,11 @@ object V2EmbeddingGenerationFile {
         return digests.databaseBinding()
     }
 
-    fun inspect(file: File): V2OrderedEmbeddingBinding {
+    fun inspect(
+        file: File,
+        onRowProgress: ((completedRows: Int, totalRows: Int) -> Unit)? = null,
+        onHashProgress: ((completedBytes: Long, totalBytes: Long) -> Unit)? = null,
+    ): V2OrderedEmbeddingBinding {
         require(file.isFile && file.length() >= HEADER_BYTES) { "missing or short PEMB file" }
         RandomAccessFile(file, "r").use { input ->
             val header = ByteArray(HEADER_BYTES).also(input::readFully)
@@ -783,20 +791,40 @@ object V2EmbeddingGenerationFile {
             require(file.length() == expectedLength) {
                 "PEMB length ${file.length()} != $expectedLength"
             }
+            val fileDigest = MessageDigest.getInstance("SHA-256").apply { update(header) }
+            var completedBytes = HEADER_BYTES.toLong()
+            onHashProgress?.invoke(0L, expectedLength)
             val ids = LongArray(count)
-            input.seek(HEADER_BYTES.toLong())
-            repeat(count) { index -> ids[index] = input.readLongLittleEndian() }
+            val idBytes = ByteArray(Long.SIZE_BYTES)
+            val idValues = ByteBuffer.wrap(idBytes).order(ByteOrder.LITTLE_ENDIAN)
+            repeat(count) { index ->
+                input.readFully(idBytes)
+                fileDigest.update(idBytes)
+                ids[index] = idValues.getLong(0)
+                completedBytes += idBytes.size
+            }
             require(ids.all { it > 0L } &&
                 (1 until ids.size).all { index -> ids[index - 1] < ids[index] }
             ) { "PEMB IDs are not strictly increasing" }
             val digests = OrderedEmbeddingDigests(count, dimension)
             val embedding = ByteArray(recordBytes)
+            onRowProgress?.invoke(0, count)
             repeat(count) { index ->
                 input.readFully(embedding)
+                fileDigest.update(embedding)
+                completedBytes += embedding.size
                 V2Clamp3VectorCodec.requireValidBlob(embedding)
                 digests.update(ids[index], embedding)
+                val completedRows = index + 1
+                if (completedRows == count || completedRows % 4096 == 0) {
+                    onRowProgress?.invoke(completedRows, count)
+                    onHashProgress?.invoke(completedBytes, expectedLength)
+                }
             }
-            return digests.fileBinding(expectedLength, V2FileSha256.digest(file))
+            require(completedBytes == expectedLength && input.filePointer == expectedLength) {
+                "PEMB bytes changed during inspection"
+            }
+            return digests.fileBinding(expectedLength, fileDigest.digest().toV2CommitHex())
         }
     }
 
@@ -888,23 +916,36 @@ object V2GraphGenerationFile {
             require(file.length() == expectedLength) {
                 "graph length ${file.length()} != $expectedLength"
             }
+            val fileDigest = MessageDigest.getInstance("SHA-256").apply { update(header) }
+            var completedBytes = header.size.toLong()
+            onHashProgress?.invoke(0L, expectedLength)
             val digest = MessageDigest.getInstance("SHA-256").apply {
                 updateLengthPrefixed("v2-ordered-track-set-v1")
                 updateInt(nodes)
             }
             var previous = Long.MIN_VALUE
             onRowProgress?.invoke(0, nodes)
+            val idBytes = ByteArray(Long.SIZE_BYTES)
+            val idValues = ByteBuffer.wrap(idBytes).order(ByteOrder.LITTLE_ENDIAN)
             repeat(nodes) {
-                val id = input.readLongLittleEndian()
+                input.readFully(idBytes)
+                fileDigest.update(idBytes)
+                completedBytes += idBytes.size
+                val id = idValues.getLong(0)
                 require(id > 0L && id > previous) { "graph IDs are not strictly increasing" }
                 digest.updateLong(id)
                 previous = id
             }
+            val edgeBytes = ByteArray(Int.SIZE_BYTES + Float.SIZE_BYTES)
+            val edgeValues = ByteBuffer.wrap(edgeBytes).order(ByteOrder.LITTLE_ENDIAN)
             repeat(nodes) { node ->
                 var rowWeight = 0.0
                 repeat(neighbors) { neighbor ->
-                    val neighborIndex = input.readIntLittleEndian()
-                    val score = input.readFloatLittleEndian()
+                    input.readFully(edgeBytes)
+                    fileDigest.update(edgeBytes)
+                    completedBytes += edgeBytes.size
+                    val neighborIndex = edgeValues.getInt(0)
+                    val score = edgeValues.getFloat(Int.SIZE_BYTES)
                     require(neighborIndex in 0 until nodes) {
                         "graph edge $node:$neighbor has invalid neighbor index $neighborIndex"
                     }
@@ -919,16 +960,16 @@ object V2GraphGenerationFile {
                 val completedRows = node + 1
                 if (completedRows == nodes || completedRows % 4096 == 0) {
                     onRowProgress?.invoke(completedRows, nodes)
+                    onHashProgress?.invoke(completedBytes, expectedLength)
                 }
+            }
+            require(completedBytes == expectedLength && input.filePointer == expectedLength) {
+                "graph bytes changed during inspection"
             }
             return V2IndexGenerationGraphBinding(
                 relativePath = GRAPH_FILE,
                 byteLength = file.length(),
-                sha256 = if (onHashProgress == null) {
-                    V2FileSha256.digest(file)
-                } else {
-                    V2FileSha256.digest(file, onHashProgress)
-                },
+                sha256 = fileDigest.digest().toV2CommitHex(),
                 nodeCount = nodes,
                 neighborsPerNode = neighbors,
                 orderedTrackSetSha256 = digest.digest().toV2CommitHex(),
@@ -1691,14 +1732,15 @@ class V2IndexGenerationPublisher(
      * unreceipted compatibility embeddings: their host inference cannot claim Android V2 receipt
      * provenance even when the model artifacts and output space are byte-hash pinned.
      */
-    fun publishServerMerge(
+    internal fun publishServerMerge(
         privateStagingDatabase: File,
         baseGeneration: V2ResolvedActiveIndexGeneration,
         bundleDatabaseSha256: String,
         addedTrackCount: Int,
-        exactUpdatedGraphFile: File,
+        preparedGraphUpdate: V2PreparedGraphUpdate,
         expectedActive: V2GenerationPublicationExpectation =
             V2GenerationPublicationCoordinator.capture(filesDir, gson),
+        onProgress: (V2GenerationPublicationProgress) -> Unit = {},
     ): V2ResolvedActiveIndexGeneration {
         require(bundleDatabaseSha256.matches(SHA256)) {
             "server bundle database hash is invalid"
@@ -1718,8 +1760,11 @@ class V2IndexGenerationPublisher(
             textRetrievalSpec = baseGeneration.manifest.textRetrievalSpec,
             baseGeneration = baseGeneration,
             expectedActive = expectedActive,
-            derivedGraphFile = exactUpdatedGraphFile,
+            derivedGraphFile = preparedGraphUpdate.graphFile,
+            preparedGraphUpdate = preparedGraphUpdate,
+            consumePreparedAssets = true,
             serverMergeAddedTrackCount = addedTrackCount,
+            onProgress = onProgress,
             validateCoverage = { embedding, stable, coverage ->
                 val inheritedStable = baseGeneration.manifest.stableTrackUidCoverage
                 val inheritedCoverage = baseGeneration.manifest.embeddingCoverage
@@ -1750,8 +1795,11 @@ class V2IndexGenerationPublisher(
         baseGeneration: V2ResolvedActiveIndexGeneration?,
         expectedActive: V2GenerationPublicationExpectation,
         derivedGraphFile: File?,
+        preparedGraphUpdate: V2PreparedGraphUpdate? = null,
+        consumePreparedAssets: Boolean = false,
         rebuildDerivedIndexes: Boolean = false,
         serverMergeAddedTrackCount: Int? = null,
+        onProgress: (V2GenerationPublicationProgress) -> Unit = {},
         validateCoverage: (
             V2OrderedEmbeddingBinding,
             V2StableTrackUidCoverageBinding,
@@ -1773,6 +1821,9 @@ class V2IndexGenerationPublisher(
             "server merge must preserve Random Walk with an exact updated graph"
         }
         require((origin == V2IndexGenerationOrigin.SERVER_MERGE) ==
+            (preparedGraphUpdate != null)
+        ) { "only a server merge may consume prepared graph-update artifacts" }
+        require((origin == V2IndexGenerationOrigin.SERVER_MERGE) ==
             (serverMergeAddedTrackCount != null)
         ) { "server merge publication is missing its exact append count" }
         require(privateStagingDatabase.isFile) { "derived-generation staging DB is missing" }
@@ -1790,6 +1841,9 @@ class V2IndexGenerationPublisher(
                 "only base-bound derived generations may bind an active base"
             }
             requireCurrentBase(base)
+        }
+        preparedGraphUpdate?.let { prepared ->
+            requirePreparedGraphUpdate(privateStagingDatabase, prepared)
         }
         if (baseGeneration != null) {
             require(expectedActive.pointer?.generationId == baseGeneration.manifest.generationId &&
@@ -1813,7 +1867,20 @@ class V2IndexGenerationPublisher(
         require(staging.mkdir()) { "cannot create staging generation $staging" }
         try {
             val generationDatabase = File(staging, DATABASE_FILE)
-            snapshotDatabase(privateStagingDatabase, generationDatabase)
+            if (consumePreparedAssets) {
+                require(!File(privateStagingDatabase.path + "-wal").exists() &&
+                    !File(privateStagingDatabase.path + "-shm").exists()
+                ) { "prepared server-merge database has SQLite sidecar files" }
+                onProgress(V2GenerationPublicationProgress(
+                    "Moving the prepared database into unpublished generation staging",
+                ))
+                movePreparedFile(privateStagingDatabase, generationDatabase)
+            } else {
+                onProgress(V2GenerationPublicationProgress(
+                    "Compacting the prepared database into unpublished generation staging",
+                ))
+                snapshotDatabase(privateStagingDatabase, generationDatabase)
+            }
             val embeddingFile = File(staging, EMBEDDING_FILE)
             val database = SQLiteDatabase.openDatabase(
                 generationDatabase.path,
@@ -1822,10 +1889,38 @@ class V2IndexGenerationPublisher(
             )
             try {
                 database.disableWriteAheadLogging()
-                val embeddingBinding = V2EmbeddingGenerationFile.write(
-                    V2SqliteOrderedEmbeddingSource(database),
-                    embeddingFile,
-                )
+                val embeddingBinding = preparedGraphUpdate?.let { prepared ->
+                    onProgress(V2GenerationPublicationProgress(
+                        "Moving the prepared packed embeddings into generation staging",
+                    ))
+                    movePreparedFile(prepared.embeddingFile, embeddingFile)
+                    require(embeddingFile.length() == prepared.embeddingBinding.byteLength) {
+                        "prepared packed embeddings changed before publication"
+                    }
+                    prepared.embeddingBinding
+                } ?: V2EmbeddingGenerationFile.write(
+                        source = V2SqliteOrderedEmbeddingSource(database),
+                        target = embeddingFile,
+                        onRowProgress = { completedRows, totalRows ->
+                            onProgress(V2GenerationPublicationProgress(
+                                detail = "Packed $completedRows of $totalRows embeddings for retrieval",
+                                completedUnits = completedRows.toLong(),
+                                totalUnits = totalRows.toLong(),
+                                unit = V2GenerationPublicationUnit.ROWS,
+                            ))
+                        },
+                        onHashProgress = { completedBytes, totalBytes ->
+                            onProgress(V2GenerationPublicationProgress(
+                                detail = "Hashed $completedBytes of $totalBytes packed-embedding bytes",
+                                completedUnits = completedBytes,
+                                totalUnits = totalBytes,
+                                unit = V2GenerationPublicationUnit.BYTES,
+                            ))
+                        },
+                    )
+                onProgress(V2GenerationPublicationProgress(
+                    "Checking embedding provenance and stable-track coverage",
+                ))
                 val stableCoverage = V2StableTrackUidCoverage.inspect(
                     database,
                     embeddingBinding.trackCount,
@@ -1837,6 +1932,9 @@ class V2IndexGenerationPublisher(
                 )
                 validateCoverage(embeddingBinding, stableCoverage, embeddingCoverage)
                 if (baseGeneration != null) {
+                    onProgress(V2GenerationPublicationProgress(
+                        "Checking the prepared index against its active base",
+                    ))
                     when (origin) {
                         V2IndexGenerationOrigin.LIBRARY_MAINTENANCE ->
                             requireMaintenanceSubset(
@@ -1857,9 +1955,44 @@ class V2IndexGenerationPublisher(
                 var installedGraphFile: File? = null
                 val graphBinding = derivedGraphFile?.let { source ->
                     val target = File(staging, V2GraphGenerationFile.GRAPH_FILE)
-                    copyAndSync(source, target)
+                    if (preparedGraphUpdate != null) {
+                        onProgress(V2GenerationPublicationProgress(
+                            "Moving the prepared similarity graph into generation staging",
+                        ))
+                        movePreparedFile(source, target)
+                        require(target.length() == preparedGraphUpdate.graphBinding.byteLength) {
+                            "prepared similarity graph changed before publication"
+                        }
+                    } else {
+                        copyAndSync(source, target) { completedBytes, totalBytes ->
+                            onProgress(V2GenerationPublicationProgress(
+                                detail = "Copied $completedBytes of $totalBytes graph bytes",
+                                completedUnits = completedBytes,
+                                totalUnits = totalBytes,
+                                unit = V2GenerationPublicationUnit.BYTES,
+                            ))
+                        }
+                    }
                     installedGraphFile = target
-                    V2GraphGenerationFile.inspect(target).also { graph ->
+                    preparedGraphUpdate?.graphBinding ?: V2GraphGenerationFile.inspect(
+                        file = target,
+                        onRowProgress = { completedRows, totalRows ->
+                            onProgress(V2GenerationPublicationProgress(
+                                detail = "Checked $completedRows of $totalRows similarity-graph rows",
+                                completedUnits = completedRows.toLong(),
+                                totalUnits = totalRows.toLong(),
+                                unit = V2GenerationPublicationUnit.ROWS,
+                            ))
+                        },
+                        onHashProgress = { completedBytes, totalBytes ->
+                            onProgress(V2GenerationPublicationProgress(
+                                detail = "Hashed $completedBytes of $totalBytes similarity-graph bytes",
+                                completedUnits = completedBytes,
+                                totalUnits = totalBytes,
+                                unit = V2GenerationPublicationUnit.BYTES,
+                            ))
+                        },
+                    ).also { graph ->
                         require(graph.nodeCount == embeddingBinding.trackCount &&
                             graph.orderedTrackSetSha256 == embeddingBinding.orderedTrackSetSha256
                         ) { "imported graph is not bound to the exact PEMB track ordering" }
@@ -1896,6 +2029,9 @@ class V2IndexGenerationPublisher(
                     graphPolicy = graphPolicy,
                     graph = graphBinding,
                 )
+                onProgress(V2GenerationPublicationProgress(
+                    "Recording the index bindings used by the recommendation engine",
+                ))
                 installInvalidationReceipt(
                     database = database,
                     jobSpecId = jobSpecId,
@@ -1908,14 +2044,30 @@ class V2IndexGenerationPublisher(
                     embeddingCoverage = embeddingCoverage,
                     graph = graphBinding,
                 )
-                database.rawQuery("PRAGMA integrity_check", null).use { cursor ->
-                    require(cursor.moveToFirst() && cursor.getString(0) == "ok" &&
-                        !cursor.moveToNext()
-                    ) { "derived generation database integrity check failed" }
+                onProgress(V2GenerationPublicationProgress(
+                    "Checking the completed SQLite index for corruption",
+                ))
+                database.rawQuery("PRAGMA integrity_check(1)", null).use { cursor ->
+                    require(cursor.moveToFirst() && cursor.getString(0) == "ok") {
+                        "derived generation database integrity check failed"
+                    }
                 }
                 database.close()
                 syncFile(generationDatabase)
 
+                onProgress(V2GenerationPublicationProgress(
+                    "Hashing the completed database for the immutable index manifest",
+                ))
+                val generationDatabaseSha256 = V2FileSha256.digest(
+                    generationDatabase,
+                ) { completedBytes, totalBytes ->
+                    onProgress(V2GenerationPublicationProgress(
+                        detail = "Hashed $completedBytes of $totalBytes database bytes",
+                        completedUnits = completedBytes,
+                        totalUnits = totalBytes,
+                        unit = V2GenerationPublicationUnit.BYTES,
+                    ))
+                }
                 val provisional = V2IndexGenerationManifest(
                     schemaVersion = MANIFEST_SCHEMA_VERSION,
                     origin = origin,
@@ -1931,7 +2083,7 @@ class V2IndexGenerationPublisher(
                     createdAtEpochMs = 0L,
                     databaseRelativePath = DATABASE_FILE,
                     databaseByteLength = generationDatabase.length(),
-                    databaseSha256 = V2FileSha256.digest(generationDatabase),
+                    databaseSha256 = generationDatabaseSha256,
                     databaseContentSha256 = embeddingBinding.databaseContentSha256,
                     orderedTrackSetSha256 = embeddingBinding.orderedTrackSetSha256,
                     stableTrackUidCoverage = stableCoverage,
@@ -1949,11 +2101,17 @@ class V2IndexGenerationPublisher(
                     generationId = V2IndexGenerationIdentity.generationId(provisional),
                 )
                 val manifestFile = File(staging, MANIFEST_FILE)
+                onProgress(V2GenerationPublicationProgress(
+                    "Writing the immutable index manifest",
+                ))
                 writeManifest(manifestFile, manifest)
                 syncDirectory(staging)
                 val manifestSha256 = V2FileSha256.digest(manifestFile)
                 baseGeneration?.let(::requireCurrentBase)
                 beforePointerPublication(manifest)
+                onProgress(V2GenerationPublicationProgress(
+                    "Activating the completed music index",
+                ))
                 return V2GenerationPublicationCoordinator.installAndCommit(
                     filesDir = filesDir,
                     expected = expectedActive,
@@ -1981,6 +2139,52 @@ class V2IndexGenerationPublisher(
         }
         require(target.isFile && target.length() > 0L) { "VACUUM INTO did not publish a DB" }
         syncFile(target)
+    }
+
+    private fun requirePreparedGraphUpdate(
+        privateStagingDatabase: File,
+        prepared: V2PreparedGraphUpdate,
+    ) {
+        require(prepared.plan.strategy == V2GraphUpdateStrategy.INCREMENTAL) {
+            "server merge requires an exact incremental graph update"
+        }
+        require(prepared.databaseFile.canonicalFile == privateStagingDatabase.canonicalFile) {
+            "prepared graph update belongs to another database"
+        }
+        require(prepared.plan.targetNodes == prepared.embeddingBinding.trackCount &&
+            prepared.plan.targetNodes == prepared.graphBinding.nodeCount &&
+            prepared.plan.embeddingDimension == prepared.embeddingBinding.dimension &&
+            prepared.plan.neighborsPerNode == prepared.graphBinding.neighborsPerNode &&
+            prepared.embeddingBinding.orderedTrackSetSha256 ==
+            prepared.graphBinding.orderedTrackSetSha256
+        ) { "prepared graph-update bindings disagree" }
+        require(prepared.embeddingFile.isFile &&
+            prepared.embeddingFile.length() == prepared.embeddingBinding.byteLength &&
+            prepared.graphFile.isFile &&
+            prepared.graphFile.length() == prepared.graphBinding.byteLength
+        ) { "prepared graph-update files changed before publication" }
+        val database = EmbeddingDatabase.open(privateStagingDatabase)
+        val proof = try {
+            database.getSmallBinaryData(V2GraphExactProof.DATABASE_KEY)
+        } finally {
+            database.close()
+        }
+        require(V2GraphExactProof.matches(
+            bytes = proof,
+            graphSha256 = prepared.graphBinding.sha256,
+            embeddingSha256 = prepared.embeddingBinding.fileSha256,
+        )) { "prepared graph-update proof does not bind its exact files" }
+    }
+
+    private fun movePreparedFile(source: File, target: File) {
+        require(source.isFile) { "prepared publication artifact is missing" }
+        require(!target.exists()) { "publication destination already exists" }
+        try {
+            Files.move(source.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
+        } catch (_: AtomicMoveNotSupportedException) {
+            Files.move(source.toPath(), target.toPath())
+        }
+        require(target.isFile && !source.exists()) { "prepared publication artifact was not moved" }
     }
 
     private fun replaceDerivedGraphExactProof(
@@ -2179,41 +2383,6 @@ class V2IndexGenerationPublisher(
         val escaped = base.databaseFile.canonicalPath.replace("'", "''")
         database.execSQL("ATTACH DATABASE '$escaped' AS $alias")
         try {
-            val inheritedEmbeddingMismatch = database.rawQuery(
-                """
-                SELECT COUNT(*)
-                FROM $alias.${V2EmbeddingCommitRepository.EMBEDDING_TABLE} base
-                LEFT JOIN ${V2EmbeddingCommitRepository.EMBEDDING_TABLE} current
-                  ON current.track_id = base.track_id
-                 AND current.embedding = base.embedding
-                WHERE current.track_id IS NULL
-                """.trimIndent(),
-                null,
-            ).use { cursor -> check(cursor.moveToFirst()); cursor.getLong(0) }
-            require(inheritedEmbeddingMismatch == 0L) {
-                "server merge changed or removed inherited embedding rows"
-            }
-            val inheritedTrackMismatch = database.rawQuery(
-                """
-                SELECT COUNT(*)
-                FROM $alias.tracks base
-                LEFT JOIN tracks current ON current.id = base.id
-                WHERE current.id IS NULL OR NOT (
-                    current.metadata_key IS base.metadata_key AND
-                    current.filename_key IS base.filename_key AND
-                    current.artist IS base.artist AND
-                    current.album IS base.album AND
-                    current.title IS base.title AND
-                    current.duration_ms IS base.duration_ms AND
-                    current.file_path IS base.file_path AND
-                    current.source IS base.source
-                )
-                """.trimIndent(),
-                null,
-            ).use { cursor -> check(cursor.moveToFirst()); cursor.getLong(0) }
-            require(inheritedTrackMismatch == 0L) {
-                "server merge changed or removed inherited track rows"
-            }
             val invalidAdditionCount = database.rawQuery(
                 """
                 SELECT COUNT(*)
@@ -2229,7 +2398,6 @@ class V2IndexGenerationPublisher(
             require(invalidAdditionCount == 0L) {
                 "server merge introduced a non-server track or a track without an embedding"
             }
-            requireServerMergeReceiptsUnchanged(database, alias)
             requireServerMergeAuditReceipts(
                 database = database,
                 baseAlias = alias,
@@ -2238,62 +2406,6 @@ class V2IndexGenerationPublisher(
         } finally {
             database.execSQL("DETACH DATABASE $alias")
         }
-    }
-
-    private fun requireServerMergeReceiptsUnchanged(
-        database: SQLiteDatabase,
-        baseAlias: String,
-    ) {
-        val receiptTable = V2EmbeddingCommitRepository.RECEIPT_TABLE
-        fun tableExists(schema: String): Boolean = database.rawQuery(
-            "SELECT 1 FROM $schema.sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
-            arrayOf(receiptTable),
-        ).use { it.moveToFirst() }
-        val baseHasReceipts = tableExists(baseAlias)
-        val currentHasReceipts = tableExists("main")
-        if (!baseHasReceipts) {
-            require(!currentHasReceipts || database.rawQuery(
-                "SELECT COUNT(*) FROM $receiptTable",
-                null,
-            ).use { cursor -> check(cursor.moveToFirst()); cursor.getLong(0) } == 0L) {
-                "server merge introduced V2 receipts"
-            }
-            return
-        }
-        require(currentHasReceipts) { "server merge removed the V2 receipt table" }
-        val baseCount = database.rawQuery(
-            "SELECT COUNT(*) FROM $baseAlias.$receiptTable",
-            null,
-        ).use { cursor -> check(cursor.moveToFirst()); cursor.getLong(0) }
-        val currentCount = database.rawQuery(
-            "SELECT COUNT(*) FROM $receiptTable",
-            null,
-        ).use { cursor -> check(cursor.moveToFirst()); cursor.getLong(0) }
-        require(currentCount == baseCount) { "server merge changed V2 receipt count" }
-        val mismatched = database.rawQuery(
-            """
-            SELECT COUNT(*)
-            FROM $receiptTable current
-            LEFT JOIN $baseAlias.$receiptTable base ON
-                base.receipt_schema_version = current.receipt_schema_version AND
-                base.work_id = current.work_id AND
-                base.stable_track_span_id = current.stable_track_span_id AND
-                base.stable_identity_spec_id = current.stable_identity_spec_id AND
-                base.stable_identity_strength = current.stable_identity_strength AND
-                base.embedding_spec_id = current.embedding_spec_id AND
-                base.provider_physical_path = current.provider_physical_path AND
-                base.provider_offset_ms = current.provider_offset_ms AND
-                base.provider_duration_ms = current.provider_duration_ms AND
-                base.track_id = current.track_id AND
-                base.metadata_sha256 = current.metadata_sha256 AND
-                base.embedding_byte_length = current.embedding_byte_length AND
-                base.embedding_sha256 = current.embedding_sha256 AND
-                base.committed_at_epoch_ms = current.committed_at_epoch_ms
-            WHERE base.track_id IS NULL
-            """.trimIndent(),
-            null,
-        ).use { cursor -> check(cursor.moveToFirst()); cursor.getLong(0) }
-        require(mismatched == 0L) { "server merge changed V2 receipt evidence" }
     }
 
     private fun requireServerMergeAuditReceipts(
@@ -2322,33 +2434,6 @@ class V2IndexGenerationPublisher(
         }
         require(currentCount == baseCount + addedTrackCount) {
             "server merge receipt delta differs from its appended track count"
-        }
-        if (baseHasTable) {
-            val missingInherited = database.rawQuery(
-                """
-                SELECT COUNT(*)
-                FROM $baseAlias.$table base
-                LEFT JOIN $table current ON
-                    current.receipt_schema_version = base.receipt_schema_version AND
-                    current.bundle_id = base.bundle_id AND
-                    current.root_id = base.root_id AND
-                    current.relative_path = base.relative_path AND
-                    current.source_sha256 = base.source_sha256 AND
-                    current.source_size_bytes = base.source_size_bytes AND
-                    current.provider_file_id = base.provider_file_id AND
-                    current.provider_physical_path = base.provider_physical_path AND
-                    current.track_id = base.track_id AND
-                    current.embedding_sha256 = base.embedding_sha256 AND
-                    current.embedding_spec_id = base.embedding_spec_id AND
-                    current.output_space_id = base.output_space_id AND
-                    current.merged_at_epoch_ms = base.merged_at_epoch_ms
-                WHERE current.track_id IS NULL
-                """.trimIndent(),
-                null,
-            ).use { cursor -> check(cursor.moveToFirst()); cursor.getLong(0) }
-            require(missingInherited == 0L) {
-                "server merge changed an inherited server row receipt"
-            }
         }
         val baseJoin = if (baseHasTable) {
             "LEFT JOIN $baseAlias.$table inherited ON inherited.track_id = receipt.track_id"
@@ -3280,6 +3365,22 @@ object V2IndexGenerationReader {
     private fun elapsedMs(startedNs: Long): Long =
         (System.nanoTime() - startedNs) / 1_000_000L
 
+    @Synchronized
+    internal fun rememberFreshlyPublished(
+        pointer: V2ActiveGenerationPointer,
+        resolved: V2ResolvedActiveIndexGeneration,
+    ) {
+        require(pointer.generationId == resolved.manifest.generationId &&
+            pointer.manifestSha256 == resolved.manifestSha256 &&
+            resolved.directory.name == pointer.generationId
+        ) { "fresh publication does not match its active pointer" }
+        cached = CachedGeneration(
+            pointer = pointer,
+            signature = GenerationFileSignature.capture(resolved.directory),
+            resolved = resolved,
+        )
+    }
+
     internal fun requireActivePointer(
         filesDir: File,
         gson: Gson = GsonBuilder().disableHtmlEscaping().create(),
@@ -3741,20 +3842,6 @@ private fun RandomAccessFile.writeLongLittleEndian(value: Long) {
     write(ByteBuffer.allocate(Long.SIZE_BYTES).order(ByteOrder.LITTLE_ENDIAN).putLong(value).array())
 }
 
-private fun RandomAccessFile.readLongLittleEndian(): Long {
-    val bytes = ByteArray(Long.SIZE_BYTES)
-    readFully(bytes)
-    return ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).long
-}
-
-private fun RandomAccessFile.readIntLittleEndian(): Int {
-    val bytes = ByteArray(Int.SIZE_BYTES)
-    readFully(bytes)
-    return ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).int
-}
-
-private fun RandomAccessFile.readFloatLittleEndian(): Float =
-    Float.fromBits(readIntLittleEndian())
 
 private fun MessageDigest.updateLengthPrefixed(value: String) {
     val bytes = value.toByteArray(StandardCharsets.UTF_8)

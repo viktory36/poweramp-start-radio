@@ -153,6 +153,7 @@ object V2IndexingStoragePolicy {
 
 /** Peak-space admission for bootstrap import and immutable library maintenance. */
 object V2GenerationMutationStoragePolicy {
+    private const val DATABASE_GROWTH_PER_TRACK = 8L * 1024L
     private const val SQLITE_AND_ATOMIC_HEADROOM = 64L * 1024L * 1024L
     private const val SAFETY_NUMERATOR = 6L
     private const val SAFETY_DENOMINATOR = 5L
@@ -212,22 +213,35 @@ object V2GenerationMutationStoragePolicy {
         return estimate(peak, availableBytes)
     }
 
-    /**
-     * Remaining peak after the selected bundle is already staged: one mutable clone of the active
-     * SQLite database plus the publisher's immutable SQLite/PEMB/graph copies.
-     */
+    /** Remaining peak after the selected bundle is staged; prepared DB and graph ownership moves. */
     fun estimateServerMerge(
         active: V2ResolvedActiveIndexGeneration,
-        bundleBytes: Long,
+        addedTrackCount: Int,
         availableBytes: Long,
     ): V2GenerationMutationStorageEstimate {
-        require(bundleBytes > 0L) { "server bundle length must be positive" }
-        val databaseBytes = active.manifest.databaseByteLength
-        val embeddingBytes = active.manifest.embeddingByteLength
-        val graphBytes = active.manifest.graph?.byteLength ?: 0L
+        require(addedTrackCount > 0) { "server merge must add at least one track" }
+        val addedTracks = addedTrackCount.toLong()
+        val databaseBytes = add(
+            active.manifest.databaseByteLength,
+            multiply(addedTracks, DATABASE_GROWTH_PER_TRACK),
+        )
+        val embeddingBytes = add(
+            active.manifest.embeddingByteLength,
+            multiply(addedTracks, Long.SIZE_BYTES + V2_CLAMP3_BLOB_BYTES.toLong()),
+        )
+        val graph = requireNotNull(active.manifest.graph) {
+            "server merge requires an active similarity graph"
+        }
+        val graphBytes = add(
+            graph.byteLength,
+            multiply(
+                addedTracks,
+                Long.SIZE_BYTES + graph.neighborsPerNode.toLong() * 2L * Int.SIZE_BYTES,
+            ),
+        )
         val peak = add(
-            add(multiply(databaseBytes, 2L), embeddingBytes),
-            add(multiply(graphBytes, 2L), SQLITE_AND_ATOMIC_HEADROOM),
+            add(databaseBytes, embeddingBytes),
+            add(graphBytes, SQLITE_AND_ATOMIC_HEADROOM),
         )
         return estimate(peak, availableBytes)
     }

@@ -41,6 +41,23 @@ class V2GraphWorkPlannerTest {
     }
 
     @Test
+    fun `standalone publication counts one graph output instead of a duplicate database blob`() {
+        val plan = V2GraphWorkPlanner.plan(
+            targetNodes = 80_500,
+            embeddingDimension = 768,
+            neighborsPerNode = 5,
+            storeGraphInDatabase = false,
+            existingGraphNodes = 80_421,
+            existingGraphNeighborsPerNode = 5,
+        )
+
+        assertEquals(
+            V2GraphWorkPlanner.graphFileBytes(80_500, 5),
+            plan.graphBinaryOutputBytes,
+        )
+    }
+
+    @Test
     fun `missing or incompatible graph has an explicit quadratic full rebuild`() {
         val missing = V2GraphWorkPlanner.plan(
             targetNodes = 1_000,

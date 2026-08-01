@@ -145,6 +145,22 @@ class V2IndexingStoragePolicyTest {
     }
 
     @Test
+    fun `server merge reserves one prepared database pemb and graph`() {
+        val estimate = V2GenerationMutationStoragePolicy.estimateServerMerge(
+            active = active(withGraph = true),
+            addedTrackCount = 1_000,
+            availableBytes = Long.MAX_VALUE,
+        )
+        val retainedArtifacts = 380_000_000L + 245_760_016L + 4_000_000L +
+            1_000L * (8L * 1024L + Long.SIZE_BYTES + V2_CLAMP3_BLOB_BYTES +
+                Long.SIZE_BYTES + 5L * 2L * Int.SIZE_BYTES)
+        val formerDuplicateCopyFloor = 2L * 380_000_000L + 245_760_016L + 2L * 4_000_000L
+
+        assertTrue(estimate.requiredAdditionalBytes > retainedArtifacts)
+        assertTrue(estimate.requiredAdditionalBytes < formerDuplicateCopyFloor)
+    }
+
+    @Test
     fun `mutation capacity error names the operation`() {
         val error = assertThrows(V2StorageCapacityException::class.java) {
             V2GenerationMutationStoragePolicy.requireCapacity(

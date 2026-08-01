@@ -4,12 +4,11 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.net.Uri
-import android.system.Os
-import android.system.OsConstants
 import com.powerampstartradio.AudioLibraryPermission
 import com.powerampstartradio.data.EmbeddingDatabase
 import com.powerampstartradio.indexing.GraphUpdater
 import com.powerampstartradio.indexing.V2ActiveLibraryCatalog
+import com.powerampstartradio.indexing.V2ActiveLibraryGenerationBinding
 import com.powerampstartradio.indexing.V2ActiveLibraryCatalogLoader
 import com.powerampstartradio.indexing.V2ActiveLibraryCatalogStore
 import com.powerampstartradio.indexing.V2ExactGraphIncrementalBase
@@ -17,6 +16,7 @@ import com.powerampstartradio.indexing.V2GraphUpdateStrategy
 import com.powerampstartradio.indexing.V2GraphUpdaterControl
 import com.powerampstartradio.indexing.V2GraphUpdaterProgress
 import com.powerampstartradio.indexing.V2GraphUpdaterStage
+import com.powerampstartradio.indexing.V2PreparedGraphUpdate
 import com.powerampstartradio.indexing.V2ProcessLibraryInspectionCoordinator
 import com.powerampstartradio.poweramp.TrackNormalization
 import kotlinx.coroutines.Dispatchers
@@ -26,7 +26,6 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
-import java.io.RandomAccessFile
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.UUID
@@ -159,7 +158,6 @@ internal enum class V2ServerMergeStage {
     APPENDING_EMBEDDINGS,
     UPDATING_SIMILARITY_GRAPH,
     PUBLISHING_GENERATION,
-    RECONCILING_LIBRARY,
 }
 
 internal data class V2ServerMergeProgress(
@@ -294,12 +292,13 @@ internal object V2ServerBundleReciprocalAssignmentPolicy {
 internal object V2ServerBundleValidator {
     fun validate(
         databaseFile: File,
+        sourceSha256: String,
         onRowProgress: (completedRows: Int, totalRows: Int) -> Unit = { _, _ -> },
     ): V2ServerBundleValidation {
         require(databaseFile.isFile && databaseFile.length() > 0L) {
             "Selected server bundle is missing or empty"
         }
-        val sourceSha256 = V2FileSha256.digest(databaseFile)
+        require(sourceSha256.matches(SHA256)) { "Server bundle database hash is invalid" }
         val database = SQLiteDatabase.openDatabase(
             databaseFile.path,
             null,
@@ -491,7 +490,6 @@ internal object V2ServerBundleValidator {
             require(bundleId == expectedBundleId) {
                 "Server bundle logical ID does not match its ordered rows and canonical spec"
             }
-            requireIntegrity(database)
             return V2ServerBundleValidation(
                 sourceByteLength = databaseFile.length(),
                 sourceSha256 = sourceSha256,
@@ -704,6 +702,7 @@ internal class V2ServerBundleMerger(
     private val providerAcquirer: V2PowerampProviderSnapshotAcquirer =
         V2PowerampProviderSnapshotAcquirer(context),
     private val sourceFingerprinter: V2SourceFingerprintProvider = V2ExactSourceFingerprinter(),
+    private val cancellationCheck: () -> Unit = {},
 ) {
     private val appContext = context.applicationContext
     private val mergeRoot = File(filesDir, "indexing_v2/server-merges")
@@ -777,10 +776,8 @@ internal class V2ServerBundleMerger(
             "Cannot create private server-merge staging"
         }
         removeAbandonedStaging()
-        syncDirectory(mergeRoot.parentFile ?: filesDir)
         val staging = File(mergeRoot, ".staging-${UUID.randomUUID()}")
         require(staging.mkdir()) { "Cannot create private server-merge operation" }
-        syncDirectory(mergeRoot)
         try {
             val bundleDatabase = File(staging, "server-bundle.db")
             publish(
@@ -790,7 +787,11 @@ internal class V2ServerBundleMerger(
                 0L,
                 sourceLength,
             )
-            copyAndSync(openSource, bundleDatabase, sourceLength) { copied, total ->
+            val bundleDatabaseSha256 = copyToStaging(
+                openSource,
+                bundleDatabase,
+                sourceLength,
+            ) { copied, total ->
                 publish(
                     onProgress,
                     V2ServerMergeStage.COPYING_BUNDLE,
@@ -804,7 +805,10 @@ internal class V2ServerBundleMerger(
                 V2ServerMergeStage.VALIDATING_BUNDLE,
                 "Validating server model, source-span, and embedding evidence",
             )
-            val validation = V2ServerBundleValidator.validate(bundleDatabase) { completed, total ->
+            val validation = V2ServerBundleValidator.validate(
+                databaseFile = bundleDatabase,
+                sourceSha256 = bundleDatabaseSha256,
+            ) { completed, total ->
                 publish(
                     onProgress,
                     V2ServerMergeStage.VALIDATING_BUNDLE,
@@ -898,7 +902,7 @@ internal class V2ServerBundleMerger(
             V2GenerationMutationStoragePolicy.requireCapacity(
                 V2GenerationMutationStoragePolicy.estimateServerMerge(
                     active = base,
-                    bundleBytes = bundleDatabase.length(),
+                    addedTrackCount = resolved.accepted.size,
                     availableBytes = filesDir.usableSpace,
                 ),
                 operation = "Server embedding merge",
@@ -945,38 +949,44 @@ internal class V2ServerBundleMerger(
             )
             requireAddedBindings(stagedCatalog, stagedAdditions)
             requireInheritedBindingsPreserved(baseCatalog, stagedCatalog)
-            val graphFile = updateExactGraph(
+            val preparedGraphUpdate = updateExactGraph(
                 base = base,
                 stagedDatabase = stagedDatabase,
                 staging = staging,
                 onProgress = onProgress,
             )
             requireAcceptedSourcesStillCurrent(resolved.accepted, onProgress)
-            publish(
-                onProgress,
-                V2ServerMergeStage.PUBLISHING_GENERATION,
-                "Hashing and atomically publishing the merged music index",
-            )
             val generation = publisher.publishServerMerge(
                 privateStagingDatabase = stagedDatabase,
                 baseGeneration = base,
                 bundleDatabaseSha256 = validation.sourceSha256,
                 addedTrackCount = resolved.accepted.size,
-                exactUpdatedGraphFile = graphFile,
+                preparedGraphUpdate = preparedGraphUpdate,
                 expectedActive = expectedActive,
+                onProgress = { progress ->
+                    publish(
+                        onProgress,
+                        V2ServerMergeStage.PUBLISHING_GENERATION,
+                        progress.detail,
+                        progress.completedUnits,
+                        progress.totalUnits,
+                    )
+                },
             )
             require(generation.manifest.origin == V2IndexGenerationOrigin.SERVER_MERGE &&
                 generation.manifest.baseGenerationId == base.manifest.generationId &&
                 generation.manifest.trackCount == base.manifest.trackCount + resolved.accepted.size
             ) { "Published generation is not the exact server append" }
 
-            publish(
-                onProgress,
-                V2ServerMergeStage.RECONCILING_LIBRARY,
-                "Binding the merged generation to the same Poweramp snapshot",
+            val catalog = V2ActiveLibraryCatalog(
+                generationBinding = V2ActiveLibraryGenerationBinding(
+                    databaseGenerationId = generation.manifest.generationId,
+                    providerGenerationId = stagedCatalog.generationBinding.providerGenerationId,
+                ),
+                bindings = stagedCatalog.bindings,
+                quarantinedTracks = stagedCatalog.quarantinedTracks,
+                unboundPowerampFileIds = stagedCatalog.unboundPowerampFileIds,
             )
-            val catalog = V2ActiveLibraryCatalogLoader.load(generation, providerSnapshot)
-            requireAddedBindings(catalog, stagedAdditions)
             V2ActiveLibraryCatalogStore(filesDir).write(generation, catalog)
             val added = resolved.accepted.map { accepted ->
                 V2ServerBundleRowOutcome(
@@ -1001,7 +1011,6 @@ internal class V2ServerBundleMerger(
             )
         } finally {
             staging.deleteRecursively()
-            syncDirectory(mergeRoot)
         }
     }
 
@@ -1357,11 +1366,6 @@ internal class V2ServerBundleMerger(
                             require(!cursor.moveToNext()) { "Server embedding ID became ambiguous" }
                         }
                     }
-                    V2Clamp3VectorCodec.requireValidBlob(blob)
-                    require(MessageDigest.isEqual(
-                        MessageDigest.getInstance("SHA-256").digest(blob),
-                        accepted.bundle.embeddingSha256.hexBytes(),
-                    )) { "Validated server embedding changed before append" }
                     val artist = TrackNormalization.normalizeArtist(accepted.provider.artist)
                     val album = TrackNormalization.normalizeAlbum(accepted.provider.album)
                     val title = TrackNormalization.normalizeTitle(accepted.provider.title)
@@ -1428,16 +1432,10 @@ internal class V2ServerBundleMerger(
             } finally {
                 target.endTransaction()
             }
-            target.rawQuery("PRAGMA integrity_check", null).use { cursor ->
-                require(cursor.moveToFirst() && cursor.getString(0) == "ok" &&
-                    !cursor.moveToNext()
-                ) { "Merged staging database failed SQLite integrity check" }
-            }
         } finally {
             source.close()
             target.close()
         }
-        syncFile(stagedDatabase)
         return additions
     }
 
@@ -1470,7 +1468,7 @@ internal class V2ServerBundleMerger(
         stagedDatabase: File,
         staging: File,
         onProgress: (V2ServerMergeProgress) -> Unit,
-    ): File {
+    ): V2PreparedGraphUpdate {
         require(base.manifest.graph != null && base.graphFile != null) {
             "Server merge requires an active exact graph so Random Walk remains available"
         }
@@ -1485,8 +1483,13 @@ internal class V2ServerBundleMerger(
             "Updating the exact similarity graph for appended embeddings",
         )
         val database = EmbeddingDatabase.openReadWrite(stagedDatabase)
-        val plan = try {
-            GraphUpdater(database, graphDirectory).rebuildIndices(
+        val prepared = try {
+            GraphUpdater(
+                db = database,
+                filesDir = graphDirectory,
+                checkpointsEnabled = false,
+                storeGraphInDatabase = false,
+            ).rebuildAfterByteExactAppendForPublication(
                 control = object : V2GraphUpdaterControl {
                     override fun onProgress(progress: V2GraphUpdaterProgress) {
                         publish(
@@ -1501,23 +1504,20 @@ internal class V2ServerBundleMerger(
                     override fun onControlPoint(
                         stage: V2GraphUpdaterStage,
                         completedUnits: Long,
-                    ) = Unit
+                    ) = cancellationCheck()
                 },
                 exactBase = exactBase,
             )
         } finally {
             database.close()
         }
-        require(plan.strategy == V2GraphUpdateStrategy.INCREMENTAL) {
+        require(prepared.plan.strategy == V2GraphUpdateStrategy.INCREMENTAL) {
             "Server append did not produce an exact incremental graph update"
         }
-        val graphFile = File(graphDirectory, V2GraphGenerationFile.GRAPH_FILE)
-        require(graphFile.isFile && graphFile.length() > 0L) {
+        require(prepared.graphFile.isFile && prepared.graphFile.length() > 0L) {
             "Exact server-merge graph output is missing"
         }
-        syncFile(stagedDatabase)
-        syncFile(graphFile)
-        return graphFile
+        return prepared
     }
 
     private fun requireAcceptedSourcesStillCurrent(
@@ -1689,13 +1689,6 @@ internal class V2ServerBundleMerger(
                 .thenBy(V2ServerBundleRowOutcome::relativePath),
         )
 
-    private fun String.hexBytes(): ByteArray {
-        require(length == 64)
-        return ByteArray(length / 2) { index ->
-            substring(index * 2, index * 2 + 2).toInt(16).toByte()
-        }
-    }
-
     private fun ByteArray.toHex(): String = joinToString("") { byte ->
         (byte.toInt() and 0xff).toString(16).padStart(2, '0')
     }
@@ -1725,7 +1718,6 @@ internal class V2ServerBundleMerger(
                     onProgress(copied, base.manifest.databaseByteLength)
                 }
                 output.flush()
-                output.fd.sync()
             }
         }
         require(copied == base.manifest.databaseByteLength &&
@@ -1735,16 +1727,16 @@ internal class V2ServerBundleMerger(
         require(target.isFile && target.length() == copied) {
             "Byte-exact active-generation staging copy is incomplete"
         }
-        syncFile(target)
     }
 
-    private fun copyAndSync(
+    private fun copyToStaging(
         openSource: () -> InputStream,
         target: File,
         expectedLength: Long?,
         onProgress: (Long, Long?) -> Unit,
-    ) {
+    ): String {
         require(!target.exists()) { "Server-bundle staging destination already exists" }
+        val digest = MessageDigest.getInstance("SHA-256")
         var copied = 0L
         BufferedInputStream(openSource(), COPY_BUFFER_BYTES).use { input ->
             FileOutputStream(target).use { output ->
@@ -1754,15 +1746,16 @@ internal class V2ServerBundleMerger(
                     if (read < 0) break
                     if (read == 0) continue
                     output.write(buffer, 0, read)
+                    digest.update(buffer, 0, read)
                     copied = Math.addExact(copied, read.toLong())
                     onProgress(copied, expectedLength)
                 }
                 output.flush()
-                output.fd.sync()
             }
         }
         require(copied > 0L) { "Selected server bundle is empty" }
         expectedLength?.let { require(copied == it) { "Server bundle copy ended early" } }
+        return digest.digest().toHex()
     }
 
     private fun removeAbandonedStaging() {
@@ -1777,19 +1770,9 @@ internal class V2ServerBundleMerger(
         detail: String,
         completed: Long? = null,
         total: Long? = null,
-    ) = callback(V2ServerMergeProgress(stage, detail, completed, total))
-
-    private fun syncFile(file: File) {
-        RandomAccessFile(file, "rw").use { it.fd.sync() }
-    }
-
-    private fun syncDirectory(directory: File) {
-        val descriptor = Os.open(directory.path, OsConstants.O_RDONLY, 0)
-        try {
-            Os.fsync(descriptor)
-        } finally {
-            Os.close(descriptor)
-        }
+    ) {
+        cancellationCheck()
+        callback(V2ServerMergeProgress(stage, detail, completed, total))
     }
 
     private companion object {

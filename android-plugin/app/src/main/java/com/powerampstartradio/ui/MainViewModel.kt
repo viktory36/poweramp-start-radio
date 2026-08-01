@@ -4,7 +4,6 @@ import android.app.Application
 import android.content.Context
 import android.net.Uri
 import android.os.Debug
-import android.provider.OpenableColumns
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -63,15 +62,14 @@ import com.powerampstartradio.indexing.v2.V2PowerampProviderSnapshotAcquirer
 import com.powerampstartradio.indexing.v2.V2ProviderPathGroupSnapshot
 import com.powerampstartradio.indexing.v2.V2ResolvedActiveIndexGeneration
 import com.powerampstartradio.indexing.v2.V2ResolvedLibraryDatabase
-import com.powerampstartradio.indexing.v2.V2ServerBundleMerger
-import com.powerampstartradio.indexing.v2.V2ServerBundleRowDisposition
-import com.powerampstartradio.indexing.v2.V2ServerMergeResult
 import com.powerampstartradio.poweramp.PowerampHelper
 import com.powerampstartradio.poweramp.PowerampReceiver
 import com.powerampstartradio.services.RadioService
 import com.powerampstartradio.services.RadioRequestAdmission
 import com.powerampstartradio.services.RecommendationWorkAdmission
 import com.powerampstartradio.services.MusicIndexMutationAdmission
+import com.powerampstartradio.services.ServerMergeProgressState
+import com.powerampstartradio.services.ServerMergeService
 import com.powerampstartradio.services.StableTrackSpanReceiptReader
 import com.powerampstartradio.similarity.RecommendationAssetFiles
 import com.powerampstartradio.similarity.RecommendationEngine
@@ -113,22 +111,6 @@ private fun activeMusicIndexHashStatus(progress: V2GenerationArtifactHashProgres
         completedBytes = progress.completedBytes,
         totalBytes = progress.totalBytes,
     )
-
-enum class ServerMergeProgressPhase {
-    PREPARING,
-    RELEASING_RECOMMENDATION_RESOURCES,
-    WAITING_FOR_LIBRARY_INSPECTION,
-    MERGING,
-}
-
-data class ServerMergeProgressState(
-    val phase: ServerMergeProgressPhase,
-    val detail: String,
-    val completedUnits: Long? = null,
-    val totalUnits: Long? = null,
-    /** Stable merger-stage name when [phase] is [ServerMergeProgressPhase.MERGING]. */
-    val mergeStage: String? = null,
-)
 
 internal fun activeLibraryCatalogProgressText(
     progress: V2ActiveLibraryCatalogLoadProgress,
@@ -181,9 +163,6 @@ internal fun activeLibraryCatalogProgressText(
  */
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val indexingHandoffReservationOwner = RecommendationWorkAdmission.uiHandoffOwner(
-        UUID.randomUUID().toString(),
-    )
-    private val musicIndexMutationOwner = RecommendationWorkAdmission.musicIndexMutationOwner(
         UUID.randomUUID().toString(),
     )
     private val libraryLifecycleMutationOwner = MusicIndexMutationAdmission.newOwner(
@@ -358,7 +337,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val importError: StateFlow<String?> = _importError.asStateFlow()
 
     private val _musicIndexUpdateResult = MutableStateFlow(
-        prefs.getString(LAST_SERVER_MERGE_RESULT_PREF, null),
+        ServerMergeService.lastResult(application),
     )
     val musicIndexUpdateResult: StateFlow<String?> = _musicIndexUpdateResult.asStateFlow()
 
@@ -2919,40 +2898,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private suspend fun prepareForMusicIndexMutation() {
-        RecommendationWorkAdmission.reserve(musicIndexMutationOwner)
-        synchronized(RETRIEVAL_RESOURCE_ADMISSION_LOCK) {
-            retrievalResourceReleaseRequired = true
-            updateRetrievalResourceAdmissionLocked()
-        }
-        try {
-            releaseProcessRetrievalResourcesForIndexing()
-            check(
-                RadioService.suspendAndReleaseRecommendationResources(
-                    timeoutMs = 60_000L,
-                ),
-            ) {
-                MUSIC_INDEX_MUTATION_BUSY_MESSAGE
-            }
-        } catch (error: Throwable) {
-            releaseMusicIndexMutationReservation()
-            throw error
-        }
-    }
-
-    private fun releaseMusicIndexMutationReservation() {
-        val globallyAvailable = RecommendationWorkAdmission.release(musicIndexMutationOwner)
-        val locallyAvailable = synchronized(RETRIEVAL_RESOURCE_ADMISSION_LOCK) {
-            val wasBlocked = retrievalResourcesSuspended.get()
-            updateRetrievalResourceAdmissionLocked()
-            wasBlocked && !retrievalResourcesSuspended.get()
-        }
-        if (locallyAvailable) onRetrievalResourcesBecameAvailable()
-        if (globallyAvailable) {
-            RadioService.kickDeferredRecovery(getApplication<Application>())
-        }
-    }
-
     private fun saveRecentSearch(search: RecentSearch) {
         // Deduplicate by exact search state, not by human-facing label.
         val stateKey = search.stateKey
@@ -3231,6 +3176,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         viewModelScope.launch(Dispatchers.IO) {
+            var handledCompletionId = 0L
+            ServerMergeService.state.collect { merge ->
+                if (merge.operationId > 0L) {
+                    _serverMergeProgress.value = merge.progress
+                    _importStatus.value = merge.progress?.detail
+                    _importError.value = merge.errorText
+                    merge.resultText?.let { _musicIndexUpdateResult.value = it }
+                }
+                updateLibraryControlsBlockedReason()
+
+                val completion = merge.completion
+                if (completion != null && completion.operationId != handledCompletionId) {
+                    handledCompletionId = completion.operationId
+                    if (completion.activeGenerationChanged) {
+                        invalidateAllPreviewsForContextChange()
+                        rankIndexSnapshot = null
+                        invalidateTextEmbeddingIndex()
+                        IndexingViewModel.invalidateCache()
+                        invalidateUnindexedCountEvidence()
+                    }
+                    refreshDatabaseInfo()
+                }
+            }
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
             RecommendationWorkAdmission.indexingReserved.collect { reserved ->
                 val transition = synchronized(RETRIEVAL_RESOURCE_ADMISSION_LOCK) {
                     val wasBlocked = retrievalResourcesSuspended.get()
@@ -3356,7 +3327,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             "A radio queue is still finishing. Try opening on-device indexing again after it completes."
         internal const val MUSIC_INDEX_MUTATION_BUSY_MESSAGE =
             "A radio queue is still finishing. Try merging the server index again after it completes."
-        private const val LAST_SERVER_MERGE_RESULT_PREF = "last_server_merge_result_v2"
         private const val RECORDING_LOOKUP_DISPLAY_LIMIT = 50
         private const val BYTES_PER_MIB = 1024L * 1024L
         private val TEXT_INFERENCE_CLEANUP_SCOPE =
@@ -4816,7 +4786,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun updateLibraryControlsBlockedReason() {
         _libraryControlsBlockedReason.value = when {
-            _libraryLifecycleBusy.value -> "A music-index update is already running."
+            _libraryLifecycleBusy.value || ServerMergeService.state.value.running ->
+                "A music-index update is already running."
             else -> indexingLibraryConflictReason()
         }
     }
@@ -4943,205 +4914,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _importError.value = "Import a music index before merging server embeddings."
             return
         }
-        if (!beginLibraryLifecycle { _importError.value = it }) return
         _importError.value = null
-        publishServerMergeProgress(
-            ServerMergeProgressState(
-                phase = ServerMergeProgressPhase.PREPARING,
-                detail = "Preparing the server merge",
-            ),
-        )
-        viewModelScope.launch(Dispatchers.IO) {
-            val activeBefore = activeGenerationIdOrNull()
-            val activeTrackCountBefore = runCatching {
-                V2IndexGenerationReader.requireActive(
-                    getApplication<Application>().filesDir,
-                ).manifest.trackCount
-            }.getOrDefault(0)
-            val selectedDocument = selectedMusicIndexDocument(uri)
-            var mutationReserved = false
-            try {
-                val startedNs = System.nanoTime()
-                val app = getApplication<Application>()
-                persistServerMergeResult(
-                    "Merge started · ${selectedDocument.summary}\n" +
-                        "Completion has not yet been recorded.",
-                )
-                publishServerMergeProgress(
-                    ServerMergeProgressState(
-                        phase = ServerMergeProgressPhase.RELEASING_RECOMMENDATION_RESOURCES,
-                        detail = "Releasing recommendation resources before changing the music index",
-                    ),
-                )
-                prepareForMusicIndexMutation()
-                mutationReserved = true
-                publishServerMergeProgress(
-                    ServerMergeProgressState(
-                        phase = ServerMergeProgressPhase.WAITING_FOR_LIBRARY_INSPECTION,
-                        detail = "Waiting for the current Poweramp library comparison to finish",
-                    ),
-                )
-                val result = V2ServerBundleMerger(app).merge(uri) { progress ->
-                    publishServerMergeProgress(
-                        ServerMergeProgressState(
-                            phase = ServerMergeProgressPhase.MERGING,
-                            detail = progress.detail,
-                            completedUnits = progress.completedUnits,
-                            totalUnits = progress.totalUnits,
-                            mergeStage = progress.stage.name,
-                        ),
-                    )
-                }
-                if (!result.noOp) {
-                    invalidateAllPreviewsForContextChange()
-                    rankIndexSnapshot = null
-                    invalidateTextEmbeddingIndex()
-                    IndexingViewModel.invalidateCache()
-                    invalidateUnindexedCountEvidence()
-                }
-                publishDatabaseInfo(
-                    readDatabaseInfo(
-                        resolution = V2ResolvedLibraryDatabase(
-                            databaseFile = result.generation.databaseFile,
-                            activeGeneration = result.generation,
-                        ),
-                        activeCatalogOverride = result.activeCatalog,
-                    ),
-                )
-                val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L
-                persistServerMergeResult(
-                    serverMergeResultText(
-                        result = result,
-                        selectedDocument = selectedDocument,
-                        activeTrackCountBefore = activeTrackCountBefore,
-                        elapsedMs = elapsedMs,
-                    ),
-                )
-                publishServerMergeProgress(null)
-                val dispositionCounts = result.rowOutcomes
-                    .groupingBy { it.disposition }
-                    .eachCount()
-                    .entries
-                    .sortedBy { it.key.name }
-                    .joinToString(",") { "${it.key.name}:${it.value}" }
-                val matchEvidenceCounts = result.rowOutcomes
-                    .mapNotNull { it.matchEvidence }
-                    .groupingBy { it }
-                    .eachCount()
-                    .entries
-                    .sortedBy { it.key.name }
-                    .joinToString(",") { "${it.key.name}:${it.value}" }
-                Log.i(
-                    "MainViewModel",
-                    "Server index merge completed: added=${result.addedTrackCount} " +
-                        "noOp=${result.noOp} elapsedMs=$elapsedMs " +
-                        "bundle=${result.sourceValidation.bundleId} " +
-                        "dispositions=[$dispositionCounts] " +
-                        "matchEvidence=[$matchEvidenceCounts]",
-                )
-            } catch (cancelled: CancellationException) {
-                publishServerMergeProgress(null)
-                val activeChanged = activeGenerationIdOrNull()?.let { it != activeBefore } == true
-                persistServerMergeResult(
-                    "Last merge was interrupted · ${selectedDocument.summary}\n" +
-                        if (activeChanged) {
-                            "A new music index was published before interruption. Reopen Settings " +
-                                "to refresh its details."
-                        } else {
-                            "Current music index unchanged."
-                        },
-                )
-                throw cancelled
-            } catch (error: Exception) {
-                Log.e("MainViewModel", "Server index merge failed", error)
-                publishServerMergeProgress(null)
-                val activeChanged = activeGenerationIdOrNull()?.let { it != activeBefore } == true
-                _importError.value = if (activeChanged) {
-                    "The merged music index is active, but this screen could not refresh. " +
-                        "Reopen Settings to refresh it."
-                } else {
-                    val detail = error.message?.trim()?.takeIf { it.isNotEmpty() }
-                        ?: "The selected server bundle could not be merged"
-                    "$detail. The current music index was not changed."
-                }
-                persistServerMergeResult(
-                    if (activeChanged) {
-                        "Last merge published a new index but refresh failed · " +
-                            "${selectedDocument.summary}\n${_importError.value}"
-                    } else {
-                        "Last merge failed · ${selectedDocument.summary}\n" +
-                            _importError.value
-                    },
-                )
-                refreshDatabaseInfo()
-            } finally {
-                if (mutationReserved ||
-                    RecommendationWorkAdmission.isReservedBy(musicIndexMutationOwner)
-                ) {
-                    releaseMusicIndexMutationReservation()
-                }
-                finishLibraryLifecycle()
-            }
+        val submission = ServerMergeService.submit(getApplication<Application>(), uri)
+        if (!submission.accepted) {
+            _importError.value = submission.errorText ?: "The server merge could not be started."
         }
-    }
-
-    private fun publishServerMergeProgress(progress: ServerMergeProgressState?) {
-        _serverMergeProgress.value = progress
-        // Existing Settings collectors retain their String contract until the determinate UI is
-        // wired to serverMergeProgress.
-        _importStatus.value = progress?.detail
-    }
-
-    private data class SelectedMusicIndexDocument(
-        val displayName: String,
-        val byteCount: Long?,
-    ) {
-        val summary: String
-            get() = buildString {
-                append(displayName)
-                byteCount?.let { bytes ->
-                    append(" · ")
-                    append("%.1f MiB".format(Locale.US, bytes.toDouble() / BYTES_PER_MIB))
-                }
-            }
-    }
-
-    private fun selectedMusicIndexDocument(uri: Uri): SelectedMusicIndexDocument {
-        var displayName: String? = null
-        var byteCount: Long? = null
-        runCatching {
-            getApplication<Application>().contentResolver.query(
-                uri,
-                arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
-                null,
-                null,
-                null,
-            )?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val nameColumn = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    val sizeColumn = cursor.getColumnIndex(OpenableColumns.SIZE)
-                    if (nameColumn >= 0 && !cursor.isNull(nameColumn)) {
-                        displayName = cursor.getString(nameColumn)
-                    }
-                    if (sizeColumn >= 0 && !cursor.isNull(sizeColumn)) {
-                        byteCount = cursor.getLong(sizeColumn).takeIf { it >= 0L }
-                    }
-                }
-            }
-        }.onFailure { error ->
-            Log.w("MainViewModel", "Could not read selected server-bundle identity", error)
-        }
-        return SelectedMusicIndexDocument(
-            displayName = displayName?.takeIf { it.isNotBlank() }
-                ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
-                ?: "selected file",
-            byteCount = byteCount,
-        )
-    }
-
-    private fun persistServerMergeResult(result: String) {
-        _musicIndexUpdateResult.value = result
-        prefs.edit().putString(LAST_SERVER_MERGE_RESULT_PREF, result).apply()
+        updateLibraryControlsBlockedReason()
     }
 
     private fun invalidateUnindexedCountEvidence() {
@@ -5154,61 +4932,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             .remove("unindexed_count_attention_fingerprint")
             .remove("unindexed_count_detection_policy")
             .apply()
-    }
-
-    private fun serverMergeResultText(
-        result: V2ServerMergeResult,
-        selectedDocument: SelectedMusicIndexDocument,
-        activeTrackCountBefore: Int,
-        elapsedMs: Long,
-    ): String {
-        val counts = result.rowOutcomes.groupingBy { it.disposition }.eachCount()
-        val parts = mutableListOf<String>()
-        parts += "${result.addedTrackCount} added"
-        counts[V2ServerBundleRowDisposition.ALREADY_INDEXED]
-            ?.takeIf { it > 0 }
-            ?.let { parts += "$it already indexed" }
-        counts[V2ServerBundleRowDisposition.NOT_IN_POWERAMP_LIBRARY]
-            ?.takeIf { it > 0 }
-            ?.let { parts += "$it not in Poweramp" }
-        counts[V2ServerBundleRowDisposition.CUE_OR_SHARED_SOURCE]
-            ?.takeIf { it > 0 }
-            ?.let { parts += "$it CUE or shared-source" }
-        counts[V2ServerBundleRowDisposition.AMBIGUOUS_POWERAMP_PATH]
-            ?.takeIf { it > 0 }
-            ?.let { parts += "$it ambiguous" }
-        counts[V2ServerBundleRowDisposition.SOURCE_FILE_UNAVAILABLE]
-            ?.takeIf { it > 0 }
-            ?.let { parts += "$it source files unavailable" }
-        counts[V2ServerBundleRowDisposition.SOURCE_BYTES_MISMATCH]
-            ?.takeIf { it > 0 }
-            ?.let { parts += "$it phone files differ from server" }
-        val bundleIdentity = result.sourceValidation.bundleId
-            .removePrefix("server-bundle-v1-")
-            .take(12)
-        val elapsed = if (elapsedMs < 60_000L) {
-            "%.1f s".format(Locale.US, elapsedMs / 1_000.0)
-        } else {
-            "${elapsedMs / 60_000L} min ${(elapsedMs % 60_000L) / 1_000L} s"
-        }
-        return buildString {
-            append(if (result.noOp) "Last merge made no changes" else "Last merge completed")
-            append(" · ")
-            append(selectedDocument.summary)
-            append('\n')
-            append(result.sourceValidation.tracks.size)
-            append(" server embeddings · ")
-            append(parts.joinToString(" · "))
-            append('\n')
-            append("Music index ")
-            append(activeTrackCountBefore)
-            append(" → ")
-            append(result.generation.manifest.trackCount)
-            append(" tracks · bundle ")
-            append(bundleIdentity)
-            append(" · ")
-            append(elapsed)
-        }
     }
 
     private fun activeGenerationIdOrNull(): String? = runCatching {
