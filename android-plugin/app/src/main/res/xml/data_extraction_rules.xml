@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup disableIfNoEncryptionCapabilities="true">
+        <include
+            domain="sharedpref"
+            path="settings.xml" />
+        <include
+            domain="sharedpref"
+            path="indexing.xml" />
+    </cloud-backup>
+
+    <device-transfer>
+        <include
+            domain="sharedpref"
+            path="settings.xml" />
+        <include
+            domain="sharedpref"
+            path="indexing.xml" />
+        <include
+            domain="file"
+            path="session_history.json" />
+        <include
+            domain="file"
+            path="session_history.json.bak" />
+        <include
+            domain="file"
+            path="indexing_v2/generations/" />
+        <include
+            domain="file"
+            path="mert.tflite" />
+        <include
+            domain="file"
+            path="clamp3_audio.tflite" />
+        <include
+            domain="file"
+            path="clamp3_text.tflite" />
+        <include
+            domain="file"
+            path="sentencepiece.bpe.model" />
+    </device-transfer>
+</data-extraction-rules>

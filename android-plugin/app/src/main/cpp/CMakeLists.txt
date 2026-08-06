@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22.1)
-project(soxr-jni C)
+project(poweramp-start-radio-native C CXX)
 
 # libsoxr - Android build with NEON SIMD (CR32 + CR32S + CR64 + VR32, PFFFT)
 set(SOXR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/soxr)
@@ -39,3 +39,24 @@ add_library(math-jni SHARED math_jni.c)
 target_compile_options(math-jni PRIVATE -O2)
 target_link_libraries(math-jni PRIVATE log)
 target_link_options(math-jni PRIVATE -Wl,-z,max-page-size=16384)
+
+# Use the checkpoint's serialized SentencePiece model directly. The former
+# Kotlin approximation could not reproduce the model's embedded nmt_nfkc
+# normalization table for all Unicode input.
+set(SPM_ENABLE_SHARED OFF CACHE BOOL "" FORCE)
+set(SPM_BUILD_TEST OFF CACHE BOOL "" FORCE)
+set(SPM_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(SPM_ENABLE_TCMALLOC OFF CACHE BOOL "" FORCE)
+set(SPM_ENABLE_NFKC_COMPILE OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/sentencepiece EXCLUDE_FROM_ALL)
+
+add_library(sentencepiece-jni SHARED sentencepiece_jni.cpp)
+target_include_directories(sentencepiece-jni PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sentencepiece/src
+)
+target_compile_options(sentencepiece-jni PRIVATE -O3 -fvisibility=hidden)
+target_link_libraries(sentencepiece-jni PRIVATE sentencepiece-static log)
+target_link_options(sentencepiece-jni PRIVATE
+    -Wl,--gc-sections
+    -Wl,-z,max-page-size=16384
+)

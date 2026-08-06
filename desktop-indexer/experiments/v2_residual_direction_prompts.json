@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "frozen_before_ranking": "2026-07-15",
+  "described_tracks": [],
+  "open_queries": [
+    {
+      "id": "neutral_music",
+      "prompt": "music"
+    },
+    {
+      "id": "neutral_song",
+      "prompt": "a song"
+    },
+    {
+      "id": "neutral_piece_of_music",
+      "prompt": "a piece of music"
+    },
+    {
+      "id": "neutral_audio_recording",
+      "prompt": "an audio recording of music"
+    }
+  ],
+  "language_groups": [],
+  "operator_anchors": []
+}

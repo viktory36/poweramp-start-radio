@@ -2,12 +2,56 @@ package com.powerampstartradio.similarity.algorithms
 
 import android.util.Log
 import com.powerampstartradio.data.EmbeddingIndex
-import kotlin.math.abs
-import kotlin.math.exp
-import kotlin.math.ln
+import com.powerampstartradio.data.StableTrackIdentityCatalog
+import com.powerampstartradio.data.StableVisibleResultIdentity
+import com.powerampstartradio.ui.FindMusicOperator
+import com.powerampstartradio.ui.FindMusicRefineSpec
+
+data class RankedComposedRow(
+    val objectiveRank: Int,
+    val row: ComposedRankingRow,
+)
+
+data class DetailedComposedRanking(
+    val rows: List<ComposedRankingRow>,
+    /** Identity-representative rows used to compute every ingredient percentile. */
+    val ingredientRankingDomainCount: Int,
+    /** Exact domain ranked by the objective; Refine narrows this to its primary neighborhood. */
+    val objectiveRankingDomainCount: Int,
+)
+
+/** Full All-of order backed by primitive arrays; row evidence is materialized only while scanned. */
+class AllOfRankingSnapshot internal constructor(
+    private val trackIds: LongArray,
+    private val objectiveScores: FloatArray,
+    private val anchorPercentiles: List<FloatArray>,
+    private val rankedIndices: IntArray,
+) : Iterable<RankedComposedRow> {
+    val size: Int get() = rankedIndices.size
+
+    override fun iterator(): Iterator<RankedComposedRow> = object : Iterator<RankedComposedRow> {
+        private var position = 0
+
+        override fun hasNext(): Boolean = position < rankedIndices.size
+
+        override fun next(): RankedComposedRow {
+            if (!hasNext()) throw NoSuchElementException()
+            val objectiveRank = position + 1
+            val trackIndex = rankedIndices[position++]
+            return RankedComposedRow(
+                objectiveRank = objectiveRank,
+                row = ComposedRankingRow(
+                    trackId = trackIds[trackIndex],
+                    objectiveScore = objectiveScores[trackIndex],
+                    anchorPercentiles = anchorPercentiles.map { it[trackIndex] },
+                ),
+            )
+        }
+    }
+}
 
 /**
- * Multi-seed ranking via Geometric Mean of Percentiles.
+ * Composed retrieval over per-ingredient corpus percentiles.
  *
  * For each seed, computes cosine similarity to all tracks, converts to
  * percentile ranks, then takes the weighted geometric mean. This is
@@ -17,9 +61,9 @@ import kotlin.math.ln
  * Algorithm:
  * 1. For each seed: dot(seed, all_tracks) → similarities
  * 2. If weight < 0, negate similarities ("less like")
- * 3. Convert to percentile ranks: argsort.argsort / N → (0, 1]
- * 4. Weighted geometric mean: exp(Σ w_i * ln(percentile_i))
- * 5. Return top-K by geo mean score
+ * 3. Convert to empirical upper-CDF percentiles; equal cosine scores stay tied
+ * 4. Apply the explicit All of or Refine objective
+ * 5. Return top-K with that objective's evidence
  */
 object GeoMeanSelector {
 
@@ -41,112 +85,299 @@ object GeoMeanSelector {
         seeds: List<Pair<FloatArray, Float>>,
         topK: Int,
         excludeTrackIds: Set<Long> = emptySet(),
-    ): List<Pair<Long, Float>> {
-        val n = index.numTracks
-        if (n == 0 || seeds.isEmpty()) return emptyList()
-
-        val t0 = System.nanoTime()
-
-        // Normalize absolute weights to sum to 1
-        val totalAbsWeight = seeds.sumOf { abs(it.second).toDouble() }.toFloat()
-        if (totalAbsWeight < 1e-8f) return emptyList()
-
-        // Compute percentiles for each seed
-        val logPercentiles = FloatArray(n) // accumulates weighted log(percentile)
-        for ((embedding, weight) in seeds) {
-            val normW = abs(weight) / totalAbsWeight
-            val sims = index.computeAllSimilarities(embedding)
-
-            // If negative weight, negate similarities
-            if (weight < 0) {
-                for (i in sims.indices) sims[i] = -sims[i]
-            }
-
-            // Argsort → rank mapping
-            // sortedIndices[rank] = trackIndex (ascending similarity)
-            val sortedIndices = sims.indices.sortedBy { sims[it] }.toIntArray()
-            val ranks = IntArray(n)
-            for (rank in sortedIndices.indices) {
-                ranks[sortedIndices[rank]] = rank
-            }
-
-            // Accumulate weighted log(percentile)
-            // percentile = (rank + 1) / N, in (0, 1]
-            val logN = ln(n.toFloat())
-            for (i in 0 until n) {
-                logPercentiles[i] += normW * (ln((ranks[i] + 1).toFloat()) - logN)
-            }
-        }
-
-        // Convert accumulated log to geo mean, find top-K
-        // Use a partial sort via priority queue for efficiency
-        val excludeSet = if (excludeTrackIds.isEmpty()) null else {
-            // Build trackId lookup for exclusion
-            val set = HashSet<Long>(excludeTrackIds.size)
-            set.addAll(excludeTrackIds)
-            set
-        }
-
-        // Simple approach: compute scores and find top-K
-        data class Scored(val index: Int, val score: Float)
-        val topResults = mutableListOf<Scored>()
-        var minScore = Float.NEGATIVE_INFINITY
-
-        for (i in 0 until n) {
-            if (excludeSet != null && index.getTrackId(i) in excludeSet) continue
-            val score = exp(logPercentiles[i])
-            if (topResults.size < topK) {
-                topResults.add(Scored(i, score))
-                if (topResults.size == topK) {
-                    topResults.sortByDescending { it.score }
-                    minScore = topResults.last().score
-                }
-            } else if (score > minScore) {
-                topResults[topResults.lastIndex] = Scored(i, score)
-                topResults.sortByDescending { it.score }
-                minScore = topResults.last().score
-            }
-        }
-
-        topResults.sortByDescending { it.score }
-        val elapsed = (System.nanoTime() - t0) / 1_000_000
-        Log.d(TAG, "computeRanking: ${seeds.size} seeds, $n tracks, top-$topK in ${elapsed}ms")
-
-        return topResults.map { index.getTrackId(it.index) to it.score }
-    }
+        includedTrackIds: Set<Long>? = null,
+    ): List<Pair<Long, Float>> = computeRankingDetailed(
+        index = index,
+        seeds = seeds,
+        operator = FindMusicOperator.ALL_OF,
+        topK = topK,
+        excludeTrackIds = excludeTrackIds,
+        includedTrackIds = includedTrackIds,
+    ).map { it.trackId to it.objectiveScore }
 
     /**
-     * Compute a signed blended-query cosine for UI display.
-     *
-     * This is not the ranking objective. It gives multi-seed results a score in the
-     * same family as single-seed text/audio cosine so the displayed percentage
-     * remains interpretable across search modes.
+     * Rank using the selected explicit objective and retain that objective's evidence.
+     * Negative signs are applied before percentile conversion. Refine requires a positive
+     * primary ingredient; its secondary ingredient may be positive or negative.
      */
-    fun computeDisplaySimilarities(
+    fun computeRankingDetailed(
         index: EmbeddingIndex,
         seeds: List<Pair<FloatArray, Float>>,
-    ): FloatArray {
-        if (seeds.isEmpty()) return FloatArray(index.numTracks)
+        operator: FindMusicOperator,
+        topK: Int,
+        refineSpec: FindMusicRefineSpec? = null,
+        excludeTrackIds: Set<Long> = emptySet(),
+        identityCatalog: StableTrackIdentityCatalog? = null,
+        includedTrackIds: Set<Long>? = null,
+        cancellationCheck: (() -> Unit)? = null,
+    ): List<ComposedRankingRow> = computeRankingDetailedSnapshot(
+        index = index,
+        seeds = seeds,
+        operator = operator,
+        topK = topK,
+        refineSpec = refineSpec,
+        excludeTrackIds = excludeTrackIds,
+        identityCatalog = identityCatalog,
+        includedTrackIds = includedTrackIds,
+        cancellationCheck = cancellationCheck,
+    ).rows
 
-        val dim = seeds.first().first.size
-        val blended = FloatArray(dim)
+    fun computeRankingDetailedSnapshot(
+        index: EmbeddingIndex,
+        seeds: List<Pair<FloatArray, Float>>,
+        operator: FindMusicOperator,
+        topK: Int,
+        refineSpec: FindMusicRefineSpec? = null,
+        excludeTrackIds: Set<Long> = emptySet(),
+        identityCatalog: StableTrackIdentityCatalog? = null,
+        includedTrackIds: Set<Long>? = null,
+        cancellationCheck: (() -> Unit)? = null,
+    ): DetailedComposedRanking {
+        val n = index.numTracks
+        if (n == 0 || seeds.isEmpty()) {
+            return DetailedComposedRanking(emptyList(), 0, 0)
+        }
+
+        val t0 = System.nanoTime()
+        val space = computePercentileSpace(
+            index,
+            seeds,
+            identityCatalog,
+            includedTrackIds,
+            cancellationCheck,
+        )
+        cancellationCheck?.invoke()
+        val weights = FloatArray(seeds.size) { seeds[it].second }
+        val representativeExclusions = representativeExclusions(
+            excludeTrackIds,
+            identityCatalog,
+            space.trackIds,
+        )
+        val excludedRankingRows = representativeExclusions.count { excludedId ->
+            excludedId in space.trackIds
+        }
+        val objectiveRankingDomainCount: Int
+        val topResults = when (operator) {
+            FindMusicOperator.ALL_OF -> {
+                require(refineSpec == null) { "All of cannot carry a Refine specification" }
+                val scores = FindMusicComposition.allOfObjective(space.percentiles, weights)
+                objectiveRankingDomainCount = space.trackIds.size - excludedRankingRows
+                FindMusicComposition.rankAllOf(
+                    trackIds = space.trackIds,
+                    objectiveScores = scores,
+                    anchorPercentiles = space.percentiles,
+                    topK = topK,
+                    excludedTrackIds = representativeExclusions,
+                    rankingTieKeys = space.rankingTieKeys,
+                )
+            }
+            FindMusicOperator.REFINE -> {
+                val exactRefineSpec = requireNotNull(refineSpec) {
+                    "Refine needs a primary ingredient and neighborhood"
+                }
+                require(weights.size == 2 && weights.all { it.isFinite() && it != 0f }) {
+                    "Refine needs exactly two finite non-zero ingredient weights"
+                }
+                require(exactRefineSpec.primaryIngredientIndex in weights.indices) {
+                    "Refine primary ingredient is out of range"
+                }
+                require(weights[exactRefineSpec.primaryIngredientIndex] > 0f) {
+                    "Refine primary ingredient must be positive"
+                }
+                val refined = FindMusicComposition.rankRefine(
+                    trackIds = space.trackIds,
+                    anchorPercentiles = space.percentiles,
+                    refineSpec = exactRefineSpec,
+                    topK = topK,
+                    excludedTrackIds = representativeExclusions,
+                    rankingTieKeys = space.rankingTieKeys,
+                )
+                objectiveRankingDomainCount = refined.objectiveRankingDomainCount
+                refined.rows
+            }
+        }
+        cancellationCheck?.invoke()
+        val elapsed = (System.nanoTime() - t0) / 1_000_000
+        Log.d(TAG, "computeRanking: $operator, ${seeds.size} seeds, $n tracks, top-$topK in ${elapsed}ms")
+
+        return DetailedComposedRanking(
+            rows = topResults,
+            ingredientRankingDomainCount = space.trackIds.size,
+            objectiveRankingDomainCount = objectiveRankingDomainCount,
+        )
+    }
+
+    fun computeAllOfRankingSnapshot(
+        index: EmbeddingIndex,
+        seeds: List<Pair<FloatArray, Float>>,
+        excludeTrackIds: Set<Long> = emptySet(),
+        identityCatalog: StableTrackIdentityCatalog? = null,
+        includedTrackIds: Set<Long>? = null,
+        cancellationCheck: (() -> Unit)? = null,
+    ): AllOfRankingSnapshot {
+        if (index.numTracks == 0 || seeds.isEmpty()) {
+            return AllOfRankingSnapshot(LongArray(0), FloatArray(0), emptyList(), IntArray(0))
+        }
+        val space = computePercentileSpace(
+            index,
+            seeds,
+            identityCatalog,
+            includedTrackIds,
+            cancellationCheck,
+        )
+        cancellationCheck?.invoke()
+        val weights = FloatArray(seeds.size) { seeds[it].second }
+        val scores = FindMusicComposition.allOfObjective(space.percentiles, weights)
+        val representativeExclusions = representativeExclusions(
+            excludeTrackIds,
+            identityCatalog,
+            space.trackIds,
+        )
+        val rankedIndices = FindMusicComposition.rankedAllOfIndices(
+            trackIds = space.trackIds,
+            scores = scores,
+            topK = space.trackIds.size,
+            excludedTrackIds = representativeExclusions,
+            rankingTieKeys = space.rankingTieKeys,
+        )
+        cancellationCheck?.invoke()
+        return AllOfRankingSnapshot(
+            trackIds = space.trackIds,
+            objectiveScores = scores,
+            anchorPercentiles = space.percentiles,
+            rankedIndices = rankedIndices.toIntArray(),
+        )
+    }
+
+    private fun computePercentileSpace(
+        index: EmbeddingIndex,
+        seeds: List<Pair<FloatArray, Float>>,
+        identityCatalog: StableTrackIdentityCatalog?,
+        includedTrackIds: Set<Long>?,
+        cancellationCheck: (() -> Unit)?,
+    ): PercentileSpace {
+        val sourceTrackIds = LongArray(index.numTracks) { index.getTrackId(it) }
+        if (includedTrackIds != null) {
+            require(includedTrackIds.isNotEmpty()) { "Included track domain must not be empty" }
+            require(includedTrackIds.all { sourceTrackIds.binarySearch(it) >= 0 }) {
+                "Included track domain contains an ID outside the embedding index"
+            }
+        }
+        val includedSourceIndices = if (includedTrackIds == null) {
+            sourceTrackIds.indices.toList().toIntArray()
+        } else {
+            sourceTrackIds.indices.filter { sourceTrackIds[it] in includedTrackIds }.toIntArray()
+        }
+        require(includedTrackIds == null || includedSourceIndices.size == includedTrackIds.size) {
+            "Included track domain does not map one-to-one onto the embedding index"
+        }
+        val includedSourceTrackIds = LongArray(includedSourceIndices.size) { position ->
+            sourceTrackIds[includedSourceIndices[position]]
+        }
+        val sourceIdentities = identityCatalog?.let { catalog ->
+            List(includedSourceTrackIds.size) { position ->
+                catalog.visibleResultIdentity(includedSourceTrackIds[position])
+            }
+        }
+        val representativeIndices = representativeIndices(includedSourceTrackIds, sourceIdentities)
+        val trackIds = LongArray(representativeIndices.size) { position ->
+            includedSourceTrackIds[representativeIndices[position]]
+        }
+        val representativeSourceIndices = IntArray(representativeIndices.size) { position ->
+            includedSourceIndices[representativeIndices[position]]
+        }
+        val rankingTieKeys = identityCatalog?.let { catalog ->
+            List(trackIds.size) { position -> catalog.rankingTieKey(trackIds[position]) }
+        }
+        val percentiles = ArrayList<FloatArray>(seeds.size)
         for ((embedding, weight) in seeds) {
-            for (i in 0 until dim) {
-                blended[i] += embedding[i] * weight
+            cancellationCheck?.invoke()
+            val sourceSimilarities = index.computeAllSimilarities(embedding)
+            val direction = if (weight < 0f) -1f else 1f
+            val similarities = FloatArray(representativeIndices.size) { position ->
+                sourceSimilarities[representativeSourceIndices[position]] * direction
+            }
+            percentiles += percentileRanks(similarities, trackIds, rankingTieKeys)
+        }
+        return PercentileSpace(trackIds, rankingTieKeys, percentiles)
+    }
+
+    /** One row per indexing-verified acoustic identity; every legacy row remains distinct. */
+    internal fun representativeIndices(
+        trackIds: LongArray,
+        identities: List<StableVisibleResultIdentity>?,
+    ): IntArray {
+        if (identities == null) return trackIds.indices.toList().toIntArray()
+        require(identities.size == trackIds.size)
+
+        val representativeByStableIdentity = HashMap<String, Int>()
+        identities.forEachIndexed { index, identity ->
+            if (!identity.isCollapsibleRecording) return@forEachIndexed
+            val previous = representativeByStableIdentity[identity.identityToken]
+            if (previous == null || trackIds[index] < trackIds[previous]) {
+                representativeByStableIdentity[identity.identityToken] = index
             }
         }
 
-        var normSq = 0f
-        for (v in blended) normSq += v * v
-        if (normSq < 1e-12f) return FloatArray(index.numTracks)
+        return trackIds.indices.filter { index ->
+            val identity = identities[index]
+            !identity.isCollapsibleRecording ||
+                representativeByStableIdentity.getValue(identity.identityToken) == index
+        }.toIntArray()
+    }
 
-        val invNorm = 1f / kotlin.math.sqrt(normSq)
-        for (i in blended.indices) blended[i] *= invNorm
-
-        val sims = index.computeAllSimilarities(blended)
-        for (i in sims.indices) {
-            sims[i] = sims[i].coerceIn(-1f, 1f)
+    private fun representativeExclusions(
+        excludedTrackIds: Set<Long>,
+        identityCatalog: StableTrackIdentityCatalog?,
+        representativeTrackIds: LongArray,
+    ): Set<Long> {
+        if (identityCatalog == null || excludedTrackIds.isEmpty()) return excludedTrackIds
+        val excludedIdentityTokens = excludedTrackIds.mapTo(hashSetOf()) { trackId ->
+            identityCatalog.visibleResultIdentity(trackId).identityToken
         }
-        return sims
+        return representativeTrackIds.filterTo(linkedSetOf()) { trackId ->
+            identityCatalog.visibleResultIdentity(trackId).identityToken in
+                excludedIdentityTokens
+        }
+    }
+
+    private data class PercentileSpace(
+        val trackIds: LongArray,
+        val rankingTieKeys: List<String>?,
+        val percentiles: List<FloatArray>,
+    )
+
+    /** Empirical upper-CDF percentile: exactly equal cosine scores receive one percentile. */
+    internal fun percentileRanks(
+        similarities: FloatArray,
+        trackIds: LongArray,
+        rankingTieKeys: List<String>? = null,
+    ): FloatArray {
+        require(similarities.size == trackIds.size)
+        require(rankingTieKeys == null || rankingTieKeys.size == trackIds.size)
+        if (similarities.isEmpty()) return FloatArray(0)
+        require(similarities.all(Float::isFinite)) { "Similarity scores must be finite" }
+        val sortedIndices = similarities.indices.sortedWith(
+            compareBy<Int> { similarities[it] }
+                .thenBy { rankingTieKeys?.get(it).orEmpty() }
+                .thenBy { trackIds[it] },
+        )
+        val ranks = FloatArray(similarities.size)
+        var start = 0
+        while (start < sortedIndices.size) {
+            var endExclusive = start + 1
+            val score = similarities[sortedIndices[start]]
+            while (endExclusive < sortedIndices.size &&
+                similarities[sortedIndices[endExclusive]] == score
+            ) {
+                endExclusive++
+            }
+            val percentile = endExclusive.toFloat() / similarities.size
+            for (position in start until endExclusive) {
+                ranks[sortedIndices[position]] = percentile
+            }
+            start = endExclusive
+        }
+        return ranks
     }
 }

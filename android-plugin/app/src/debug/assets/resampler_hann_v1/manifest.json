@@ -1,0 +1,93 @@
+{
+  "coefficientDtype": "TorchAudio dtype=None: float64 construction then float32 kernel",
+  "fixtures": [
+    {
+      "chunkSchedule": [
+        1,
+        7,
+        79,
+        80,
+        81,
+        503,
+        4096
+      ],
+      "expectedFile": "general-44100.expected.f32le",
+      "expectedSamples": 27213,
+      "expectedSha256": "f7f2818ede90f8bf5f6a4122be8fb3b5fe222e4d06f967adaa209a1c4d27cd5e",
+      "fromRate": 44100,
+      "inputFile": "general-44100.input.f32le",
+      "inputSamples": 50003,
+      "inputSha256": "6353e77f8ed791b7f09408187c042b7ebe5329e9b38adca4921e40bb2433c226",
+      "name": "general-44100",
+      "toRate": 24000
+    },
+    {
+      "chunkSchedule": [
+        1,
+        7,
+        79,
+        80,
+        81,
+        503,
+        4096
+      ],
+      "expectedFile": "general-48000.expected.f32le",
+      "expectedSamples": 26001,
+      "expectedSha256": "7687ef579d7ce569c8eabc5a29dad03e7c87d34035b8c32b22ae6bece99cbb64",
+      "fromRate": 48000,
+      "inputFile": "general-48000.input.f32le",
+      "inputSamples": 52001,
+      "inputSha256": "5c41f22cb6cbc53e276d72c6d273cf85c8f3b2f96d12117b9f54ad634c70c475",
+      "name": "general-48000",
+      "toRate": 24000
+    },
+    {
+      "chunkSchedule": [
+        1,
+        7,
+        79,
+        80,
+        81,
+        503,
+        4096
+      ],
+      "expectedFile": "short-44100.expected.f32le",
+      "expectedSamples": 95,
+      "expectedSha256": "e2c45a5b9a7a3ef18926a07746ecd495cfe7ad551b117d4159550534559a331c",
+      "fromRate": 44100,
+      "inputFile": "short-44100.input.f32le",
+      "inputSamples": 173,
+      "inputSha256": "bd0c50e6052bc36a681b83464413adbd5ee08699c2120a42324f489f21e3afcd",
+      "name": "short-44100",
+      "toRate": 24000
+    },
+    {
+      "chunkSchedule": [
+        1,
+        7,
+        79,
+        80,
+        81,
+        503,
+        4096
+      ],
+      "expectedFile": "short-48000.expected.f32le",
+      "expectedSamples": 16,
+      "expectedSha256": "5b4db79c5ed6366c31e5f34d78c17d3edaf633436c3e7bb3c2374b4b6e2fb951",
+      "fromRate": 48000,
+      "inputFile": "short-48000.input.f32le",
+      "inputSamples": 31,
+      "inputSha256": "e48b29c666651a66e66ebcf13bce83b6780f505f9232ca3ccb43893d776f1ca7",
+      "name": "short-48000",
+      "toRate": 24000
+    }
+  ],
+  "generator": "desktop-indexer/experiments/generate_torchaudio_hann_v1_fixtures.py",
+  "lowpassFilterWidth": 6,
+  "resamplingMethod": "sinc_interp_hann",
+  "rolloff": 0.99,
+  "specId": "torchaudio-hann-v1-width6-rolloff0.99-f32-target-length",
+  "targetLength": "ceil(float32(reducedTo * inputSamples / reducedFrom))",
+  "torchVersion": "2.10.0+cu128",
+  "torchaudioVersion": "2.10.0+cu128"
+}

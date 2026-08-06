@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Older Android releases cannot separate cloud backup from device transfer. -->
+    <include
+        domain="sharedpref"
+        path="settings.xml" />
+    <include
+        domain="sharedpref"
+        path="indexing.xml" />
+</full-backup-content>

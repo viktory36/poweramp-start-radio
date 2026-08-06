@@ -1,0 +1,18 @@
+[Unit]
+Description=Poweramp Start Radio server indexer
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=poweramp-indexer
+Group=poweramp-indexer
+ExecStart=/opt/poweramp-server-indexer/.venv/bin/poweramp-indexer server run --config /etc/poweramp-server-indexer.toml
+Restart=on-failure
+RestartSec=30
+Nice=10
+IOSchedulingClass=idle
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

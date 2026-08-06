@@ -4,8 +4,10 @@
 
     <!-- Permissions -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
@@ -18,18 +20,21 @@
     <application
         android:name=".PowerampStartRadioApp"
         android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.PowerampStartRadio"
-        tools:targetApi="34">
+        tools:targetApi="35">
 
         <!-- Main Activity -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:theme="@style/Theme.PowerampStartRadio">
+            android:theme="@style/Theme.PowerampStartRadio"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -40,13 +45,8 @@
         <activity
             android:name=".indexing.IndexingActivity"
             android:exported="false"
-            android:theme="@style/Theme.PowerampStartRadio" />
-
-        <!-- Benchmark Activity (debug) — launch via adb -->
-        <activity
-            android:name=".benchmark.BenchmarkActivity"
-            android:exported="true"
-            android:theme="@style/Theme.PowerampStartRadio" />
+            android:theme="@style/Theme.PowerampStartRadio"
+            android:windowSoftInputMode="adjustResize" />
 
         <!-- Radio Service -->
         <service
@@ -55,18 +55,28 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="music_radio" />
+                android:value="User-initiated Poweramp recommendation queue generation and verified queue delivery" />
         </service>
 
         <!-- Indexing Service -->
         <service
             android:name=".indexing.IndexingService"
             android:exported="false"
-            android:foregroundServiceType="specialUse">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="audio_indexing" />
-        </service>
+            android:foregroundServiceType="mediaProcessing" />
+
+        <!-- User-started server-index merge; intentionally non-durable after process death. -->
+        <service
+            android:name=".services.ServerMergeService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProcessing" />
+
+        <receiver
+            android:name=".indexing.V2IndexingBootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
 
         <!-- Home Screen Widget -->
         <receiver
@@ -74,39 +84,29 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
-                <action android:name="com.maxmpz.audioplayer.TRACK_CHANGED" />
-                <action android:name="com.maxmpz.audioplayer.STATUS_CHANGED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
             <meta-data
                 android:name="android.appwidget.provider"
                 android:resource="@xml/start_radio_widget_info" />
         </receiver>
-
-        <!-- Debug: trigger radio from ADB for automated testing -->
         <receiver
-            android:name=".debug.DebugRadioReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="com.powerampstartradio.DEBUG_START_RADIO" />
-            </intent-filter>
-        </receiver>
+            android:name=".widget.StartRadioWidgetActionReceiver"
+            android:exported="false" />
 
-        <!-- Debug: trigger multi-seed search from ADB -->
-        <receiver
-            android:name=".debug.DebugMultiSeedReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="com.powerampstartradio.DEBUG_MULTI_SEED" />
-            </intent-filter>
-        </receiver>
-
-        <!-- Broadcast receiver for Poweramp track changes -->
+        <!--
+          Poweramp's documented explicit event contract requires an exported manifest receiver and
+          exposes no sender permission. Runtime code authenticates the sender when Android exposes
+          its identity; otherwise delivery is only a refresh hint and command input is re-read and
+          verified against Poweramp's providers.
+        -->
         <receiver
             android:name=".poweramp.PowerampReceiver"
-            android:exported="true">
+            android:exported="true"
+            tools:ignore="ExportedReceiver">
             <intent-filter>
-                <action android:name="com.maxmpz.audioplayer.TRACK_CHANGED" />
-                <action android:name="com.maxmpz.audioplayer.STATUS_CHANGED" />
+                <action android:name="com.maxmpz.audioplayer.TRACK_CHANGED_EXPLICIT" />
+                <action android:name="com.maxmpz.audioplayer.STATUS_CHANGED_EXPLICIT" />
             </intent-filter>
         </receiver>
 
