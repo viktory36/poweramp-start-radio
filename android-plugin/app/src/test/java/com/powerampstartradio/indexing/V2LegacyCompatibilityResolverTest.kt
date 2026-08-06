@@ -237,6 +237,150 @@ class V2LegacyCompatibilityResolverTest {
     }
 
     @Test
+    fun `missing provider timing becomes reviewable reciprocal path attention`() {
+        val result = V2LegacyCompatibilityResolver.resolve(
+            listOf(
+                provider(
+                    1,
+                    "/storage/Music/albums/Tool/10 - Blank.flac",
+                    "||blank|0",
+                    durationMs = 0,
+                ),
+            ),
+            listOf(
+                database(
+                    10,
+                    "C:\\backups\\Music\\albums\\Tool\\10 - Blank.flac",
+                    "tool|undertow|blank|1000",
+                    durationMs = 1_000,
+                ),
+            ),
+        )
+
+        assertTrue(result.bindings.isEmpty())
+        assertEquals(
+            listOf(
+                V2LegacyCompatibilityBinding(
+                    1,
+                    10,
+                    V2LegacyCompatibilityEvidence
+                        .EXACT_MUSIC_RELATIVE_PATH_PROVIDER_TIMING_UNAVAILABLE,
+                ),
+            ),
+            result.providerTimingUnavailableBindings,
+        )
+        assertTrue(result.pathTimingConflictBindings.isEmpty())
+        assertTrue(result.unmatchedPowerampFileIds.isEmpty())
+        assertTrue(result.unmatchedTrackIds.isEmpty())
+    }
+
+    @Test
+    fun `positive incompatible timing remains a replacement candidate`() {
+        val result = V2LegacyCompatibilityResolver.resolve(
+            listOf(
+                provider(
+                    1,
+                    "/storage/Music/show.flac",
+                    "new artist|new album|new recording|200000",
+                    durationMs = 200_000,
+                ),
+            ),
+            listOf(
+                database(
+                    10,
+                    "C:\\Music\\show.flac",
+                    "old artist|old album|old recording|100000",
+                    durationMs = 100_000,
+                ),
+            ),
+        )
+
+        assertTrue(result.bindings.isEmpty())
+        assertTrue(result.providerTimingUnavailableBindings.isEmpty())
+        assertEquals(
+            listOf(
+                V2LegacyCompatibilityBinding(
+                    1,
+                    10,
+                    V2LegacyCompatibilityEvidence.EXACT_PATH_TIMING_CONFLICT,
+                ),
+            ),
+            result.pathTimingConflictBindings,
+        )
+    }
+
+    @Test
+    fun `matching tags do not activate an exact path whose provider timing is unavailable`() {
+        val result = V2LegacyCompatibilityResolver.resolve(
+            listOf(
+                provider(
+                    1,
+                    "/storage/Music/unknown.flac",
+                    "artist|album|unknown|0",
+                    durationMs = 0,
+                ),
+            ),
+            listOf(
+                database(
+                    10,
+                    "/storage/Music/unknown.flac",
+                    "artist|album|unknown|100000",
+                    durationMs = 100_000,
+                ),
+            ),
+        )
+
+        assertTrue(result.bindings.isEmpty())
+        assertEquals(1, result.providerTimingUnavailableBindings.size)
+    }
+
+    @Test
+    fun `duplicate paths cannot manufacture unavailable timing attention`() {
+        val providers = listOf(
+            provider(1, "/storage/Music/duplicate.flac", "||duplicate|0", durationMs = 0),
+            provider(2, "/storage/Music/duplicate.flac", "||duplicate|0", durationMs = 0),
+        )
+        val databases = listOf(
+            database(
+                10,
+                "C:\\Music\\duplicate.flac",
+                "artist|album|duplicate|100000",
+            ),
+        )
+
+        val result = V2LegacyCompatibilityResolver.resolve(providers, databases)
+
+        assertTrue(result.providerTimingUnavailableBindings.isEmpty())
+        assertEquals(setOf(1L, 2L), result.unmatchedPowerampFileIds)
+        assertEquals(setOf(10L), result.unmatchedTrackIds)
+    }
+
+    @Test
+    fun `CUE shaped missing timing never becomes ordinary path attention`() {
+        val result = V2LegacyCompatibilityResolver.resolve(
+            listOf(
+                provider(
+                    1,
+                    "/storage/Music/image.flac",
+                    "artist|album|part|0",
+                    durationMs = 0,
+                    compatibilityEligible = false,
+                    requiresSpanSpecificRebuild = true,
+                ),
+            ),
+            listOf(
+                database(
+                    10,
+                    "C:\\Music\\image.flac",
+                    "artist|album|part|100000",
+                ),
+            ),
+        )
+
+        assertTrue(result.providerTimingUnavailableBindings.isEmpty())
+    }
+
+    @Test
     fun `input order cannot change bindings`() {
         val providers = listOf(
             provider(3, "/storage/Music/c/3.flac", "c|c|c|100000"),

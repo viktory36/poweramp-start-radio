@@ -10,6 +10,9 @@ enum class V2UnindexedDetectionKind {
     /** Poweramp cannot currently provide enough source information to plan this row. */
     SOURCE_ATTENTION,
 
+    /** An imported row has the same reciprocal path, but Poweramp exposes no current timing. */
+    LEGACY_PATH_TIMING_UNAVAILABLE,
+
 }
 
 data class V2ProviderOccurrence(
@@ -33,6 +36,7 @@ internal object V2UnindexedDetectionPolicy {
         providerOccurrences: Collection<V2ProviderOccurrence>,
         receipts: Collection<V2ProviderSpanReceipt>,
         compatibilityCoveredIds: Set<Long> = emptySet(),
+        providerTimingUnavailableIds: Set<Long> = emptySet(),
     ): List<V2UnindexedOccurrence> {
         val representedSpans = receipts.mapTo(hashSetOf()) { it.providerSpan }
         return providerOccurrences
@@ -52,10 +56,17 @@ internal object V2UnindexedDetectionPolicy {
             .filterNot { (_, duplicates) ->
                 duplicates.any { it.powerampFileId in compatibilityCoveredIds }
             }
-            .map { (occurrence, _) ->
+            .map { (occurrence, duplicates) ->
+                val providerTimingUnavailable = duplicates.any {
+                    it.powerampFileId in providerTimingUnavailableIds
+                }
                 V2UnindexedOccurrence(
                     powerampFileId = occurrence.powerampFileId,
-                    kind = V2UnindexedDetectionKind.DEFINITELY_UNINDEXED,
+                    kind = if (providerTimingUnavailable) {
+                        V2UnindexedDetectionKind.LEGACY_PATH_TIMING_UNAVAILABLE
+                    } else {
+                        V2UnindexedDetectionKind.DEFINITELY_UNINDEXED
+                    },
                 )
             }
     }

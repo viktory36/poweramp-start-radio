@@ -67,6 +67,13 @@ class V2IndexingFailureClassifierTest {
                 "short cache",
             ),
         )
+        assertCode(
+            TrackFailureCode.INSUFFICIENT_AUDIO_SIGNAL,
+            TrackPcmCache.PcmContractException(
+                TrackPcmCache.PcmContractFailure.INSUFFICIENT_AUDIO_SIGNAL,
+                "effectively silent",
+            ),
+        )
     }
 
     private fun assertCode(expected: TrackFailureCode, error: Throwable) {

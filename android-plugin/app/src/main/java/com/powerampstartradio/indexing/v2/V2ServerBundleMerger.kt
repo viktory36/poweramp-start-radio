@@ -986,6 +986,8 @@ internal class V2ServerBundleMerger(
                 bindings = stagedCatalog.bindings,
                 quarantinedTracks = stagedCatalog.quarantinedTracks,
                 unboundPowerampFileIds = stagedCatalog.unboundPowerampFileIds,
+                providerTimingUnavailableBindings =
+                    stagedCatalog.providerTimingUnavailableBindings,
             )
             V2ActiveLibraryCatalogStore(filesDir).write(generation, catalog)
             val added = resolved.accepted.map { accepted ->

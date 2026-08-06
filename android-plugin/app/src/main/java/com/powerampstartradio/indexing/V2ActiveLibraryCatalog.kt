@@ -112,6 +112,7 @@ internal class V2ActiveLibraryCatalog internal constructor(
     bindings: Collection<V2ActiveLibraryBinding>,
     quarantinedTracks: Collection<V2ActiveLibraryQuarantinedTrack>,
     unboundPowerampFileIds: Collection<Long>,
+    providerTimingUnavailableBindings: Collection<V2LegacyCompatibilityBinding> = emptyList(),
 ) {
     val bindings: List<V2ActiveLibraryBinding> = immutableList(
         bindings.sortedWith(
@@ -123,6 +124,13 @@ internal class V2ActiveLibraryCatalog internal constructor(
         quarantinedTracks.sortedBy(V2ActiveLibraryQuarantinedTrack::trackId),
     )
     val unboundPowerampFileIds: Set<Long> = immutableSet(unboundPowerampFileIds.sorted())
+    /** Reciprocal imported paths withheld from both recommendations and automatic reindexing. */
+    val providerTimingUnavailableBindings: List<V2LegacyCompatibilityBinding> = immutableList(
+        providerTimingUnavailableBindings.sortedWith(
+            compareBy(V2LegacyCompatibilityBinding::powerampFileId)
+                .thenBy(V2LegacyCompatibilityBinding::trackId),
+        ),
+    )
 
     private val bindingByTrackId: Map<Long, V2ActiveLibraryBinding> = immutableMap(
         this.bindings.associateBy(V2ActiveLibraryBinding::trackId),
@@ -172,6 +180,29 @@ internal class V2ActiveLibraryCatalog internal constructor(
         require(this.unboundPowerampFileIds.all { it > 0L }) {
             "active-library catalog contains a non-positive unbound Poweramp ID"
         }
+        require(this.providerTimingUnavailableBindings.all { binding ->
+            binding.evidence ==
+                V2LegacyCompatibilityEvidence.EXACT_ABSOLUTE_PATH_PROVIDER_TIMING_UNAVAILABLE ||
+                binding.evidence ==
+                V2LegacyCompatibilityEvidence.EXACT_MUSIC_RELATIVE_PATH_PROVIDER_TIMING_UNAVAILABLE
+        }) { "active-library catalog contains invalid unavailable-timing evidence" }
+        require(
+            this.providerTimingUnavailableBindings.map { it.powerampFileId }.distinct().size ==
+                this.providerTimingUnavailableBindings.size &&
+                this.providerTimingUnavailableBindings.map { it.trackId }.distinct().size ==
+                this.providerTimingUnavailableBindings.size,
+        ) { "active-library catalog repeats an unavailable-timing conflict" }
+        val unavailableTimingTrackIds = this.providerTimingUnavailableBindings
+            .mapTo(hashSetOf()) { it.trackId }
+        val quarantinedTimingTrackIds = this.quarantinedTracks.asSequence()
+            .filter { it.reason == V2ActiveLibraryQuarantineReason.PATH_TIMING_CONFLICT }
+            .mapTo(hashSetOf()) { it.trackId }
+        require(unavailableTimingTrackIds.all(quarantinedTimingTrackIds::contains)) {
+            "unavailable-timing database row is not quarantined"
+        }
+        require(this.providerTimingUnavailableBindings.all {
+            it.powerampFileId in this.unboundPowerampFileIds
+        }) { "unavailable-timing Poweramp row is not unbound" }
     }
 
     fun containsActiveTrack(trackId: Long): Boolean = trackId in activeTrackIds
@@ -326,6 +357,12 @@ internal object V2ActiveLibraryCatalogBuilder {
                 V2ActiveLibraryQuarantineReason.PATH_TIMING_CONFLICT,
             )
         }
+        compatibility.providerTimingUnavailableBindings.forEach { binding ->
+            quarantineReasons.putIfAbsent(
+                binding.trackId,
+                V2ActiveLibraryQuarantineReason.PATH_TIMING_CONFLICT,
+            )
+        }
         database.forEach { candidate ->
             if (candidate.trackId !in activeTrackIds) {
                 quarantineReasons.putIfAbsent(
@@ -349,6 +386,8 @@ internal object V2ActiveLibraryCatalogBuilder {
                 .map(V2LegacyProviderCandidate::powerampFileId)
                 .filterNot(activeProviderIds::contains)
                 .toSet(),
+            providerTimingUnavailableBindings =
+                compatibility.providerTimingUnavailableBindings,
         )
     }
 
@@ -364,6 +403,8 @@ internal object V2ActiveLibraryCatalogBuilder {
             V2ActiveLibraryBindingEvidence.LEGACY_EXACT_ABSOLUTE_PATH
         V2LegacyCompatibilityEvidence.EXACT_MUSIC_RELATIVE_PATH ->
             V2ActiveLibraryBindingEvidence.LEGACY_EXACT_MUSIC_RELATIVE_PATH
+        V2LegacyCompatibilityEvidence.EXACT_ABSOLUTE_PATH_PROVIDER_TIMING_UNAVAILABLE,
+        V2LegacyCompatibilityEvidence.EXACT_MUSIC_RELATIVE_PATH_PROVIDER_TIMING_UNAVAILABLE,
         V2LegacyCompatibilityEvidence.CUE_LOGICAL_METADATA_REPAIR,
         V2LegacyCompatibilityEvidence.EXACT_PATH_TIMING_CONFLICT ->
             error("non-coverage legacy evidence cannot activate a database row")

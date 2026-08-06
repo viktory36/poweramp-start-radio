@@ -66,6 +66,7 @@ class TrackPcmCache private constructor(
         private const val LEGACY_RESAMPLE_CONTEXT_MS = 100L
         private const val IO_BUFFER_BYTES = 1024 * 1024
         private const val MAX_RESAMPLE_CHUNK_DURATION_MS = 60_000L
+        private const val MIN_SIGNAL_VARIANCE = 1e-9
         private const val LEGACY_KAISER_SPEC_ID =
             "legacy-kaiser-polyphase-v1-exact-rational-target-length"
         private const val HEX = "0123456789abcdef"
@@ -276,6 +277,8 @@ class TrackPcmCache private constructor(
         LOGICAL_BOUNDARY_MISMATCH,
         PREPROCESSING_MISMATCH,
         PCM_ARTIFACT_MISMATCH,
+        BELOW_MINIMUM_DURATION,
+        INSUFFICIENT_AUDIO_SIGNAL,
     }
 
     class PcmContractException(
@@ -473,6 +476,11 @@ class TrackPcmCache private constructor(
                 mean = mean,
                 isCancelled = isCancelled,
                 onProgress = onNormalizationProgress,
+            )
+            contract(
+                varianceAndDigest.variance >= MIN_SIGNAL_VARIANCE,
+                PcmContractFailure.INSUFFICIENT_AUDIO_SIGNAL,
+                "Decoded audio contains less than -90 dBFS of varying signal",
             )
             val standardDeviation = sqrt(varianceAndDigest.variance.toFloat() + 1e-7f)
             return Result(

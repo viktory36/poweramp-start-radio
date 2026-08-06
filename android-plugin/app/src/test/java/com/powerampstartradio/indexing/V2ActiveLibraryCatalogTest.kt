@@ -87,6 +87,44 @@ class V2ActiveLibraryCatalogTest {
     }
 
     @Test
+    fun `missing provider timing keeps reciprocal imported path quarantined and reviewable`() {
+        val catalog = build(
+            provider = listOf(
+                provider(
+                    id = 7,
+                    path = "/storage/Music/album/blank.flac",
+                    metadataKey = "||blank|0",
+                    durationMs = 0,
+                ),
+            ),
+            database = listOf(
+                database(
+                    id = 10,
+                    path = "C:\\Music\\album\\blank.flac",
+                    metadataKey = "artist|album|blank|1000",
+                    durationMs = 1_000,
+                ),
+            ),
+        )
+
+        assertTrue(catalog.activeTrackIds.isEmpty())
+        assertEquals(setOf(7L), catalog.unboundPowerampFileIds)
+        assertEquals(
+            V2ActiveLibraryQuarantineReason.PATH_TIMING_CONFLICT,
+            catalog.quarantinedTracks.single().reason,
+        )
+        assertEquals(
+            V2LegacyCompatibilityBinding(
+                powerampFileId = 7,
+                trackId = 10,
+                evidence = V2LegacyCompatibilityEvidence
+                    .EXACT_MUSIC_RELATIVE_PATH_PROVIDER_TIMING_UNAVAILABLE,
+            ),
+            catalog.providerTimingUnavailableBindings.single(),
+        )
+    }
+
+    @Test
     fun `duplicate receipt span and duplicate legacy candidates never choose by input order`() {
         val receiptSourceA = provider(1, "/storage/Music/receipt.flac", "a|a|r|100000")
         val receiptSourceB = provider(2, receiptSourceA.normalizedPhysicalPath, receiptSourceA.metadataKey)

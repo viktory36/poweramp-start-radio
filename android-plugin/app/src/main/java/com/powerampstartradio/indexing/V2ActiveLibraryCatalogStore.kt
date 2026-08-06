@@ -19,8 +19,8 @@ import java.security.MessageDigest
 /** Compact, deterministic encoding for the last fully reconciled Poweramp binding catalog. */
 internal object V2ActiveLibraryCatalogCodec {
     private const val MAGIC = 0x50535243
-    private const val VERSION = 2
-    private const val POLICY_ID = "v2-active-library-durable-cache-v2"
+    private const val VERSION = 3
+    private const val POLICY_ID = "v2-active-library-durable-cache-v3"
     private const val MAX_ROW_COUNT = 5_000_000
     private const val TRAILER = 0x5053524341545631L
     private const val SHA256_LENGTH = 32
@@ -69,6 +69,12 @@ internal object V2ActiveLibraryCatalogCodec {
         }
         data.writeInt(catalog.unboundPowerampFileIds.size)
         catalog.unboundPowerampFileIds.sorted().forEach(data::writeLong)
+        data.writeInt(catalog.providerTimingUnavailableBindings.size)
+        catalog.providerTimingUnavailableBindings.forEach { binding ->
+            data.writeLong(binding.trackId)
+            data.writeLong(binding.powerampFileId)
+            data.writeByte(binding.providerTimingUnavailableEvidenceWireId)
+        }
         data.writeLong(TRAILER)
         data.flush()
         digestOutput.on(false)
@@ -159,6 +165,22 @@ internal object V2ActiveLibraryCatalogCodec {
         }
         val unbound = ArrayList<Long>(unboundCount)
         repeat(unboundCount) { unbound += data.readLong() }
+        val providerTimingUnavailableCount = data.readBoundedCount(
+            "provider timing unavailable binding",
+        )
+        require(providerTimingUnavailableCount <= minOf(quarantinedCount, unboundCount)) {
+            "active-library cache unavailable-timing count exceeds its unresolved rows"
+        }
+        val providerTimingUnavailable = ArrayList<V2LegacyCompatibilityBinding>(
+            providerTimingUnavailableCount,
+        )
+        repeat(providerTimingUnavailableCount) {
+            providerTimingUnavailable += V2LegacyCompatibilityBinding(
+                trackId = data.readLong(),
+                powerampFileId = data.readLong(),
+                evidence = providerTimingUnavailableEvidenceFromWireId(data.readUnsignedByte()),
+            )
+        }
         require(data.readLong() == TRAILER) { "active-library cache is incomplete" }
         require(data.read() == -1) { "active-library cache has trailing data" }
         require(bindings.size + quarantined.size == storedDatabaseTrackCount) {
@@ -175,6 +197,7 @@ internal object V2ActiveLibraryCatalogCodec {
             bindings = bindings,
             quarantinedTracks = quarantined,
             unboundPowerampFileIds = unbound,
+            providerTimingUnavailableBindings = providerTimingUnavailable,
         )
     }
 
@@ -242,6 +265,22 @@ internal object V2ActiveLibraryCatalogCodec {
             4 -> V2ActiveLibraryQuarantineReason.NO_CURRENT_PROVIDER_BINDING
             else -> error("active-library cache has invalid quarantine reason")
         }
+
+    private val V2LegacyCompatibilityBinding.providerTimingUnavailableEvidenceWireId: Int
+        get() = when (evidence) {
+            V2LegacyCompatibilityEvidence.EXACT_ABSOLUTE_PATH_PROVIDER_TIMING_UNAVAILABLE -> 1
+            V2LegacyCompatibilityEvidence.EXACT_MUSIC_RELATIVE_PATH_PROVIDER_TIMING_UNAVAILABLE ->
+                2
+            else -> error("active-library cache has invalid unavailable-timing evidence")
+        }
+
+    private fun providerTimingUnavailableEvidenceFromWireId(
+        wireId: Int,
+    ): V2LegacyCompatibilityEvidence = when (wireId) {
+        1 -> V2LegacyCompatibilityEvidence.EXACT_ABSOLUTE_PATH_PROVIDER_TIMING_UNAVAILABLE
+        2 -> V2LegacyCompatibilityEvidence.EXACT_MUSIC_RELATIVE_PATH_PROVIDER_TIMING_UNAVAILABLE
+        else -> error("active-library cache has invalid unavailable-timing evidence")
+    }
 }
 
 /** Durable optimization only: any read/write failure falls back to exact provider reconciliation. */

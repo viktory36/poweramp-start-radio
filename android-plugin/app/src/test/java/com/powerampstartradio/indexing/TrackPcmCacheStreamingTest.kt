@@ -86,6 +86,56 @@ class TrackPcmCacheStreamingTest {
     }
 
     @Test
+    fun `effectively silent audio is rejected before inference`() {
+        listOf(
+            "digital-silence" to FloatArray(TARGET_RATE),
+            "below-floor" to FloatArray(TARGET_RATE) { index ->
+                if (index % 2 == 0) 2e-5f else -2e-5f
+            },
+        ).forEach { (name, samples) ->
+            val output = File(temporary.root, "$name.pcm")
+
+            val error = assertThrows(TrackPcmCache.PcmContractException::class.java) {
+                cache(FakeStreamDecoder(samples, TARGET_RATE)).build(
+                    sourceFile = temporary.newFile("$name.flac"),
+                    logicalStartUs = 0L,
+                    logicalDurationUs = 0L,
+                    chunkDurationMs = 1_000L,
+                    outputFile = output,
+                    boundaryMode = TrackPcmCache.BoundaryMode.REQUIRE_PHYSICAL_END_OF_STREAM,
+                    resamplerPolicy = TrackPcmCache.ResamplerPolicy.TORCHAUDIO_HANN_V1,
+                )
+            }
+
+            assertEquals(TrackPcmCache.PcmContractFailure.INSUFFICIENT_AUDIO_SIGNAL, error.reason)
+            assertFalse(output.exists())
+            assertScratchAbsent(output)
+        }
+    }
+
+    @Test
+    fun `quiet audio above the signal floor remains indexable`() {
+        val samples = FloatArray(TARGET_RATE) { index ->
+            if (index % 2 == 0) 1e-3f else -1e-3f
+        }
+        val output = File(temporary.root, "quiet-audio.pcm")
+
+        val result = cache(FakeStreamDecoder(samples, TARGET_RATE)).build(
+            sourceFile = temporary.newFile("quiet-audio.flac"),
+            logicalStartUs = 0L,
+            logicalDurationUs = 0L,
+            chunkDurationMs = 1_000L,
+            outputFile = output,
+            boundaryMode = TrackPcmCache.BoundaryMode.REQUIRE_PHYSICAL_END_OF_STREAM,
+            resamplerPolicy = TrackPcmCache.ResamplerPolicy.TORCHAUDIO_HANN_V1,
+        )
+
+        assertEquals(TARGET_RATE.toLong(), result.exactSampleCount24k)
+        assertTrue(output.isFile)
+        assertScratchAbsent(output)
+    }
+
+    @Test
     fun `CUE decode enforces exact provider half-open native boundary`() {
         val startUs = 123_456L
         val durationUs = 1_234_567L

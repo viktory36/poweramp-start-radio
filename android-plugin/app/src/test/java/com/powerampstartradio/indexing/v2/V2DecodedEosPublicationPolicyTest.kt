@@ -32,6 +32,27 @@ class V2DecodedEosPublicationPolicyTest {
     }
 
     @Test
+    fun `subsecond decoded EOS is a typed minimum-duration failure`() {
+        val span = provisionalSpan(
+            declaredUs = 0L,
+            estimateSource = V2DurationEstimateSource.UNAVAILABLE,
+        )
+        val error = assertThrows(TrackPcmCache.PcmContractException::class.java) {
+            V2DecodedEosSpanFinalizer.finalize(span, evidence(observedUs = 500_000L))
+        }
+
+        assertEquals(TrackPcmCache.PcmContractFailure.BELOW_MINIMUM_DURATION, error.reason)
+        assertEquals(
+            TrackFailureCode.BELOW_MINIMUM_DURATION,
+            V2IndexingFailureClassifier.classify(
+                error,
+                IndexingStage.DECODE_AND_MERT,
+                span,
+            ).code,
+        )
+    }
+
+    @Test
     fun `decoded overrun remains authoritative`() {
         val finalized = V2DecodedEosSpanFinalizer.finalize(
             provisionalSpan(declaredUs = 160_200_000L),

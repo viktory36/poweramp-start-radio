@@ -107,6 +107,10 @@ object V2IndexingFailureClassifier {
                 TrackFailureCode.INVALID_MODEL_OUTPUT
             pcmContract?.reason == TrackPcmCache.PcmContractFailure.PCM_ARTIFACT_MISMATCH ->
                 TrackFailureCode.PARTIAL_ARTIFACT
+            pcmContract?.reason == TrackPcmCache.PcmContractFailure.BELOW_MINIMUM_DURATION ->
+                TrackFailureCode.BELOW_MINIMUM_DURATION
+            pcmContract?.reason == TrackPcmCache.PcmContractFailure.INSUFFICIENT_AUDIO_SIGNAL ->
+                TrackFailureCode.INSUFFICIENT_AUDIO_SIGNAL
             pcmContract != null -> TrackFailureCode.INVALID_LOGICAL_SPAN
             boundary != null && span.executionBoundaryRequirement ==
                 V2ExecutionBoundaryRequirement.VERIFY_END_OF_STREAM_AND_RECONCILE ->

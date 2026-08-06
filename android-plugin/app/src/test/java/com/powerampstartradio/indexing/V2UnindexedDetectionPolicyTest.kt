@@ -101,6 +101,25 @@ class V2UnindexedDetectionPolicyTest {
     }
 
     @Test
+    fun `missing timing conflict remains visible but is not classified as fresh`() {
+        val imported = occurrence(27, "/music/imported.flac", 0)
+
+        assertEquals(
+            listOf(
+                V2UnindexedOccurrence(
+                    imported.powerampFileId,
+                    V2UnindexedDetectionKind.LEGACY_PATH_TIMING_UNAVAILABLE,
+                ),
+            ),
+            V2UnindexedDetectionPolicy.classify(
+                providerOccurrences = listOf(imported),
+                receipts = emptyList(),
+                providerTimingUnavailableIds = setOf(imported.powerampFileId),
+            ),
+        )
+    }
+
+    @Test
     fun `standalone raw CUE source image is never offered as a track`() {
         val rawCueRow = occurrence(26, "/music/image.flac", 900_000)
             .copy(isRawCueSourceImage = true)

@@ -15,6 +15,11 @@ class V2IndexingSelectionPolicyTest {
         val missingPath = track(8L, V2UnindexedDetectionKind.SOURCE_ATTENTION, 0).copy(
             path = null,
         )
+        val importedTimingUnavailable = track(
+            9L,
+            V2UnindexedDetectionKind.LEGACY_PATH_TIMING_UNAVAILABLE,
+            0,
+        )
 
         assertEquals(
             setOf(1L, 3L),
@@ -25,6 +30,7 @@ class V2IndexingSelectionPolicyTest {
                     hidden,
                     unknownCue,
                     missingPath,
+                    importedTimingUnavailable,
                 ),
                 hiddenIds = setOf(4L),
             ),

@@ -106,6 +106,7 @@ internal fun indexingFailureSummary(code: TrackFailureCode): String = when (code
     TrackFailureCode.CORRUPT_OR_TRUNCATED -> "Audio appears corrupt or truncated"
     TrackFailureCode.DECODER_ERROR -> "Audio decoding failed"
     TrackFailureCode.BELOW_MINIMUM_DURATION -> "Audio is too short to embed"
+    TrackFailureCode.INSUFFICIENT_AUDIO_SIGNAL -> "Decoded audio is effectively silent"
     TrackFailureCode.OUT_OF_MEMORY -> "The device ran out of memory"
     TrackFailureCode.THERMAL_SHUTDOWN -> "Indexing stopped for device temperature"
     TrackFailureCode.PROCESS_INTERRUPTED -> "Android interrupted indexing"

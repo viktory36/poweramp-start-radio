@@ -811,9 +811,7 @@ fun IndexingScreen(
                                 AllIndexedContent(
                                     totalMissing = unindexedTracks.size,
                                     sourceAttentionCount = unindexedTracks.count {
-                                        it.detectionKind ==
-                                            V2UnindexedDetectionKind.SOURCE_ATTENTION &&
-                                            !V2IndexingSelectionPolicy.isReadyTrack(it)
+                                        !V2IndexingSelectionPolicy.isReadyTrack(it)
                                     },
                                     neverIndexCount = dismissedIds.count { it in missingIds },
                                     ignoredCount = 0,
@@ -1351,8 +1349,14 @@ private fun TrackSelectionContent(
                 !V2IndexingSelectionPolicy.isReadyTrack(it)
         }
     }
+    val providerTimingUnavailableTracks = remember(filteredTracks) {
+        filteredTracks.filter {
+            it.detectionKind == V2UnindexedDetectionKind.LEGACY_PATH_TIMING_UNAVAILABLE
+        }
+    }
     val filteredAttentionCount =
-        filteredFailures.size + filteredPreflightAttention.size + sourceAttentionTracks.size
+        filteredFailures.size + filteredPreflightAttention.size + sourceAttentionTracks.size +
+            providerTimingUnavailableTracks.size
     val selectableVisibleIds = remember(readyTracks) {
         readyTracks.asSequence()
             .map { it.powerampFileId }
@@ -1429,7 +1433,8 @@ private fun TrackSelectionContent(
         ) {
             if (filteredFailures.isNotEmpty() ||
                 filteredPreflightAttention.isNotEmpty() ||
-                sourceAttentionTracks.isNotEmpty()
+                sourceAttentionTracks.isNotEmpty() ||
+                providerTimingUnavailableTracks.isNotEmpty()
             ) {
                 item(key = "failure-heading") {
                     Row(
@@ -1447,7 +1452,7 @@ private fun TrackSelectionContent(
                                 onNeverAllAttention(
                                     filteredFailures,
                                     filteredPreflightAttention,
-                                    sourceAttentionTracks,
+                                    sourceAttentionTracks + providerTimingUnavailableTracks,
                                 )
                             },
                         ) {
@@ -1478,6 +1483,37 @@ private fun TrackSelectionContent(
                         attention = attention,
                         onTryAgain = onTryAgainPreflight,
                         onNever = onNeverPreflight,
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                    )
+                }
+            }
+            if (providerTimingUnavailableTracks.isNotEmpty()) {
+                item(key = "provider-timing-attention-heading") {
+                    Column(
+                        modifier = Modifier.fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                    ) {
+                        Text(
+                            "Indexed path needs review",
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Text(
+                            "An older index row has this exact path, but Poweramp reports no " +
+                                "duration to confirm whether the file changed.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                items(
+                    providerTimingUnavailableTracks,
+                    key = { "provider-timing:${it.powerampFileId}" },
+                ) { track ->
+                    SourceAttentionItem(
+                        track = track,
+                        onNever = {
+                            onNeverAllAttention(emptyList(), emptyList(), listOf(track))
+                        },
                         modifier = Modifier.padding(horizontal = 16.dp),
                     )
                 }
@@ -1545,7 +1581,14 @@ private fun SourceAttentionItem(
         Text(
             buildString {
                 if (track.artist.isNotBlank()) append(track.artist).append(" · ")
-                append("No usable audio details")
+                append(
+                    when (track.detectionKind) {
+                        V2UnindexedDetectionKind.LEGACY_PATH_TIMING_UNAVAILABLE ->
+                            "Existing indexed path · Poweramp duration unavailable"
+                        V2UnindexedDetectionKind.SOURCE_ATTENTION -> "No usable audio details"
+                        V2UnindexedDetectionKind.DEFINITELY_UNINDEXED -> "Ready to index"
+                    },
+                )
             },
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1596,11 +1639,13 @@ private fun TrackRow(
                     V2UnindexedDetectionKind.SOURCE_ATTENTION ->
                         append(
                             if (isSelectable) {
-                                "Duration measured during indexing"
+                                "Poweramp duration unavailable · measured while indexing"
                             } else {
                                 "No usable duration"
                             },
                         )
+                    V2UnindexedDetectionKind.LEGACY_PATH_TIMING_UNAVAILABLE ->
+                        append("Existing indexed path · Poweramp duration unavailable")
                     V2UnindexedDetectionKind.DEFINITELY_UNINDEXED -> Unit
                 }
                 if (track.artist.isNotEmpty()) {

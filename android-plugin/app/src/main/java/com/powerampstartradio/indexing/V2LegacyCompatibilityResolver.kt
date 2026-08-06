@@ -5,6 +5,8 @@ import java.text.Normalizer
 internal enum class V2LegacyCompatibilityEvidence {
     EXACT_ABSOLUTE_PATH,
     EXACT_MUSIC_RELATIVE_PATH,
+    EXACT_ABSOLUTE_PATH_PROVIDER_TIMING_UNAVAILABLE,
+    EXACT_MUSIC_RELATIVE_PATH_PROVIDER_TIMING_UNAVAILABLE,
     CUE_LOGICAL_METADATA_REPAIR,
     EXACT_PATH_TIMING_CONFLICT,
 }
@@ -39,6 +41,7 @@ internal data class V2LegacyCompatibilityBinding(
 internal data class V2LegacyCompatibilityResult(
     val bindings: List<V2LegacyCompatibilityBinding>,
     val repairBindings: List<V2LegacyCompatibilityBinding>,
+    val providerTimingUnavailableBindings: List<V2LegacyCompatibilityBinding>,
     val pathTimingConflictBindings: List<V2LegacyCompatibilityBinding>,
     val unmatchedPowerampFileIds: Set<Long>,
     val unmatchedTrackIds: Set<Long>,
@@ -67,6 +70,7 @@ internal object V2LegacyCompatibilityResolver {
         val remainingDatabase = database.associateByTo(hashMapOf()) { it.trackId }
         val bindings = mutableListOf<V2LegacyCompatibilityBinding>()
         val repairBindings = mutableListOf<V2LegacyCompatibilityBinding>()
+        val providerTimingUnavailableBindings = mutableListOf<V2LegacyCompatibilityBinding>()
         val pathTimingConflictBindings = mutableListOf<V2LegacyCompatibilityBinding>()
 
         bindReciprocalUnique(
@@ -97,6 +101,38 @@ internal object V2LegacyCompatibilityResolver {
             compatible = ::pathEvidenceCompatible,
             sink = bindings,
         )
+
+        // An ordinary row with no Poweramp timing cannot prove that current bytes differ from the
+        // reciprocally unique imported path. Preserve it as reviewable attention instead of either
+        // activating the imported embedding or automatically indexing a possible duplicate.
+        bindReciprocalUnique(
+            remainingProvider,
+            remainingDatabase,
+            V2LegacyCompatibilityEvidence.EXACT_ABSOLUTE_PATH_PROVIDER_TIMING_UNAVAILABLE,
+            keyForProvider = { candidate ->
+                candidate.normalizedPhysicalPath.takeIf {
+                    candidate.compatibilityEligible && !candidate.requiresSpanSpecificRebuild &&
+                        candidate.offsetMs == 0L && it.isNotBlank()
+                }
+            },
+            keyForDatabase = { it.normalizedPath?.takeIf(String::isNotBlank) },
+            compatible = ::providerTimingUnavailable,
+            sink = providerTimingUnavailableBindings,
+        )
+        bindReciprocalUnique(
+            remainingProvider,
+            remainingDatabase,
+            V2LegacyCompatibilityEvidence.EXACT_MUSIC_RELATIVE_PATH_PROVIDER_TIMING_UNAVAILABLE,
+            keyForProvider = { candidate ->
+                candidate.normalizedPhysicalPath.takeIf {
+                    candidate.compatibilityEligible && !candidate.requiresSpanSpecificRebuild &&
+                        candidate.offsetMs == 0L
+                }?.let(::strictMusicRelativePath)
+            },
+            keyForDatabase = { it.normalizedPath?.let(::strictMusicRelativePath) },
+            compatible = ::providerTimingUnavailable,
+            sink = providerTimingUnavailableBindings,
+        )
         // A legacy CUE row can identify which imported row it supersedes without claiming that
         // the imported audio was decoded from the correct logical span.
         bindReciprocalUnique(
@@ -121,8 +157,8 @@ internal object V2LegacyCompatibilityResolver {
             sink = repairBindings,
         )
 
-        // A reciprocal path with incompatible timing is evidence of a conflict, not coverage and
-        // not proof that the current bytes are new. Keep it out of automatic indexing.
+        // A reciprocal path with two incompatible positive durations is actionable replacement
+        // evidence. It remains unbound so normal indexing can replace the stale imported row.
         bindReciprocalUnique(
             remainingProvider,
             remainingDatabase,
@@ -134,7 +170,8 @@ internal object V2LegacyCompatibilityResolver {
             },
             keyForDatabase = { it.normalizedPath?.let(::strictMusicRelativePath) },
             compatible = { providerCandidate, databaseCandidate ->
-                !durationCompatible(providerCandidate, databaseCandidate)
+                providerCandidate.durationMs > 0 && databaseCandidate.durationMs > 0 &&
+                    !durationCompatible(providerCandidate, databaseCandidate)
             },
             sink = pathTimingConflictBindings,
         )
@@ -145,6 +182,10 @@ internal object V2LegacyCompatibilityResolver {
                     .thenBy(V2LegacyCompatibilityBinding::trackId),
             ),
             repairBindings = repairBindings.sortedWith(
+                compareBy(V2LegacyCompatibilityBinding::powerampFileId)
+                    .thenBy(V2LegacyCompatibilityBinding::trackId),
+            ),
+            providerTimingUnavailableBindings = providerTimingUnavailableBindings.sortedWith(
                 compareBy(V2LegacyCompatibilityBinding::powerampFileId)
                     .thenBy(V2LegacyCompatibilityBinding::trackId),
             ),
@@ -277,13 +318,22 @@ internal object V2LegacyCompatibilityResolver {
         return kotlin.math.abs(left - right) <= DURATION_TOLERANCE_MS
     }
 
-    /** Exact reciprocal paths tolerate broken provider timing only when all normalized tags agree. */
+    private fun providerTimingUnavailable(
+        provider: V2LegacyProviderCandidate,
+        database: V2LegacyDatabaseCandidate,
+    ): Boolean = provider.durationMs <= 0 && database.durationMs > 0
+
+    /** Exact reciprocal paths tolerate conflicting positive timing only when normalized tags agree. */
     internal fun pathEvidenceCompatible(
         provider: V2LegacyProviderCandidate,
         database: V2LegacyDatabaseCandidate,
-    ): Boolean = durationCompatible(provider, database) ||
-        metadataWithoutDuration(provider.metadataKey).takeIf(String::isNotBlank) ==
-        metadataWithoutDuration(database.metadataKey).takeIf(String::isNotBlank)
+    ): Boolean {
+        if (provider.durationMs <= 0 || database.durationMs <= 0) return false
+        if (durationCompatible(provider, database)) return true
+        val providerMetadata = metadataWithoutDuration(provider.metadataKey)
+        if (providerMetadata.isBlank()) return false
+        return providerMetadata == metadataWithoutDuration(database.metadataKey)
+    }
 
     internal fun strictMusicRelativePath(path: String): String? {
         val normalized = Normalizer.normalize(path.replace('\\', '/').trim(), Normalizer.Form.NFC)

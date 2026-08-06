@@ -68,7 +68,9 @@ object V2TrackFailurePolicies {
             exhaustedTrigger = RetryTrigger.DECODER_OR_APP_CHANGED,
         )
 
-        TrackFailureCode.BELOW_MINIMUM_DURATION ->
+        TrackFailureCode.BELOW_MINIMUM_DURATION,
+        TrackFailureCode.INSUFFICIENT_AUDIO_SIGNAL,
+        ->
             blocked(TrackFailureCategory.TOO_SHORT, RetryTrigger.SOURCE_OR_LIBRARY_CHANGED)
 
         TrackFailureCode.OUT_OF_MEMORY,
@@ -1176,6 +1178,7 @@ private fun TrackFailureCode.discardsPartialProgress(): Boolean = when (this) {
     TrackFailureCode.CORRUPT_OR_TRUNCATED,
     TrackFailureCode.DECODER_ERROR,
     TrackFailureCode.BELOW_MINIMUM_DURATION,
+    TrackFailureCode.INSUFFICIENT_AUDIO_SIGNAL,
     TrackFailureCode.INFERENCE_FAILED,
     TrackFailureCode.INVALID_MODEL_OUTPUT,
     TrackFailureCode.PARTIAL_ARTIFACT,

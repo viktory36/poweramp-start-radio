@@ -26,6 +26,10 @@ class V2ActiveLibraryCatalogStoreTest {
         assertEquals(catalog().bindings, restored.bindings)
         assertEquals(catalog().quarantinedTracks, restored.quarantinedTracks)
         assertEquals(catalog().unboundPowerampFileIds, restored.unboundPowerampFileIds)
+        assertEquals(
+            catalog().providerTimingUnavailableBindings,
+            restored.providerTimingUnavailableBindings,
+        )
     }
 
     @Test
@@ -111,10 +115,18 @@ class V2ActiveLibraryCatalogStoreTest {
         quarantinedTracks = listOf(
             V2ActiveLibraryQuarantinedTrack(
                 trackId = 3,
-                reason = V2ActiveLibraryQuarantineReason.NO_CURRENT_PROVIDER_BINDING,
+                reason = V2ActiveLibraryQuarantineReason.PATH_TIMING_CONFLICT,
             ),
         ),
         unboundPowerampFileIds = listOf(202, 201),
+        providerTimingUnavailableBindings = listOf(
+            V2LegacyCompatibilityBinding(
+                powerampFileId = 201,
+                trackId = 3,
+                evidence = V2LegacyCompatibilityEvidence
+                    .EXACT_MUSIC_RELATIVE_PATH_PROVIDER_TIMING_UNAVAILABLE,
+            ),
+        ),
     )
 
     private companion object {

@@ -268,18 +268,18 @@ class NewTrackDetector(
         )
         val compatibilityCoveredIds = compatibility.bindings
             .mapTo(hashSetOf()) { it.powerampFileId }
+        val providerTimingUnavailableIds = compatibility.providerTimingUnavailableBindings
+            .mapTo(hashSetOf()) { it.powerampFileId }
         val classified = V2UnindexedDetectionPolicy.classify(
             providerOccurrences = occurrences,
             receipts = receiptSnapshot.receipts,
             compatibilityCoveredIds = compatibilityCoveredIds,
+            providerTimingUnavailableIds = providerTimingUnavailableIds,
         )
         val distinctOccurrenceCount = occurrences.distinctBy(V2ProviderOccurrence::providerSpan).size
         val duplicateProviderRows = occurrences.size - distinctOccurrenceCount
         val unindexed = buildUnindexedTracks(powerampEntries, sourceGroups, classified)
-        val attention = unindexed.count {
-            it.detectionKind == V2UnindexedDetectionKind.SOURCE_ATTENTION &&
-                !V2IndexingSelectionPolicy.isReadyTrack(it)
-        }
+        val attention = unindexed.count { !V2IndexingSelectionPolicy.isReadyTrack(it) }
         val ready = unindexed.count(V2IndexingSelectionPolicy::isReadyTrack)
         val representedSpans = receiptSnapshot.receipts.mapTo(hashSetOf()) { it.providerSpan }
         val exactRepresented = occurrences.asSequence()
@@ -311,6 +311,7 @@ class NewTrackDetector(
             TAG,
             "Detection: ready=$ready attention=$attention " +
                 "compatibilityCovered=${compatibilityCoveredIds.size} " +
+                "providerTimingUnavailable=${providerTimingUnavailableIds.size} " +
                 "compatibilityEvidence=$compatibilityCounts exactRepresented=$exactRepresented " +
                 "duplicateProviderRows=$duplicateProviderRows " +
                 "validReceipts=${receiptSnapshot.receipts.size} " +
@@ -333,26 +334,31 @@ class NewTrackDetector(
         onProgress("Applying saved exact matches for this unchanged Poweramp library...")
         val representedProviderIds = catalog.bindings
             .mapTo(hashSetOf()) { it.powerampFileId }
-        val classifiedIds = V2UnindexedDetectionPolicy.classify(
-            providerOccurrences = snapshot.groups.flatMap { group ->
-                group.rows.map { row ->
-                    V2ProviderOccurrence(
-                        powerampFileId = row.powerampFileId,
-                        providerSpan = V2CommittedProviderSpan(
-                            normalizedPhysicalPath = row.physicalPath,
-                            offsetMs = row.offsetMs,
-                            durationMs = row.durationMs,
-                        ),
-                        isRawCueSourceImage = row.cueSourceImageFolderId != null,
-                    )
-                }
-            },
+        val providerTimingUnavailableIds = catalog.providerTimingUnavailableBindings
+            .mapTo(hashSetOf()) { it.powerampFileId }
+        val occurrences = snapshot.groups.flatMap { group ->
+            group.rows.map { row ->
+                V2ProviderOccurrence(
+                    powerampFileId = row.powerampFileId,
+                    providerSpan = V2CommittedProviderSpan(
+                        normalizedPhysicalPath = row.physicalPath,
+                        offsetMs = row.offsetMs,
+                        durationMs = row.durationMs,
+                    ),
+                    isRawCueSourceImage = row.cueSourceImageFolderId != null,
+                )
+            }
+        }
+        val classificationById = V2UnindexedDetectionPolicy.classify(
+            providerOccurrences = occurrences,
             receipts = emptyList(),
             compatibilityCoveredIds = representedProviderIds,
-        ).mapTo(hashSetOf()) { it.powerampFileId }
+            providerTimingUnavailableIds = providerTimingUnavailableIds,
+        ).associateBy(V2UnindexedOccurrence::powerampFileId)
         val unindexed = snapshot.groups.flatMap { group ->
             group.rows.mapNotNull { row ->
-                if (row.powerampFileId !in classifiedIds) return@mapNotNull null
+                val classification = classificationById[row.powerampFileId]
+                    ?: return@mapNotNull null
                 val durationMs = Math.toIntExact(row.durationMs)
                 UnindexedTrack(
                     powerampFileId = row.powerampFileId,
@@ -361,10 +367,15 @@ class NewTrackDetector(
                     title = TrackNormalization.normalizeTitle(row.title),
                     durationMs = durationMs,
                     path = TrackNormalization.normalizePath(row.providerPhysicalPath),
-                    detectionKind = if (durationMs <= 0) {
+                    detectionKind = if (
+                        classification.kind ==
+                        V2UnindexedDetectionKind.LEGACY_PATH_TIMING_UNAVAILABLE
+                    ) {
+                        classification.kind
+                    } else if (durationMs <= 0) {
                         V2UnindexedDetectionKind.SOURCE_ATTENTION
                     } else {
-                        V2UnindexedDetectionKind.DEFINITELY_UNINDEXED
+                        classification.kind
                     },
                     offsetMs = row.offsetMs,
                     cueFolderId = row.cueSourceImageFolderId,
@@ -404,7 +415,11 @@ class NewTrackDetector(
         return powerampEntries.mapNotNull { entry ->
             val classification = classificationById[entry.id] ?: return@mapNotNull null
             val sourceGroup = entry.path?.let(sourceGroups::get).orEmpty()
-            val kind = if (entry.durationMs <= 0) {
+            val kind = if (
+                classification.kind == V2UnindexedDetectionKind.LEGACY_PATH_TIMING_UNAVAILABLE
+            ) {
+                classification.kind
+            } else if (entry.durationMs <= 0) {
                 V2UnindexedDetectionKind.SOURCE_ATTENTION
             } else {
                 classification.kind

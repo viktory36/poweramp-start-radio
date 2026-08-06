@@ -295,7 +295,7 @@ class V2VerifiedPcmCacheStore(
     }
 
     private companion object {
-        const val SCHEMA_VERSION = 1
+        const val SCHEMA_VERSION = 2
         val SHA256 = Regex("^[0-9a-f]{64}$")
     }
 }

@@ -1,5 +1,7 @@
 package com.powerampstartradio.indexing.v2
 
+import com.powerampstartradio.indexing.TrackPcmCache
+
 /** Decoder evidence produced by the single PCM materialization pass for an ordinary file. */
 data class V2DecodedEosEvidence(
     val sourceSampleRateHz: Int,
@@ -49,8 +51,11 @@ object V2DecodedEosSpanFinalizer {
             "decoded EOS 24 kHz count disagrees with the pinned resampler"
         }
         val expectedWork = V2AudioSpanMath.expectedWorkFor24kSamples(exact24k)
-        require(expectedWork.mertWindows > 0 && expectedWork.clampSegments > 0) {
-            "decoded EOS audio is below the one-second indexing floor"
+        if (expectedWork.mertWindows <= 0 || expectedWork.clampSegments <= 0) {
+            throw TrackPcmCache.PcmContractException(
+                TrackPcmCache.PcmContractFailure.BELOW_MINIMUM_DURATION,
+                "Decoded audio is below the one-second indexing floor",
+            )
         }
         val canonicalEndUs = V2AudioSpanMath.canonicalTimeUsForSampleBoundary(
             evidence.observedEndSourceSampleExclusive,
