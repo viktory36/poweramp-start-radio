@@ -121,6 +121,7 @@ import com.powerampstartradio.ui.TextSearchResult
 import com.powerampstartradio.ui.TextIngredientState
 import com.powerampstartradio.ui.forSeed
 import com.powerampstartradio.ui.effectiveLibraryAddedDays
+import com.powerampstartradio.ui.hasSameExecutionControlsAs
 import com.powerampstartradio.ui.libraryAddedDaysLabel
 import com.powerampstartradio.ui.recordingDisplayLabel
 import com.powerampstartradio.ui.replayEligibilityKey
@@ -1795,6 +1796,7 @@ fun TextSearchScreen(
     val textResultPlanner by viewModel.findMusicTextResultPlanner.collectAsState()
     val sharedQueueLength by viewModel.numTracks.collectAsState()
     var pendingQueueResult by remember { mutableStateOf<TextSearchResult?>(null) }
+    var pendingRecentReplay by remember { mutableStateOf<FindMusicQuerySpec?>(null) }
     var showRecentSearches by rememberSaveable { mutableStateOf(false) }
     var recordingPickerSeedId by rememberSaveable { mutableStateOf<Long?>(null) }
     val focusRequester = remember { FocusRequester() }
@@ -1806,6 +1808,16 @@ fun TextSearchScreen(
     // Active result: prefer multi-seed if it exists, else text-only
     val activeResult = multiSeedResult ?: textSearchResult
     val editorScrollState = rememberScrollState()
+
+    val requestRecentReplay: (FindMusicQuerySpec) -> Unit = { savedSearch ->
+        showRecentSearches = false
+        val currentControlsSearch = viewModel.recentSearchWithCurrentControls(savedSearch)
+        if (savedSearch.hasSameExecutionControlsAs(currentControlsSearch)) {
+            viewModel.replayRecentSearch(savedSearch)
+        } else {
+            pendingRecentReplay = savedSearch
+        }
+    }
 
     pendingQueueResult?.let { result ->
         QueuePlacementDialog(
@@ -1819,6 +1831,23 @@ fun TextSearchScreen(
         )
     }
 
+    pendingRecentReplay?.let { savedSearch ->
+        val currentControlsSearch = viewModel.recentSearchWithCurrentControls(savedSearch)
+        RecentFindMusicReplayDialog(
+            search = savedSearch,
+            currentControlsSearch = currentControlsSearch,
+            onDismiss = { pendingRecentReplay = null },
+            onUseCurrentControls = {
+                pendingRecentReplay = null
+                viewModel.replayRecentSearch(currentControlsSearch)
+            },
+            onUseSavedControls = {
+                pendingRecentReplay = null
+                viewModel.replayRecentSearch(savedSearch)
+            },
+        )
+    }
+
     if (showRecentSearches) {
         RecentFindMusicSheet(
             searches = recentSearches,
@@ -1827,10 +1856,7 @@ fun TextSearchScreen(
                 viewModel.clearRecentSearches()
                 showRecentSearches = false
             },
-            onReplay = { search ->
-                showRecentSearches = false
-                viewModel.replayRecentSearch(search)
-            },
+            onReplay = requestRecentReplay,
         )
     }
 
@@ -2347,7 +2373,7 @@ fun TextSearchScreen(
                     InlineRecentFindMusic(
                         searches = recentSearches.take(5),
                         onClear = viewModel::clearRecentSearches,
-                        onReplay = viewModel::replayRecentSearch,
+                        onReplay = requestRecentReplay,
                     )
                 }
 
@@ -2577,6 +2603,88 @@ private fun RecentFindMusicSheet(
 }
 
 @Composable
+private fun RecentFindMusicReplayDialog(
+    search: FindMusicQuerySpec,
+    currentControlsSearch: FindMusicQuerySpec,
+    onDismiss: () -> Unit,
+    onUseCurrentControls: () -> Unit,
+    onUseSavedControls: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Run this search again") },
+        text = {
+            Text(
+                search.displayLabel,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+        confirmButton = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.End,
+            ) {
+                RecentFindMusicReplayChoice(
+                    label = "Use current result controls",
+                    summary = recentFindMusicControlSummary(currentControlsSearch),
+                    onClick = onUseCurrentControls,
+                )
+                RecentFindMusicReplayChoice(
+                    label = "Use saved result controls",
+                    summary = recentFindMusicControlSummary(search),
+                    onClick = onUseSavedControls,
+                )
+                TextButton(onClick = onDismiss) {
+                    Text("Cancel")
+                }
+            }
+        },
+    )
+}
+
+@Composable
+private fun RecentFindMusicReplayChoice(
+    label: String,
+    summary: String,
+    onClick: () -> Unit,
+) {
+    TextButton(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Text(
+                label,
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            Text(
+                summary,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+private fun recentFindMusicControlSummary(search: FindMusicQuerySpec): String {
+    val resultStyle = when {
+        search.textResultPlanner == FindMusicTextResultPlanner.VARIED_DPP ||
+            search.textResultPlanner == FindMusicTextResultPlanner.VARIED_ALL_OF_DPP -> "Varied"
+        search.operator == FindMusicOperator.REFINE -> search.refineSpec?.let { refine ->
+            "Refine, ${refineNeighborhoodLabel(refine.neighborhood)} primary neighborhood"
+        } ?: "Refine"
+        search.operator == FindMusicOperator.ALL_OF && search.activeIngredientCount >= 2 ->
+            "Ranked"
+        else -> "Closest"
+    }
+    return "${libraryAddedDaysLabel(search.effectiveLibraryAddedDays)} \u00b7 " +
+        "${search.resultLimit} results \u00b7 $resultStyle"
+}
+
+@Composable
 private fun InlineRecentFindMusic(
     searches: List<FindMusicQuerySpec>,
     onClear: () -> Unit,
@@ -2739,6 +2847,9 @@ private fun RecordingPickerSheet(
     onRetry: () -> Unit,
     onChoose: (com.powerampstartradio.data.EmbeddedTrack) -> Unit,
 ) {
+    LaunchedEffect(query, state) {
+        if (state is RecordingLookupState.Idle) onRetry()
+    }
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
             modifier = Modifier
@@ -2759,19 +2870,17 @@ private fun RecordingPickerSheet(
             )
             when (state) {
                 RecordingLookupState.Idle -> {
-                    Text(
-                        "The recording lookup has not started.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp),
-                    )
-                    TextButton(
-                        onClick = onRetry,
-                        modifier = Modifier.padding(horizontal = 12.dp),
+                    Row(
+                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
-                        Icon(Icons.Default.Refresh, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Try again")
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                        Text(
+                            "Starting recording lookup",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                 }
                 is RecordingLookupState.Loading -> Row(

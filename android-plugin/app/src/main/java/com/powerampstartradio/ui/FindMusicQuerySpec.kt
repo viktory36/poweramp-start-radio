@@ -160,6 +160,47 @@ data class FindMusicQuerySpec(
 val FindMusicQuerySpec.effectiveLibraryAddedDays: Int?
     get() = libraryAddedDays ?: libraryAddedRange.dayCount?.toInt()
 
+/** Applies the user's current execution controls without changing the saved musical request. */
+internal fun FindMusicQuerySpec.withCurrentExecutionControls(
+    resultLimit: Int,
+    libraryAddedDays: Int?,
+    requestedPlanner: FindMusicTextResultPlanner,
+    refineNeighborhood: FindMusicRefineNeighborhood,
+): FindMusicQuerySpec {
+    require(resultLimit in 1..FindMusicQuerySpec.MAX_RESULT_LIMIT)
+    require(libraryAddedDays == null || libraryAddedDays in 1..MAX_LIBRARY_ADDED_DAYS)
+    val compatiblePlanner = when {
+        isSimplePositiveTextOnly &&
+            requestedPlanner == FindMusicTextResultPlanner.VARIED_DPP ->
+            FindMusicTextResultPlanner.VARIED_DPP
+        operator == FindMusicOperator.ALL_OF && activeIngredientCount >= 2 &&
+            requestedPlanner == FindMusicTextResultPlanner.VARIED_ALL_OF_DPP ->
+            FindMusicTextResultPlanner.VARIED_ALL_OF_DPP
+        else -> FindMusicTextResultPlanner.CLOSEST
+    }
+    return copy(
+        resultLimit = resultLimit,
+        textResultPlanner = compatiblePlanner,
+        refineSpec = refineSpec?.let { refine ->
+            if (operator == FindMusicOperator.REFINE) {
+                refine.copy(neighborhood = refineNeighborhood)
+            } else {
+                refine
+            }
+        },
+        libraryAddedRange = LibraryAddedRange.ALL_DATES,
+        libraryAddedDays = libraryAddedDays,
+    )
+}
+
+internal fun FindMusicQuerySpec.hasSameExecutionControlsAs(
+    other: FindMusicQuerySpec,
+): Boolean =
+    resultLimit == other.resultLimit &&
+        effectiveLibraryAddedDays == other.effectiveLibraryAddedDays &&
+        textResultPlanner == other.textResultPlanner &&
+        refineSpec?.neighborhood == other.refineSpec?.neighborhood
+
 /** Structured persistence with exact migration from the prior rank-v3 singleton-text schema. */
 object FindMusicQuerySpecCodec {
     fun toJsonArray(list: List<FindMusicQuerySpec>): String = JsonArray().apply {

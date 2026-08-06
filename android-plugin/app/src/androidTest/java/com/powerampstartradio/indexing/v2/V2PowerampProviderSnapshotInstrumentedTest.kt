@@ -188,6 +188,36 @@ class V2PowerampProviderSnapshotInstrumentedTest {
         )
     }
 
+    @Test
+    fun injectedNullDurationIsAcceptedAsUnknownDuration() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val cursor = MatrixCursor(
+            V2PowerampProviderSnapshotAcquirer.REQUIRED_PROJECTION.toTypedArray(),
+        ).apply {
+            addRow(
+                arrayOf<Any?>(
+                    42L,
+                    "Artist",
+                    "Album",
+                    "Title",
+                    null,
+                    "/storage/emulated/0/Music",
+                    "track.flac",
+                    0L,
+                    null,
+                    1L,
+                ),
+            )
+        }
+
+        val snapshot = V2PowerampProviderSnapshotAcquirer(
+            context = context,
+            providerQuery = V2PowerampProviderQuery { _, _, _ -> cursor },
+        ).acquireBlocking()
+
+        assertEquals(0L, snapshot.groups.single().rows.single().durationMs)
+    }
+
     private fun assertSnapshotInvariants(
         snapshot: V2ProviderPathGroupSnapshot,
         summary: SnapshotSummary,

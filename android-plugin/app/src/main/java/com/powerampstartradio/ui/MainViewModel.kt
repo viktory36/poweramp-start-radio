@@ -2745,6 +2745,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (databaseRefreshGate.hasDeferredRequest()) {
             refreshDatabaseInfo()
         }
+        viewModelScope.launch(Dispatchers.Main.immediate) {
+            startPendingSongSeedLookup()
+        }
         startPendingSessionReplayEligibilityRefresh()
         refreshDisplayedQueueEligibility()
     }
@@ -2921,24 +2924,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             .apply()
     }
 
-    private fun restoredTextIngredientState(search: RecentSearch): List<TextIngredientState> =
-        search.textIngredients.mapNotNull { text ->
-            val active = text.query.isNotBlank() && text.weight > 0f
-            if (!active) return@mapNotNull null
-            TextIngredientState(
-                query = text.query,
-                weight = text.weight,
-                negative = text.negative,
-            )
-        }
+    fun recentSearchWithCurrentControls(search: RecentSearch): RecentSearch =
+        search.withCurrentExecutionControls(
+            resultLimit = _numTracks.value,
+            libraryAddedDays = _libraryAddedDays.value,
+            requestedPlanner = _findMusicTextResultPlanner.value,
+            refineNeighborhood = _findMusicRefineNeighborhood.value,
+        )
 
-    private fun restoreRefineEditorState(search: FindMusicQuerySpec) {
-        val refine = search.refineSpec
-        _findMusicRefinePrimaryIngredientIndex.value = refine?.primaryIngredientIndex ?: 0
-        refine?.neighborhood?.let(::setFindMusicRefineNeighborhood)
-    }
-
-    /** Replay restores the complete editor request before running it again. */
+    /** Reruns one immutable request without changing Settings or the current editor. */
     fun replayRecentSearch(search: RecentSearch) {
         val isPlainText = search.isSimplePositiveTextOnly
         val surface = if (isPlainText) {
@@ -2946,29 +2940,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         } else {
             FindMusicSurface.COMPOSED
         }
-        // The replayed request becomes the editor's visible current state, so persist the same
-        // values that the controls now show rather than reverting them after process recreation.
-        persistFindMusicOperator(search.operator)
-        persistFindMusicTextResultPlanner(search.textResultPlanner)
-        search.refineSpec?.neighborhood?.let(::setFindMusicRefineNeighborhood)
-        setLibraryAddedDays(search.effectiveLibraryAddedDays)
         launchFindMusicRequest(surface) { revision ->
             validateQueryContract(search)?.let { message ->
-                kotlinx.coroutines.withContext(Dispatchers.Main) {
-                    _songSeeds.value = search.songSeeds.filter { it.weight > 0f }.map { anchor ->
-                        SongSeedState(
-                            query = anchor.displayLabel,
-                            confirmedTrack = null,
-                            stableTrackSpanId = anchor.stableTrackSpanId,
-                            libraryBinding = search.libraryBinding,
-                            weight = 0f,
-                            negative = false,
-                        )
-                    }
-                    _textIngredients.value = restoredTextIngredientState(search)
-                    _findMusicOperator.value = search.operator
-                    restoreRefineEditorState(search)
-                }
                 publishFindMusicError(
                     revision = revision,
                     surface = surface,
@@ -2979,13 +2952,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 return@launchFindMusicRequest
             }
             if (search.songSeeds.none { it.weight > 0f }) {
-                kotlinx.coroutines.withContext(Dispatchers.Main) {
-                    cancelSongSeedLookup()
-                    _songSeeds.value = emptyList()
-                    _textIngredients.value = restoredTextIngredientState(search)
-                    _findMusicOperator.value = search.operator
-                    restoreRefineEditorState(search)
-                }
                 if (isPlainText) {
                     executeTextSearch(revision, surface, search)
                 } else {
@@ -3010,7 +2976,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 return@launchFindMusicRequest
             }
             val dbFile = library.databaseFile
-            val restoredSeeds = mutableListOf<SongSeedState>()
             var resolvedSearch: FindMusicQuerySpec? = null
             var resolutionFailure: FindMusicAnchorBindingResult.Failure? = null
             val db = EmbeddingDatabase.open(dbFile)
@@ -3034,16 +2999,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         continue
                     }
                     val track = db.getTrackById(s.trackId)
-                    if (track != null) {
-                        restoredSeeds.add(SongSeedState(
-                            query = s.displayLabel,
-                            confirmedTrack = track,
-                            stableTrackSpanId = s.stableTrackSpanId,
-                            libraryBinding = resolvedSearch?.libraryBinding,
-                            weight = s.weight,
-                            negative = s.negative,
-                        ))
-                    } else {
+                    if (track == null) {
                         resolutionFailure = FindMusicAnchorBindingResult.Failure(
                             message = "This saved search no longer matches the current library. " +
                                 "Recreate it and choose the recording again: ${s.displayLabel}.",
@@ -3076,21 +3032,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 failure.diagnosticDetail?.let { detail ->
                     Log.w("MainViewModel", "Find Music replay anchor failure: $detail")
                 }
-                kotlinx.coroutines.withContext(Dispatchers.Main) {
-                    _songSeeds.value = search.songSeeds.filter { it.weight > 0f }.map { anchor ->
-                        SongSeedState(
-                            query = anchor.displayLabel,
-                            confirmedTrack = null,
-                            stableTrackSpanId = anchor.stableTrackSpanId,
-                            libraryBinding = search.libraryBinding,
-                            weight = 0f,
-                            negative = false,
-                        )
-                    }
-                    _textIngredients.value = restoredTextIngredientState(search)
-                    _findMusicOperator.value = search.operator
-                    restoreRefineEditorState(search)
-                }
                 publishFindMusicError(
                     revision = revision,
                     surface = surface,
@@ -3102,14 +3043,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 return@launchFindMusicRequest
             }
             val exactSearch = checkNotNull(resolvedSearch)
-
-            kotlinx.coroutines.withContext(Dispatchers.Main) {
-                _songSeeds.value = restoredSeeds
-                _textIngredients.value = restoredTextIngredientState(search)
-                _findMusicOperator.value = search.operator
-                restoreRefineEditorState(search)
-            }
-
             executeComposedSearch(revision, exactSearch, bindCurrentAnchors = false)
         }
     }
@@ -3130,6 +3063,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val songSeedLookupGate = LatestFindMusicRequestGate()
     private val songSeedLookupJobLock = Any()
     private var songSeedLookupJob: Job? = null
+    private var pendingSongSeedLookup: PendingSongSeedLookup? = null
+
+    private data class PendingSongSeedLookup(
+        val seedId: Long,
+        val query: String,
+        val revision: Long,
+    )
 
     /** Composed search results (separate from single-text raw-cosine results). */
     private val _multiSeedResult = MutableStateFlow<TextSearchResult?>(null)
@@ -3654,6 +3594,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun updateSongSeedQuery(index: Int, query: String) {
         val current = _songSeeds.value.toMutableList()
+        if (current.getOrNull(index)?.query == query) return
         var editedSeedId: Long? = null
         if (index in current.indices) {
             editedSeedId = current[index].id
@@ -3736,13 +3677,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun searchSongSeed(index: Int) {
-        val seeds = _songSeeds.value
-        if (index !in seeds.indices) return
-        val query = seeds[index].query.trim()
+        val seed = _songSeeds.value.getOrNull(index) ?: return
+        val query = seed.query.trim()
         if (query.isBlank()) return
 
-        val seedId = seeds[index].id
-        val revision = songSeedLookupGate.begin()
+        val request = PendingSongSeedLookup(
+            seedId = seed.id,
+            query = query,
+            revision = songSeedLookupGate.begin(),
+        )
+        songSeedSearchBinding = null
+        songSeedSearchStableIds = emptyMap()
+        _recordingLookupState.value = RecordingLookupStateReducer.start(
+            request.seedId,
+            request.query,
+        )
+        submitSongSeedLookup(request)
+    }
+
+    private fun submitSongSeedLookup(request: PendingSongSeedLookup) {
+        if (!songSeedLookupGate.isCurrent(request.revision)) return
         lateinit var job: Job
         job = viewModelScope.launch(
             context = Dispatchers.IO,
@@ -3751,11 +3705,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val filesDir = getApplication<Application>().filesDir
                 val library = getOrCreateTextLibrarySnapshot(filesDir) { status ->
-                    if (songSeedLookupGate.isCurrent(revision)) {
+                    if (songSeedLookupGate.isCurrent(request.revision)) {
                         _recordingLookupState.value = RecordingLookupStateReducer.progress(
                             current = _recordingLookupState.value,
-                            seedId = seedId,
-                            query = query,
+                            seedId = request.seedId,
+                            query = request.query,
                             message = status,
                         )
                     }
@@ -3763,10 +3717,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val dbFile = library.databaseFile
                 _recordingLookupState.value = RecordingLookupStateReducer.progress(
                     current = _recordingLookupState.value,
-                    seedId = seedId,
-                    query = query,
+                    seedId = request.seedId,
+                    query = request.query,
                     message = "Searching indexed artist, album, title, and filename fields for " +
-                        "\"$query\"",
+                        "\"${request.query}\"",
                 )
                 val db = EmbeddingDatabase.open(dbFile)
                 var binding: StableIdentityGenerationBinding? = null
@@ -3774,7 +3728,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 var hasMoreMatches = false
                 val results = try {
                     val matchPage = db.searchTracksByTextPage(
-                        query = query,
+                        query = request.query,
                         limit = RECORDING_LOOKUP_DISPLAY_LIMIT,
                         includeTrackId = library.activeDomain::containsActiveTrack,
                         canonicalTrackId =
@@ -3789,9 +3743,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 } finally {
                     db.close()
                 }
-                val currentSeed = _songSeeds.value.getOrNull(index)
-                if (songSeedLookupGate.isCurrent(revision) &&
-                    currentSeed?.id == seedId && currentSeed.query.trim() == query
+                val currentSeed = _songSeeds.value.firstOrNull { it.id == request.seedId }
+                if (songSeedLookupGate.isCurrent(request.revision) &&
+                    currentSeed?.query?.trim() == request.query
                 ) {
                     if (isCurrentReadOnlyFindMusicLibrary(
                             filesDir,
@@ -3803,16 +3757,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         songSeedSearchStableIds = stableIds
                         _recordingLookupState.value = RecordingLookupStateReducer.succeed(
                             current = _recordingLookupState.value,
-                            seedId = seedId,
-                            query = query,
+                            seedId = request.seedId,
+                            query = request.query,
                             candidates = results,
                             hasMoreMatches = hasMoreMatches,
                         )
                     } else {
                         _recordingLookupState.value = RecordingLookupStateReducer.fail(
                             current = _recordingLookupState.value,
-                            seedId = seedId,
-                            query = query,
+                            seedId = request.seedId,
+                            query = request.query,
                             message = "The library changed during lookup. Search for the recording again.",
                         )
                     }
@@ -3821,11 +3775,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 throw e
             } catch (e: Exception) {
                 Log.e("MainViewModel", "Song seed search failed", e)
-                if (songSeedLookupGate.isCurrent(revision)) {
+                if (songSeedLookupGate.isCurrent(request.revision)) {
                     _recordingLookupState.value = RecordingLookupStateReducer.fail(
                         current = _recordingLookupState.value,
-                        seedId = seedId,
-                        query = query,
+                        seedId = request.seedId,
+                        query = request.query,
                         message = "Recording search could not read the active library. Try again.",
                     )
                 }
@@ -3837,27 +3791,64 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         trackRetrievalJobUntilCompletion(job)
         var previous: Job? = null
+        var stale = false
         val admitted = synchronized(RETRIEVAL_RESOURCE_ADMISSION_LOCK) {
-            if (recommendationResourcesBlocked()) {
+            if (!songSeedLookupGate.isCurrent(request.revision)) {
+                stale = true
+                false
+            } else if (recommendationResourcesBlocked()) {
+                synchronized(songSeedLookupJobLock) {
+                    previous = songSeedLookupJob
+                    songSeedLookupJob = null
+                    pendingSongSeedLookup = request
+                }
                 false
             } else {
                 activeRetrievalResourceJobs.add(job)
                 synchronized(songSeedLookupJobLock) {
                     previous = songSeedLookupJob
                     songSeedLookupJob = job
+                    pendingSongSeedLookup = null
                 }
                 true
             }
         }
-        if (!admitted) {
-            job.cancel(CancellationException("On-device indexing owns recommendation resources"))
+        if (stale) {
+            job.cancel(CancellationException("Stale song lookup"))
             return
         }
-        songSeedSearchBinding = null
-        songSeedSearchStableIds = emptyMap()
-        _recordingLookupState.value = RecordingLookupStateReducer.start(seedId, query)
         previous?.cancel(CancellationException("Superseded song lookup"))
+        if (!admitted) {
+            job.cancel(CancellationException("On-device indexing owns recommendation resources"))
+            val stillPending = synchronized(songSeedLookupJobLock) {
+                pendingSongSeedLookup == request
+            }
+            if (stillPending) {
+                _recordingLookupState.value = RecordingLookupStateReducer.progress(
+                    current = _recordingLookupState.value,
+                    seedId = request.seedId,
+                    query = request.query,
+                    message = "Waiting for current library work to release the music index",
+                )
+            }
+            return
+        }
         job.start()
+    }
+
+    private fun startPendingSongSeedLookup() {
+        val request = synchronized(songSeedLookupJobLock) {
+            pendingSongSeedLookup.also { pendingSongSeedLookup = null }
+        } ?: return
+        val currentSeed = _songSeeds.value.firstOrNull { it.id == request.seedId }
+        val loading = _recordingLookupState.value as? RecordingLookupState.Loading
+        if (!songSeedLookupGate.isCurrent(request.revision) ||
+            currentSeed?.query?.trim() != request.query ||
+            loading?.seedId != request.seedId || loading.query != request.query
+        ) {
+            return
+        }
+        submitSongSeedLookup(request)
     }
 
     fun dismissSongSeedSearch() {
@@ -3865,9 +3856,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun cancelSongSeedLookup(): Job? {
-        songSeedLookupGate.cancel()
-        val job = synchronized(songSeedLookupJobLock) {
-            songSeedLookupJob.also { songSeedLookupJob = null }
+        val job = synchronized(RETRIEVAL_RESOURCE_ADMISSION_LOCK) {
+            songSeedLookupGate.cancel()
+            synchronized(songSeedLookupJobLock) {
+                pendingSongSeedLookup = null
+                songSeedLookupJob.also { songSeedLookupJob = null }
+            }
         }
         job?.cancel(CancellationException("Song lookup dismissed"))
         _recordingLookupState.value = RecordingLookupStateReducer.clear()

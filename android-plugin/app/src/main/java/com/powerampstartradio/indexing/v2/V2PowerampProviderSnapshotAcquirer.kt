@@ -495,10 +495,10 @@ class V2PowerampProviderSnapshotAcquirer(
     }
 
     private fun readRow(cursor: Cursor, columns: RequiredColumns): V2RawPowerampProviderRow {
-        if (cursor.isNull(columns.id) || cursor.isNull(columns.duration)) {
+        if (cursor.isNull(columns.id)) {
             fail(
                 V2PowerampProviderSnapshotFailureCode.INVALID_PROVIDER_ROW,
-                "Poweramp row ${cursor.position} has null ID or duration",
+                "Poweramp row ${cursor.position} has null ID",
             )
         }
         val id = cursor.getLong(columns.id)
@@ -522,7 +522,9 @@ class V2PowerampProviderSnapshotAcquirer(
             artist = cursor.getString(columns.artist),
             album = cursor.getString(columns.album),
             title = cursor.getString(columns.title),
-            durationMs = cursor.getLong(columns.duration),
+            durationMs = if (cursor.isNull(columns.duration)) 0L else {
+                cursor.getLong(columns.duration)
+            },
             folderPath = folderPath,
             fileName = fileName,
             offsetMs = if (offsetWasNull) 0L else cursor.getLong(columns.offset),
