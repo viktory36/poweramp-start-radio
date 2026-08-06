@@ -100,7 +100,7 @@ def main() -> int:
 
     manifest = {
         "specId": "torchaudio-hann-v1-width6-rolloff0.99-f32-target-length",
-        "generator": str(Path(__file__).resolve()),
+        "generator": str(Path(__file__).resolve().relative_to(REPO_ROOT)),
         "torchVersion": torch.__version__,
         "torchaudioVersion": torchaudio.__version__,
         "resamplingMethod": "sinc_interp_hann",

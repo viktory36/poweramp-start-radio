@@ -38,7 +38,7 @@ DEFAULT_SNAPSHOT = (
     / "desktop-indexer"
     / "audit_raw_data"
     / "phone-snapshots"
-    / "2026-07-25T1708+0300_qv7706c3mq"
+    / "current"
 )
 DEFAULT_OUTPUT = (
     REPO_ROOT

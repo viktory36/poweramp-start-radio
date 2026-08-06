@@ -48,7 +48,7 @@ DEFAULT_DB = (
     / "desktop-indexer"
     / "audit_raw_data"
     / "phone-snapshots"
-    / "2026-07-07T223308+0300_qv7706c3mq"
+    / "current"
     / "embeddings.db"
 )
 DEFAULT_DEVICE_RUN = (
