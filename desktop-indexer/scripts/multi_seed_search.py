@@ -29,10 +29,8 @@ Usage:
 import argparse
 import sqlite3
 import struct
-import sys
 from pathlib import Path
 
-import numpy as np
 import torch
 
 
@@ -214,11 +212,6 @@ def blend_and_search(tracks, emb_matrix, components, top_k=20):
     query = blended.unsqueeze(0)  # [1, 768]
     sims = torch.cosine_similarity(query, emb_matrix)
     ranked = torch.argsort(sims, descending=True)
-
-    # Exclude seed songs from results
-    seed_indices = {idx for _, _, _, idx in
-                    [(None, None, None, None)]  # dummy
-                    if False}
 
     print(f"\nTop {top_k} results:")
     print("-" * 80)

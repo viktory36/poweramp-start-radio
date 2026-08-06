@@ -12,15 +12,16 @@ Usage:
 """
 
 import argparse
-import json
+import hashlib
 import logging
+import os
+import shutil
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
@@ -439,33 +440,39 @@ def convert_clamp3_text(output_dir: Path):
 
 
 def export_tokenizer(output_dir: Path):
-    """Export the XLM-RoBERTa tokenizer vocabulary for on-device use.
-
-    Saves a JSON file with the Unigram vocabulary: {piece: [token_id, score]}.
-    The score is the log probability used for Viterbi DP segmentation.
-    """
-    from tokenizers import Tokenizer as HFTokenizer
+    """Export the authoritative serialized XLM-R SentencePiece model."""
     from transformers import AutoTokenizer
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("Loading xlm-roberta-base tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base")
+    tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base", use_fast=False)
+    source = Path(tokenizer.vocab_file)
+    if not source.is_file():
+        raise RuntimeError(f"Serialized SentencePiece model not found: {source}")
 
-    fast_tok = HFTokenizer.from_pretrained("xlm-roberta-base")
-    tok_json = json.loads(fast_tok.to_str())
-    unigram_vocab = tok_json["model"]["vocab"]
-    logger.info(f"Loaded Unigram model: {len(unigram_vocab)} pieces")
+    expected_sha256 = "cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865"
+    actual_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise RuntimeError(
+            "xlm-roberta-base tokenizer bytes changed: "
+            f"expected {expected_sha256}, got {actual_sha256}"
+        )
 
-    vocab = {}
-    for idx, (piece, score) in enumerate(unigram_vocab):
-        vocab[piece] = [idx, score]
-
-    vocab_path = output_dir / "xlm_roberta_vocab.json"
-    with open(vocab_path, "w", encoding="utf-8") as f:
-        json.dump(vocab, f, ensure_ascii=False)
-    size_kb = vocab_path.stat().st_size / 1024
-    logger.info(f"Saved vocabulary: {vocab_path} ({size_kb:.0f} KB)")
+    model_path = output_dir / "sentencepiece.bpe.model"
+    temp_path = output_dir / ".sentencepiece.bpe.model.tmp"
+    with source.open("rb") as input_file, temp_path.open("wb") as output_file:
+        shutil.copyfileobj(input_file, output_file, length=1024 * 1024)
+        output_file.flush()
+        os.fsync(output_file.fileno())
+    temp_path.replace(model_path)
+    size_kb = model_path.stat().st_size / 1024
+    logger.info(
+        "Saved exact SentencePiece model: %s (%.0f KB, sha256=%s)",
+        model_path,
+        size_kb,
+        actual_sha256,
+    )
 
     # Validate
     test_queries = ["ethereal ambient", "psychedelic", "trance", "melancholic"]
@@ -474,7 +481,7 @@ def export_tokenizer(output_dir: Path):
         hf_tokens = tokenizer.convert_ids_to_tokens(hf_ids)
         logger.info(f"Validate '{test}': {hf_tokens} ids={hf_ids}")
 
-    return vocab_path
+    return model_path
 
 
 def main():

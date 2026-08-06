@@ -1,0 +1,65 @@
+{
+  "cohort_id": "native-kaiser-vs-torchaudio-hann-v1",
+  "tracks": [
+    {
+      "slug": "fixture-01",
+      "path": "/path/to/music/fixture-01.flac",
+      "format": "FLAC 24-bit",
+      "role": "48 kHz acoustic, transient, dynamic, longer than ten minutes"
+    },
+    {
+      "slug": "fixture-02",
+      "path": "/path/to/music/fixture-02.flac",
+      "format": "FLAC 16-bit",
+      "role": "48 kHz short electronic production with sharp transients"
+    },
+    {
+      "slug": "fixture-03",
+      "path": "/path/to/music/fixture-03.flac",
+      "format": "FLAC",
+      "role": "44.1 kHz experimental electronic, sustained textures and long-form change"
+    },
+    {
+      "slug": "fixture-04",
+      "path": "/path/to/music/fixture-04.flac",
+      "format": "FLAC",
+      "role": "44.1 kHz techno with dense percussion and transients"
+    },
+    {
+      "slug": "fixture-05",
+      "path": "/path/to/music/fixture-05.flac",
+      "format": "FLAC",
+      "role": "44.1 kHz niche psytrance with fast spectral and rhythmic detail"
+    },
+    {
+      "slug": "fixture-06",
+      "path": "/path/to/music/fixture-06.flac",
+      "format": "FLAC",
+      "role": "44.1 kHz complex bass/electronic material"
+    },
+    {
+      "slug": "fixture-07",
+      "path": "/path/to/music/fixture-07.flac",
+      "format": "FLAC",
+      "role": "44.1 kHz quiet acoustic jazz with sparse passages"
+    },
+    {
+      "slug": "fixture-08",
+      "path": "/path/to/music/fixture-08.flac",
+      "format": "FLAC",
+      "role": "44.1 kHz quiet broadband ambience"
+    },
+    {
+      "slug": "fixture-09",
+      "path": "/path/to/music/fixture-09.mp3",
+      "format": "MP3 320 kbps",
+      "role": "44.1 kHz lossy electronic, extended arrangement"
+    },
+    {
+      "slug": "fixture-10",
+      "path": "/path/to/music/fixture-10.mp3",
+      "format": "MP3 320 kbps",
+      "role": "44.1 kHz lossy quiet electronic/acoustic hybrid"
+    }
+  ]
+}

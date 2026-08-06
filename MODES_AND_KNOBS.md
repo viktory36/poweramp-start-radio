@@ -1,300 +1,205 @@
-# Modes and Knobs
+# Modes and Controls
 
-Poweramp Start Radio offers two main recommendation surfaces:
-- radio from the current Poweramp track
-- retrieval from text and multi-seed search
+The app builds a radio from **Now Playing**, or a complete result queue through **Find Music**.
+Relevance comes from normalized 768-dimensional CLaMP3 embeddings. Metadata supplies recording
+identity, artist limits, dates, and display, not musical scoring.
 
-This guide walks through the modes and controls behind both, and how they shape the results you see.
+## Shared Settings
 
-## App Offerings
+| Control | Effect |
+| --- | --- |
+| Queue size | Request 10-100 tracks, in steps of 10, for radio and Find Music |
+| Poweramp added date | All dates, or exactly the last N rolling 24-hour periods, using Poweramp's first-added timestamp |
+| Artist-credit limits | Enable the per-artist cap and spacing constraints for radio |
+| Max per artist | Limit occurrences of the same complete artist credit in a new radio queue |
+| Min artist spacing | Require this many intervening tracks between matching artist credits in radio |
 
-### Current-track radio
+Unknown added dates qualify only under All dates. Artist matching ignores case and surrounding
+whitespace; blank credits are unlimited. Radio enforces artist constraints during selection,
+so they can change subsequent choices. Find Music queues its displayed results instead of applying
+the radio artist limits afterward.
 
-The app reads the current Poweramp track, matches it to the embedding database, and builds a queue from that seed.
+Queues may be shorter than requested when constraints, available tracks, graph reachability,
+or DPP's remaining rank prevent filling them.
 
-Current-track radio is shaped by:
-- the selection mode
-- mode-specific knobs such as `Similarity` or `Return Frequency`
-- optional drift
-- artist repetition controls
-- queue size
+### Reading the Rank
 
-### Text retrieval
+The result's nearest/match number is an **ordinal rank**, not a physical distance or confidence:
+`#100` means 99 reference identities rank ahead of it.
 
-The app embeds a text description into the same `768d` CLaMP3 space as the audio library and retrieves matching tracks.
+- **Radio:** cosine rank from the original seed across the full active indexed library, excluding
+  the seed. Selection mode, drift, date window, and memory do not change this reference.
+- **One positive text description:** full-active-library text-to-audio cosine rank.
+- **Composed Find Music:** full-active-library weighted All-of rank for the same ingredients,
+  directions, and weights, excluding recording anchors themselves, including when Refine or
+  Varied selects the queue.
 
-### Multi-seed retrieval
+Changing ingredients or weights changes the reference. Changing the library can also change ranks.
+Expanded details show the selection domain and, for Refine, the primary and secondary ranks.
 
-The app combines:
-- a text description
-- one or more song seeds
-- positive and negative directions
-- relative weights between those directions
+## Radio Modes
 
-Multi-seed retrieval can be used as a search surface on its own or as the starting point for queueing a chosen result list into Poweramp.
+### Closest to Seed
 
-## Common Radio Controls
+**Choose this for the nearest matches.** Sort the eligible library by seed cosine and select in
+that order, subject to artist constraints. There is no relevance knob because this mode has one
+fixed objective.
 
-### Queue Size
+### Uniform Shuffle
 
-How many tracks the app tries to queue.
+**Choose this for discovery without a similarity preference.** Give every eligible recording
+identity an equal-opportunity deterministic permutation. **New order** changes the permutation;
+saved sessions keep the exact order they produced.
 
-Larger queues give the mode more room to express its selection behavior. Smaller queues make the earliest choices matter more.
+### MMR
 
-### Max Per Artist
+**Choose this for nearby music with less repetition.** At each step, choose the candidate maximizing
 
-A cap on how many tracks by one artist can appear in the queue.
+```text
+lambda * cosine(candidate, query)
+  - (1 - lambda) * max cosine(candidate, previously selected track)
+```
 
-This sits on top of the selection mode. It does not decide the queue by itself; it simply stops one artist from taking over the finished result.
+The relevance/variety slider is `lambda`: higher values emphasize closeness; at 1, selection
+follows nearest order. Lower values penalize resemblance more strongly.
+Before any track is selected or remembered, the overlap term is zero.
 
-### Min Artist Spacing
+**Selection pool** restricts which candidates MMR can consider. Without drift it is a fixed
+seed-nearest subset; with drift it is retrieved around the evolving query after each pick.
+For eligible count `N`, pool fraction `f`, and requested length `K`, its size is
+`min(N, max(floor(N*f), 100, K))`. The default is 2%; All eligible uses the full domain.
+A larger pool gives low-relevance MMR more room to explore, but need not change a high-relevance queue.
 
-How many tracks the app tries to keep between appearances by the same artist.
+#### Drift
 
-This is often one of the most noticeable cleanup controls in the app. Even a strong selector can feel repetitive if artist repeats land too close together.
+Only MMR supports drift. It changes the query for later picks; the displayed seed rank still
+refers to the original seed.
 
-## Selection Modes
+| Direction | Controls and behavior |
+| --- | --- |
+| Seed + last pick | Normalize a weighted blend of the original seed and last pick. Starting seed pull sets the seed share; Seed-pull fade changes it over the queue. |
+| Rolling direction | Blend each pick into the previous direction and normalize. Higher Prior-direction memory changes direction more slowly. |
 
-### Maximum Marginal Relevance (MMR)
+Seed-pull fade schedules:
 
-MMR starts with tracks closest to the current search, then re-scores the remaining candidates one by one.
+- **Hold:** keep the starting share.
+- **Linear:** halve it at the chosen point; reach zero after twice that many picks.
+- **Exponential:** halve it every chosen half-life, independently of queue length.
+- **Step:** hold until the drop point, then use one fifth of the starting share.
 
-A candidate keeps its relevance to the current query, but is penalized when it overlaps too much with the single chosen track it most resembles.
+### DPP
 
-Mental model:
-- retrieve a nearby neighborhood around the seed
-- pick one strong result
-- keep rejecting tracks that are too redundant with one already-chosen neighbor
+**Choose this for a relevant set covering different embedding directions.** Greedily add the track
+with greatest marginal determinant gain, measuring redundancy against the selected set as a whole.
+MMR instead penalizes resemblance to the single most similar previous track.
 
-What it brings:
-- a close, readable relationship to the seed
-- protection against obvious near-duplicates
-- a direct relevance-versus-variety tradeoff
+The kernel is `L[i,j] = q[i] * q[j] * cosine(i,j)`, where
+`q[i] = (max(0, seed cosine[i]) / maximum positive candidate cosine)^p`.
+**Seed pull** is the exponent `p`: stronger values favor seed relevance over set diversity.
+At zero, all qualities are equal and the first tie follows the stable nearest ordering.
 
-Main knob:
-- `Similarity`
+**Selection pool:**
 
-How `Similarity` changes MMR:
-- higher values keep more of the queue close to the seed
-- lower values let the diversity penalty bite harder
-- very high values approach straight nearest-neighbor retrieval
-- lower values still stay in the same neighborhood, but spend more of the queue covering different parts of it
+- **All eligible** (default): select from the entire eligible non-seed domain. The implementation
+  grows a working prefix until bounds prove the same choices as full-domain greedy selection.
+- **Nearest subset:** intentionally restrict that domain using **Subset size**, with the same
+  count rule as MMR above.
 
-### Determinantal Point Process (DPP)
+The full-domain certificate proves agreement with the greedy algorithm, not globally optimal
+DPP MAP selection. DPP does not drift.
 
-DPP also starts from tracks closest to the current search, but it re-scores each remaining candidate against the chosen set as a whole.
+### Remember Previous
 
-Mental model:
-- retrieve a nearby neighborhood around the seed
-- build the list as a set
-- once several chosen tracks already occupy the same local neighborhood, another very similar track from that neighborhood ranks lower for the next slot
+Enable this for DPP or MMR when repeating a radio from the same seed.
+All successfully enqueued recordings from that seed are excluded from new membership and
+participate in diversity scoring:
 
-What it brings:
-- broader coverage within the nearby search region
-- stronger resistance to the queue collapsing into one dense clump
-- a more globally balanced set than MMR usually produces
+- **MMR:** the maximum-overlap term also includes remembered recordings.
+- **DPP:** project candidates away from the span of remembered vectors, then run greedy DPP.
+  If `U` is an orthonormal basis of that span, the kernel becomes
+  `L[i,j] = q[i] * q[j] * x[i]^T * (I - U*U^T) * x[j]`.
 
-Mode-specific controls:
-- none
+Memory is uncapped and persists independently of session history. Successful ordinary radios
+are recorded even while the checkbox is off; previews and failed enqueues are not.
+On first use, available saved radio queues populate memory once.
+**Clear memory** resets every seed without deleting saved queues or importing them again.
+Turning the checkbox off ignores memory without erasing it.
 
-DPP is presented as a distinct selection behavior rather than a tunable family.
+Freshness costs closeness: especially with DPP, later queues can move farther from the seed.
+Once remembered vectors span the embedding space, DPP can return no further independent directions.
+It never silently forgets tracks or switches algorithms to fill a queue. Saved-queue replay sends
+the saved list directly, independently of memory.
 
-Useful contrast with MMR:
-- `MMR` compares a candidate to the single chosen track it most overlaps with
-- `DPP` compares a candidate to the chosen set together
+### Graph Explorer
 
-### Random Walk
+**Choose this for indirect connections through nearby music.** Compute the exact terminal
+probabilities of a non-backtracking traversal over the index's nearest-neighbor graph, following
+up to 100 links. Each outgoing link is equally likely; the immediately previous node cannot be
+the next step.
 
-Random Walk uses the precomputed similarity graph instead of ranking directly from the seed embedding at runtime.
+**Stop chance per link** controls route length: higher values favor shorter routes, lower values
+carry probability farther. Results rank by terminal probability, not direct seed cosine.
+The graph must match the active index. Inactive/copy nodes are removed and affected neighbor
+lists are repaired by exact cosine search before traversal.
 
-It starts at the seed track and follows local graph links from track to track. Tracks rise when many walks tend to end on them, not simply because they are the seed's closest direct cosine neighbors.
+## Find Music
 
-Mental model:
-- the library is a graph of local similarity links
-- the walk starts at the seed
-- it either continues outward or jumps back and starts again
-- tracks that are easy to reach through many plausible paths rise in the ranking
+Use a text description, select a specific recording, or add several ingredients.
+Recording lookup requires you to confirm the recording; it never silently uses the first title match.
+The result list is the queue: replace upcoming tracks or append exactly the displayed order.
 
-What it brings:
-- indirect connections instead of only direct neighbors
-- deeper exploration of the library's local structure
-- a more exploratory mode than the embedding-scan selectors
+### One Description
 
-Main knob:
-- `Return Frequency`
+- **Closest:** text-to-audio cosine order across the selected date scope.
+- **Varied (DPP):** the same cosine relevance supplies DPP quality for a less redundant set.
 
-How `Return Frequency` changes Random Walk:
-- higher values jump back to the seed more often
-- lower values let the walk travel farther before restarting
-- high return frequency stays tighter around the seed's immediate graph neighborhood
-- low return frequency gives the walk more chance to reach deeper or less obvious terminals
+This uses the whole selected scope, not the radio's nearest-subset setting.
 
-Random Walk works best when the graph is present and current.
+### All Of
 
-## Drift
+**Choose this for music satisfying multiple ingredients together.** Each ingredient receives
+tie-aware cosine percentiles within the selected library/date scope. For **Less like**, cosine
+is negated before calculating percentiles. A percentile is the fraction of library identities
+scoring at or below that candidate; equal scores receive equal percentiles. Combine them as:
 
-Drift is an optional modifier on the sequential radio path.
+```text
+score(track) = product(percentile(track, ingredient)^weight)
+```
 
-In the current app:
-- drift applies with `MMR`
-- drift is not used with `Random Walk`
-- drift is disabled for `DPP`
+Weights sum to 1. A low percentile for an ingredient reduces the combined score, which favors
+joint matches rather than an interleaved union of each ingredient's favorites.
 
-Drift changes the query after each pick, so later selections are not based only on the original seed.
+- **Ranked:** return that objective's strongest matches in order.
+- **Varied (DPP):** use the same objective as quality and select a less redundant set from the
+  complete scope. Its fixed quality exponent is 64, chosen from the comparisons in
+  [Measurements](EVALUATION.md#recommendation-tradeoffs).
 
-### Seed interpolation
+**Priority** sets exact shares from 10/90 to 90/10 in 10-point steps for two ingredients. With more ingredients,
+adjusting one weight redistributes the remaining unheld budget. **Hold** preserves a share while
+editing; adding/removing ingredients releases holds. Hold is an editor aid, not another algorithm input.
 
-Each step builds the next query as a weighted mix of:
-- the original seed
-- the most recently chosen track
+### Refine
 
-Controls:
-- `Seed weight`
-- decay schedule
+**Choose this for a secondary preference inside one anchor's neighborhood.** Take the primary
+ingredient's nearest 0.25%, 0.5%, 1%, or 2% of eligible non-seed identities, then rank inside that
+set by the secondary ingredient. Candidate count is exactly `ceil(eligible count * fraction)`.
+Secondary ties use primary percentile, then stable identity order.
 
-How `Seed weight` changes seed interpolation:
-- high values keep the original seed strongly present throughout the queue
-- low values let the latest pick steer the next search more aggressively
+The primary must be Like; the secondary can be Like or Less like. There are no weights because
+the ingredients have different jobs. The neighborhood never widens to fill a queue.
 
-Decay schedules:
-- `None`: the seed keeps the same strength throughout
-- `Linear`: the seed fades steadily over the queue
-- `Exponential`: the seed fades quickly at first, then more gently
-- `Step`: the seed holds, then drops more abruptly
+### History
 
-This is the more anchor-aware version of drift.
+Saved queues can be replayed exactly. Recent searches can also be repeated using their original
+settings or current Settings, without overwriting your defaults. Opening a recent search restores
+its text, confirmed recordings, weights, and planner; Back leaves those inputs ready to edit.
 
-### Momentum
+## Identity and Repeatability
 
-Momentum keeps a running average of where the queue has been heading.
+Complete-content copies with matching indexed spans share a recommendation identity when the app
+has evidence they are equal. Different masters, live versions, and FLAC/MP3 copies can still remain
+separate. Similar embeddings alone are not proof of duplicate identity.
 
-Instead of mixing only the seed and the latest pick, it blends each new pick into a continuing state that becomes the next query.
-
-Control:
-- `Carry-over`
-
-How `Carry-over` changes momentum:
-- high values make the running average change slowly
-- low values let new picks redirect the query quickly
-
-Momentum usually produces a smoother, less anchor-conscious trajectory than seed interpolation.
-
-## How the Radio Controls Work Together
-
-A compact way to read the radio surface:
-- `Selection Mode` chooses the selection logic
-- `Similarity` or `Return Frequency` changes the character inside that logic
-- `Drift` decides whether the query stays fixed or evolves over the queue
-- `Max Per Artist` and `Min Artist Spacing` clean up artist repetition after selection
-
-Examples:
-- `MMR` + high `Similarity` + no drift: tight neighborhood around the seed
-- `MMR` + lower `Similarity` + drift: local neighborhood with a changing query
-- `DPP`: nearby pool, but spread across more of it as a set
-- `Random Walk` + low `Return Frequency`: longer excursions through the graph
-
-## Search Controls
-
-### Text Search Results
-
-How many results the search screen shows for text-only and multi-seed retrieval.
-
-This does not change the meaning of the search. It changes how much of the ranked list is shown or available for direct queueing.
-
-## Multi-Seed Search
-
-Multi-seed search combines several directions at once.
-
-The active seeds can be:
-- a text description
-- one or more song seeds
-
-Each seed contributes through three properties: weight, sign, and lock state.
-
-### Weight
-
-Weight controls how much a seed matters relative to the other active seeds.
-
-The active weights are normalized against each other, so what matters is each seed's share of the total active mix.
-
-Important details in the current app:
-- the text seed can drop to `0%` when song seeds are present, allowing song-only multi-seed search
-- song seeds keep a small nonzero floor while active so they stay present in the mix
-
-### Sign
-
-Every seed can be either:
-- positive: `more like this`
-- negative: `less like this`
-
-Sign changes the search direction.
-
-A negative seed tells the ranking system to favor tracks that do well on the other active seeds while ranking poorly against that seed.
-
-### Lock
-
-Lock freezes a seed's current share while the other unlocked seeds redistribute the remaining weight budget.
-
-This is useful when one ingredient should stay fixed while the others are adjusted around it.
-
-## How Multi-Seed Ranking Works
-
-The app does not rank multi-seed search by a simple averaged embedding.
-
-It uses a geo-mean-of-percentiles ranking.
-
-In practical terms:
-- for each seed, the app measures how every track ranks against that seed across the full library
-- those raw similarities are converted into percentile positions
-- the percentile positions are combined using the seed weights
-- tracks rise when they do well across the weighted combination of directions
-
-What this offers:
-- better behavior than naive vector blending when seeds live in different parts of the embedding space
-- clean handling of positive and negative seeds
-- stronger bridge-finding between distant seeds
-
-## What the Percentage Means in Multi-Seed Search
-
-The shown `%` in multi-seed results is a display metric, not the internal geo-mean ranking score.
-
-The ranking score is good for ordering results, but it bunches too close to `100%` to be useful as a reader-facing number.
-
-The app therefore shows:
-- cosine similarity to a signed weighted blend of the active seeds
-
-That displayed `%` answers this question:
-- how closely does this result match the combined direction implied by the active seed mix?
-
-That makes the number:
-- easier to read across single-seed and multi-seed search
-- more spread out
-- more informative than the raw geo-mean score as a user-facing percentage
-
-So multi-seed search has two separate concepts:
-- ranking score: used internally to order the results
-- display percentage: shown in the UI because it is easier to interpret
-
-## How the Multi-Seed Controls Work Together
-
-A compact way to read the multi-seed surface:
-- `Weight` decides how much each seed matters
-- `Sign` decides whether each seed attracts or repels the search
-- `Lock` decides which shares stay fixed while the others move
-
-Examples:
-- text `70%` + song `30%`: mostly the text world, nudged toward that song's neighborhood
-- text `50%` + song `50%`: look for tracks that can satisfy both directions
-- text `70%` + negative song `30%`: keep the text world, avoid the part of it that leans toward that song
-- two positive song seeds plus one negative seed: triangulate a zone while carving out an unwanted nearby influence
-
-## Source of Truth
-
-Implementation lives in:
-- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/RecommendationEngine.kt`
-- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/algorithms/MmrSelector.kt`
-- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/algorithms/DppSelector.kt`
-- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/algorithms/RandomWalkSelector.kt`
-- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/algorithms/DriftEngine.kt`
-- `android-plugin/app/src/main/java/com/powerampstartradio/similarity/algorithms/GeoMeanSelector.kt`
-- `android-plugin/app/src/main/java/com/powerampstartradio/ui/MainViewModel.kt`
+The same index, active library, request, and remembered set produce the same ordered identities.
+Uniform shuffle's order value is part of the request. Independently generating embeddings on
+different hardware is not promised to produce byte-identical vectors.

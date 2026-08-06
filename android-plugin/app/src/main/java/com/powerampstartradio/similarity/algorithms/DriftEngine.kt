@@ -3,7 +3,8 @@ package com.powerampstartradio.similarity.algorithms
 import com.powerampstartradio.ui.DecaySchedule
 import com.powerampstartradio.ui.DriftMode
 import com.powerampstartradio.ui.RadioConfig
-import kotlin.math.exp
+import kotlin.math.max
+import kotlin.math.pow
 import kotlin.math.sqrt
 
 /**
@@ -37,7 +38,6 @@ object DriftEngine {
      * @param currentEmb Embedding of the most recently selected track
      * @param emaState Running EMA state (only for MOMENTUM mode, null initially)
      * @param step Current step index (0-based)
-     * @param totalSteps Total planned steps
      * @param config Radio configuration with drift parameters
      * @return DriftResult with new query, EMA state, and seed weight for provenance
      */
@@ -46,12 +46,16 @@ object DriftEngine {
         currentEmb: FloatArray,
         emaState: FloatArray?,
         step: Int,
-        totalSteps: Int,
         config: RadioConfig
     ): DriftResult {
         return when (config.driftMode) {
             DriftMode.SEED_INTERPOLATION -> {
-                val alpha = computeAlpha(config.anchorStrength, step, totalSteps, config.anchorDecay)
+                val alpha = computeAlpha(
+                    baseAlpha = config.anchorStrength,
+                    step = step,
+                    decay = config.anchorDecay,
+                    halfLifeTracks = config.effectiveAnchorHalfLifeTracks,
+                )
                 val query = interpolate(seedEmb, currentEmb, alpha)
                 DriftResult(query, currentEmb, seedWeight = alpha)
             }
@@ -71,19 +75,27 @@ object DriftEngine {
      *
      * @param baseAlpha Base anchor strength (0..1)
      * @param step Current step
-     * @param totalSteps Total steps planned
      * @param decay Decay schedule
      * @return Effective alpha at this step
      */
-    internal fun computeAlpha(baseAlpha: Float, step: Int, totalSteps: Int, decay: DecaySchedule): Float {
-        if (totalSteps <= 1) return baseAlpha
-        val progress = step.toFloat() / (totalSteps - 1).toFloat()  // 0..1
-
+    internal fun computeAlpha(
+        baseAlpha: Float,
+        step: Int,
+        decay: DecaySchedule,
+        halfLifeTracks: Float,
+    ): Float {
+        require(baseAlpha in 0f..1f) { "baseAlpha must be between 0 and 1" }
+        require(step >= 0) { "step must be non-negative" }
+        require(halfLifeTracks > 0f && halfLifeTracks.isFinite()) {
+            "halfLifeTracks must be finite and positive"
+        }
+        val elapsed = step.toFloat()
         return when (decay) {
             DecaySchedule.NONE -> baseAlpha
-            DecaySchedule.LINEAR -> baseAlpha * (1f - progress)
-            DecaySchedule.EXPONENTIAL -> baseAlpha * exp(-3f * progress)
-            DecaySchedule.STEP -> if (progress < 0.5f) baseAlpha else baseAlpha * 0.2f
+            DecaySchedule.LINEAR -> baseAlpha * max(0f, 1f - elapsed / (2f * halfLifeTracks))
+            DecaySchedule.EXPONENTIAL ->
+                baseAlpha * 0.5f.pow(elapsed / halfLifeTracks)
+            DecaySchedule.STEP -> if (elapsed < halfLifeTracks) baseAlpha else baseAlpha * 0.2f
         }
     }
 

@@ -18,27 +18,9 @@ class TrackMatcher(
 ) {
     companion object {
         private const val TAG = "TrackMatcher"
-
-        private var cachedEntries: List<PowerampFileEntry>? = null
-        private var cachedByPath: Map<String, List<PowerampFileEntry>>? = null
-        private var cachedByMetadataKey: Map<String, List<PowerampFileEntry>>? = null
-        private var cachedByArtistAlbumTitle: Map<String, List<PowerampFileEntry>>? = null
-        private var cachedByArtistTitle: Map<String, List<PowerampFileEntry>>? = null
-        private var cachedByTitle: Map<String, List<PowerampFileEntry>>? = null
-        private var cachedByFilenameKey: Map<String, List<PowerampFileEntry>>? = null
-        private var cachedEntryCount: Int = 0
-
-        fun invalidateCache() {
-            cachedEntries = null
-            cachedByPath = null
-            cachedByMetadataKey = null
-            cachedByArtistAlbumTitle = null
-            cachedByArtistTitle = null
-            cachedByTitle = null
-            cachedByFilenameKey = null
-            cachedEntryCount = 0
-        }
     }
+
+    private val providerIndex = RequestScopedSnapshot<PowerampProviderIndex>()
 
     data class MatchResult(
         val embeddedTrack: EmbeddedTrack,
@@ -46,12 +28,15 @@ class TrackMatcher(
     )
 
     enum class MatchType {
+        ACTIVE_CATALOG_EXACT,
         PATH_EXACT,
         METADATA_EXACT,
         ARTIST_ALBUM_TITLE,
         FILENAME,
         ARTIST_TITLE,
         ARTIST_TITLE_FUZZY,
+        COMPOSED_QUERY,
+        NOT_APPLICABLE,
         NOT_FOUND
     }
 
@@ -77,6 +62,16 @@ class TrackMatcher(
         val metadataKey: String,
         val metadataPrefix: String,
         val filenameKeys: Set<String>,
+    )
+
+    private data class PowerampProviderIndex(
+        val entries: List<PowerampFileEntry>,
+        val byPath: Map<String, List<PowerampFileEntry>>,
+        val byMetadataKey: Map<String, List<PowerampFileEntry>>,
+        val byArtistAlbumTitle: Map<String, List<PowerampFileEntry>>,
+        val byArtistTitle: Map<String, List<PowerampFileEntry>>,
+        val byTitle: Map<String, List<PowerampFileEntry>>,
+        val byFilenameKey: Map<String, List<PowerampFileEntry>>,
     )
 
     private data class MatchScore(
@@ -146,32 +141,63 @@ class TrackMatcher(
         return null
     }
 
-    private fun ensureCache(context: Context) {
-        if (cachedEntries != null) return
+    /**
+     * One matcher is created for one durable request. It publishes one complete provider index
+     * atomically and never shares it process-wide, so every later request observes library
+     * additions/removals while every operation within this request sees one coherent snapshot.
+     */
+    private fun requireProviderIndex(context: Context): PowerampProviderIndex =
+        providerIndex.require {
+            buildProviderIndex(PowerampHelper.requireCompleteFileSnapshot(context))
+        }
 
-        val entries = PowerampHelper.getAllFileEntries(context)
-        cachedEntries = entries
-        cachedByPath = entries.groupByTo(HashMap()) { it.path ?: "" }.filterKeys { it.isNotBlank() }
-        cachedByMetadataKey = entries.groupByTo(HashMap()) { it.metadataKey }
-        cachedByArtistAlbumTitle = entries.groupByTo(HashMap()) { "${it.artist}\u0000${it.album}\u0000${it.title}" }
-        cachedByArtistTitle = entries.groupByTo(HashMap()) { "${it.artist}\u0000${it.title}" }
-        cachedByTitle = entries.groupByTo(HashMap()) { it.title }
-
+    private fun buildProviderIndex(snapshot: PowerampLibrarySnapshot): PowerampProviderIndex {
+        val entries = snapshot.entries
         val byFilenameKey = HashMap<String, MutableList<PowerampFileEntry>>(entries.size * 2)
         for (entry in entries) {
             for (key in entry.filenameKeys) {
                 byFilenameKey.getOrPut(key) { mutableListOf() }.add(entry)
             }
         }
-        cachedByFilenameKey = byFilenameKey
-        cachedEntryCount = entries.size
-
-        Log.d(TAG, "Indexed ${entries.size} Poweramp tracks (${byFilenameKey.size} filename keys)")
+        return PowerampProviderIndex(
+            entries = entries,
+            byPath = entries.groupByTo(HashMap()) { it.path ?: "" }
+                .filterKeys { it.isNotBlank() },
+            byMetadataKey = entries.groupByTo(HashMap()) { it.metadataKey },
+            byArtistAlbumTitle = entries.groupByTo(HashMap()) {
+                "${it.artist}\u0000${it.album}\u0000${it.title}"
+            },
+            byArtistTitle = entries.groupByTo(HashMap()) { "${it.artist}\u0000${it.title}" },
+            byTitle = entries.groupByTo(HashMap()) { it.title },
+            byFilenameKey = byFilenameKey,
+        ).also {
+            Log.d(
+                TAG,
+                "Request snapshot indexed ${entries.size} Poweramp tracks " +
+                    "(${byFilenameKey.size} filename keys)",
+            )
+        }
     }
 
     fun findFileId(context: Context, track: EmbeddedTrack): Long? {
-        ensureCache(context)
-        return resolveEntry(track)?.id
+        return resolveEntry(track, requireProviderIndex(context))?.id
+    }
+
+    /** Resolve against a caller-owned complete snapshot so a multi-track plan cannot mix reads. */
+    fun findFileId(snapshot: PowerampLibrarySnapshot, track: EmbeddedTrack): Long? =
+        resolveEntry(track, buildProviderIndex(snapshot))?.id
+
+    /** Keeps occurrence order and intentionally does not collapse repeated requested recordings. */
+    fun findFileIds(
+        snapshot: PowerampLibrarySnapshot,
+        tracks: List<EmbeddedTrack>,
+    ): List<Long?> {
+        val index = buildProviderIndex(snapshot)
+        val resolved = tracks.map { track -> resolveEntry(track, index)?.id }
+        return IdentityConsistentFileResolutionPolicy.rejectAliasedIdentities(
+            trackIds = tracks.map(EmbeddedTrack::id),
+            fileIds = resolved,
+        )
     }
 
     fun mapSingleTrackToFileId(
@@ -179,9 +205,9 @@ class TrackMatcher(
         similarTrack: SimilarTrack,
         seen: MutableSet<Long>
     ): Long? {
-        ensureCache(context)
+        val index = requireProviderIndex(context)
 
-        val entry = resolveEntry(similarTrack.track)
+        val entry = resolveEntry(similarTrack.track, index)
         if (entry == null) {
             Log.w(TAG, "MISS: '${similarTrack.track.artist ?: ""}' - '${similarTrack.track.title ?: ""}' (fnKey='${similarTrack.track.filenameKey}')")
             return null
@@ -197,18 +223,18 @@ class TrackMatcher(
         context: Context,
         similarTracks: List<SimilarTrack>
     ): List<MappedTrack> {
-        ensureCache(context)
+        val index = requireProviderIndex(context)
 
         val seen = mutableSetOf<Long>()
         val result = mutableListOf<MappedTrack>()
 
         for (similarTrack in similarTracks) {
-            val fileId = mapSingleTrackToFileId(context, similarTrack, seen)
+            val entry = resolveEntry(similarTrack.track, index)
+            val fileId = entry?.id?.takeIf(seen::add)
             if (fileId != null) {
                 result.add(MappedTrack(similarTrack, fileId))
             } else {
-                val resolved = resolveEntry(similarTrack.track)
-                if (resolved != null && resolved.id in seen) continue
+                if (entry != null && entry.id in seen) continue
                 result.add(MappedTrack(similarTrack, null))
             }
         }
@@ -219,14 +245,14 @@ class TrackMatcher(
     }
 
     fun auditQueueResolution(context: Context, tracks: List<EmbeddedTrack>): QueueAudit {
-        ensureCache(context)
+        val index = requireProviderIndex(context)
 
         val counts = linkedMapOf<MatchType, Int>()
         val misses = mutableListOf<String>()
         var matched = 0
 
         for (track in tracks) {
-            val resolution = resolveWithType(track)
+            val resolution = resolveWithType(track, index)
             if (resolution == null) {
                 if (misses.size < 50) misses += track.metadataKey
                 continue
@@ -244,14 +270,17 @@ class TrackMatcher(
         )
     }
 
-    private fun resolveWithType(track: EmbeddedTrack): Pair<PowerampFileEntry, MatchType>? {
+    private fun resolveWithType(
+        track: EmbeddedTrack,
+        index: PowerampProviderIndex,
+    ): Pair<PowerampFileEntry, MatchType>? {
         val lookup = track.asLookup()
-        val byPath = cachedByPath!!
-        val byMetadataKey = cachedByMetadataKey!!
-        val byArtistAlbumTitle = cachedByArtistAlbumTitle!!
-        val byArtistTitle = cachedByArtistTitle!!
-        val byTitle = cachedByTitle!!
-        val byFilenameKey = cachedByFilenameKey!!
+        val byPath = index.byPath
+        val byMetadataKey = index.byMetadataKey
+        val byArtistAlbumTitle = index.byArtistAlbumTitle
+        val byArtistTitle = index.byArtistTitle
+        val byTitle = index.byTitle
+        val byFilenameKey = index.byFilenameKey
 
         lookup.path?.let { path ->
             chooseBestPoweramp(lookup, byPath[path].orEmpty())?.let {
@@ -286,12 +315,14 @@ class TrackMatcher(
             return it to MatchType.ARTIST_TITLE_FUZZY
         }
 
-        logMissDiagnostics(lookup)
+        logMissDiagnostics(lookup, index)
         return null
     }
 
-    private fun resolveEntry(track: EmbeddedTrack): PowerampFileEntry? =
-        resolveWithType(track)?.first
+    private fun resolveEntry(
+        track: EmbeddedTrack,
+        index: PowerampProviderIndex,
+    ): PowerampFileEntry? = resolveWithType(track, index)?.first
 
     private fun chooseBestEmbedded(
         lookup: EmbeddedCandidate,
@@ -304,8 +335,8 @@ class TrackMatcher(
         if (liveCandidates.isEmpty()) return null
         val scored = liveCandidates.map { candidate ->
             candidate to embeddedScore(lookup, candidate)
-        }.sortedWith(compareBy<Pair<EmbeddedCandidate, MatchScore>> { it.second })
-        return scored.first().first
+        }
+        return UniqueBestMatchPolicy.choose(scored)
     }
 
     private fun chooseBestPoweramp(
@@ -319,8 +350,8 @@ class TrackMatcher(
         if (liveCandidates.isEmpty()) return null
         val scored = liveCandidates.map { candidate ->
             candidate to powerampScore(lookup, candidate)
-        }.sortedWith(compareBy<Pair<PowerampFileEntry, MatchScore>> { it.second })
-        return scored.first().first
+        }
+        return UniqueBestMatchPolicy.choose(scored)
     }
 
     private fun embeddedScore(lookup: EmbeddedCandidate, candidate: EmbeddedCandidate): MatchScore {
@@ -345,9 +376,12 @@ class TrackMatcher(
         )
     }
 
-    private fun logMissDiagnostics(lookup: EmbeddedCandidate) {
-        val byTitle = cachedByTitle!!
-        val byFilenameKey = cachedByFilenameKey!!
+    private fun logMissDiagnostics(
+        lookup: EmbeddedCandidate,
+        index: PowerampProviderIndex,
+    ) {
+        val byTitle = index.byTitle
+        val byFilenameKey = index.byFilenameKey
         val words = lookup.title.split(Regex("\\s+"))
             .filter { it.length >= 4 }
             .take(3)
@@ -441,5 +475,68 @@ class TrackMatcher(
         if (a.isBlank() || b.isBlank()) return a.isBlank() && b.isBlank()
         if (a == b) return true
         return a.contains(b) || b.contains(a)
+    }
+}
+
+/** Equal best evidence is ambiguous; provider/cursor order is never a tie-break. */
+internal object UniqueBestMatchPolicy {
+    fun <T, S : Comparable<S>> choose(scored: List<Pair<T, S>>): T? {
+        if (scored.isEmpty()) return null
+        var best: Pair<T, S>? = null
+        var bestCount = 0
+        for (candidate in scored) {
+            val comparison = best?.let { candidate.second.compareTo(it.second) } ?: -1
+            when {
+                best == null || comparison < 0 -> {
+                    best = candidate
+                    bestCount = 1
+                }
+                comparison == 0 -> bestCount++
+            }
+        }
+        return best?.first?.takeIf { bestCount == 1 }
+    }
+}
+
+/** One current Poweramp row cannot prove two different active embedding identities. */
+internal object IdentityConsistentFileResolutionPolicy {
+    fun rejectAliasedIdentities(
+        trackIds: List<Long>,
+        fileIds: List<Long?>,
+    ): List<Long?> {
+        require(trackIds.size == fileIds.size) { "Track and Poweramp resolutions are misaligned" }
+        val identitiesByFileId = HashMap<Long, MutableSet<Long>>()
+        fileIds.forEachIndexed { index, fileId ->
+            if (fileId != null) {
+                identitiesByFileId.getOrPut(fileId) { mutableSetOf() }.add(trackIds[index])
+            }
+        }
+        val ambiguousFileIds = identitiesByFileId
+            .filterValues { trackIdentities -> trackIdentities.size > 1 }
+            .keys
+        return fileIds.map { fileId -> fileId?.takeUnless { it in ambiguousFileIds } }
+    }
+}
+
+/** Caches one success or failure, preventing a request from mixing provider snapshots. */
+internal class RequestScopedSnapshot<T> {
+    private var attempted = false
+    private var value: T? = null
+    private var failure: Exception? = null
+
+    @Synchronized
+    fun require(loader: () -> T): T {
+        if (!attempted) {
+            try {
+                value = loader()
+            } catch (caught: Exception) {
+                failure = caught
+            } finally {
+                attempted = true
+            }
+        }
+        failure?.let { throw it }
+        @Suppress("UNCHECKED_CAST")
+        return value as T
     }
 }

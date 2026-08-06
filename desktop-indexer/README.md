@@ -1,132 +1,142 @@
-# Desktop Indexer
+# Desktop and Server Indexer
 
-This directory contains the desktop pipeline that builds the database used by the Android app.
-
-## Overview
-
-The production path is CLaMP3:
-
-- MERT extracts `768d` features from `5s` windows of audio
-- the CLaMP3 audio encoder turns those window features into one `768d` embedding per track
-- the CLaMP3 text encoder produces embeddings in the same space for text search
-
-The resulting `embeddings.db` is portable. Once built, it can be copied to the phone and used offline by the Android app.
+Build a CLaMP3 music database, query it, export Android models, or watch folders for new tracks.
 
 ## Install
 
-```bash
-cd desktop-indexer
-python -m pip install -e '.[export]'
-```
-
-For library-scale indexing, use a GPU-capable PyTorch installation. CPU is best kept for debugging and small test runs.
-
-`.[export]` includes the LiteRT export dependencies used by `poweramp-indexer export all`.
-
-## Main CLI Commands
-
-### Scan a library from scratch
+From this directory:
 
 ```bash
-poweramp-indexer scan /path/to/music -o embeddings.db
+uv sync --extra dev --extra export
+uv run poweramp-indexer --help
 ```
 
-Useful options:
+Python 3.10+ is required. `dev` adds pytest/Ruff; `export` adds LiteRT conversion dependencies.
+For indexing alone, omit those extras. Install matching PyTorch/torchaudio builds for your hardware.
+`ffmpeg` and `ffprobe` enable fallback decoding of files torchaudio cannot read.
 
-- `--fp32`
-- `--batch-size N`
-- `--max-duration 600`
-- `--cache-dir /path/to/mert_cache`
-- `--phase 1`
-- `--phase 2`
+## Embedding Pipeline
 
-`scan` performs both embedding generation and graph building.
+1. Decode to mono and resample to 24 kHz with the TorchAudio Hann policy.
+2. Normalize the decoded span and extract MERT features in consecutive five-second windows.
+3. Feed the averaged MERT layer features to CLaMP3's audio encoder in 128-frame segments.
+4. Combine segment outputs with frame-count weights and L2-normalize one 768d vector.
 
-Desktop MERT defaults to FP16. Use `--fp32` when you want the full-precision path.
+There is no duration cap by default. A final audio remainder shorter than one second is skipped;
+long sequences use CLaMP3's overlapping last-segment convention. This is whole-track processing,
+not one vector per excerpt. Text queries use CLaMP3's text encoder in the same embedding space.
 
-### Incrementally update an existing database
+## Library Indexing
 
 ```bash
-poweramp-indexer update /path/to/music --database embeddings.db
+uv run poweramp-indexer scan /path/to/music -o embeddings.db
 ```
 
-`update` adds new files, can remove missing ones, and refreshes the Random Walk graph by default. Use `--no-rebuild-graph` if you want to skip that step temporarily.
+The scan first caches MERT features, then writes embeddings and builds cluster/kNN data for
+Graph Explorer. CPU decoding of the next track overlaps current GPU inference. Rerunning resumes
+from the cache.
 
-You can also rebuild the graph explicitly:
+| Option | Use |
+| --- | --- |
+| `--batch-size 16` | Increase MERT throughput if GPU memory permits; default 8 |
+| `--fp32` | Use FP32 MERT instead of the desktop FP16 default |
+| `--phase 1` / `--phase 2` | Run extraction and database encoding separately |
+| `--cache-dir PATH` | Choose where MERT intermediate files live |
+
+Phone/server indexing uses FP32. Use `--fp32` for stricter cross-device comparison.
 
 ```bash
-poweramp-indexer graph embeddings.db --clusters 200 --knn 5
+uv run poweramp-indexer update /path/to/music --database embeddings.db
+uv run poweramp-indexer graph embeddings.db --clusters 200 --knn 5
 ```
 
-### Inspect the database
+**Update removes rows for missing files by default.** Use `--no-remove-missing` if a source root
+is temporarily incomplete. It also rebuilds the graph; `--no-rebuild-graph` postpones that work.
+
+These commands update the desktop copy only. After initial phone import, grow the active phone
+index through on-device indexing or server merge, not by overwriting its private database.
+
+## Server Indexing
+
+Server mode watches folders, maintains a durable work ledger, and publishes a cumulative graphless
+database for phone merge. It embeds one physical file per track; it does not split CUE sheets.
+
+Copy and edit [the example config](deploy/server-indexer.example.toml).
+Keep state, cache, and exports outside the watched roots.
+
+| Config field | Meaning |
+| --- | --- |
+| `listen_roots` | Stable root IDs and folders to watch |
+| `state_db` | Private work ledger; not the phone export |
+| `bundle_db` | Cumulative export to sync to the phone |
+| `cache_dir` | Temporary source/inference files |
+| `poll_interval_seconds` | Time between scans |
+| `settle_seconds` | How long a file must remain unchanged before indexing |
+| `max_files_per_cycle` | Maximum work batch per cycle |
+| `max_attempts`, `retry_delays_seconds` | Failure retry policy |
+| `mert_batch_size` | MERT inference batch size |
+
+Initialize the ledger:
 
 ```bash
-poweramp-indexer info embeddings.db
+uv run poweramp-indexer server init --config /path/to/server.toml
 ```
 
-### Query similar tracks
+Add **`--baseline-existing` only if the current files are already indexed on your phone**.
+It records those files without embedding them; newly arriving files will be indexed.
 
 ```bash
-poweramp-indexer similar embeddings.db "radiohead karma police"
-poweramp-indexer similar embeddings.db --file ~/Downloads/song.mp3
-poweramp-indexer similar embeddings.db --random
+uv run poweramp-indexer server run --config /path/to/server.toml
+uv run poweramp-indexer server status --config /path/to/server.toml
+uv run poweramp-indexer server status --config /path/to/server.toml --json
 ```
 
-### Text-to-audio search
+Status reports done/ready/active/retry/blocked/baseline counts, throughput, ETA, output path,
+publication counts, and errors. It reads the ledger without scanning music or loading models.
+`server once` runs one cycle; `server retry` reopens blocked files for another attempt.
+
+For unattended operation, adapt [the systemd unit](deploy/poweramp-server-indexer.service).
+Its service user must read the listen roots and write state/cache/export directories.
+
+Files must settle before indexing. A private source snapshot prevents a changing download from
+producing a mismatched vector. Failed files stop automatic retries after the configured limit.
+The export is replaced atomically after a successful publication, so readers see a complete file.
+
+### Transfer to the Phone
+
+1. Sync the music to the phone and let Poweramp scan it.
+2. Copy `bundle_db`, not `state_db`. For the latest complete batch, wait for an empty queue,
+   no cycle error/blocked files, and a Published count matching completed tracks in status.
+3. In Settings, choose **Merge server index** and select the export.
+
+The phone matches rows to its own library, checks model and source-span compatibility, skips
+already indexed rows, and updates its graph. You can merge the same cumulative export repeatedly.
+Shared CUE images are rejected rather than assigning a full-image vector to one split track.
+
+## Query and Export
 
 ```bash
-poweramp-indexer search embeddings.db "dark minimal techno"
+uv run poweramp-indexer info embeddings.db
+uv run poweramp-indexer similar embeddings.db "radiohead karma police"
+uv run poweramp-indexer similar embeddings.db --file /path/to/song.flac
+uv run poweramp-indexer similar embeddings.db --random
+uv run poweramp-indexer search embeddings.db "slow psychedelic guitar"
+uv run poweramp-indexer export all --output-dir models
 ```
 
-### Export Android model files
+The model export produces `mert.tflite`, `clamp3_audio.tflite`, `clamp3_text.tflite`, and
+`sentencepiece.bpe.model`. See [Setup](../SETUP.md) for phone installation.
+
+## Database and Development
+
+A library database stores track metadata, vectors in `embeddings_clamp3`, preprocessing/model
+metadata, and cluster/kNN data. Server bundles omit the graph and add source provenance for merging.
 
 ```bash
-poweramp-indexer export all
+uv run --extra dev pytest tests experiments -q
+uv run --extra dev ruff check .
 ```
 
-This writes the Android-facing LiteRT assets such as:
-
-- `mert.tflite`
-- `clamp3_audio.tflite`
-- `clamp3_text.tflite`
-- `xlm_roberta_vocab.json`
-
-## What The Database Contains
-
-`embeddings.db` stores:
-
-- track metadata in `tracks`
-- audio embeddings in `embeddings_clamp3`
-- cluster centroids in `clusters`
-- the Random Walk graph in `binary_data.knn_graph`
-- metadata such as source path, model, version, and embedding dimension
-
-On Android, that database is later materialized into mmap-backed runtime files for the hot paths.
-
-## Supporting Scripts
-
-The CLI is the main entry point, but a few scripts are useful when validating or inspecting the system:
-
-- `scripts/generate_clamp3_embeddings.py`
-  - lower-level generation path and graph-building helpers
-- `src/poweramp_indexer/export_litert.py`
-  - exports the Android LiteRT models
-- `scripts/validate_tflite_clamp3.py`
-  - compares desktop TFLite audio output against the desktop database
-- `scripts/validate_benchmark.py`
-  - compares Android benchmark JSON against the desktop database
-- `scripts/replay_multiseed.py`
-  - replays logged multi-seed runs
-- `scripts/test_incremental_graph.py`
-  - exercises the incremental graph path used by on-device indexing
-- `scripts/evaluate_clamp3.py`
-  - ad hoc offline similarity and text-search inspection
-
-## Notes
-
-- CLI entry point: `poweramp_indexer.cli:cli`
-- `scan` builds the graph
-- `update` refreshes the graph by default
-- the Android app relies on the graph for Random Walk mode
-- some legacy MuLan and Flamingo artifacts may still appear in `models/` or audit files
-- current app work centers on the CLaMP3 path
+Implementation: `src/poweramp_indexer/cli.py` (commands), `embeddings_clamp3.py` (inference),
+`server_indexer.py` (watcher/status), `server_bundle.py` (export), `export_litert.py` (models).
+[Experiments](experiments/README.md) contains host recommendation and parity tools.

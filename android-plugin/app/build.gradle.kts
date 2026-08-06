@@ -1,3 +1,5 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -6,15 +8,19 @@ plugins {
 
 android {
     namespace = "com.powerampstartradio"
-    compileSdk = 35
+    compileSdk = 36
     ndkVersion = "27.2.12479018"
 
     defaultConfig {
-        applicationId = "com.powerampstartradio"
+        // V2 is intentionally installable beside the daily-use V1 app while it is
+        // being instrumented and validated on the phone.
+        applicationId = "com.powerampstartradio.v2"
         minSdk = 26
-        targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        // Target the phone's Android 16 contract. This also retains Android 15's
+        // mediaProcessing timeout behavior, which applies to target 35 and newer.
+        targetSdk = 36
+        versionCode = 2000000
+        versionName = "2.0.0-experimental"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -47,10 +53,6 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-
     buildFeatures {
         compose = true
     }
@@ -65,12 +67,22 @@ android {
     }
 }
 
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
+    }
+}
+
 dependencies {
     // Core Android
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
     implementation("androidx.activity:activity-compose:1.8.2")
+    // LiteRT's Play delivery dependency still requests Fragment 1.1.0, which is
+    // incompatible with Activity Result registration. Keep the runtime on a
+    // current stable Fragment even though V2 does not call Fragment APIs itself.
+    implementation("androidx.fragment:fragment:1.8.9")
 
     // Compose
     implementation(platform("androidx.compose:compose-bom:2025.01.01"))
@@ -80,18 +92,8 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.foundation:foundation")
 
-    // Glance for home screen widget
-    implementation("androidx.glance:glance-appwidget:1.0.0")
-    implementation("androidx.glance:glance-material3:1.0.0")
-
-    // SQLite for reading embeddings database
-    implementation("androidx.sqlite:sqlite-ktx:2.4.0")
-
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
-
-    // Document picker
-    implementation("androidx.documentfile:documentfile:1.0.1")
 
     // JSON serialization for session history persistence
     implementation("com.google.code.gson:gson:2.11.0")

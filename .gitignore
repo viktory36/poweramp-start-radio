@@ -8,6 +8,8 @@ __pycache__/
 *.so
 .Python
 .venv/
+.pytest_cache/
+.ruff_cache/
 venv/
 ENV/
 env/
@@ -31,12 +33,25 @@ local.properties
 /android-plugin/app/.cxx/
 /android-plugin/captures/
 /android-plugin/.android-wsl-env
+/android-plugin/.kotlin/
 .externalNativeBuild/
 .cxx/
+
+# Local evaluation corpora and device captures. Curated findings live in the docs.
+/discovery/
 
 # Database files (user-specific)
 *.db
 embeddings.db
+/desktop-indexer/audit_raw_data/
+/desktop-indexer/models/
+/desktop-indexer/mert_cache/
+/desktop-indexer/clamp3_evaluation_raw.txt
+/desktop-indexer/*_comparison.txt
+/desktop-indexer/fused_audit.json
+
+# Host-specific server deployment remains local; generic samples are tracked.
+/desktop-indexer/deploy/box-*
 
 # OS files
 .DS_Store

@@ -10,7 +10,7 @@ deploying to Android.
 
 Usage:
     python scripts/validate_tflite_clamp3.py --db audit_raw_data/embeddings_clamp3.db \
-        --music /home/v/testmusic --n 50
+        --music /path/to/music --n 50
 """
 
 import argparse
@@ -290,5 +290,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import torch
     main()

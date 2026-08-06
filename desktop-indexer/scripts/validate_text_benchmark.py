@@ -19,8 +19,6 @@ import argparse
 import json
 import struct
 import subprocess
-import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -261,11 +259,11 @@ def main():
 
         # Show top-5 from each side
         if cos < 0.99 or overlap < 7:
-            print(f"  Desktop top-5:")
+            print("  Desktop top-5:")
             for i, idx in enumerate(top_desktop[:5]):
                 print(f"    {i+1}. {sims[idx]:.4f}  {track_labels[idx]}")
             if qr.get("topMatches"):
-                print(f"  Device top-5:")
+                print("  Device top-5:")
                 for i, hit in enumerate(qr["topMatches"][:5]):
                     print(f"    {i+1}. {hit['similarity']:.4f}  {hit['label']}")
 

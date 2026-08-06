@@ -71,7 +71,7 @@ def main():
 
         if not rows:
             print(f"Track {i+1}: {artist} - {title}")
-            print(f"  NOT FOUND in desktop DB\n")
+            print("  NOT FOUND in desktop DB\n")
             continue
 
         db_id, blob = rows[0]
@@ -125,7 +125,7 @@ def main():
     print()
     print("=" * 70)
     print(f"SUMMARY ({len(cosines)}/{len(tracks)} tracks matched)")
-    print(f"  Per-track cosine vs desktop:")
+    print("  Per-track cosine vs desktop:")
     for name, cos in zip(names, cosines):
         print(f"    {name}: {cos:.6f}")
     print()

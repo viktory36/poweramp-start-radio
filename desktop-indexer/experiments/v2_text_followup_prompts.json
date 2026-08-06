@@ -1,0 +1,201 @@
+{
+  "version": 1,
+  "status": "follow_up_after_initial_results",
+  "frozen_on": "2026-07-12",
+  "initial_evidence": {
+    "prompt_spec_sha256": "e992ab5ec08c569d5d2880062a1a070bea40c524dc774f3a71fd8b44d6524d59",
+    "prompt_results_sha256": "f57a2dc02b73b7885830fb1298e98c31ec6c3d8289c2399c7bb7f2d6c75d3696",
+    "summary_sha256": "9b362267cf724f33e469f883a2647f1fde3fbfdab9344119be811a3d5c96206e"
+  },
+  "interpretation_limits": [
+    "These prompts were authored after the original 55-prompt rankings were inspected.",
+    "They diagnose prompt sensitivity and model semantics; they are not a preregistered replacement-model scorecard.",
+    "Metadata is used only to identify frozen target tracks and make outputs readable."
+  ],
+  "described_track_transformations": {
+    "terse": "Keep only the main genre, culture, era, or performance category.",
+    "audio_only": "Remove artist, title, geography, era, and named genre where practical; retain audible traits.",
+    "paraphrase": "Preserve the original conjunction while changing word order and vocabulary."
+  },
+  "described_track_variants": [
+    {
+      "family": "hallucinogen_demention",
+      "target_track_ids": [13384],
+      "variants": {
+        "terse": "dark late-1990s Goa trance",
+        "audio_only": "rapid rolling bass beneath psychedelic acid synthesizers and alien textures in a dark hypnotic instrumental",
+        "paraphrase": "hypnotic dark Goa trance from the late 1990s, driven by fast rolling bass and strange acidic psychedelic synthesizer sounds"
+      }
+    },
+    {
+      "family": "nusrat_allah_hoo",
+      "target_track_ids": [209],
+      "variants": {
+        "terse": "ecstatic Pakistani Sufi qawwali",
+        "audio_only": "powerful male devotional call-and-response singing with harmonium, tabla and handclaps that accelerate",
+        "paraphrase": "Pakistani qawwali that grows ecstatic through commanding male Sufi vocals, harmonium, tabla and increasingly rapid clapping"
+      }
+    },
+    {
+      "family": "seedhe_maut_anthem",
+      "target_track_ids": [26499],
+      "variants": {
+        "terse": "Hindi underground hip hop duo",
+        "audio_only": "two forceful male rappers trading lines in Hindi over a hard sparse beat",
+        "paraphrase": "hard minimal underground hip hop in Hindi, with two assertive male voices exchanging bars"
+      }
+    },
+    {
+      "family": "aphex_twin_4",
+      "target_track_ids": [2682],
+      "variants": {
+        "terse": "playful 1990s IDM",
+        "audio_only": "skittering fast breakbeats under a bright childlike synthesizer melody with a playful mood",
+        "paraphrase": "bright mischievous 1990s intelligent dance music combining a nursery-like synth tune with rapid fractured drums"
+      }
+    },
+    {
+      "family": "daft_punk_da_funk",
+      "target_track_ids": [7876],
+      "variants": {
+        "terse": "midtempo 1990s French house instrumental",
+        "audio_only": "a dry drum machine and distorted squelching synthesizer bass riff at a steady midtempo, without vocals",
+        "paraphrase": "instrumental French house from the 1990s, centered on a rubbery overdriven synth-bass hook and dry midtempo machine drums"
+      }
+    },
+    {
+      "family": "burial_archangel",
+      "target_track_ids": [5831],
+      "variants": {
+        "terse": "dark rainy UK garage",
+        "audio_only": "shuffling two-step drums, deep sub bass, vinyl crackle and chopped ghostly vocals in a dark rain-soaked atmosphere",
+        "paraphrase": "rainy nocturnal UK garage built from spectral cut-up voices, dusty surface noise, low sub bass and an uneven two-step shuffle"
+      }
+    },
+    {
+      "family": "bicep_glue",
+      "target_track_ids": [3982, 37907, 41459],
+      "variants": {
+        "terse": "euphoric nostalgic breakbeat rave",
+        "audio_only": "warm trance pads, an airy female vocal fragment and breakbeat drums creating bittersweet euphoric nostalgia",
+        "paraphrase": "nostalgic electronic breakbeats with hazy female vocal sampling, glowing trance chords and an emotional euphoric rave feeling"
+      }
+    },
+    {
+      "family": "tool_schism",
+      "target_track_ids": [31830],
+      "variants": {
+        "terse": "odd-meter progressive metal",
+        "audio_only": "an intricate prominent electric bass riff in shifting meters with heavy guitars and intense male singing",
+        "paraphrase": "progressive metal led by a complex bass figure, forceful male vocals and heavy guitar parts that keep changing time signature"
+      }
+    },
+    {
+      "family": "nicola_cruz_cumbia",
+      "target_track_ids": [21972],
+      "variants": {
+        "terse": "Andean electronic cumbia",
+        "audio_only": "wooden flutes and organic hand percussion over deep slow electronic bass with a ritual atmosphere",
+        "paraphrase": "downtempo electronic cumbia from the Andes, blending deep bass with ceremonial percussion and breathy wooden flutes"
+      }
+    },
+    {
+      "family": "raf_saperra_modern_mirza",
+      "target_track_ids": [25130],
+      "variants": {
+        "terse": "Punjabi UK garage bhangra",
+        "audio_only": "Punjabi male singing over syncopated garage drums, soundsystem bass and modern bassline production",
+        "paraphrase": "modern UK bassline and garage production carrying Punjabi bhangra vocals with a heavy soundsystem low end"
+      }
+    },
+    {
+      "family": "takeo_moriyama_watarase",
+      "target_track_ids": [57301, 74859],
+      "variants": {
+        "terse": "spiritual Japanese modal jazz",
+        "audio_only": "searching saxophone improvisation and an intense open modal melody over powerful drums and piano",
+        "paraphrase": "Japanese spiritual jazz with forceful drumming, piano and exploratory saxophone circling a spacious modal theme"
+      }
+    },
+    {
+      "family": "technical_hitch_my_pain",
+      "target_track_ids": [28891],
+      "variants": {
+        "terse": "extremely fast dark hi-tech psytrance",
+        "audio_only": "a relentless very fast kick-bass pattern with dark synthetic sound design and dramatic orchestral samples",
+        "paraphrase": "dark high-tech psychedelic trance at extreme speed, combining nonstop kick and bass with cinematic orchestral fragments"
+      }
+    },
+    {
+      "family": "foals_milk_black_spiders",
+      "target_track_ids": [11725],
+      "variants": {
+        "terse": "slow-building emotional indie rock",
+        "audio_only": "chiming guitars, strings and male singing gradually build from restraint to an explosive final climax",
+        "paraphrase": "emotional indie rock where male vocals, bright interlocking guitar and strings accumulate toward a huge ending"
+      }
+    },
+    {
+      "family": "dgary_tiambaly",
+      "target_track_ids": [7838],
+      "variants": {
+        "terse": "virtuosic Malagasy acoustic guitar",
+        "audio_only": "earthy male vocals over intricate fingerpicked acoustic guitar polyrhythms",
+        "paraphrase": "Malagasy song with a highly agile acoustic guitarist weaving complex cross-rhythms beneath an unpolished male voice"
+      }
+    },
+    {
+      "family": "sierra_ferrell_fox_hunt",
+      "target_track_ids": [56439],
+      "variants": {
+        "terse": "up-tempo Appalachian old-time string band",
+        "audio_only": "expressive female country singing with fiddle and acoustic guitar in a brisk old-fashioned string-band performance",
+        "paraphrase": "lively Appalachian old-time music led by characterful female vocals, sawing fiddle and acoustic guitar"
+      }
+    }
+  ],
+  "contrast_groups": [
+    {
+      "id": "temporal_direction",
+      "left_label": "quiet_to_noise",
+      "left_prompt": "intimate quiet acoustic music that gradually erupts into overwhelming distorted noise",
+      "right_label": "noise_to_quiet",
+      "right_prompt": "overwhelming distorted noise that gradually dissolves into intimate quiet acoustic music"
+    },
+    {
+      "id": "drums_negation",
+      "left_label": "without_drums",
+      "left_prompt": "slowly evolving granular drone without drums, vocals or a steady beat",
+      "right_label": "with_drums",
+      "right_prompt": "slowly evolving granular drone with loud drums, vocals and a steady beat"
+    },
+    {
+      "id": "dark_heaviness_negation",
+      "left_label": "not_heavy",
+      "left_prompt": "dark and threatening without distorted guitars, loud drums or cinematic orchestra",
+      "right_label": "heavy",
+      "right_prompt": "dark and threatening with distorted guitars, loud drums and cinematic orchestra"
+    },
+    {
+      "id": "rhythm_section_negation",
+      "left_label": "dry_instrumental",
+      "left_prompt": "dry close-miked drums and distorted electric bass with no vocals and almost no reverb",
+      "right_label": "reverberant_vocal",
+      "right_prompt": "reverberant distant drums and distorted electric bass with prominent vocals and enormous reverb"
+    },
+    {
+      "id": "math_rock_vocals",
+      "left_label": "clean_no_screaming",
+      "left_prompt": "odd-meter math rock with interlocking clean guitars, crisp live drums and no screaming",
+      "right_label": "distorted_screaming",
+      "right_prompt": "odd-meter math rock with interlocking distorted guitars, crisp live drums and constant screaming"
+    },
+    {
+      "id": "instrumental_vocals",
+      "left_label": "without_vocals",
+      "left_prompt": "instrumental music without vocals",
+      "right_label": "with_vocals",
+      "right_prompt": "music dominated by prominent vocals"
+    }
+  ]
+}

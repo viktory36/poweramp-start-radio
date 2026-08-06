@@ -3,6 +3,10 @@ package com.powerampstartradio.indexing
 import android.util.Log
 import com.google.ai.edge.litert.Accelerator
 import java.io.File
+import java.io.FileInputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.channels.FileChannel
 import kotlin.math.sqrt
 
 /**
@@ -28,9 +32,9 @@ class MertInference(
 
     companion object {
         private const val TAG = "MertInference"
-        const val SAMPLE_RATE = 24000
+        const val SAMPLE_RATE = MertWindowPolicy.SAMPLE_RATE
         const val WINDOW_SEC = 5
-        const val WINDOW_SAMPLES = SAMPLE_RATE * WINDOW_SEC  // 120000
+        const val WINDOW_SAMPLES = MertWindowPolicy.WINDOW_SAMPLES
         const val FEATURE_DIM = 768
         /** Max audio duration per decode chunk in seconds.
          *  Longer tracks are decoded in multiple chunks to bound memory.
@@ -72,6 +76,20 @@ class MertInference(
         val windowsExtracted: Int,
         val carrySamples: FloatArray,
     )
+
+    data class WholeTrackNormalization(
+        val sampleCount: Long,
+        val mean: Float,
+        val standardDeviation: Float,
+    ) {
+        init {
+            require(sampleCount > 0L) { "sampleCount must be positive" }
+            require(mean.isFinite()) { "mean must be finite" }
+            require(standardDeviation.isFinite() && standardDeviation > 0f) {
+                "standardDeviation must be finite and positive"
+            }
+        }
+    }
 
     // Pre-allocated buffer for one 5s window (reused across all windows)
     private val windowBuffer = FloatArray(WINDOW_SAMPLES)
@@ -186,6 +204,88 @@ class MertInference(
             "inference=${totalInferMs}ms, ${if (numWindows > 0) totalInferMs / numWindows else 0}ms/window")
 
         return ExtractionResult(count, carry)
+    }
+
+    /**
+     * Extract features from one verified raw 24 kHz float PCM file.
+     *
+     * The caller computes [normalization] over the entire logical track before this
+     * method starts. Every real sample is normalized with those same statistics;
+     * only a final 1-5 second tail is padded, and its padding stays zero. This is the
+     * memory-bounded equivalent of desktop Wav2Vec2FeatureExtractor normalization.
+     */
+    fun extractFeaturesFromPcmFile(
+        pcmFile: File,
+        normalization: WholeTrackNormalization,
+        onFeatureExtracted: (FloatArray) -> Unit,
+        onWindowDone: (() -> Unit)? = null,
+    ): Int {
+        require(pcmFile.isFile) { "PCM cache is missing: ${pcmFile.absolutePath}" }
+        val expectedBytes = Math.multiplyExact(normalization.sampleCount, Float.SIZE_BYTES.toLong())
+        require(pcmFile.length() == expectedBytes) {
+            "PCM cache size mismatch: expected $expectedBytes bytes, got ${pcmFile.length()}"
+        }
+
+        val fullWindows = normalization.sampleCount / WINDOW_SAMPLES
+        val tailSamples = (normalization.sampleCount % WINDOW_SAMPLES).toInt()
+        val hasTailWindow = tailSamples >= SAMPLE_RATE
+        val expectedWindows = MertWindowPolicy.windowCount(normalization.sampleCount)
+        if (expectedWindows == 0) return 0
+
+        val byteBuffer = ByteBuffer.allocateDirect(WINDOW_SAMPLES * Float.SIZE_BYTES)
+            .order(ByteOrder.LITTLE_ENDIAN)
+        var extracted = 0
+        var totalInferMs = 0L
+
+        FileInputStream(pcmFile).channel.use { channel ->
+            for (windowIndex in 0 until expectedWindows) {
+                val actualSamples = if (windowIndex < fullWindows) WINDOW_SAMPLES else tailSamples
+                byteBuffer.clear()
+                byteBuffer.limit(actualSamples * Float.SIZE_BYTES)
+                require(readFully(channel, byteBuffer)) {
+                    "PCM cache ended during window ${windowIndex + 1}/$expectedWindows"
+                }
+                byteBuffer.flip()
+                windowBuffer.fill(0f)
+                byteBuffer.asFloatBuffer().get(windowBuffer, 0, actualSamples)
+                for (i in 0 until actualSamples) {
+                    windowBuffer[i] =
+                        (windowBuffer[i] - normalization.mean) / normalization.standardDeviation
+                }
+
+                val feature = runInference(windowBuffer) { inferMs -> totalInferMs += inferMs }
+                    ?: throw IllegalStateException(
+                        "MERT inference failed at window ${windowIndex + 1}/$expectedWindows"
+                    )
+                onFeatureExtracted(feature)
+                extracted++
+                onWindowDone?.invoke()
+            }
+
+            val expectedConsumedSamples =
+                fullWindows * WINDOW_SAMPLES + if (hasTailWindow) tailSamples.toLong() else 0L
+            val expectedConsumedBytes = expectedConsumedSamples * Float.SIZE_BYTES
+            require(channel.position() == expectedConsumedBytes) {
+                "PCM cache consumption mismatch: read ${channel.position()} of " +
+                    "$expectedConsumedBytes inference bytes"
+            }
+        }
+
+        Log.i(
+            TAG,
+            "TIMING: mert $extracted verified whole-track-normalized windows: " +
+                "inference=${totalInferMs}ms, ${totalInferMs / extracted}ms/window",
+        )
+        return extracted
+    }
+
+    private fun readFully(channel: FileChannel, buffer: ByteBuffer): Boolean {
+        while (buffer.hasRemaining()) {
+            val read = channel.read(buffer)
+            if (read < 0) return false
+            if (read == 0) Thread.yield()
+        }
+        return true
     }
 
     /**

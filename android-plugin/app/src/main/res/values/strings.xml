@@ -1,5 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Poweramp Start Radio</string>
-    <string name="widget_description">One-tap button to start radio based on current Poweramp track</string>
+    <string name="app_name">Poweramp Start Radio V2</string>
+    <string name="widget_description">Start a radio queue from the track playing in Poweramp</string>
+    <string name="widget_no_track_playing">No track playing</string>
+    <string name="widget_playback_unavailable">Poweramp playback unavailable</string>
+    <string name="widget_play_track_in_poweramp">Play in Poweramp</string>
+    <string name="widget_refresh_poweramp_playback">Open Poweramp to refresh</string>
+    <string name="widget_preview_title">Current Poweramp track</string>
+    <string name="widget_preview_subtitle">Artist and album</string>
+    <string name="widget_open_app_action">Open Poweramp Start Radio V2</string>
+    <string name="widget_open_app_for_track_action">Open Poweramp Start Radio V2. Current track: %1$s</string>
+    <string name="widget_start_radio_action">Start radio from the current Poweramp track</string>
+    <string name="widget_start_radio_for_track_action">Start radio from %1$s</string>
+    <string name="widget_refresh_poweramp_action">Open Poweramp to refresh playback state</string>
+    <string name="widget_no_track_action">Open Poweramp to play a track</string>
 </resources>

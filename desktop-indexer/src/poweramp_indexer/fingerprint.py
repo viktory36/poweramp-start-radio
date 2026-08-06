@@ -67,11 +67,6 @@ def extract_metadata(file_path: Path) -> TrackMetadata:
     """
     try:
         import mutagen
-        from mutagen.easyid3 import EasyID3
-        from mutagen.flac import FLAC
-        from mutagen.mp4 import MP4
-        from mutagen.oggvorbis import OggVorbis
-        from mutagen.oggopus import OggOpus
     except ImportError:
         logger.warning("mutagen not installed, using filename-only metadata")
         return TrackMetadata(
