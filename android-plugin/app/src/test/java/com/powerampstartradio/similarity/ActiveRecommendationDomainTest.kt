@@ -41,7 +41,7 @@ class ActiveRecommendationDomainTest {
             quarantinedTrackIds = longArrayOf(20),
         )
 
-        val domain = ActiveRecommendationDomain.create(catalog, identities, index)
+        val domain = createDomain(catalog, identities, index)
 
         assertEquals(3, domain.activeTrackCount)
         assertArrayEquals(longArrayOf(10, 30, 40), domain.orderedActiveTrackIds())
@@ -117,7 +117,7 @@ class ActiveRecommendationDomainTest {
     @Test
     fun `only full-content proven copies share an active representative`() {
         val index = index(longArrayOf(10, 20, 30, 40, 50, 60))
-        val domain = ActiveRecommendationDomain.create(
+        val domain = createDomain(
             activeCatalog(
                 activeTrackIds = longArrayOf(10, 20, 30, 40, 50, 60),
                 quarantinedTrackIds = longArrayOf(),
@@ -155,7 +155,7 @@ class ActiveRecommendationDomainTest {
         )
         assertEquals(1, identities.duplicateExcessCount)
 
-        val domain = ActiveRecommendationDomain.create(
+        val domain = createDomain(
             activeCatalog(
                 activeTrackIds = longArrayOf(10, 30),
                 quarantinedTrackIds = longArrayOf(20),
@@ -173,7 +173,7 @@ class ActiveRecommendationDomainTest {
     @Test
     fun `added-date domain filters occurrences before duplicate identity collapse`() {
         val index = index(longArrayOf(10, 20, 30, 40))
-        val domain = ActiveRecommendationDomain.create(
+        val domain = createDomain(
             activeCatalog(
                 activeTrackIds = longArrayOf(10, 20, 30, 40),
                 quarantinedTrackIds = longArrayOf(),
@@ -229,7 +229,7 @@ class ActiveRecommendationDomainTest {
     @Test
     fun `full active seed rank remains global when selection uses an added-date subset`() {
         val index = index(longArrayOf(10, 20, 30, 40))
-        val domain = ActiveRecommendationDomain.create(
+        val domain = createDomain(
             activeCatalog(
                 activeTrackIds = longArrayOf(10, 20, 30, 40),
                 quarantinedTrackIds = longArrayOf(),
@@ -281,7 +281,7 @@ class ActiveRecommendationDomainTest {
             stableRow(40, 1),
             stableRow(50, 2),
         )
-        val domain = ActiveRecommendationDomain.create(
+        val domain = createDomain(
             activeCatalog(
                 activeTrackIds = longArrayOf(10, 30, 40, 50),
                 quarantinedTrackIds = longArrayOf(20),
@@ -354,7 +354,7 @@ class ActiveRecommendationDomainTest {
 
     @Test
     fun `ordered active hash binds membership and order deterministically`() {
-        val first = ActiveRecommendationDomain.create(
+        val first = createDomain(
             activeCatalog(
                 activeTrackIds = longArrayOf(30, 10),
                 quarantinedTrackIds = longArrayOf(20),
@@ -362,7 +362,7 @@ class ActiveRecommendationDomainTest {
             identities(legacyRow(10), legacyRow(20), legacyRow(30)),
             index(longArrayOf(10, 20, 30)),
         )
-        val repeated = ActiveRecommendationDomain.create(
+        val repeated = createDomain(
             activeCatalog(
                 activeTrackIds = longArrayOf(10, 30),
                 quarantinedTrackIds = longArrayOf(20),
@@ -370,7 +370,7 @@ class ActiveRecommendationDomainTest {
             identities(legacyRow(10), legacyRow(20), legacyRow(30)),
             index(longArrayOf(10, 20, 30)),
         )
-        val changed = ActiveRecommendationDomain.create(
+        val changed = createDomain(
             activeCatalog(
                 activeTrackIds = longArrayOf(10, 20),
                 quarantinedTrackIds = longArrayOf(30),
@@ -395,12 +395,12 @@ class ActiveRecommendationDomainTest {
             activeTrackIds = longArrayOf(10, 20, 30),
             quarantinedTrackIds = longArrayOf(),
         )
-        val grouped = ActiveRecommendationDomain.create(
+        val grouped = createDomain(
             catalog,
             identities(stableRow(10, 1), stableRow(20, 1), legacyRow(30)),
             index,
         )
-        val separate = ActiveRecommendationDomain.create(
+        val separate = createDomain(
             catalog,
             identities(stableRow(10, 1), stableRow(20, 2), legacyRow(30)),
             index,
@@ -423,21 +423,21 @@ class ActiveRecommendationDomainTest {
         val alignedIdentities = identities(legacyRow(10), legacyRow(20))
 
         assertThrows(IllegalArgumentException::class.java) {
-            ActiveRecommendationDomain.create(
+            createDomain(
                 activeCatalog(activeTrackIds = longArrayOf(10), quarantinedTrackIds = longArrayOf()),
                 alignedIdentities,
                 index,
             )
         }
         assertThrows(IllegalArgumentException::class.java) {
-            ActiveRecommendationDomain.create(
+            createDomain(
                 activeCatalog(activeTrackIds = longArrayOf(10), quarantinedTrackIds = longArrayOf(99)),
                 alignedIdentities,
                 index,
             )
         }
         assertThrows(IllegalArgumentException::class.java) {
-            ActiveRecommendationDomain.create(
+            createDomain(
                 activeCatalog(activeTrackIds = longArrayOf(10), quarantinedTrackIds = longArrayOf(20)),
                 identities(legacyRow(10), legacyRow(30)),
                 index,
@@ -455,12 +455,31 @@ class ActiveRecommendationDomainTest {
         )
 
         assertThrows(IllegalArgumentException::class.java) {
-            ActiveRecommendationDomain.create(
+            createDomain(
                 wrongCatalog,
                 identities(legacyRow(10)),
                 index,
             )
         }
+    }
+
+    @Test
+    fun `index dates alone control eligibility even when Poweramp dates disagree`() {
+        val ids = longArrayOf(10, 20, 30, 40)
+        val dates = longArrayOf(100L, 1_100L, 1_000L, 0L)
+        val domain = ActiveRecommendationDomain.create(
+            activeCatalog(ids, longArrayOf(), createdAtByTrackId = mapOf(
+                10L to 2_000L, 20L to 0L, 30L to 100L, 40L to 2_000L,
+            )),
+            identities(*ids.map(::legacyRow).toTypedArray()),
+            index(ids),
+            dates,
+        )
+        dates[1] = 0L
+        assertArrayEquals(longArrayOf(20, 30), domain.candidateDomain(1_000L).orderedEligibleTrackIds())
+        assertArrayEquals(ids, domain.candidateDomain(null).orderedEligibleTrackIds())
+        assertEquals(1_100L, domain.indexAddedAtEpochSecondForTrack(20L))
+        assertEquals(0L, domain.indexAddedAtEpochSecondForTrack(40L))
     }
 
     private fun activeCatalog(
@@ -488,6 +507,17 @@ class ActiveRecommendationDomainTest {
             )
         },
         unboundPowerampFileIds = emptyList(),
+    )
+
+    private fun createDomain(
+        activeCatalog: V2ActiveLibraryCatalog,
+        identityCatalog: StableTrackIdentityCatalog,
+        embeddingIndex: EmbeddingIndex,
+    ): ActiveRecommendationDomain = ActiveRecommendationDomain.create(
+        activeCatalog, identityCatalog, embeddingIndex,
+        identityCatalog.orderedTrackIds().map {
+            activeCatalog.createdAtEpochSecondForTrack(it) ?: 0L
+        }.toLongArray(),
     )
 
     private fun identities(vararg rows: StableTrackIdentityRow): StableTrackIdentityCatalog =

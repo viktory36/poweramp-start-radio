@@ -105,6 +105,7 @@ data class FindMusicQuerySpec(
     /** Exact rolling day count for new queries; null falls back to the legacy preset field. */
     val libraryAddedDays: Int? = null,
     val libraryBinding: StableIdentityGenerationBinding? = null,
+    val rememberPrevious: Boolean = false,
 ) {
     val activeTextIngredients: List<FindMusicTextIngredient>
         get() = textIngredients.filter { it.query.isNotBlank() && it.weight > 0f }
@@ -166,6 +167,7 @@ internal fun FindMusicQuerySpec.withCurrentExecutionControls(
     libraryAddedDays: Int?,
     requestedPlanner: FindMusicTextResultPlanner,
     refineNeighborhood: FindMusicRefineNeighborhood,
+    rememberPrevious: Boolean = this.rememberPrevious,
 ): FindMusicQuerySpec {
     require(resultLimit in 1..FindMusicQuerySpec.MAX_RESULT_LIMIT)
     require(libraryAddedDays == null || libraryAddedDays in 1..MAX_LIBRARY_ADDED_DAYS)
@@ -190,6 +192,7 @@ internal fun FindMusicQuerySpec.withCurrentExecutionControls(
         },
         libraryAddedRange = LibraryAddedRange.ALL_DATES,
         libraryAddedDays = libraryAddedDays,
+        rememberPrevious = rememberPrevious,
     )
 }
 
@@ -199,7 +202,8 @@ internal fun FindMusicQuerySpec.hasSameExecutionControlsAs(
     resultLimit == other.resultLimit &&
         effectiveLibraryAddedDays == other.effectiveLibraryAddedDays &&
         textResultPlanner == other.textResultPlanner &&
-        refineSpec?.neighborhood == other.refineSpec?.neighborhood
+        refineSpec?.neighborhood == other.refineSpec?.neighborhood &&
+        rememberPrevious == other.rememberPrevious
 
 /** Structured persistence with exact migration from the prior rank-v3 singleton-text schema. */
 object FindMusicQuerySpecCodec {
@@ -220,6 +224,7 @@ object FindMusicQuerySpecCodec {
         addProperty("ranking_version", spec.rankingVersion)
         addProperty("operator", spec.operator.wireName)
         addProperty("result_limit", spec.resultLimit)
+        addProperty("remember_previous", spec.rememberPrevious)
         addProperty("text_result_planner", spec.textResultPlanner.wireName)
         addProperty("text_result_planner_version", spec.textResultPlanner.currentVersion)
         spec.refineSpec?.let { refine ->
@@ -266,10 +271,10 @@ object FindMusicQuerySpecCodec {
         val sourceSchemaVersion = obj.int("schema_version") ?: 1
         val libraryAddedDays = if (obj.has("library_added_days")) {
             requireNotNull(obj.int("library_added_days")) {
-                "Poweramp added-date day count is missing"
+                "Index added-date day count is missing"
             }.also { days ->
                 require(days in 1..MAX_LIBRARY_ADDED_DAYS) {
-                    "Poweramp added-date day count must be 1..$MAX_LIBRARY_ADDED_DAYS"
+                    "Index added-date day count must be 1..$MAX_LIBRARY_ADDED_DAYS"
                 }
             }
         } else {
@@ -383,11 +388,12 @@ object FindMusicQuerySpecCodec {
             libraryAddedRange = obj.string("library_added_range")?.let { stored ->
                 LibraryAddedRange.entries.firstOrNull { it.name == stored }
                     ?: throw IllegalArgumentException(
-                        "Unknown Poweramp added-date range: $stored",
+                        "Unknown index added-date range: $stored",
                     )
             } ?: LibraryAddedRange.ALL_DATES,
             libraryAddedDays = libraryAddedDays,
             libraryBinding = libraryBinding,
+            rememberPrevious = obj.boolean("remember_previous") ?: false,
         )
     }
 
@@ -475,7 +481,7 @@ internal fun validateFindMusicQueryContract(querySpec: FindMusicQuerySpec): Stri
         INCOMPATIBLE_SAVED_FIND_MUSIC_QUERY_MESSAGE
     querySpec.libraryAddedDays != null &&
         querySpec.libraryAddedDays !in 1..MAX_LIBRARY_ADDED_DAYS ->
-        "This saved query has an invalid Poweramp added-date day count"
+        "This saved query has an invalid index added-date day count"
     querySpec.resultLimit !in 1..FindMusicQuerySpec.MAX_RESULT_LIMIT ->
         "This saved query has an invalid result count: ${querySpec.resultLimit}"
     querySpec.textResultPlanner == FindMusicTextResultPlanner.VARIED_DPP &&

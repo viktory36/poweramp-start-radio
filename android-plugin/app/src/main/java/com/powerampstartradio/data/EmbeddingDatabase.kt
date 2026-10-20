@@ -11,6 +11,8 @@ import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
+import java.time.LocalDateTime
+import java.time.ZoneOffset
 
 /**
  * Data class representing a track from the embedding database.
@@ -25,6 +27,7 @@ data class EmbeddedTrack(
     val durationMs: Int,
     val filePath: String,
     val source: String = "desktop",
+    val indexAddedAtEpochSecond: Long = 0L,
 )
 
 data class EmbeddedTrackTextSearchResult(
@@ -438,10 +441,31 @@ class EmbeddingDatabase private constructor(
      */
     fun getTrackById(id: Long): EmbeddedTrack? {
         val cursor = db.rawQuery(
-            "SELECT id, metadata_key, filename_key, artist, album, title, duration_ms, file_path FROM tracks WHERE id = ?",
+            "SELECT * FROM tracks WHERE id = ?",
             arrayOf(id.toString())
         )
         return cursor.use { cursorToTrack(it) }
+    }
+
+    /** SQLite CURRENT_TIMESTAMP is UTC. Unknown dates stay zero, never Poweramp/file dates. */
+    internal fun loadIndexAddedAtEpochSeconds(orderedTrackIds: LongArray): LongArray {
+        val result = LongArray(orderedTrackIds.size)
+        var position = 0
+        db.rawQuery(
+            "SELECT id, CAST(strftime('%s', created_at) AS INTEGER) FROM tracks ORDER BY id",
+            null,
+        ).use { cursor ->
+            while (position < orderedTrackIds.size && cursor.moveToNext()) {
+                val trackId = cursor.getLong(0)
+                if (trackId < orderedTrackIds[position]) continue
+                require(trackId == orderedTrackIds[position]) {
+                    "Embedding track ${orderedTrackIds[position]} has no metadata row"
+                }
+                result[position++] = cursor.getLong(1).coerceAtLeast(0L)
+            }
+        }
+        require(position == orderedTrackIds.size) { "Embedding added dates are incomplete" }
+        return result
     }
 
     /**
@@ -792,16 +816,22 @@ class EmbeddingDatabase private constructor(
 
     private fun cursorToTrackAtCurrentPosition(cursor: Cursor): EmbeddedTrack {
         val sourceIdx = cursor.getColumnIndex("source")
+        val addedAtIdx = cursor.getColumnIndex("created_at")
+        val addedAt = if (addedAtIdx < 0 || cursor.isNull(addedAtIdx)) 0L else runCatching {
+            LocalDateTime.parse(cursor.getString(addedAtIdx).replace(' ', 'T'))
+                .toEpochSecond(ZoneOffset.UTC).coerceAtLeast(0L)
+        }.getOrDefault(0L)
         return EmbeddedTrack(
-            id = cursor.getLong(0),
-            metadataKey = cursor.getString(1),
-            filenameKey = cursor.getString(2),
-            artist = cursor.getString(3),
-            album = cursor.getString(4),
-            title = cursor.getString(5),
-            durationMs = cursor.getInt(6),
-            filePath = cursor.getString(7),
+            id = cursor.getLong(cursor.getColumnIndexOrThrow("id")),
+            metadataKey = cursor.getString(cursor.getColumnIndexOrThrow("metadata_key")),
+            filenameKey = cursor.getString(cursor.getColumnIndexOrThrow("filename_key")),
+            artist = cursor.getString(cursor.getColumnIndexOrThrow("artist")),
+            album = cursor.getString(cursor.getColumnIndexOrThrow("album")),
+            title = cursor.getString(cursor.getColumnIndexOrThrow("title")),
+            durationMs = cursor.getInt(cursor.getColumnIndexOrThrow("duration_ms")),
+            filePath = cursor.getString(cursor.getColumnIndexOrThrow("file_path")),
             source = if (sourceIdx >= 0) cursor.getString(sourceIdx) ?: "desktop" else "desktop",
+            indexAddedAtEpochSecond = addedAt,
         )
     }
 

@@ -10,10 +10,16 @@ class RadioSelectionMemory(private val filesDir: File) {
     fun initializeFromHistory(sessions: List<RadioResult>) = withDatabase { database ->
         database.beginTransaction()
         try {
-            val initialized = database.rawQuery("SELECT 1 FROM state WHERE key = 'initialized'", null)
-                .use { it.moveToFirst() }
-            if (!initialized) {
-                sessions.forEach { recordSession(database, it) }
+            val initialized = database.rawQuery("SELECT key FROM state", null).use { cursor ->
+                buildSet { while (cursor.moveToNext()) add(cursor.getString(0)) }
+            }
+            if ("initialized" !in initialized || "find_music_initialized" !in initialized) {
+                sessions.forEach { session ->
+                    val marker = if (session.findMusicSessionEvidence != null) {
+                        "find_music_initialized"
+                    } else "initialized"
+                    if (marker !in initialized) recordSession(database, session)
+                }
                 markInitialized(database)
             }
             database.setTransactionSuccessful()
@@ -58,29 +64,46 @@ class RadioSelectionMemory(private val filesDir: File) {
                     )
                 }
                 if (!sameSeed) continue
-                database.rawQuery(
-                    "SELECT track_id, generation_id, metadata_key, filename_key, duration_ms " +
-                        "FROM tracks WHERE seed_key = ? ORDER BY track_id",
-                    arrayOf(seeds.getString(0)),
-                ).use { tracks ->
-                    while (tracks.moveToNext()) {
-                        val trackId = tracks.getLong(0)
-                        if (tracks.getString(1) != currentGeneration) {
-                            val current = resolveTrack(trackId) ?: continue
-                            if (current.metadataKey != tracks.getString(2) ||
-                                current.filenameKey != tracks.getString(3) ||
-                                current.durationMs != tracks.getInt(4)
-                            ) continue
-                        }
-                        remembered += trackId
-                    }
-                }
+                remembered += readTracks(database, seeds.getString(0), currentGeneration, resolveTrack)
             }
         }
         remembered.toList()
     }
 
-    /** Clear all seeds, retaining the import marker so saved history does not refill memory. */
+    fun rememberedSearchTrackIds(
+        query: FindMusicQuerySpec,
+        currentGeneration: String,
+        resolveTrack: (Long) -> EmbeddedTrack?,
+    ): List<Long> = withDatabase { database ->
+        readTracks(database, FindMusicMemoryKey.of(query), currentGeneration, resolveTrack)
+    }
+
+    private fun readTracks(
+        database: SQLiteDatabase,
+        key: String,
+        currentGeneration: String,
+        resolveTrack: (Long) -> EmbeddedTrack?,
+    ): List<Long> = database.rawQuery(
+        "SELECT track_id, generation_id, metadata_key, filename_key, duration_ms " +
+            "FROM tracks WHERE seed_key = ? ORDER BY track_id",
+        arrayOf(key),
+    ).use { tracks ->
+        buildList {
+            while (tracks.moveToNext()) {
+                val trackId = tracks.getLong(0)
+                if (tracks.getString(1) != currentGeneration) {
+                    val current = resolveTrack(trackId) ?: continue
+                    if (current.metadataKey != tracks.getString(2) ||
+                        current.filenameKey != tracks.getString(3) ||
+                        current.durationMs != tracks.getInt(4)
+                    ) continue
+                }
+                add(trackId)
+            }
+        }
+    }
+
+    /** Clear every seed and search, retaining markers so history cannot refill memory. */
     fun clear() = withDatabase { database ->
         database.beginTransaction()
         try {
@@ -94,6 +117,11 @@ class RadioSelectionMemory(private val filesDir: File) {
     }
 
     private fun recordSession(database: SQLiteDatabase, session: RadioResult) {
+        session.findMusicSessionEvidence?.querySpec?.let { query ->
+            val generation = session.generation?.generationId ?: return
+            recordTracks(database, FindMusicMemoryKey.of(query), generation, session.tracks)
+            return
+        }
         if (session.isDirectQueue || session.composedQuerySpec != null) return
         val seed = session.seedIdentity ?: return
         val generation = session.generation?.generationId ?: return
@@ -109,7 +137,16 @@ class RadioSelectionMemory(private val filesDir: File) {
             put("artist", session.seedTrack.artist)
             put("title", session.seedTrack.title)
         }, SQLiteDatabase.CONFLICT_REPLACE).also { check(it != -1L) { "Could not remember the seed" } }
-        for (row in queued) {
+        recordTracks(database, key, generation, queued)
+    }
+
+    private fun recordTracks(
+        database: SQLiteDatabase,
+        key: String,
+        generation: String,
+        rows: List<QueuedTrackResult>,
+    ) {
+        for (row in rows.filter { it.status == QueueStatus.QUEUED }) {
             database.insertWithOnConflict("tracks", null, ContentValues().apply {
                 put("seed_key", key)
                 put("track_id", row.track.id)
@@ -125,6 +162,7 @@ class RadioSelectionMemory(private val filesDir: File) {
 
     private fun markInitialized(database: SQLiteDatabase) {
         database.execSQL("INSERT OR IGNORE INTO state(key) VALUES ('initialized')")
+        database.execSQL("INSERT OR IGNORE INTO state(key) VALUES ('find_music_initialized')")
     }
 
     private fun <T> withDatabase(block: (SQLiteDatabase) -> T): T = synchronized(LOCK) {

@@ -24,10 +24,10 @@ internal data class ActiveRecommendationDomainBinding(
 )
 
 /**
- * Request-scoped subset of the active library after applying Poweramp first-seen eligibility.
+ * Request-scoped subset of the active library after applying embedding-index added dates.
  *
  * Occurrences are filtered before visible identities are collapsed, so a recently added copy is
- * still eligible when another copy of the same recording was first seen earlier.
+ * still eligible when another copy of the same recording was indexed earlier.
  */
 internal class RecommendationCandidateDomain internal constructor(
     val minimumCreatedAtEpochSecond: Long?,
@@ -179,6 +179,7 @@ internal class ActiveRecommendationDomain private constructor(
     private val activeCatalog: V2ActiveLibraryCatalog,
     private val identityCatalog: StableTrackIdentityCatalog,
     private val orderedActiveIds: LongArray,
+    private val orderedActiveIndexAddedAtEpochSeconds: LongArray,
     private val orderedActiveIdentityRepresentativeIds: LongArray,
     private val orderedActiveIdentityRepresentativeIndexPositions: IntArray,
     private val activeRepresentativeByVisibleIdentity: Map<String, Long>,
@@ -245,6 +246,12 @@ internal class ActiveRecommendationDomain private constructor(
 
     fun orderedActiveTrackIds(): LongArray = orderedActiveIds.copyOf()
 
+    fun indexAddedAtEpochSecondForTrack(trackId: Long): Long {
+        val position = orderedActiveIds.binarySearch(trackId)
+        require(position >= 0) { "Track $trackId is outside the active domain" }
+        return orderedActiveIndexAddedAtEpochSeconds[position]
+    }
+
     /** One active row per proven identity; every sampled or legacy row remains present. */
     fun orderedActiveIdentityRepresentativeTrackIds(): LongArray =
         orderedActiveIdentityRepresentativeIds.copyOf()
@@ -271,7 +278,7 @@ internal class ActiveRecommendationDomain private constructor(
             )
         }
         require(minimumCreatedAtEpochSecond > 0L) {
-            "Poweramp first-seen cutoff must be positive"
+            "Embedding-index added-date cutoff must be positive"
         }
 
         val eligibleIds = ArrayList<Long>()
@@ -279,9 +286,7 @@ internal class ActiveRecommendationDomain private constructor(
         val representativeIndices = ArrayList<Int>()
         val representativeByIdentity = LinkedHashMap<String, Long>()
         orderedActiveIds.forEachIndexed { activePosition, trackId ->
-            val createdAt = requireNotNull(
-                activeCatalog.createdAtEpochSecondForTrack(trackId),
-            ) { "Active track $trackId has no Poweramp first-seen time" }
+            val createdAt = orderedActiveIndexAddedAtEpochSeconds[activePosition]
             if (createdAt == 0L || createdAt < minimumCreatedAtEpochSecond) {
                 return@forEachIndexed
             }
@@ -389,7 +394,7 @@ internal class ActiveRecommendationDomain private constructor(
     }
 
     companion object {
-        const val BINDING_SPEC_ID = "active-recommendation-domain-v3"
+        const val BINDING_SPEC_ID = "active-recommendation-domain-v4"
         private const val ACTIVE_IDS_DIGEST_DOMAIN =
             "active-recommendation-domain-ordered-track-ids-v1\u0000"
         private const val ACTIVE_IDENTITY_REPRESENTATIVE_IDS_DIGEST_DOMAIN =
@@ -400,7 +405,11 @@ internal class ActiveRecommendationDomain private constructor(
             activeCatalog: V2ActiveLibraryCatalog,
             identityCatalog: StableTrackIdentityCatalog,
             embeddingIndex: EmbeddingIndex,
+            indexAddedAtEpochSeconds: LongArray,
         ): ActiveRecommendationDomain {
+            require(indexAddedAtEpochSeconds.size == embeddingIndex.numTracks) {
+                "Embedding-index added dates and embedding rows differ"
+            }
             val activeBinding = activeCatalog.generationBinding
             val identityBinding = identityCatalog.binding
             require(activeBinding.databaseGenerationId == identityBinding.generationId) {
@@ -514,6 +523,9 @@ internal class ActiveRecommendationDomain private constructor(
                 activeCatalog = activeCatalog,
                 identityCatalog = identityCatalog,
                 orderedActiveIds = activeIds,
+                orderedActiveIndexAddedAtEpochSeconds = LongArray(activeIds.size) {
+                    indexAddedAtEpochSeconds[activeIndices[it]]
+                },
                 orderedActiveIdentityRepresentativeIds = orderedIdentityRepresentativeIds,
                 orderedActiveIdentityRepresentativeIndexPositions =
                     orderedIdentityRepresentativeIndices,

@@ -786,7 +786,7 @@ internal class RadioRequestStore(
         require(
             config.libraryAddedDays == null ||
                 config.libraryAddedDays in 1..MAX_LIBRARY_ADDED_DAYS,
-        ) { "Poweramp added-date day count is outside the supported range" }
+        ) { "Index added-date day count is outside the supported range" }
         require(config.candidatePoolSize in 0..MAX_CANDIDATE_POOL_SIZE)
         if (config.selectionMode in setOf(
                 com.powerampstartradio.ui.SelectionMode.CLOSEST,

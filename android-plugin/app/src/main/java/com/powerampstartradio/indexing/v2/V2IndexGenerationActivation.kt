@@ -474,7 +474,10 @@ object V2GenerationPublicationCoordinator {
             },
         )
         afterInstallBeforePointerPublication(manifest)
-        if (next != current) writePointer(filesDir, next, gson)
+        if (next != current) {
+            FavoritesIndexUpdate.prepare(filesDir, current?.generationId, next.generationId)
+            writePointer(filesDir, next, gson)
+        }
         V2IndexGenerationReader.rememberFreshlyPublished(next, resolved)
         pruneUnreferencedGenerations(
             filesDir,
@@ -507,7 +510,10 @@ object V2GenerationPublicationCoordinator {
             generationId = generationId,
             manifestSha256 = manifestSha256,
         )
-        if (next != current) writePointer(filesDir, next, gson)
+        if (next != current) {
+            FavoritesIndexUpdate.prepare(filesDir, current?.generationId, next.generationId)
+            writePointer(filesDir, next, gson)
+        }
         pruneUnreferencedGenerations(
             filesDir,
             next,

@@ -108,6 +108,7 @@ object FindMusicTextQueuePlanner {
         requestedResultCount: Int,
         embeddingIndex: EmbeddingIndex,
         cancellationCheck: (() -> Unit)? = null,
+        previouslyQueuedTrackIds: List<Long> = emptyList(),
     ): FindMusicTextQueuePlan {
         require(completeRelevanceRanking.isNotEmpty()) {
             "Complete text relevance ranking must be non-empty"
@@ -129,17 +130,21 @@ object FindMusicTextQueuePlanner {
 
         val selections: List<FindMusicTextQueueSelection>
         val dppEvidence: DppSelectionEvidence?
+        val rememberedIds = previouslyQueuedTrackIds.toHashSet()
         when (planner) {
             FindMusicTextResultPlanner.CLOSEST -> {
                 selections = completeRelevanceRanking
+                    .withIndex()
+                    .asSequence()
+                    .filter { it.value.trackId !in rememberedIds }
                     .take(requestedResultCount)
-                    .mapIndexed { index, row ->
+                    .map { (index, row) ->
                         FindMusicTextQueueSelection(
                             trackId = row.trackId,
                             textSimilarity = row.score,
                             originalTextObjectiveRank = index + 1,
                         )
-                    }
+                    }.toList()
                 dppEvidence = null
             }
             FindMusicTextResultPlanner.VARIED_DPP -> {
@@ -154,6 +159,7 @@ object FindMusicTextQueuePlanner {
                     index = embeddingIndex,
                     initialCandidateCount = initialWorkingCount,
                     qualityExponent = VARIED_QUALITY_EXPONENT,
+                    initiallySelectedTrackIds = previouslyQueuedTrackIds,
                     cancellationCheck = cancellationCheck,
                 )
                 selections = certified.tracks.map { selected ->

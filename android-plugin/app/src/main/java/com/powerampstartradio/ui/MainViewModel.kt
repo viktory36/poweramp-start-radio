@@ -493,7 +493,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 withContext(Dispatchers.IO) { RadioSelectionMemory(application.filesDir).clear() }
                 invalidatePreview(SelectionMode.DPP)
                 invalidatePreview(SelectionMode.MMR)
-                "Radio memory cleared. Session history kept."
+                "Radio and Find Music memory cleared. Session history kept."
             } catch (failure: Exception) {
                 Log.e("MainViewModel", "Could not clear radio selection memory", failure)
                 "Could not clear radio memory: ${failure.message}"
@@ -515,7 +515,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setLibraryAddedDays(days: Int?) {
         require(days == null || days in 1..MAX_LIBRARY_ADDED_DAYS) {
-            "Poweramp added-date day count must be 1..$MAX_LIBRARY_ADDED_DAYS"
+            "Index added-date day count must be 1..$MAX_LIBRARY_ADDED_DAYS"
         }
         if (_libraryAddedDays.value == days) return
         _libraryAddedDays.value = days
@@ -717,6 +717,281 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun startRadio() {
         RadioService.startRadio(getApplication(), buildConfig())
+    }
+
+    private val _favorites = MutableStateFlow<List<FavoriteEntry>>(emptyList())
+    val favorites: StateFlow<List<FavoriteEntry>> = _favorites.asStateFlow()
+    val favoritesRevision: StateFlow<Long> = RadioService.favoritesRevision
+    private val _favoriteNewSeedKeys = MutableStateFlow<Set<String>>(emptySet())
+    val favoriteNewSeedKeys: StateFlow<Set<String>> = _favoriteNewSeedKeys.asStateFlow()
+    private val _favoriteNewMatchesStatus = MutableStateFlow<String?>(null)
+    val favoriteNewMatchesStatus: StateFlow<String?> = _favoriteNewMatchesStatus.asStateFlow()
+    private var favoriteBadgesJob: Job? = null
+    private val favoriteBadgesRevision = java.util.concurrent.atomic.AtomicLong()
+    private val _favoritesLoading = MutableStateFlow(false)
+    val favoritesLoading: StateFlow<Boolean> = _favoritesLoading.asStateFlow()
+    private val _favoritesError = MutableStateFlow<String?>(null)
+    val favoritesError: StateFlow<String?> = _favoritesError.asStateFlow()
+    private val _favoriteMatches = MutableStateFlow(FavoriteMatchesState())
+    val favoriteMatches: StateFlow<FavoriteMatchesState> = _favoriteMatches.asStateFlow()
+    private val _favoriteResultCount = MutableStateFlow(
+        prefs.getInt("favorite_result_count", 100).coerceIn(1, 1_000),
+    )
+    val favoriteResultCount: StateFlow<Int> = _favoriteResultCount.asStateFlow()
+    private var favoriteJob: Job? = null
+    private val favoriteRevision = java.util.concurrent.atomic.AtomicLong()
+
+    fun setFavoriteResultCount(count: Int) {
+        val value = count.coerceIn(1, 1_000)
+        _favoriteResultCount.value = value
+        prefs.edit().putInt("favorite_result_count", value).apply()
+    }
+
+    fun refreshFavorites() {
+        stopFavoriteNewMatchScan()
+        val revision = favoriteBadgesRevision.get()
+        viewModelScope.launch(Dispatchers.IO) {
+            _favoritesLoading.value = true
+            _favoritesError.value = null
+            try {
+                val entries = RadioService.favoriteEntries(getApplication<Application>().filesDir)
+                if (favoriteBadgesRevision.get() == revision) {
+                    _favorites.value = entries
+                    refreshFavoriteNewMatches(entries, revision)
+                }
+            } catch (failure: Exception) {
+                Log.e("Favorites", "Could not load request counts", failure)
+                _favoritesError.value = "Could not read Favorites. Try again."
+            } finally { _favoritesLoading.value = false }
+        }
+    }
+
+    fun stopFavoriteNewMatchScan() {
+        favoriteBadgesRevision.incrementAndGet()
+        favoriteBadgesJob?.cancel()
+        favoriteBadgesJob = null
+        _favoriteNewMatchesStatus.value = null
+    }
+
+    private fun favoriteNewMatchContext(library: FindMusicLibrarySnapshot, limit: Int): String =
+        "${library.generation.generationId}|${library.activeDomain.orderedActiveTrackIdsSha256}|$limit"
+
+    private fun refreshFavoriteNewMatches(entries: List<FavoriteEntry>, revision: Long) {
+        val limit = _favoriteResultCount.value
+        _favoriteNewSeedKeys.value = emptySet()
+        val job = viewModelScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
+            val requestJob = currentCoroutineContext()[Job]
+            fun ensureCurrent() {
+                requestJob?.ensureActive()
+                if (favoriteBadgesRevision.get() != revision) throw CancellationException("Favorites changed")
+            }
+            fun status(message: String?) {
+                if (favoriteBadgesRevision.get() == revision) _favoriteNewMatchesStatus.value = message
+            }
+            try {
+                ensureCurrent()
+                if (entries.isEmpty()) return@launch
+                val filesDir = getApplication<Application>().filesDir
+                val active = V2LibraryDatabaseResolver.requirePublished(filesDir)
+                val additions = com.powerampstartradio.indexing.v2.FavoritesIndexUpdate.read(active.directory)
+                // Without additions, no favorite can have a New result. Avoid loading models/indexes.
+                if (additions.isEmpty()) return@launch
+                val started = System.nanoTime()
+                status("Loading favorite neighborhoods for the updated index")
+                val library = getOrCreateTextLibrarySnapshot(filesDir, ::status)
+                check(library.generation.generationId == active.manifest.generationId) {
+                    "The index changed while preparing favorite neighborhoods"
+                }
+                val contextKey = favoriteNewMatchContext(library, limit)
+                val store = FavoritesStore(filesDir)
+                val cached = store.newMatchFlags(contextKey)
+                ensureCurrent()
+                _favoriteNewSeedKeys.update { previous ->
+                    if (favoriteBadgesRevision.get() == revision) {
+                        cached.filterValues { it }.keys.toSet()
+                    } else previous
+                }
+                var completed = entries.count { it.seed.key in cached }
+                var failed = 0
+                val pending = LinkedHashMap<String, Boolean>()
+                val database = EmbeddingDatabase.open(library.databaseFile)
+                try {
+                    for (entry in entries) {
+                        ensureCurrent()
+                        if (entry.seed.key in cached) continue
+                        status("Ranking nearest matches \u00b7 $completed/${entries.size} seeds")
+                        try {
+                            val trackId = resolveFavoriteTrackId(entry.seed, library, database)
+                            val embedding = if (trackId != null) {
+                                checkNotNull(library.embeddingIndex.getEmbeddingByTrackId(trackId))
+                            } else generateTextEmbeddingWithRetry(null, checkNotNull(entry.seed.text),
+                                filesDir, library.textAssets)
+                            ensureCurrent()
+                            val hasNew = FavoritesRanking.hasNewNearest(embedding, trackId, limit,
+                                library.embeddingIndex, library.activeDomain, library.identityCatalog, additions)
+                            ensureCurrent()
+                            pending[entry.seed.key] = hasNew
+                            if (hasNew) _favoriteNewSeedKeys.update { previous ->
+                                if (favoriteBadgesRevision.get() == revision) previous + entry.seed.key else previous
+                            }
+                            if (pending.size >= 16) {
+                                store.saveNewMatchFlags(contextKey, pending)
+                                pending.clear()
+                            }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (failure: Exception) {
+                            failed++
+                            Log.w("Favorites", "Could not rank new matches for ${entry.seed.key}", failure)
+                        }
+                        completed++
+                    }
+                    ensureCurrent()
+                    store.saveNewMatchFlags(contextKey, pending)
+                } finally { database.close() }
+                status(if (failed > 0) "New matches unavailable for $failed seeds" else null)
+                Log.i("Favorites", "newBadges seeds=${entries.size} cached=${cached.size} failed=$failed " +
+                    "limit=$limit totalMs=${elapsedMs(started)}")
+            } catch (cancelled: CancellationException) {
+                status(null)
+                throw cancelled
+            } catch (failure: Exception) {
+                Log.e("Favorites", "Could not update favorite New indicators", failure)
+                status("Could not rank new matches. Refresh to try again.")
+            }
+        }
+        trackRetrievalJobUntilCompletion(job)
+        val admitted = synchronized(RETRIEVAL_RESOURCE_ADMISSION_LOCK) {
+            if (recommendationResourcesBlocked() || favoriteBadgesRevision.get() != revision) false else {
+                activeRetrievalResourceJobs.add(job)
+                favoriteBadgesJob = job
+                true
+            }
+        }
+        if (admitted) job.start() else job.cancel()
+    }
+
+    private fun resolveFavoriteTrackId(
+        seed: FavoriteSeed,
+        library: FindMusicLibrarySnapshot,
+        database: EmbeddingDatabase,
+    ): Long? {
+        val savedId = seed.trackId ?: return null
+        val resolved = seed.stableTrackSpanId?.let(library.identityCatalog::resolveStable)
+            as? com.powerampstartradio.data.StableTrackIdentityResolution.Resolved
+        val id = resolved?.trackId ?: savedId
+        val track = database.getTrackById(id)
+        check(track != null && (resolved != null || (
+            com.powerampstartradio.poweramp.TrackNormalization.normalizeTitle(track.title) ==
+                com.powerampstartradio.poweramp.TrackNormalization.normalizeTitle(seed.title) &&
+            com.powerampstartradio.poweramp.TrackNormalization.normalizeArtist(track.artist) ==
+                com.powerampstartradio.poweramp.TrackNormalization.normalizeArtist(seed.artist)
+            ))) { "This favorite is no longer in the indexed library." }
+        return id
+    }
+
+    fun closeFavorite() {
+        favoriteRevision.incrementAndGet()
+        favoriteJob?.cancel()
+        favoriteJob = null
+        _favoriteMatches.value = FavoriteMatchesState()
+    }
+
+    fun openFavorite(seed: FavoriteSeed) {
+        stopFavoriteNewMatchScan()
+        val revision = favoriteRevision.incrementAndGet()
+        favoriteJob?.cancel()
+        _favoriteMatches.value = FavoriteMatchesState(seed = seed, loading = true,
+            status = "Opening the current music index")
+        val limit = _favoriteResultCount.value
+        val job = viewModelScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
+            fun status(message: String) {
+                _favoriteMatches.update { previous ->
+                    if (favoriteRevision.get() == revision) previous.copy(status = message) else previous
+                }
+            }
+            try {
+                val started = System.nanoTime()
+                val filesDir = getApplication<Application>().filesDir
+                val library = getOrCreateTextLibrarySnapshot(filesDir, ::status)
+                val database = EmbeddingDatabase.open(library.databaseFile)
+                var resolvedSeedTrackId: Long? = null
+                val results = try {
+                    val trackId = resolveFavoriteTrackId(seed, library, database)
+                    resolvedSeedTrackId = trackId
+                    val embedding = if (trackId != null) {
+                        checkNotNull(library.embeddingIndex.getEmbeddingByTrackId(trackId)) {
+                            "This favorite has no indexed embedding."
+                        }
+                    } else generateTextEmbeddingWithRetry(null, checkNotNull(seed.text), filesDir,
+                        library.textAssets, ::status)
+                    currentCoroutineContext().ensureActive()
+                    status("Ranking the full library by cosine similarity")
+                    val added = com.powerampstartradio.indexing.v2.FavoritesIndexUpdate.read(
+                        library.databaseFile.parentFile!!,
+                    )
+                    FavoritesRanking.nearest(embedding, trackId, limit, library.embeddingIndex,
+                        library.activeDomain, library.identityCatalog, database, added)
+                } finally { database.close() }
+                currentCoroutineContext().ensureActive()
+                check(activeGenerationIdOrNull() == library.generation.generationId) {
+                    "The music index changed. Open this favorite again for fresh results."
+                }
+                runCatching {
+                    FavoritesStore(filesDir).saveNewMatchFlags(favoriteNewMatchContext(library, limit),
+                        mapOf(seed.key to results.any { it.isNew }))
+                }.onFailure { Log.w("Favorites", "Could not cache the favorite's New indicator", it) }
+                _favoriteMatches.update { previous ->
+                    if (favoriteRevision.get() == revision) {
+                        FavoriteMatchesState(seed, results, library.generation.generationId,
+                            resolvedSeedTrackId = resolvedSeedTrackId)
+                    } else previous
+                }
+                Log.i("Favorites", "nearest seed=${seed.key} count=${results.size} " +
+                    "new=${results.count { it.isNew }} totalMs=${elapsedMs(started)}")
+            } catch (cancelled: CancellationException) {
+                _favoriteMatches.update { previous ->
+                    if (favoriteRevision.get() == revision) FavoriteMatchesState(seed = seed,
+                        error = "Lookup paused for indexing. Open this favorite again when indexing is closed.")
+                    else previous
+                }
+                throw cancelled
+            } catch (failure: Exception) {
+                Log.e("Favorites", "Nearest lookup failed", failure)
+                _favoriteMatches.update { previous ->
+                    if (favoriteRevision.get() == revision) FavoriteMatchesState(seed = seed,
+                        error = failure.message ?: "Could not load nearest recordings. Try again.")
+                    else previous
+                }
+            }
+        }
+        trackRetrievalJobUntilCompletion(job)
+        val admitted = synchronized(RETRIEVAL_RESOURCE_ADMISSION_LOCK) {
+            if (recommendationResourcesBlocked()) false else {
+                activeRetrievalResourceJobs.add(job)
+                favoriteJob = job
+                true
+            }
+        }
+        if (admitted) job.start() else {
+            job.cancel()
+            _favoriteMatches.value = FavoriteMatchesState(seed = seed,
+                error = "Close on-device indexing before opening a favorite.")
+        }
+    }
+
+    fun startRadioFromFavorite(match: FavoriteMatch) {
+        val generation = _favoriteMatches.value.generationId ?: return
+        RadioService.startRadioFromFavorite(getApplication(), match.track.id, generation, buildConfig())
+    }
+
+    fun startRadioFromFavoriteSeed(): Boolean {
+        val state = _favoriteMatches.value
+        val trackId = state.resolvedSeedTrackId ?: return false
+        val generation = state.generationId ?: return false
+        if (state.loading || state.error != null) return false
+        RadioService.startRadioFromFavorite(getApplication(), trackId, generation, buildConfig())
+        return true
     }
 
     fun cancelSearch() {
@@ -1885,8 +2160,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val identityStartedNs = System.nanoTime()
         onStatus("Loading stable recording identities for ${embeddingIndex.numTracks} embeddings")
         val database = EmbeddingDatabase.open(activeGeneration.databaseFile)
+        val indexAddedAtEpochSeconds: LongArray
         val identityCatalog = try {
-            StableTrackIdentityCatalog.load(filesDir, database, embeddingIndex)
+            StableTrackIdentityCatalog.load(filesDir, database, embeddingIndex).also {
+                indexAddedAtEpochSeconds = database.loadIndexAddedAtEpochSeconds(it.orderedTrackIds())
+            }
         } finally {
             database.close()
         }
@@ -1897,6 +2175,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             activeCatalog = activeCatalog,
             identityCatalog = identityCatalog,
             embeddingIndex = embeddingIndex,
+            indexAddedAtEpochSeconds = indexAddedAtEpochSeconds,
         )
         val activeDomainMs = elapsedMs(activeDomainStartedNs)
         require(activeDomain.activeTrackCount > 0) {
@@ -2110,7 +2389,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (days == null) {
             "No indexed recordings are available."
         } else {
-            "No indexed recordings were added to Poweramp in the " +
+            "No recordings were added to the embedding index in the " +
                 "${libraryAddedDaysLabel(days).lowercase()}."
         }
 
@@ -2192,9 +2471,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         TextEmbeddingIndexGeneration.invalidate()
     }
 
-    /**
-     * Search for the best matching track by text query using CLaMP3 text embeddings.
-     */
+    private suspend fun rememberedFindMusicTrackIds(
+        query: FindMusicQuerySpec,
+        library: FindMusicLibrarySnapshot,
+        database: EmbeddingDatabase,
+        candidateDomain: com.powerampstartradio.similarity.RecommendationCandidateDomain,
+    ): List<Long> {
+        if (!query.rememberPrevious) return emptyList()
+        return RadioService.rememberedSearchTrackIds(
+            query, library.generation.generationId, database::getTrackById,
+        ).asSequence()
+            .filter(library.activeDomain::containsActiveTrack)
+            .map { trackId ->
+                candidateDomain.representativeForVisibleIdentity(trackId)
+                    ?: library.activeDomain.activeIdentityRepresentativeTrackId(trackId)
+            }
+            .distinct()
+            .sorted()
+            .toList()
+    }
+
+    private fun noNewFindMusicMatchesMessage(remembered: List<Long>): String =
+        if (remembered.isEmpty()) "No matches found" else
+            "No new queue could be formed in this search scope. " +
+                "Clear memory in Settings or turn Remember previous off."
+
+    /** Search for the best matching track by text query using CLaMP3 text embeddings. */
     fun performTextSearch(query: String) {
         val normalized = query.trim()
         if (normalized.isBlank()) return
@@ -2210,6 +2512,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             resultLimit = _numTracks.value,
             textResultPlanner = _findMusicTextResultPlanner.value,
             libraryAddedDays = _libraryAddedDays.value,
+            rememberPrevious = _rememberPrevious.value,
         )
         launchFindMusicRequest(FindMusicSurface.TEXT) { revision ->
             executeTextSearch(revision, FindMusicSurface.TEXT, spec)
@@ -2319,12 +2622,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         var rankingElapsedMs = 0L
         var planningElapsedMs = 0L
         var materializationElapsedMs = 0L
+        var rememberedTrackIds = emptyList<Long>()
         try {
             catalog = library.identityCatalog
             boundSpec = spec.copy(
                 schemaVersion = FindMusicQuerySpec.CURRENT_SCHEMA_VERSION,
                 libraryBinding = catalog.binding,
             )
+            rememberedTrackIds = rememberedFindMusicTrackIds(boundSpec, library, db, candidateDomain)
+            val rememberedIds = rememberedTrackIds.toHashSet()
             val similarityStartedNs = System.nanoTime()
             publishFindMusicLoadingStatus(
                 revision,
@@ -2378,12 +2684,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     val rows = StableSimilarityTopK.select(
                         orderedTrackIds = activeTrackIds,
                         similarities = activeSimilarities,
-                        topK = candidateDomain.rankedRowsForVisibleCount(spec.resultLimit),
+                        topK = if (rememberedIds.isEmpty()) {
+                            candidateDomain.rankedRowsForVisibleCount(spec.resultLimit)
+                        } else activeTrackIds.size,
                         rankingTieKey = catalog::rankingTieKey,
                         cancellationCheck = cancellationCheck,
                     ).mapIndexed { rawRank, row ->
                         Triple(row.trackId, row.score, rawRank + 1)
-                    }
+                    }.filterNot { it.first in rememberedIds }
                     rankingElapsedMs = (System.nanoTime() - rankingStartedNs) / 1_000_000L
                     rows
                 }
@@ -2404,6 +2712,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         requestedResultCount = spec.resultLimit,
                         embeddingIndex = index,
                         cancellationCheck = cancellationCheck,
+                        previouslyQueuedTrackIds = rememberedTrackIds,
                     )
                     planningElapsedMs = (System.nanoTime() - planningStartedNs) / 1_000_000L
                     textQueuePlan = plan.evidence
@@ -2468,7 +2777,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         ensureCurrentFindMusicRequest(revision)
         if (matchedTracks.isEmpty()) {
-            publishFindMusicError(revision, surface, textQuery, "No matches found", spec)
+            publishFindMusicError(
+                revision, surface, textQuery, noNewFindMusicMatchesMessage(rememberedTrackIds), spec,
+            )
             return
         }
 
@@ -2509,6 +2820,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 activeTrackCount = activeDomain.activeTrackCount,
                 objectiveRankingDomainCount = candidateDomain.candidateIdentityCount,
                 globalRankingIdentityCount = activeDomain.activeCandidateIdentityCount,
+                rememberedTrackCount = rememberedTrackIds.size,
                 stableResultReduction = reduction.toStableResultReductionEvidence(),
                 textQueuePlan = textQueuePlan,
             ),
@@ -2696,6 +3008,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             objectiveRankingDomainCount = checkNotNull(result.objectiveRankingDomainCount),
             ingredientRankingDomainCount = result.ingredientRankingDomainCount,
             globalRankingIdentityCount = result.globalRankingIdentityCount,
+            rememberedTrackCount = result.rememberedTrackCount,
             stableResultReduction = reduction,
             textQueuePlan = result.textQueuePlan,
             allOfQueuePlan = result.allOfQueuePlan,
@@ -2990,6 +3303,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             libraryAddedDays = _libraryAddedDays.value,
             requestedPlanner = _findMusicTextResultPlanner.value,
             refineNeighborhood = _findMusicRefineNeighborhood.value,
+            rememberPrevious = _rememberPrevious.value,
         )
 
     /** Restore the musical request for editing after returning from replayed results. */
@@ -4052,6 +4366,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             textResultPlanner = _findMusicTextResultPlanner.value,
             libraryAddedDays = _libraryAddedDays.value,
             libraryBinding = queryBinding,
+            rememberPrevious = _rememberPrevious.value,
         )
         val effectivePlanner = when {
             draftQuerySpec.isSimplePositiveTextOnly &&
@@ -4200,6 +4515,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val missingEmbeddings = mutableListOf<FindMusicSongAnchor>()
         var effectiveQuerySpec = querySpec
         var equivalentSeedTrackIds: Set<Long> = emptySet()
+        var rememberedTrackIds = emptyList<Long>()
         lateinit var identityCatalog: StableTrackIdentityCatalog
         val db = EmbeddingDatabase.open(dbFile)
         try {
@@ -4251,6 +4567,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
             }
+            rememberedTrackIds = rememberedFindMusicTrackIds(effectiveQuerySpec, library, db, candidateDomain)
         } finally {
             db.close()
         }
@@ -4292,7 +4609,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 refineSpec = effectiveQuerySpec.refineSpec,
                 topK = if (
                     effectiveQuerySpec.textResultPlanner ==
-                    FindMusicTextResultPlanner.VARIED_ALL_OF_DPP
+                    FindMusicTextResultPlanner.VARIED_ALL_OF_DPP || rememberedTrackIds.isNotEmpty()
                 ) {
                     candidateDomain.candidateIdentityCount
                 } else {
@@ -4331,8 +4648,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val plannedRanking: List<RankedFindMusicRow> = when (
             effectiveQuerySpec.textResultPlanner
         ) {
-            FindMusicTextResultPlanner.CLOSEST -> ranking.mapIndexed { indexInRanking, row ->
-                RankedFindMusicRow(indexInRanking + 1, row)
+            FindMusicTextResultPlanner.CLOSEST -> {
+                val rememberedIds = rememberedTrackIds.toHashSet()
+                ranking.mapIndexed { indexInRanking, row ->
+                    RankedFindMusicRow(indexInRanking + 1, row)
+                }.filterNot { it.row.trackId in rememberedIds }
             }
             FindMusicTextResultPlanner.VARIED_ALL_OF_DPP -> {
                 publishFindMusicLoadingStatus(
@@ -4343,6 +4663,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     completeObjectiveRanking = ranking,
                     requestedResultCount = effectiveQuerySpec.resultLimit,
                     embeddingIndex = index,
+                    previouslyQueuedTrackIds = rememberedTrackIds,
                     cancellationCheck = {
                         requestJob?.ensureActive()
                         if (!findMusicRequestGate.isCurrent(revision)) {
@@ -4428,7 +4749,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val result = TextSearchResult(
             query = effectiveQuerySpec.displayLabel,
             matches = matches,
-            error = if (matches.isEmpty()) "No matches found" else null,
+            error = if (matches.isEmpty()) noNewFindMusicMatchesMessage(rememberedTrackIds) else null,
             querySpec = effectiveQuerySpec,
             libraryBinding = identityCatalog.binding,
             providerGenerationId = library.activeDomain.binding.providerGenerationId,
@@ -4437,6 +4758,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             objectiveRankingDomainCount = rankingSnapshot.objectiveRankingDomainCount,
             ingredientRankingDomainCount = rankingSnapshot.ingredientRankingDomainCount,
             globalRankingIdentityCount = globalRanking.size,
+            rememberedTrackCount = rememberedTrackIds.size,
             stableResultReduction = reduction.toStableResultReductionEvidence(),
             allOfQueuePlan = allOfQueuePlan,
             preparedSeeds = seedSpecs.map { seed ->
@@ -5612,6 +5934,7 @@ data class TextSearchResult(
     /** Exact identity domain used for composed per-ingredient percentiles. */
     val ingredientRankingDomainCount: Int? = null,
     val globalRankingIdentityCount: Int? = null,
+    val rememberedTrackCount: Int = 0,
     val unresolvedAnchors: List<FindMusicSongAnchor> = emptyList(),
     val kind: FindMusicResultKind = FindMusicResultKind.TEXT,
     val stableResultReduction: StableResultReductionEvidence? = null,

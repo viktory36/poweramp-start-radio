@@ -31,6 +31,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
@@ -95,6 +96,7 @@ import com.powerampstartradio.ui.FindMusicRefineNeighborhood
 import com.powerampstartradio.ui.FindMusicResultKind
 import com.powerampstartradio.ui.FindMusicTextResultPlanner
 import com.powerampstartradio.ui.MainViewModel
+import com.powerampstartradio.ui.FavoritesScreen
 import com.powerampstartradio.ui.LibraryRankEvidenceText
 import com.powerampstartradio.ui.MAX_LIBRARY_ADDED_DAYS
 import com.powerampstartradio.ui.MmrControlPolicy
@@ -123,6 +125,7 @@ import com.powerampstartradio.ui.forSeed
 import com.powerampstartradio.ui.effectiveLibraryAddedDays
 import com.powerampstartradio.ui.hasSameExecutionControlsAs
 import com.powerampstartradio.ui.libraryAddedDaysLabel
+import com.powerampstartradio.ui.indexAddedAgeLabel
 import com.powerampstartradio.ui.recordingDisplayLabel
 import com.powerampstartradio.ui.replayEligibilityKey
 import com.powerampstartradio.ui.theme.PowerampStartRadioTheme
@@ -230,6 +233,8 @@ fun MainScreen(
     var currentTrack by remember { mutableStateOf(PowerampReceiver.currentTrack) }
     var showSettings by rememberSaveable { mutableStateOf(false) }
     var showTextSearch by rememberSaveable { mutableStateOf(false) }
+    var showFavorites by rememberSaveable { mutableStateOf(false) }
+    val favoriteMatches by viewModel.favoriteMatches.collectAsState()
     var statusMessage by rememberSaveable { mutableStateOf("") }
     var viewingSession by rememberSaveable { mutableStateOf<Int?>(null) }
     var pendingHistoryReplay by remember { mutableStateOf<RadioResult?>(null) }
@@ -325,8 +330,10 @@ fun MainScreen(
     }
 
 
-    BackHandler(enabled = showSettings || showTextSearch || viewingSession != null) {
-        if (showTextSearch) {
+    BackHandler(enabled = showSettings || showTextSearch || showFavorites || viewingSession != null) {
+        if (showFavorites) {
+            if (favoriteMatches.seed != null) viewModel.closeFavorite() else showFavorites = false
+        } else if (showTextSearch) {
             showTextSearch = false
             viewModel.clearFindMusicResults()
             viewModel.clearSongSeeds()
@@ -339,7 +346,7 @@ fun MainScreen(
 
     ModalNavigationDrawer(
         drawerState = drawerState,
-        gesturesEnabled = sessionHistory.isNotEmpty() && !showTextSearch,
+        gesturesEnabled = sessionHistory.isNotEmpty() && !showTextSearch && !showFavorites,
         drawerContent = {
             ModalDrawerSheet(
                 modifier = Modifier.width(280.dp),
@@ -362,6 +369,7 @@ fun MainScreen(
     ) {
         // Screen: 0=home, 1=settings, 2=text search
         val screenIndex = when {
+            showFavorites -> 3
             showTextSearch -> 2
             showSettings -> 1
             else -> 0
@@ -375,6 +383,10 @@ fun MainScreen(
             label = "screen_transition"
         ) { screen ->
             when (screen) {
+                3 -> FavoritesScreen(viewModel, onBack = { showFavorites = false }, onStartRadio = {
+                    showFavorites = false
+                    viewingSession = null
+                })
                 1 -> SettingsScreen(viewModel = viewModel, databaseInfo = databaseInfo,
                     onImportDatabase = { importLauncher.launch(arrayOf("application/octet-stream", "*/*")) },
                     onMergeServerDatabase = {
@@ -417,6 +429,10 @@ fun MainScreen(
                     onClearAndReset = { viewModel.resetRadioState() },
                     onRequestPermission = { viewModel.requestPermission() },
                     onOpenSettings = { showSettings = true },
+                    onOpenFavorites = {
+                        viewModel.closeFavorite()
+                        showFavorites = true
+                    },
                     onOpenTextSearch = {
                         val prerequisite = findMusicPrerequisiteStatus(
                             context = context,
@@ -500,6 +516,7 @@ fun HomeScreen(
     onClearAndReset: () -> Unit,
     onRequestPermission: () -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenFavorites: () -> Unit,
     onOpenTextSearch: () -> Unit,
     onOpenDrawer: () -> Unit,
     viewingSession: Int?,
@@ -559,6 +576,13 @@ fun HomeScreen(
         },
         floatingActionButton = {
             Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onOpenFavorites) {
+                    Icon(Icons.Default.Favorite, contentDescription = "Favorites")
+                }
+                VerticalDivider(
+                    modifier = Modifier.height(28.dp).padding(horizontal = 4.dp),
+                    color = MaterialTheme.colorScheme.outlineVariant,
+                )
                 IconButton(
                     onClick = onOpenTextSearch,
                     enabled = !radioState.isActiveSearch(),
@@ -1477,6 +1501,7 @@ private fun TrackExplanation(
         val metaLine = listOfNotNull(
             album?.takeIf { it.isNotBlank() },
             durStr.takeIf { dur > 0 },
+            indexAddedAgeLabel(trackResult.track.indexAddedAtEpochSecond, System.currentTimeMillis() / 1_000L),
         ).joinToString(" \u00b7 ")
         if (metaLine.isNotEmpty()) {
             Text(metaLine, style = MaterialTheme.typography.bodySmall,
@@ -2454,6 +2479,10 @@ fun TextSearchScreen(
                                             result.ingredientRankingDomainCount,
                                     )?.let { scope -> append(" \u00b7 ").append(scope) }
                                 }
+                            }.let { details ->
+                                if (spec.rememberPrevious) {
+                                    "$details \u00b7 ${result.rememberedTrackCount} remembered"
+                                } else details
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -2688,7 +2717,8 @@ private fun recentFindMusicControlSummary(search: FindMusicQuerySpec): String {
         else -> "Closest"
     }
     return "${libraryAddedDaysLabel(search.effectiveLibraryAddedDays)} \u00b7 " +
-        "${search.resultLimit} results \u00b7 $resultStyle"
+        "${search.resultLimit} results \u00b7 $resultStyle \u00b7 " +
+        if (search.rememberPrevious) "Remember previous" else "Memory off"
 }
 
 @Composable
@@ -3074,7 +3104,7 @@ private fun LibraryAddedDaysControl(
 
     Column(modifier = modifier.fillMaxWidth()) {
         Text(
-            "Added to Poweramp",
+            "Added to index",
             style = titleStyle,
         )
         Row(
@@ -3943,6 +3973,7 @@ fun SettingsScreen(
     val maxPerArtist by viewModel.maxPerArtist.collectAsState()
     val minArtistSpacing by viewModel.minArtistSpacing.collectAsState()
     val numTracks by viewModel.numTracks.collectAsState()
+    val favoriteResultCount by viewModel.favoriteResultCount.collectAsState()
     val libraryAddedDays by viewModel.libraryAddedDays.collectAsState()
     val previews by viewModel.previews.collectAsState()
     val libraryControlsBlockedReason by viewModel.libraryControlsBlockedReason.collectAsState()
@@ -4180,6 +4211,35 @@ fun SettingsScreen(
             item { HorizontalDivider() }
 
             item {
+                var draft by remember(favoriteResultCount) { mutableStateOf(favoriteResultCount.toString()) }
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = draft,
+                        onValueChange = { text ->
+                            if (text.length <= 4 && text.all(Char::isDigit)) {
+                                draft = text
+                                text.toIntOrNull()?.takeIf { it in 1..1_000 }
+                                    ?.let(viewModel::setFavoriteResultCount)
+                            }
+                        },
+                        label = { Text("Favorites nearest matches") },
+                        singleLine = true,
+                        isError = draft.toIntOrNull()?.let { it !in 1..1_000 } ?: true,
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                            keyboardType = androidx.compose.ui.text.input.KeyboardType.Number,
+                        ),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Text("1\u20131,000 closest recordings from the full library per favorite. New marks " +
+                        "recordings introduced by the latest index update; it lasts until the next update.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+
+            item { HorizontalDivider() }
+
+            item {
                 Column {
                     LibraryAddedDaysControl(
                         dayCount = libraryAddedDays,
@@ -4188,8 +4248,9 @@ fun SettingsScreen(
                         titleStyle = MaterialTheme.typography.titleMedium,
                     )
                     Text(
-                        "Radio and Find Music use only recordings in this window. Poweramp's " +
-                            "first-added time determines age; days are rolling 24-hour periods.",
+                        "Radio and Find Music use only recordings first added to the embedding " +
+                            "database in this window. Server tracks use their phone merge date; " +
+                            "days are rolling 24-hour periods.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -4469,52 +4530,44 @@ fun SettingsScreen(
                 }
             }
 
-            if (selectionMode == SelectionMode.DPP || selectionMode == SelectionMode.MMR) {
-                item {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().clickable {
-                            viewModel.setRememberPrevious(!rememberPrevious)
-                        },
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Checkbox(
-                            checked = rememberPrevious,
-                            onCheckedChange = viewModel::setRememberPrevious,
-                        )
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Remember previous", style = MaterialTheme.typography.titleSmall)
-                            Text(
-                                "Treat all recordings enqueued from this seed since memory was " +
-                                    "cleared as already selected for diversity, and skip them " +
-                                    "in this queue. " +
-                                    if (selectionMode == SelectionMode.DPP) {
-                                        "DPP seeks remaining directions; it can eventually exhaust them."
-                                    } else {
-                                        "MMR also penalizes overlap with that set."
-                                    },
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(start = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth().clickable {
+                        viewModel.setRememberPrevious(!rememberPrevious)
+                    },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(
+                        checked = rememberPrevious,
+                        onCheckedChange = viewModel::setRememberPrevious,
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Remember previous", style = MaterialTheme.typography.titleSmall)
                         Text(
-                            "Clears memory for all seeds; keeps saved queues.",
-                            modifier = Modifier.weight(1f),
+                            "Remember each DPP/MMR seed and Find Music recipe. Skip earlier " +
+                                "queued tracks; diversity selectors also account for their embeddings.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        TextButton(
-                            onClick = viewModel::clearRadioMemory,
-                            enabled = !clearingRadioMemory,
-                        ) {
-                            Icon(Icons.Default.Clear, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text(if (clearingRadioMemory) "Clearing..." else "Clear memory")
-                        }
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(start = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "All seeds and searches; saved queues kept.",
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    TextButton(
+                        onClick = viewModel::clearRadioMemory,
+                        enabled = !clearingRadioMemory,
+                    ) {
+                        Icon(Icons.Default.Clear, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(if (clearingRadioMemory) "Clearing..." else "Clear memory")
                     }
                 }
             }

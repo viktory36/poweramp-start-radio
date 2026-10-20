@@ -15,6 +15,8 @@ class V2ImportedRowSupersessionCommitInstrumentedTest {
     @Test
     fun replacementAndUniquePredecessorDeletionAreAtomicAndReplayIsIdempotent() = withDatabase { db ->
         val predecessor = insertLegacy(db, "Imported", 3)
+        db.execSQL("UPDATE tracks SET created_at = '2020-01-02 03:04:05' WHERE id = ?",
+            arrayOf(predecessor.trackId))
         val vector = vector(11)
         val request = request(
             workId = "repair-work",
@@ -38,6 +40,10 @@ class V2ImportedRowSupersessionCommitInstrumentedTest {
         )
         assertEquals(V2EmbeddingCommitDisposition.REUSED, replay.disposition)
         assertEquals(first.trackId, replay.trackId)
+        db.rawQuery("SELECT created_at FROM tracks WHERE id = ?", arrayOf(first.trackId.toString())).use {
+            check(it.moveToFirst())
+            assertEquals("2020-01-02 03:04:05", it.getString(0))
+        }
         assertEquals(1L, count(db, "tracks"))
         assertEquals(1L, count(db, V2EmbeddingCommitRepository.IMPORTED_ROW_SUPERSESSION_TABLE))
     }
@@ -56,7 +62,12 @@ class V2ImportedRowSupersessionCommitInstrumentedTest {
             )
         }
         assertEquals(1L, countWhere(db, "tracks", "id = ?", predecessor.trackId))
-        assertEquals(0L, count(db, V2EmbeddingCommitRepository.RECEIPT_TABLE))
+        // The failed transaction rolls back receipt-table creation along with row changes.
+        db.rawQuery("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+            arrayOf(V2EmbeddingCommitRepository.RECEIPT_TABLE)).use {
+            check(it.moveToFirst())
+            assertEquals(0L, it.getLong(0))
+        }
 
         val predecessorVector = vector(13)
         val receiptRequest = request("owner-work", "Owned", predecessorVector, null)
@@ -291,7 +302,8 @@ class V2ImportedRowSupersessionCommitInstrumentedTest {
                         title TEXT,
                         duration_ms INTEGER,
                         file_path TEXT NOT NULL,
-                        source TEXT DEFAULT 'desktop'
+                        source TEXT DEFAULT 'desktop',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                     """.trimIndent(),
                 )

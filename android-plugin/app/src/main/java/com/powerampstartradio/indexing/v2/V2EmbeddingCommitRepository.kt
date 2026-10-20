@@ -76,7 +76,10 @@ class V2EmbeddingCommitRepository(
                         )
                     }
                     request.importedRowSupersession?.let(::requirePredecessorMatches)
-                    val trackId = insertTrack(request.metadata)
+                    val trackId = insertTrack(
+                        request.metadata,
+                        request.importedRowSupersession?.predecessor?.trackId,
+                    )
                     insertEmbedding(trackId, clampVectorBlob)
                     insertReceipt(expected, trackId, request.verifiedAtEpochMs)
                     request.importedRowSupersession?.let { authorization ->
@@ -399,7 +402,7 @@ class V2EmbeddingCommitRepository(
         arrayOf(trackId.toString()),
     ).use { cursor -> check(cursor.moveToFirst()); cursor.getLong(0) }
 
-    private fun insertTrack(metadata: V2CommitTrackMetadata): Long {
+    private fun insertTrack(metadata: V2CommitTrackMetadata, predecessorTrackId: Long?): Long {
         val values = ContentValues().apply {
             put("metadata_key", metadata.metadataKey)
             put("filename_key", metadata.filenameKey)
@@ -409,6 +412,16 @@ class V2EmbeddingCommitRepository(
             put("duration_ms", metadata.durationMs)
             put("file_path", metadata.filePath)
             put("source", metadata.source)
+            if (predecessorTrackId != null) {
+                database.rawQuery(
+                    "SELECT created_at FROM $TRACK_TABLE WHERE id = ?",
+                    arrayOf(predecessorTrackId.toString()),
+                ).use { cursor ->
+                    check(cursor.moveToFirst()) { "Reindexed predecessor is missing" }
+                    if (cursor.isNull(0)) putNull("created_at")
+                    else put("created_at", cursor.getString(0))
+                }
+            }
         }
         return database.insertOrThrow(TRACK_TABLE, null, values).also { trackId ->
             check(trackId > 0L) { "SQLite returned an invalid track id: $trackId" }

@@ -49,7 +49,7 @@ enum class SelectionMode {
     UNIFORM_SHUFFLE,
 }
 
-/** Rolling Poweramp first-seen window used to define recommendation candidates. */
+/** Rolling embedding-index added-date window used to define recommendation candidates. */
 enum class LibraryAddedRange(
     val dayCount: Long?,
     val label: String,
@@ -66,13 +66,13 @@ enum class LibraryAddedRange(
 const val DEFAULT_LIBRARY_ADDED_DAYS = 30
 const val MAX_LIBRARY_ADDED_DAYS = 36_500
 
-/** Exact rolling Poweramp first-seen window. Null keeps every dated and undated recording. */
+/** Exact rolling index-added window. Null keeps every dated and undated recording. */
 fun libraryAddedDaysLabel(days: Int?): String = when (days) {
     null -> "All dates"
     1 -> "Last 1 day"
     else -> {
         require(days in 1..MAX_LIBRARY_ADDED_DAYS) {
-            "Poweramp added-date day count must be 1..$MAX_LIBRARY_ADDED_DAYS"
+            "Index added-date day count must be 1..$MAX_LIBRARY_ADDED_DAYS"
         }
         "Last $days days"
     }
@@ -82,7 +82,7 @@ fun libraryAddedDaysLabel(days: Int?): String = when (days) {
  * Resolve a rolling N-by-24-hour window at one durable request timestamp.
  *
  * A very large finite window saturates at the first valid Unix timestamp. It remains distinct
- * from All dates because active rows with unknown first-seen time (zero) stay excluded.
+ * from All dates because active rows with unknown index-added time (zero) stay excluded.
  */
 fun minimumLibraryAddedAtEpochSecond(
     days: Int?,
@@ -90,9 +90,9 @@ fun minimumLibraryAddedAtEpochSecond(
 ): Long? {
     if (days == null) return null
     require(days in 1..MAX_LIBRARY_ADDED_DAYS) {
-        "Poweramp added-date day count must be 1..$MAX_LIBRARY_ADDED_DAYS"
+        "Index added-date day count must be 1..$MAX_LIBRARY_ADDED_DAYS"
     }
-    require(referenceEpochSecond > 0L) { "Poweramp added-date reference time must be positive" }
+    require(referenceEpochSecond > 0L) { "Index added-date reference time must be positive" }
     val durationSeconds = Math.multiplyExact(days.toLong(), 86_400L)
     return (referenceEpochSecond - durationSeconds).coerceAtLeast(1L)
 }
@@ -627,6 +627,7 @@ enum class QueueOrigin(val displayLabel: String, val isDirectList: Boolean = fal
     APP_RADIO("Started in app"),
     WIDGET_RADIO("Started from widget"),
     QUEUE_TRACK_RADIO("Started from queued track"),
+    FAVORITE_RADIO("Started from Favorites"),
     TEXT_RESULT_RADIO("Started from Find Music"),
     COMPOSED_RADIO("Started from Find Music"),
     TEXT_RESULT_LIST("Find Music queue", isDirectList = true),
@@ -732,6 +733,7 @@ data class FindMusicSessionEvidence(
     /** Exact composed identity domain used to compute ingredient percentiles. */
     val ingredientRankingDomainCount: Int? = null,
     val globalRankingIdentityCount: Int? = null,
+    val rememberedTrackCount: Int = 0,
     val stableResultReduction: StableResultReductionEvidence,
     /** Exact complete-domain text membership plan; required for Varied text results. */
     val textQueuePlan: FindMusicTextQueuePlanEvidence? = null,

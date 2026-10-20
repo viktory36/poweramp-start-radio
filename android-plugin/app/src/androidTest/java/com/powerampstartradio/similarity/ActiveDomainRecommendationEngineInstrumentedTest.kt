@@ -164,6 +164,8 @@ class ActiveDomainRecommendationEngineInstrumentedTest {
                         tracks.all { it.track.id in RECENT_CANDIDATE_IDS },
                     )
                     tracks.forEach { track ->
+                        assertEquals(REQUEST_REFERENCE_EPOCH_SECOND - 60L,
+                            track.track.indexAddedAtEpochSecond)
                         assertEquals(
                             EXPECTED_GLOBAL_SEED_RANK.getValue(track.track.id),
                             track.seedRank,
@@ -484,11 +486,9 @@ class ActiveDomainRecommendationEngineInstrumentedTest {
                             trackId = trackId,
                             powerampFileId = 1_000L + trackId,
                             evidence = V2ActiveLibraryBindingEvidence.EXACT_V2_RECEIPT_SPAN,
-                            createdAtEpochSecond = if (trackId in RECENT_CANDIDATE_IDS) {
-                                REQUEST_REFERENCE_EPOCH_SECOND - 60L
-                            } else {
-                                REQUEST_REFERENCE_EPOCH_SECOND - 10L * 86_400L
-                            },
+                            // Deliberately opposite to index dates: provider dates must be ignored.
+                            createdAtEpochSecond = if (trackId in RECENT_CANDIDATE_IDS) 1L
+                                else REQUEST_REFERENCE_EPOCH_SECOND,
                         )
                     },
                     quarantinedTracks = POISON_IDS.map { trackId ->
@@ -533,7 +533,8 @@ class ActiveDomainRecommendationEngineInstrumentedTest {
                             title TEXT,
                             duration_ms INTEGER,
                             file_path TEXT NOT NULL,
-                            source TEXT DEFAULT 'desktop'
+                            source TEXT DEFAULT 'desktop',
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         )
                         """.trimIndent(),
                     )
@@ -560,6 +561,14 @@ class ActiveDomainRecommendationEngineInstrumentedTest {
                                 "Artist $trackId",
                                 "Track $trackId",
                                 "/fixture/track-$trackId.flac",
+                            ),
+                        )
+                        database.execSQL(
+                            "UPDATE tracks SET created_at = datetime(?, 'unixepoch') WHERE id = ?",
+                            arrayOf<Any>(
+                                if (trackId in RECENT_CANDIDATE_IDS) REQUEST_REFERENCE_EPOCH_SECOND - 60L
+                                else REQUEST_REFERENCE_EPOCH_SECOND - 10L * 86_400L,
+                                trackId,
                             ),
                         )
                         database.execSQL(

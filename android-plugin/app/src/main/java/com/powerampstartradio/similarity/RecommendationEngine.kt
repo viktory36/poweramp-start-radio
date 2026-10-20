@@ -287,6 +287,9 @@ internal class RecommendationEngine(
                     activeCatalog = sourceCatalog,
                     identityCatalog = identityCatalog,
                     embeddingIndex = index,
+                    indexAddedAtEpochSeconds = database.loadIndexAddedAtEpochSeconds(
+                        identityCatalog.orderedTrackIds(),
+                    ),
                 )
                 require(domain.activeTrackCount > 0) {
                     "The active Poweramp library has no recommendation-eligible tracks"
@@ -521,7 +524,7 @@ internal class RecommendationEngine(
                 eligibleCandidateIdentityCount
             } else {
                 // Automatic DPP's prefix is an implementation detail over this request's
-                // complete first-seen-filtered candidate domain.
+                // complete index-added-date candidate domain.
                 candidateDomain.candidateIdentityCount
             }
             val activePool = config.resolveCandidatePoolSize(poolDomainCount)
@@ -726,7 +729,7 @@ internal class RecommendationEngine(
             coroutineContext.ensureActive()
             onProgress?.invoke("Selecting track ${step + 1} of ${config.numTracks}...")
 
-            // Rank only the request's exact Poweramp first-seen candidate domain.
+            // Rank only the request's exact index-added-date candidate domain.
             val selectionQuerySimilarities = if (step == 0) {
                 seedSims
             } else {

@@ -87,6 +87,7 @@ object FindMusicAllOfQueuePlanner {
         embeddingIndex: EmbeddingIndex,
         cancellationCheck: (() -> Unit)? = null,
         isEligible: (Long, List<Long>) -> Boolean = { _, _ -> true },
+        previouslyQueuedTrackIds: List<Long> = emptyList(),
     ): FindMusicAllOfQueuePlan {
         require(completeObjectiveRanking.isNotEmpty())
         require(requestedResultCount > 0)
@@ -115,6 +116,7 @@ object FindMusicAllOfQueuePlanner {
             qualityExponent = QUALITY_EXPONENT,
             cancellationCheck = cancellationCheck,
             isEligible = isEligible,
+            initiallySelectedTrackIds = previouslyQueuedTrackIds,
         )
         val selections = certified.tracks.map { selected ->
             FindMusicAllOfQueueSelection(

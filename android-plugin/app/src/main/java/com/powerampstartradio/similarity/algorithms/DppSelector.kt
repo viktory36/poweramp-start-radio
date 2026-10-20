@@ -160,17 +160,22 @@ object DppSelector {
         val suffixInitialGainBound = DoubleArray(totalCount + 1)
         for (indexInCandidates in candidates.lastIndex downTo 0) {
             if ((indexInCandidates and 1023) == 0) cancellationCheck?.invoke()
+            val upperBound = if (conditioning?.remembers(candidates[indexInCandidates].first) == true) {
+                0.0
+            } else initialGainUpperBound(
+                relevance = candidates[indexInCandidates].second,
+                exponent = qualityExponent,
+                completeDomainMaxRelevance = completeDomainMaxRelevance,
+            )
             suffixInitialGainBound[indexInCandidates] = maxOf(
-                initialGainUpperBound(
-                    relevance = candidates[indexInCandidates].second,
-                    exponent = qualityExponent,
-                    completeDomainMaxRelevance = completeDomainMaxRelevance,
-                ),
+                upperBound,
                 suffixInitialGainBound[indexInCandidates + 1],
             )
         }
 
         val attemptedCounts = mutableListOf<Int>()
+        val remainingCount = if (conditioning == null) totalCount else totalCount -
+            candidates.count { conditioning.remembers(it.first) }
         var candidateCount = firstCount
         while (true) {
             attemptedCounts += candidateCount
@@ -187,7 +192,7 @@ object DppSelector {
             val unseenBound = suffixInitialGainBound[candidateCount].takeIf {
                 candidateCount < totalCount
             }
-            val targetCount = minOf(numSelect, totalCount, conditioning?.remainingDimensions ?: numSelect)
+            val targetCount = minOf(numSelect, remainingCount, conditioning?.remainingDimensions ?: numSelect)
             val selectedEnough = run.selectedIndices.size == targetCount
             val everyStepCertified = unseenBound == null ||
                 run.selectedMarginalGains.all { gain -> gain > unseenBound }

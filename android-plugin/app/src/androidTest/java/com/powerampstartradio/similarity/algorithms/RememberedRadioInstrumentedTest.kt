@@ -95,7 +95,8 @@ class RememberedRadioInstrumentedTest {
         val memoryDirectory = File(context.cacheDir, "memory-check-${UUID.randomUUID()}").apply { mkdirs() }
         try {
             val identities = StableTrackIdentityCatalog.load(context.filesDir, database, index)
-            val domain = ActiveRecommendationDomain.create(catalog, identities, index)
+            val domain = ActiveRecommendationDomain.create(catalog, identities, index,
+                database.loadIndexAddedAtEpochSeconds(identities.orderedTrackIds()))
             val seedId = 59474L
             val historyType = object : TypeToken<List<RadioResult>>() {}.type
             val history: List<RadioResult> = Gson().fromJson(

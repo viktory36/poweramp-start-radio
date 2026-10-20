@@ -169,7 +169,7 @@ object PlanSemanticControlPolicy {
             add(integer("queue_size", "Queue size", config.numTracks, "${config.numTracks} tracks"))
             add(choice(
                 "library_added_days",
-                "Added to Poweramp",
+                "Added to index",
                 config.effectiveLibraryAddedDays?.toString() ?: "all",
                 libraryAddedDaysLabel(config.effectiveLibraryAddedDays),
             ))

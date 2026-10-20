@@ -334,6 +334,8 @@ class RadioService : Service() {
 
         private val _sessionHistory = MutableStateFlow<List<RadioResult>>(emptyList())
         val sessionHistory: StateFlow<List<RadioResult>> = _sessionHistory.asStateFlow()
+        private val _favoritesRevision = MutableStateFlow(0L)
+        val favoritesRevision: StateFlow<Long> = _favoritesRevision.asStateFlow()
 
         /** Drift reference embeddings for lazy rank computation, keyed by track ID. */
         val driftReferences = MutableStateFlow<Map<Long, FloatArray>>(emptyMap())
@@ -521,6 +523,11 @@ class RadioService : Service() {
                         _sessionHistory.value = loaded
                     }
                     runCatching {
+                        val favorites = com.powerampstartradio.ui.FavoritesStore(filesDir)
+                        favorites.initializeFromHistory(loaded)
+                        _favoritesRevision.value++
+                    }.onFailure { Log.e(TAG, "Could not import Favorites from saved requests", it) }
+                    runCatching {
                         com.powerampstartradio.ui.RadioSelectionMemory(filesDir).initializeFromHistory(loaded)
                     }.onFailure { failure ->
                         Log.e(TAG, "Could not initialize radio memory; saved history remains available", failure)
@@ -558,6 +565,8 @@ class RadioService : Service() {
                     val memory = com.powerampstartradio.ui.RadioSelectionMemory(dir)
                     memory.initializeFromHistory(snapshot)
                     memory.recordSession(result)
+                    com.powerampstartradio.ui.FavoritesStore(dir).recordSession(result)
+                    _favoritesRevision.value++
                     true
                 } catch (failure: Exception) {
                     Log.e(TAG, "Could not persist confirmed radio selection memory", failure)
@@ -577,6 +586,61 @@ class RadioService : Service() {
             val memory = com.powerampstartradio.ui.RadioSelectionMemory(directory)
             memory.initializeFromHistory(_sessionHistory.value)
             return memory.rememberedTrackIds(seedTrackId, stableSeedId, currentGeneration, resolveTrack)
+        }
+
+        suspend fun rememberedSearchTrackIds(
+            query: FindMusicQuerySpec,
+            currentGeneration: String,
+            resolveTrack: (Long) -> EmbeddedTrack?,
+        ): List<Long> {
+            historyReady.await()
+            val memory = com.powerampstartradio.ui.RadioSelectionMemory(checkNotNull(historyDir))
+            memory.initializeFromHistory(_sessionHistory.value)
+            return memory.rememberedSearchTrackIds(query, currentGeneration, resolveTrack)
+        }
+
+        suspend fun favoriteEntries(filesDir: File): List<com.powerampstartradio.ui.FavoriteEntry> {
+            historyReady.await()
+            return com.powerampstartradio.ui.FavoritesStore(filesDir).entries()
+        }
+
+        fun startRadioFromFavorite(
+            context: Context,
+            trackId: Long,
+            displayedGenerationId: String,
+            config: RadioConfig,
+        ) {
+            val token = reserveSubmission(replaceActive = false) ?: return
+            _uiState.value = RadioUiState.Loading("Preparing radio from the selected recording")
+            submitRequest(context, submissionToken = token) { appContext ->
+                buildFavoriteRadioRequest(appContext, trackId, displayedGenerationId, config)
+            }
+        }
+
+        internal fun buildFavoriteRadioRequest(
+            context: Context,
+            trackId: Long,
+            displayedGenerationId: String,
+            config: RadioConfig,
+        ): DurableRadioRequest {
+            val library = requireActiveLibrary(context)
+            require(library.generation.generationId == displayedGenerationId) {
+                "The music index changed. Open the favorite again before starting radio."
+            }
+            val fileId = requireNotNull(library.activeCatalog.powerampFileIdForTrack(trackId)) {
+                "This recording is no longer in the Poweramp library."
+            }
+            val provider = PowerampHelper.requireFileEntryById(context, fileId)
+            val displayed = PowerampTrack(realId = fileId, title = provider.title,
+                artist = provider.artist, album = provider.album, durationMs = provider.durationMs,
+                path = provider.path)
+            return buildPinnedRadioRequest(context, config, WidgetRadioSeedReference.from(displayed),
+                showToasts = false, origin = QueueOrigin.FAVORITE_RADIO).also { request ->
+                require(request.generation.generationId == displayedGenerationId &&
+                    request.radio?.seed?.identity?.embeddedTrackId == trackId) {
+                    "The selected recording's library binding changed. Open the favorite again."
+                }
+            }
         }
 
         private fun writeHistorySnapshot(
@@ -1169,11 +1233,12 @@ class RadioService : Service() {
                         bindAdmittedSubmission(submissionToken, persistedId)
                         startForegroundRequest(appContext, checkNotNull(requestId))
                     } catch (failure: Exception) {
+                        val message = RadioFailureMessage.from(failure)
                         requestId?.let { persistedId ->
                             runCatching {
                                 store.markFailed(
                                     persistedId,
-                                    "Radio could not start. Open Start Radio and try again.",
+                                    message,
                                 )
                             }.onFailure { stateFailure ->
                                 Log.e(TAG, "Could not terminalize unstarted request $persistedId", stateFailure)
@@ -1181,9 +1246,7 @@ class RadioService : Service() {
                         }
                         failSubmission(submissionToken)
                         Log.e(TAG, "Could not persist or start radio request", failure)
-                        _uiState.value = RadioUiState.Error(
-                            "Radio could not start. Open Start Radio and try again.",
-                        )
+                        _uiState.value = RadioUiState.Error(message)
                     }
                 }
             }
@@ -1220,20 +1283,7 @@ class RadioService : Service() {
         }
 
         private fun widgetFailureMessage(failure: Exception): String {
-            val detail = failure.message?.trim()?.takeIf(String::isNotBlank)
-                .orEmpty()
-            return when {
-                failure is SecurityException ||
-                    detail.contains("permission", ignoreCase = true) ||
-                    detail.contains("access", ignoreCase = true) ->
-                    "Poweramp access is unavailable. Open Start Radio and grant access."
-                detail.contains("authenticated Poweramp", ignoreCase = true) ||
-                    detail.contains("playback no longer matches", ignoreCase = true) ->
-                    "Poweramp playback changed. Return to Poweramp, then tap Start Radio again."
-                detail.contains("No track", ignoreCase = true) ->
-                    "No Poweramp track is available. Start a track, then try again."
-                else -> "Radio could not start. Open Start Radio, then try again."
-            }
+            return RadioFailureMessage.from(failure)
         }
 
         private fun reserveSubmission(
@@ -1273,7 +1323,7 @@ class RadioService : Service() {
             return token
         }
 
-        private fun buildPinnedRadioRequest(
+        internal fun buildPinnedRadioRequest(
             context: Context,
             config: RadioConfig,
             currentSeedReference: WidgetRadioSeedReference,
@@ -1294,11 +1344,8 @@ class RadioService : Service() {
                 require(currentSeedReference.matchesProvider(provider)) {
                     "The displayed Poweramp seed changed before it could be pinned"
                 }
-                val trackId = requireNotNull(
-                    activeCatalog.trackIdForPowerampFile(provider.id),
-                ) {
-                    "The displayed Poweramp track is not in the active generation"
-                }
+                val trackId = activeCatalog.trackIdForPowerampFile(provider.id)
+                    ?: throw RadioSeedNotIndexedException()
                 val track = requireNotNull(database.getTrackById(trackId)) {
                     "The displayed Poweramp track has no active embedding row"
                 }
@@ -1324,6 +1371,9 @@ class RadioService : Service() {
                     activeCatalog = activeCatalog,
                     identityCatalog = identityCatalog,
                     embeddingIndex = embeddingIndex,
+                    indexAddedAtEpochSeconds = database.loadIndexAddedAtEpochSeconds(
+                        identityCatalog.orderedTrackIds(),
+                    ),
                 )
                 val candidateDomain = activeDomain.candidateDomain(
                     minimumLibraryAddedAtEpochSecond(
@@ -2494,7 +2544,7 @@ class RadioService : Service() {
                 val seedDisplayTrack = seed.displayTrack
                 val matchType = seed.matchType
                 val textSearchSeedFileId = seed.displayTrack.realId.takeIf {
-                    origin == QueueOrigin.TEXT_RESULT_RADIO && it > 0L
+                    (origin == QueueOrigin.TEXT_RESULT_RADIO || origin == QueueOrigin.FAVORITE_RADIO) && it > 0L
                 }
                 val currentTrack =
                     PowerampReceiver.requireProviderVerifiedCurrentTrack(this@RadioService)

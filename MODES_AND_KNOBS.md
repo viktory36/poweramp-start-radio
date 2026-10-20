@@ -9,7 +9,7 @@ identity, artist limits, dates, and display, not musical scoring.
 | Control | Effect |
 | --- | --- |
 | Queue size | Request 10-100 tracks, in steps of 10, for radio and Find Music |
-| Poweramp added date | All dates, or exactly the last N rolling 24-hour periods, using Poweramp's first-added timestamp |
+| Added to index | All dates, or exactly the last N rolling 24-hour periods, using the embedding DB's original `tracks.created_at`. Server additions use the phone merge date; reindexing retains the original date. |
 | Artist-credit limits | Enable the per-artist cap and spacing constraints for radio |
 | Max per artist | Limit occurrences of the same complete artist credit in a new radio queue |
 | Min artist spacing | Require this many intervening tracks between matching artist credits in radio |
@@ -122,7 +122,7 @@ participate in diversity scoring:
 Memory is uncapped and persists independently of session history. Successful ordinary radios
 are recorded even while the checkbox is off; previews and failed enqueues are not.
 On first use, available saved radio queues populate memory once.
-**Clear memory** resets every seed without deleting saved queues or importing them again.
+**Clear memory** resets every seed and Find Music recipe without deleting saved queues or importing them again.
 Turning the checkbox off ignores memory without erasing it.
 
 Freshness costs closeness: especially with DPP, later queues can move farther from the seed.
@@ -188,11 +188,45 @@ Secondary ties use primary percentile, then stable identity order.
 The primary must be Like; the secondary can be Like or Less like. There are no weights because
 the ingredients have different jobs. The neighborhood never widens to fill a queue.
 
+### Remember Previous in Find Music
+
+The shared Settings switch also remembers successful Find Music enqueues for each recipe.
+Ranked and Closest return the strongest unseen matches in their original ranking order.
+Refine skips remembered tracks inside its original primary neighborhood without widening it.
+Varied conditions DPP on their embeddings as well as excluding them.
+
+Memory follows the ingredients, directions, and weights (or Refine's primary role), not the
+result count, date filter, planner, or neighborhood width. Searching without enqueueing does not
+add memory. All confirmed queues are recorded even with the switch off; Clear memory resets them.
+Global match ranks stay unchanged. Replaying a saved queue still sends its exact track list.
+
 ### History
 
 Saved queues can be replayed exactly. Recent searches can also be repeated using their original
 settings or current Settings, without overwriting your defaults. Opening a recent search restores
 its text, confirmed recordings, weights, and planner; Back leaves those inputs ready to edit.
+
+## Favorites
+
+Favorites ranks individual recording and text seeds by confirmed queue requests. Each active
+ingredient in a multi-seed search counts once per request. Failed deliveries and unqueued search
+previews do not count. Counts are independent of history deletion and Clear memory; initial counts
+come from retained queue history because older request frequencies were not recorded.
+
+Opening a seed ranks the current full active library by cosine similarity, excluding the seed's
+recording copies. Settings controls this list's size (default 100). Radio date, diversity, and
+memory controls do not filter this nearest list. Tapping a match puts that recording first in the
+upcoming queue, followed by radio generated using current Settings; playback is left alone.
+The song seed header starts radio from the favorite itself using the same settings.
+
+**New** marks recordings added by the latest index publication, only until the next publication.
+Opening Favorites does not clear it. An added copy of an older recording is not marked New.
+The Favorites list also marks seeds with any New result inside their configured nearest list.
+Nearest rows show elapsed days since their embedding DB row was first added, using the same
+`tracks.created_at` clock as the shared Added to index filter. Favorites itself always ranks the full library.
+Expanded main-screen queue rows show the same age beside album and duration.
+These checks run in the background and are cached for the index, active library, and list size.
+This tracking starts with the first index update after installing Favorites.
 
 ## Identity and Repeatability
 

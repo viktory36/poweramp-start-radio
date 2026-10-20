@@ -81,7 +81,54 @@ directions and none after 128; MMR could still return the remaining candidate.
 This confirms DPP's rank exhaustion without arbitrary forgetting or fallback filling.
 These runs did not enqueue music or assess the new UI/listening experience.
 
+### Find Music with Memory
+
+An October 12 native device simulation used 96,284 vectors and 96,074 active recording identities.
+After remembering the first 30 ambient matches, three Varied queues each returned 30 unseen
+recordings. Planning took 1.135, 1.199, and 1.569 s, excluding model loading and ranking.
+Every queue matched full-domain conditional DPP exactly and reproduced its ordered IDs.
+Ambient + guitar Varied returned 30 unseen recordings in 771 ms of planning, also matching
+full-domain DPP. Original objective ranks were retained throughout.
+
+Closest continued at ranks 31-60 after the first 30 were remembered. Refine kept its original
+241-recording neighborhood: with 236 remembered it returned five, then none with all remembered.
+A temporary store retained 251 recordings across reopening, ignored failed enqueues, and stayed
+empty after clearing despite old history being presented again. Small domains shortened or
+exhausted rather than repeating tracks. The simulation did not enqueue music, change radio
+memory or session history, or assess listening preference and the new UI.
+
+### Favorites
+
+A read-only October device run used 96,558 vectors and 96,417 active recording identities.
+Recording and text top-100 lists exactly matched an independent full cosine sort; ranking and
+materialization took 74-87 ms and 25 ms respectively over two runs, excluding library/model setup. Opening one
+recording favorite through the actual screen took 623 ms after app startup.
+
+Isolated device stores verified per-request individual multi-seed counts, repeat-safe history
+import, persistence, and failed-delivery exclusion. Generation-local addition lists survived
+previous-generation pruning and retries, then reset at the next publication. Newly added copies
+of existing recording identities were not marked New. Exact selected-song Poweramp binding and
+current radio configuration were verified without delivering a queue. Both new screens were
+visually inspected. Existing session history was byte-identical before and after these checks.
+
+First-screen New indicators were compared with materialized top-100 results for all 115 song
+favorites using simulated addition IDs: two marked and 113 unmarked, all agreeing. Song/text
+cutoff checks marked a seed for a new result at rank 100 with N=100, but not N=99. Cached flags
+survived reopening and were not reused after index, active-domain, or list-size changes.
+
+### Index-Added Dates
+
+On October 20, all 96,627 embedding-row dates matched independent UTC parsing of `tracks.created_at`.
+The active library's 7/30/90-day windows contained 343/841/15,713 rows, versus
+253/763/15,635 under Poweramp dates. Radio and Find Music now use the embedding dates.
+All five radio modes stayed inside an index-date-filtered fixture despite deliberately conflicting
+Poweramp dates, while seed ranks remained global. Replacing an imported row retained its original
+timestamp through retry. Favorites age labels matched the DB and were visually inspected;
+generated main-screen queue rows carry the same timestamp for expanded details and saved history.
+
 ## Device Runtime
+
+Earlier day-window measurements below used Poweramp dates.
 
 Warm July measurements:
 
