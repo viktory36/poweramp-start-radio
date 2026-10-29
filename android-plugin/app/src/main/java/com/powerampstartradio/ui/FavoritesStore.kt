@@ -12,6 +12,8 @@ data class FavoriteSeed(
     val stableTrackSpanId: String? = null,
     val title: String? = null,
     val artist: String? = null,
+    /** Transient Now Playing lookup, resolved to an embedding identity before enqueueing. */
+    val powerampFileId: Long? = null,
 ) {
     val label: String get() = text ?: title ?: "Track $trackId"
 }
@@ -124,6 +126,7 @@ class FavoritesStore(private val filesDir: File) {
         private val gson = Gson()
 
         internal fun seedsFrom(session: RadioResult): List<FavoriteSeed> {
+            session.favoriteQueueEvidence?.let { return listOf(it.seed) }
             val query = session.findMusicSessionEvidence?.querySpec ?: session.composedQuerySpec
             if (query != null) return buildList {
                 query.activeTextIngredients.forEach {

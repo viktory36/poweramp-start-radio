@@ -215,9 +215,17 @@ come from retained queue history because older request frequencies were not reco
 
 Opening a seed ranks the current full active library by cosine similarity, excluding the seed's
 recording copies. Settings controls this list's size (default 100). Radio date, diversity, and
-memory controls do not filter this nearest list. Tapping a match puts that recording first in the
-upcoming queue, followed by radio generated using current Settings; playback is left alone.
-The song seed header starts radio from the favorite itself using the same settings.
+memory controls do not filter this nearest list. Tapping a match opens its own nearest list;
+Back retraces the explored seeds without queuing anything.
+The results header offers Radio using current Settings, or Queue displayed: the playable seed
+first, then every displayed match in the selected order. Text favorites queue only their matches.
+Queue displayed bypasses radio selection, artist constraints, date filtering and selection memory;
+it sends the exact visible set and order. Saved history retains that order and the original ranks.
+
+Now Playing is pinned above the favorite seeds, including paused tracks. It opens the same fresh
+nearest list and receives the same New indicator. The toolbar search finds recordings throughout
+the active indexed library, not just favorites; choosing one opens its nearest list without
+changing Find Music inputs or settings. Browsing does not increment request counts.
 
 **New** marks recordings added by the latest index publication, only until the next publication.
 Opening Favorites does not clear it. An added copy of an older recording is not marked New.
@@ -225,6 +233,9 @@ The Favorites list also marks seeds with any New result inside their configured 
 Nearest rows show elapsed days since their embedding DB row was first added, using the same
 `tracks.created_at` clock as the shared Added to index filter. Favorites itself always ranks the full library.
 Expanded main-screen queue rows show the same age beside album and duration.
+In favorite results, Nearest and Added column headers sort the same top-N set by cosine rank or
+index-added date. Clicking the active header reverses order; date ties prefer closer matches and
+unknown dates stay last. The original cosine ranks and New indicators do not change.
 These checks run in the background and are cached for the index, active library, and list size.
 This tracking starts with the first index update after installing Favorites.
 

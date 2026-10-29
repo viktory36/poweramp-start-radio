@@ -23,6 +23,7 @@ internal object FavoritesRanking {
                 track = checkNotNull(database.getTrackById(row.trackId)),
                 rank = position + 1,
                 isNew = isNewRecording(row.trackId, identities, addedTrackIds),
+                stableTrackSpanId = identities.stableTrackSpanId(row.trackId),
             )
         }
 

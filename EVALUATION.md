@@ -116,6 +116,29 @@ favorites using simulated addition IDs: two marked and 113 unmarked, all agreein
 cutoff checks marked a seed for a new result at rank 100 with N=100, but not N=99. Cached flags
 survived reopening and were not reused after index, active-domain, or list-size changes.
 
+### Favorites Browsing and Exact Enqueue
+
+An October 24 device check opened the paused Now Playing recording's 250 nearest matches and
+matched an independent full-library cosine sort. An immediate cold-start request completed in
+6.826 s without retry; a warm song lookup took 161 ms. Library-wide recording search selected a
+non-favorite and opened its neighborhood; rapid query changes retained only the latest result.
+
+All four displayed orders preserved the seed-first 251-track plan, original cosine ranks and
+exact Poweramp file IDs through durable request storage. A real Newest-first enqueue was then
+read back independently from Poweramp: all 251 tracks matched in order, including the seed.
+The enqueue took approximately 0.5 s and left playback state, position and recording unchanged.
+The separate Radio menu action produced the configured 30-track DPP radio in 1.795 s; its
+seed-first queue also matched independent provider readback without changing playback.
+The current-song New predicate was checked with simulated addition IDs against its real nearest
+list; no embeddings or publication boundaries were fabricated. The pinned row, search sheet,
+results, and action menu were visually inspected on the phone.
+
+An October 25 device check followed three result-row neighbors into their own fresh nearest
+lists (148-150 ms ranking each) and retraced the exact prior result snapshots with Back.
+Poweramp's ordered queue and favorite request counts were unchanged by browsing.
+An actual row tap opened the selected song's neighborhood; system Back restored the prior
+list at the same scrolled position, checked with before/after screenshots.
+
 ### Index-Added Dates
 
 On October 20, all 96,627 embedding-row dates matched independent UTC parsing of `tracks.created_at`.

@@ -13,6 +13,13 @@ object SeedDistanceEvidencePolicy {
         session: RadioResult?,
         track: QueuedTrackResult,
     ): SeedDistanceEvidence? {
+        session?.favoriteQueueEvidence?.let { favorite ->
+            val position = session.tracks.indexOf(track)
+            val rank = favorite.orderedClosestRanks.getOrNull(position) ?: return null
+            return if (rank in 1..favorite.rankingIdentityCount && track.seedRank == rank) {
+                SeedDistanceEvidence(rank, favorite.rankingIdentityCount)
+            } else null
+        }
         if (session == null || session.isDirectQueue || session.composedQuerySpec != null ||
             session.composedContract != null ||
             session.matchType == TrackMatcher.MatchType.COMPOSED_QUERY ||

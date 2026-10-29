@@ -332,7 +332,7 @@ fun MainScreen(
 
     BackHandler(enabled = showSettings || showTextSearch || showFavorites || viewingSession != null) {
         if (showFavorites) {
-            if (favoriteMatches.seed != null) viewModel.closeFavorite() else showFavorites = false
+            if (favoriteMatches.seed != null) viewModel.backFromFavorite() else showFavorites = false
         } else if (showTextSearch) {
             showTextSearch = false
             viewModel.clearFindMusicResults()
@@ -383,7 +383,7 @@ fun MainScreen(
             label = "screen_transition"
         ) { screen ->
             when (screen) {
-                3 -> FavoritesScreen(viewModel, onBack = { showFavorites = false }, onStartRadio = {
+                3 -> FavoritesScreen(viewModel, currentTrack = currentTrack, onBack = { showFavorites = false }, onStartRadio = {
                     showFavorites = false
                     viewingSession = null
                 })
@@ -821,7 +821,9 @@ private fun QueueDetailsSheet(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        if (session.findMusicSessionEvidence != null) {
+                        if (session.favoriteQueueEvidence != null) {
+                            "Favorites queue details"
+                        } else if (session.findMusicSessionEvidence != null) {
                             "Find Music details"
                         } else {
                             "Radio details"
@@ -976,7 +978,14 @@ private fun RankSpreadRows(spread: RankSpread, semantics: RankSpreadSemantics) {
 private fun queueRequestFacts(session: RadioResult): List<QueueDetailFact> = buildList {
     val config = session.config
     val findMusic = session.findMusicSessionEvidence
-    if (findMusic != null) {
+    val favorite = session.favoriteQueueEvidence
+    if (favorite != null) {
+        add(QueueDetailFact("Seed", favorite.seed.label))
+        add(QueueDetailFact("Selection", "Displayed Favorites results"))
+        add(QueueDetailFact("Order", (if (favorite.seedIncluded) "Seed first, then " else "") +
+            favorite.sort.label.lowercase()))
+        add(QueueDetailFact("Library", "Full indexed Poweramp library"))
+    } else if (findMusic != null) {
         val query = findMusic.querySpec
         add(QueueDetailFact("Query", query.displayLabel))
         add(QueueDetailFact("Selection", SessionEvidenceText.findMusicMode(findMusic)))
@@ -1265,7 +1274,11 @@ private fun rankSpread(ranks: List<Int>, domain: Int): RankSpread? {
 }
 
 private fun compactSessionHeading(session: RadioResult): String =
-    if (session.findMusicSessionEvidence != null) "Find Music" else "Radio from"
+    when {
+        session.favoriteQueueEvidence != null -> "Favorites queue"
+        session.findMusicSessionEvidence != null -> "Find Music"
+        else -> "Radio from"
+    }
 
 private fun compactSessionTitle(session: RadioResult): String =
     session.findMusicSessionEvidence?.querySpec?.displayLabel
@@ -1273,6 +1286,10 @@ private fun compactSessionTitle(session: RadioResult): String =
 
 private fun compactSessionContext(session: RadioResult, outcomeSignal: String): String {
     val findMusic = session.findMusicSessionEvidence
+    session.favoriteQueueEvidence?.let { favorite ->
+        return listOfNotNull(favorite.seed.artist?.takeIf(String::isNotBlank),
+            favorite.sort.label, outcomeSignal).joinToString(" \u00b7 ")
+    }
     val parts = buildList {
         if (findMusic == null) {
             session.seedTrack.artist?.trim()?.takeIf(String::isNotBlank)?.let(::add)
@@ -1714,7 +1731,7 @@ fun SessionHistoryDrawer(sessions: List<RadioResult>, onSessionTap: (Int) -> Uni
                                         "Replayed queue"
                                     } else session.findMusicSessionEvidence?.let { evidence ->
                                         SessionEvidenceText.findMusicMode(evidence)
-                                    } ?: "Direct queue"
+                                    } ?: session.favoriteQueueEvidence?.sort?.label ?: "Direct queue"
                                 } else if (session.composedQuerySpec != null) {
                                     "All of"
                                 } else {
@@ -2877,36 +2894,49 @@ private fun compactFindMusicRankingScope(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun RecordingPickerSheet(
+internal fun RecordingPickerSheet(
     query: String,
     state: RecordingLookupState,
     onDismiss: () -> Unit,
     onRetry: () -> Unit,
     onChoose: (com.powerampstartradio.data.EmbeddedTrack) -> Unit,
+    onQueryChange: ((String) -> Unit)? = null,
 ) {
     LaunchedEffect(query, state) {
-        if (state is RecordingLookupState.Idle) onRetry()
+        if (state is RecordingLookupState.Idle && query.isNotBlank()) onRetry()
     }
-    ModalBottomSheet(onDismissRequest = onDismiss) {
+    ModalBottomSheet(onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = onQueryChange != null)) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .navigationBarsPadding()
+                .navigationBarsPadding().imePadding()
                 .padding(bottom = 12.dp),
         ) {
             Text(
-                "Choose the exact recording",
+                if (onQueryChange == null) "Choose the exact recording" else "Find a song",
                 style = MaterialTheme.typography.titleLarge,
                 modifier = Modifier.padding(horizontal = 24.dp),
             )
-            Text(
-                "Matching artist, album, title, and filename for \"${query.trim()}\"",
+            if (onQueryChange != null) {
+                val focus = remember { FocusRequester() }
+                LaunchedEffect(Unit) { focus.requestFocus() }
+                OutlinedTextField(value = query, onValueChange = onQueryChange,
+                    label = { Text("Artist or song") }, singleLine = true,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 8.dp)
+                        .focusRequester(focus),
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                        imeAction = androidx.compose.ui.text.input.ImeAction.Search),
+                    keyboardActions = androidx.compose.foundation.text.KeyboardActions(onSearch = { onRetry() }),
+                )
+            } else Text(
+                "Matching artist and title for \"${query.trim()}\"",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(start = 24.dp, top = 4.dp, end = 24.dp, bottom = 12.dp),
             )
             when (state) {
-                RecordingLookupState.Idle -> {
+                RecordingLookupState.Idle -> if (query.isNotBlank()) {
                     Row(
                         modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -2975,12 +3005,13 @@ private fun RecordingPickerSheet(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .clickable { onChoose(track) }
-                                        .padding(horizontal = 24.dp, vertical = 12.dp),
+                                        .padding(horizontal = 24.dp, vertical = if (onQueryChange == null) 12.dp else 8.dp),
                                 ) {
                                     Text(
                                         track.title ?: "Unknown title",
-                                        style = MaterialTheme.typography.bodyLarge,
-                                        fontWeight = FontWeight.Bold,
+                                        style = if (onQueryChange == null) MaterialTheme.typography.bodyLarge
+                                            else MaterialTheme.typography.bodyMedium,
+                                        fontWeight = if (onQueryChange == null) FontWeight.Bold else FontWeight.Normal,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis,
                                     )

@@ -769,6 +769,26 @@ class RadioRequestStoreTest {
             )
         }
 
+    @Test
+    fun `favorite displayed seed order and original ranks survive durable storage`() = withTempDir { root ->
+        val ids = listOf(42L, 45L, 43L, 44L)
+        val evidence = com.powerampstartradio.ui.FavoriteQueueEvidence(
+            com.powerampstartradio.ui.FavoriteSeed("song:42", trackId = 42L, title = "Seed"),
+            com.powerampstartradio.ui.FavoriteMatchesSort.NEWEST_FIRST, true, listOf(null, 3, 1, 2), 100)
+        val request = DurableRadioRequest.directQueue(generation(), providerGeneration(), ids.map(::track),
+            ids.map(::identity), ids.map { it * 10L }, "Seed", QueueOrigin.FAVORITE_RESULT_LIST,
+            DirectQueuePlacement.REPLACE_UPCOMING, requestId = uuid(90), favoriteQueueEvidence = evidence)
+        val journal = store(root, "favorite")
+        journal.persist(request)
+        val recovered = (journal.claim(request.requestId) as RadioRequestClaim.Claimed).request
+        assertEquals(ids, recovered.directQueue!!.tracks.map { it.id })
+        assertEquals(evidence, recovered.directQueue!!.favoriteQueueEvidence)
+        assertThrows(IllegalArgumentException::class.java) {
+            journal.persist(request.copy(requestId = uuid(91), directQueue = request.directQueue!!.copy(
+                favoriteQueueEvidence = evidence.copy(orderedClosestRanks = listOf(null, 1)))))
+        }
+    }
+
     private fun store(root: File, owner: String) = RadioRequestStore(
         rootDir = root,
         ownerToken = owner,

@@ -628,6 +628,7 @@ enum class QueueOrigin(val displayLabel: String, val isDirectList: Boolean = fal
     WIDGET_RADIO("Started from widget"),
     QUEUE_TRACK_RADIO("Started from queued track"),
     FAVORITE_RADIO("Started from Favorites"),
+    FAVORITE_RESULT_LIST("Favorites queue", isDirectList = true),
     TEXT_RESULT_RADIO("Started from Find Music"),
     COMPOSED_RADIO("Started from Find Music"),
     TEXT_RESULT_LIST("Find Music queue", isDirectList = true),
@@ -815,7 +816,7 @@ data class RadioResult(
     val isComplete: Boolean = true,
     val totalExpected: Int = 0,
     val metrics: QueueMetrics? = null,
-    /** True for direct-queue sessions (text/multi-seed search results). No meaningful single-seed distance. */
+    /** True when the displayed list was enqueued without running a radio selector. */
     val isDirectQueue: Boolean = false,
     /** Nullable so Gson can load V1 history records which predate structured delivery facts. */
     val delivery: QueueDeliverySummary? = null,
@@ -846,6 +847,7 @@ data class RadioResult(
     val directQueuePlacement: DirectQueuePlacement? = null,
     /** Exact query and active-domain facts for a directly queued Find Music result list. */
     val findMusicSessionEvidence: FindMusicSessionEvidence? = null,
+    val favoriteQueueEvidence: FavoriteQueueEvidence? = null,
 ) {
     val effectiveOutcome: RadioSessionOutcome
         get() = outcome ?: if (isComplete) {

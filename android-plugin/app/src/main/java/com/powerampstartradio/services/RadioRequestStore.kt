@@ -12,6 +12,7 @@ import com.powerampstartradio.ui.FindMusicQuerySpec
 import com.powerampstartradio.ui.FindMusicSessionEvidence
 import com.powerampstartradio.ui.FindMusicTextResultPlanner
 import com.powerampstartradio.ui.FindMusicTrackEvidence
+import com.powerampstartradio.ui.FavoriteQueueEvidence
 import com.powerampstartradio.ui.QueueOrigin
 import com.powerampstartradio.ui.RadioConfig
 import com.powerampstartradio.ui.RadioGenerationToken
@@ -106,6 +107,7 @@ internal data class DurableRadioRequest(
             findMusicTrackEvidence: List<FindMusicTrackEvidence>? = null,
             requestId: String = UUID.randomUUID().toString(),
             createdAtEpochMs: Long = System.currentTimeMillis(),
+            favoriteQueueEvidence: FavoriteQueueEvidence? = null,
         ) = DurableRadioRequest(
             requestId = requestId,
             createdAtEpochMs = createdAtEpochMs,
@@ -121,6 +123,7 @@ internal data class DurableRadioRequest(
                 placement,
                 findMusicSessionEvidence,
                 findMusicTrackEvidence?.toList(),
+                favoriteQueueEvidence,
             ),
         )
     }
@@ -164,6 +167,7 @@ internal data class DirectQueueRequestPayload(
     val placement: DirectQueuePlacement,
     val findMusicSessionEvidence: FindMusicSessionEvidence? = null,
     val findMusicTrackEvidence: List<FindMusicTrackEvidence>? = null,
+    val favoriteQueueEvidence: FavoriteQueueEvidence? = null,
 )
 
 internal data class DurableRadioResultReceipt(
@@ -738,6 +742,22 @@ internal class RadioRequestStore(
                 payload.origin.name
                 payload.placement.name
                 validateDirectFindMusicEvidence(request, payload)
+                val favorite = payload.favoriteQueueEvidence
+                require(payload.origin != QueueOrigin.FAVORITE_RESULT_LIST || favorite != null) {
+                    "A Favorites queue requires its displayed seed and order"
+                }
+                if (favorite != null) {
+                    require(payload.origin == QueueOrigin.FAVORITE_RESULT_LIST || payload.origin == QueueOrigin.HISTORY_REQUEUE)
+                    require(payload.findMusicSessionEvidence == null && payload.findMusicTrackEvidence == null)
+                    require(favorite.orderedClosestRanks.size == payload.tracks.size)
+                    require(favorite.rankingIdentityCount >= 0)
+                    val ranks = favorite.orderedClosestRanks.filterNotNull()
+                    require(ranks.all { it in 1..favorite.rankingIdentityCount } && ranks.distinct().size == ranks.size)
+                    require(favorite.orderedClosestRanks.count { it == null } == if (favorite.seedIncluded) 1 else 0)
+                    if (favorite.seedIncluded) {
+                        require(payload.tracks.first().id == favorite.seed.trackId && favorite.orderedClosestRanks.first() == null)
+                    }
+                }
             }
         }
     }
@@ -1375,6 +1395,9 @@ internal class RadioRequestStore(
                 require(result.findMusicSessionEvidence == direct.findMusicSessionEvidence) {
                     "Direct-queue Find Music session evidence changed"
                 }
+                require(result.favoriteQueueEvidence == direct.favoriteQueueEvidence) {
+                    "Direct-queue Favorites context changed"
+                }
                 require(result.directQueuePlacement == direct.placement)
                 require(result.tracks.size == direct.tracks.size)
                 result.tracks.indices.forEach { index ->
@@ -1388,6 +1411,9 @@ internal class RadioRequestStore(
                             direct.resolvedPowerampFileIds[index],
                     )
                     val expectedFindMusic = direct.findMusicTrackEvidence?.get(index)
+                    if (direct.favoriteQueueEvidence != null) {
+                        require(result.tracks[index].seedRank == direct.favoriteQueueEvidence.orderedClosestRanks[index])
+                    }
                     require(result.tracks[index].findMusicEvidence == expectedFindMusic) {
                         "Direct-queue Find Music row evidence changed at index $index"
                     }

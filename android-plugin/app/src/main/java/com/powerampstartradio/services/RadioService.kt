@@ -237,7 +237,7 @@ class RadioService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "radio_service"
 
-        private data class DisplayedRecommendationDomain(
+        internal data class DisplayedRecommendationDomain(
             val providerGenerationId: String,
             val orderedActiveTrackIdsSha256: String,
             val activeTrackCount: Int,
@@ -1116,6 +1116,7 @@ class RadioService : Service() {
             placement: DirectQueuePlacement = DirectQueuePlacement.REPLACE_UPCOMING,
             findMusicSessionEvidence: FindMusicSessionEvidence? = null,
             findMusicTrackEvidence: List<FindMusicTrackEvidence>? = null,
+            favoriteQueueEvidence: com.powerampstartradio.ui.FavoriteQueueEvidence? = null,
         ): RadioRequestAdmission = RadioRequestAdmissionCoordinator.admit(
             reserve = { reserveSubmission(replaceActive = true) },
             release = { submissionToken ->
@@ -1161,6 +1162,10 @@ class RadioService : Service() {
                 val findMusicTrackSnapshot = findMusicTrackEvidence?.map { evidence ->
                     evidence.copy(ingredientPercentiles = evidence.ingredientPercentiles.toList())
                 }
+                val favoriteSnapshot = favoriteQueueEvidence?.copy(
+                    seed = favoriteQueueEvidence.seed.copy(),
+                    orderedClosestRanks = favoriteQueueEvidence.orderedClosestRanks.toList(),
+                )
                 val placementAction = when (placement) {
                     DirectQueuePlacement.REPLACE_UPCOMING ->
                         "replacing Poweramp's upcoming queue"
@@ -1186,6 +1191,7 @@ class RadioService : Service() {
                         placement = placement,
                         findMusicSessionEvidence = findMusicSessionSnapshot,
                         findMusicTrackEvidence = findMusicTrackSnapshot,
+                        favoriteQueueEvidence = favoriteSnapshot,
                     )
                 }
             },
@@ -1398,7 +1404,7 @@ class RadioService : Service() {
             }
         }
 
-        private fun buildPinnedDirectQueueRequest(
+        internal fun buildPinnedDirectQueueRequest(
             context: Context,
             tracks: List<EmbeddedTrack>,
             trackIdentities: List<RadioSeedIdentity>,
@@ -1409,6 +1415,7 @@ class RadioService : Service() {
             placement: DirectQueuePlacement,
             findMusicSessionEvidence: FindMusicSessionEvidence?,
             findMusicTrackEvidence: List<FindMusicTrackEvidence>?,
+            favoriteQueueEvidence: com.powerampstartradio.ui.FavoriteQueueEvidence? = null,
         ): DurableRadioRequest {
             val library = requireActiveLibrary(context)
             val active = library.activeGeneration
@@ -1469,6 +1476,7 @@ class RadioService : Service() {
                     placement = placement,
                     findMusicSessionEvidence = findMusicSessionEvidence,
                     findMusicTrackEvidence = findMusicTrackEvidence,
+                    favoriteQueueEvidence = favoriteQueueEvidence,
                 )
             }
         }
@@ -1588,6 +1596,15 @@ class RadioService : Service() {
                     placement = placement,
                     findMusicSessionEvidence = replayFindMusicEvidence,
                     findMusicTrackEvidence = replayFindMusicRows,
+                    favoriteQueueEvidence = session.favoriteQueueEvidence?.let { favorite ->
+                        val ranks = replayRows.map { row ->
+                            favorite.orderedClosestRanks[session.tracks.indexOf(row)]
+                        }
+                        favorite.copy(orderedClosestRanks = ranks,
+                            seedIncluded = favorite.seedIncluded && ranks.firstOrNull() == null,
+                            seed = favorite.seed.copy(trackId = if (favorite.seedIncluded && ranks.firstOrNull() == null)
+                                exactTracks.first().id else favorite.seed.trackId))
+                    },
                 )
             }
         }
@@ -2477,6 +2494,7 @@ class RadioService : Service() {
                         placement = payload.placement,
                         findMusicSessionEvidence = payload.findMusicSessionEvidence,
                         findMusicTrackEvidence = payload.findMusicTrackEvidence,
+                        favoriteQueueEvidence = payload.favoriteQueueEvidence,
                         generation = request.generation,
                         providerGenerationId = request.providerGenerationId,
                         requestId = request.requestId,
@@ -3448,6 +3466,7 @@ class RadioService : Service() {
         placement: DirectQueuePlacement,
         findMusicSessionEvidence: FindMusicSessionEvidence?,
         findMusicTrackEvidence: List<FindMusicTrackEvidence>?,
+        favoriteQueueEvidence: com.powerampstartradio.ui.FavoriteQueueEvidence?,
         generation: RadioGenerationToken,
         providerGenerationId: String,
         requestId: String,
@@ -3511,7 +3530,7 @@ class RadioService : Service() {
                     val syntheticSeed = PowerampTrack(
                         realId = -1L,
                         title = label,
-                        artist = null,
+                        artist = favoriteQueueEvidence?.seed?.artist,
                         album = null,
                         durationMs = 0,
                         path = null,
@@ -3523,6 +3542,7 @@ class RadioService : Service() {
                             track = track,
                             similarity = rankingEvidence?.resultScore ?: 0f,
                             similarityToSeed = 0f,
+                            seedRank = favoriteQueueEvidence?.orderedClosestRanks?.get(index),
                             status = if (fileId == null) {
                                 QueueStatus.NOT_IN_LIBRARY
                             } else {
@@ -3557,6 +3577,7 @@ class RadioService : Service() {
                             providerGenerationId = providerGenerationId,
                             directQueuePlacement = placement,
                             findMusicSessionEvidence = findMusicSessionEvidence,
+                            favoriteQueueEvidence = favoriteQueueEvidence,
                         ),
                     )
 
@@ -3681,6 +3702,7 @@ class RadioService : Service() {
                         providerGenerationId = providerGenerationId,
                         directQueuePlacement = placement,
                         findMusicSessionEvidence = findMusicSessionEvidence,
+                        favoriteQueueEvidence = favoriteQueueEvidence,
                     )
                 }
 

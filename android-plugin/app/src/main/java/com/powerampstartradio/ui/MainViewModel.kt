@@ -739,7 +739,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
     val favoriteResultCount: StateFlow<Int> = _favoriteResultCount.asStateFlow()
     private var favoriteJob: Job? = null
+    private var pendingFavoriteSeed: FavoriteSeed? = null
     private val favoriteRevision = java.util.concurrent.atomic.AtomicLong()
+    private val favoriteBackStack = ArrayDeque<FavoriteMatchesState>()
 
     fun setFavoriteResultCount(count: Int) {
         val value = count.coerceIn(1, 1_000)
@@ -747,7 +749,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         prefs.edit().putInt("favorite_result_count", value).apply()
     }
 
-    fun refreshFavorites() {
+    fun refreshFavorites(currentTrack: com.powerampstartradio.poweramp.PowerampTrack? = null) {
         stopFavoriteNewMatchScan()
         val revision = favoriteBadgesRevision.get()
         viewModelScope.launch(Dispatchers.IO) {
@@ -757,7 +759,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val entries = RadioService.favoriteEntries(getApplication<Application>().filesDir)
                 if (favoriteBadgesRevision.get() == revision) {
                     _favorites.value = entries
-                    refreshFavoriteNewMatches(entries, revision)
+                    val pinned = currentTrack?.let {
+                        FavoriteEntry(FavoriteSeed("poweramp:${it.realId}", title = it.title,
+                            artist = it.artist, powerampFileId = it.realId), 0, 0L)
+                    }
+                    refreshFavoriteNewMatches(listOfNotNull(pinned) + entries, revision)
                 }
             } catch (failure: Exception) {
                 Log.e("Favorites", "Could not load request counts", failure)
@@ -774,7 +780,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun favoriteNewMatchContext(library: FindMusicLibrarySnapshot, limit: Int): String =
-        "${library.generation.generationId}|${library.activeDomain.orderedActiveTrackIdsSha256}|$limit"
+        "${library.generation.generationId}|${library.activeCatalog.generationBinding.providerGenerationId}|" +
+            "${library.activeDomain.orderedActiveTrackIdsSha256}|$limit"
 
     private fun refreshFavoriteNewMatches(entries: List<FavoriteEntry>, revision: Long) {
         val limit = _favoriteResultCount.value
@@ -841,8 +848,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         } catch (cancelled: CancellationException) {
                             throw cancelled
                         } catch (failure: Exception) {
-                            failed++
-                            Log.w("Favorites", "Could not rank new matches for ${entry.seed.key}", failure)
+                            if (failure is com.powerampstartradio.services.RadioSeedNotIndexedException) {
+                                pending[entry.seed.key] = false
+                            } else {
+                                failed++
+                                Log.w("Favorites", "Could not rank new matches for ${entry.seed.key}", failure)
+                            }
                         }
                         completed++
                     }
@@ -876,6 +887,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         library: FindMusicLibrarySnapshot,
         database: EmbeddingDatabase,
     ): Long? {
+        seed.powerampFileId?.let { fileId ->
+            return library.activeDomain.trackIdForPowerampFile(fileId)
+                ?: throw com.powerampstartradio.services.RadioSeedNotIndexedException()
+        }
         val savedId = seed.trackId ?: return null
         val resolved = seed.stableTrackSpanId?.let(library.identityCatalog::resolveStable)
             as? com.powerampstartradio.data.StableTrackIdentityResolution.Resolved
@@ -891,13 +906,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun closeFavorite() {
+        favoriteBackStack.clear()
+        pendingFavoriteSeed = null
         favoriteRevision.incrementAndGet()
         favoriteJob?.cancel()
         favoriteJob = null
         _favoriteMatches.value = FavoriteMatchesState()
     }
 
+    fun backFromFavorite() {
+        val previous = favoriteBackStack.removeLastOrNull() ?: return closeFavorite()
+        pendingFavoriteSeed = null
+        favoriteRevision.incrementAndGet()
+        favoriteJob?.cancel()
+        favoriteJob = null
+        val published = _databaseInfo.value
+        if (previous.generationId == published?.generationId &&
+            previous.binding?.providerGenerationId == published?.providerGenerationId
+        ) {
+            _favoriteMatches.value = previous
+        } else previous.seed?.let(::openFavorite) ?: closeFavorite()
+    }
+
     fun openFavorite(seed: FavoriteSeed) {
+        pendingFavoriteSeed = null
         stopFavoriteNewMatchScan()
         val revision = favoriteRevision.incrementAndGet()
         favoriteJob?.cancel()
@@ -916,9 +948,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val library = getOrCreateTextLibrarySnapshot(filesDir, ::status)
                 val database = EmbeddingDatabase.open(library.databaseFile)
                 var resolvedSeedTrackId: Long? = null
+                var resolvedSeedTrack: EmbeddedTrack? = null
+                var resolvedSeedStableTrackSpanId: String? = null
                 val results = try {
                     val trackId = resolveFavoriteTrackId(seed, library, database)
                     resolvedSeedTrackId = trackId
+                    resolvedSeedTrack = trackId?.let(database::getTrackById)
+                    resolvedSeedStableTrackSpanId = trackId?.let(library.identityCatalog::stableTrackSpanId)
                     val embedding = if (trackId != null) {
                         checkNotNull(library.embeddingIndex.getEmbeddingByTrackId(trackId)) {
                             "This favorite has no indexed embedding."
@@ -944,16 +980,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _favoriteMatches.update { previous ->
                     if (favoriteRevision.get() == revision) {
                         FavoriteMatchesState(seed, results, library.generation.generationId,
-                            resolvedSeedTrackId = resolvedSeedTrackId)
+                            resolvedSeedTrackId = resolvedSeedTrackId,
+                            resolvedSeedTrack = resolvedSeedTrack,
+                            resolvedSeedStableTrackSpanId = resolvedSeedStableTrackSpanId,
+                            binding = FavoriteResultsBinding(library.identityCatalog.binding,
+                                library.activeCatalog.generationBinding.providerGenerationId,
+                                library.activeDomain.orderedActiveTrackIdsSha256,
+                                library.activeDomain.activeTrackCount,
+                                resolvedSeedTrackId?.let {
+                                    library.activeDomain.candidateDomain(null).eligibleCandidateIdentityCount(it)
+                                } ?: library.activeDomain.activeCandidateIdentityCount))
                     } else previous
                 }
                 Log.i("Favorites", "nearest seed=${seed.key} count=${results.size} " +
                     "new=${results.count { it.isNew }} totalMs=${elapsedMs(started)}")
             } catch (cancelled: CancellationException) {
                 _favoriteMatches.update { previous ->
-                    if (favoriteRevision.get() == revision) FavoriteMatchesState(seed = seed,
-                        error = "Lookup paused for indexing. Open this favorite again when indexing is closed.")
-                    else previous
+                    if (favoriteRevision.get() != revision) previous else if (recommendationResourcesBlocked()) {
+                        pendingFavoriteSeed = seed
+                        FavoriteMatchesState(seed = seed, loading = true,
+                            status = "Waiting for current library work to release the music index")
+                    } else FavoriteMatchesState(seed = seed,
+                        error = "Lookup stopped. Open this favorite again to retry.")
                 }
                 throw cancelled
             } catch (failure: Exception) {
@@ -967,7 +1015,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         trackRetrievalJobUntilCompletion(job)
         val admitted = synchronized(RETRIEVAL_RESOURCE_ADMISSION_LOCK) {
-            if (recommendationResourcesBlocked()) false else {
+            if (recommendationResourcesBlocked()) {
+                pendingFavoriteSeed = seed
+                false
+            } else {
                 activeRetrievalResourceJobs.add(job)
                 favoriteJob = job
                 true
@@ -975,14 +1026,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         if (admitted) job.start() else {
             job.cancel()
-            _favoriteMatches.value = FavoriteMatchesState(seed = seed,
-                error = "Close on-device indexing before opening a favorite.")
+            _favoriteMatches.value = FavoriteMatchesState(seed = seed, loading = true,
+                status = "Waiting for current library work to release the music index")
         }
     }
 
-    fun startRadioFromFavorite(match: FavoriteMatch) {
-        val generation = _favoriteMatches.value.generationId ?: return
-        RadioService.startRadioFromFavorite(getApplication(), match.track.id, generation, buildConfig())
+    fun openFavoriteMatch(match: FavoriteMatch) {
+        val state = _favoriteMatches.value
+        if (state.loading || state.error != null || match !in state.matches) return
+        favoriteBackStack.addLast(state)
+        openFavorite(FavoriteSeed("song:${match.track.id}", trackId = match.track.id,
+            stableTrackSpanId = match.stableTrackSpanId, title = match.track.title, artist = match.track.artist))
     }
 
     fun startRadioFromFavoriteSeed(): Boolean {
@@ -992,6 +1046,129 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (state.loading || state.error != null) return false
         RadioService.startRadioFromFavorite(getApplication(), trackId, generation, buildConfig())
         return true
+    }
+
+    fun openNowPlayingFavorite(track: com.powerampstartradio.poweramp.PowerampTrack) {
+        openFavorite(FavoriteSeed("poweramp:${track.realId}", title = track.title,
+            artist = track.artist, powerampFileId = track.realId))
+    }
+
+    private val _favoriteSongQuery = MutableStateFlow("")
+    val favoriteSongQuery: StateFlow<String> = _favoriteSongQuery.asStateFlow()
+    private val _favoriteSongLookup = MutableStateFlow<RecordingLookupState>(RecordingLookupState.Idle)
+    val favoriteSongLookup: StateFlow<RecordingLookupState> = _favoriteSongLookup.asStateFlow()
+    private val favoriteSongLookupRevision = AtomicLong()
+    private var favoriteSongLookupJob: Job? = null
+    private var pendingFavoriteSongQuery: String? = null
+    private var favoriteSongStableIds: Map<Long, String?> = emptyMap()
+
+    fun searchFavoriteSongs(query: String) {
+        pendingFavoriteSongQuery = null
+        _favoriteSongQuery.value = query
+        val revision = favoriteSongLookupRevision.incrementAndGet()
+        favoriteSongLookupJob?.cancel()
+        favoriteSongStableIds = emptyMap()
+        val trimmed = query.trim()
+        if (trimmed.isEmpty()) {
+            _favoriteSongLookup.value = RecordingLookupState.Idle
+            return
+        }
+        _favoriteSongLookup.value = RecordingLookupState.Loading(0L, trimmed, "Searching indexed artists and titles")
+        fun publish(value: RecordingLookupState) {
+            _favoriteSongLookup.update { previous ->
+                if (favoriteSongLookupRevision.get() == revision) value else previous
+            }
+        }
+        val job = viewModelScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
+            try {
+                kotlinx.coroutines.delay(200L)
+                val library = getOrCreateTextLibrarySnapshot(getApplication<Application>().filesDir) { message ->
+                    if (favoriteSongLookupRevision.get() == revision) {
+                        publish(RecordingLookupState.Loading(0L, trimmed, message))
+                    }
+                }
+                val database = EmbeddingDatabase.open(library.databaseFile)
+                val page = try {
+                    database.searchTracksByTextPage(trimmed, limit = RECORDING_LOOKUP_DISPLAY_LIMIT,
+                        includeTrackId = library.activeDomain::containsActiveTrack,
+                        canonicalTrackId = library.activeDomain::activeIdentityRepresentativeTrackId)
+                } finally { database.close() }
+                currentCoroutineContext().ensureActive()
+                check(activeGenerationIdOrNull() == library.generation.generationId) {
+                    "The music index changed. Search for the song again."
+                }
+                if (favoriteSongLookupRevision.get() == revision) {
+                    favoriteSongStableIds = page.tracks.associate {
+                        it.id to library.identityCatalog.stableTrackSpanId(it.id)
+                    }
+                    publish(RecordingLookupState.Success(0L, trimmed, page.tracks, page.hasMore))
+                }
+            } catch (cancelled: CancellationException) {
+                if (favoriteSongLookupRevision.get() == revision) {
+                    if (recommendationResourcesBlocked()) {
+                        pendingFavoriteSongQuery = trimmed
+                        publish(RecordingLookupState.Loading(0L, trimmed,
+                            "Waiting for current library work to release the music index"))
+                    } else publish(RecordingLookupState.Failure(0L, trimmed, "Lookup stopped. Try again."))
+                }
+                throw cancelled
+            } catch (failure: Exception) {
+                Log.e("Favorites", "Song lookup failed", failure)
+                if (favoriteSongLookupRevision.get() == revision) {
+                    publish(RecordingLookupState.Failure(0L, trimmed,
+                        failure.message ?: "Could not search the indexed library. Try again."))
+                }
+            }
+        }
+        trackRetrievalJobUntilCompletion(job)
+        val admitted = synchronized(RETRIEVAL_RESOURCE_ADMISSION_LOCK) {
+            if (recommendationResourcesBlocked()) {
+                pendingFavoriteSongQuery = trimmed
+                false
+            } else {
+                activeRetrievalResourceJobs.add(job)
+                favoriteSongLookupJob = job
+                true
+            }
+        }
+        if (admitted) job.start() else {
+            job.cancel()
+            _favoriteSongLookup.value = RecordingLookupState.Loading(0L, trimmed,
+                "Waiting for current library work to release the music index")
+        }
+    }
+
+    fun dismissFavoriteSongSearch() {
+        pendingFavoriteSongQuery = null
+        favoriteSongLookupRevision.incrementAndGet()
+        favoriteSongLookupJob?.cancel()
+        favoriteSongLookupJob = null
+        if (_favoriteSongLookup.value is RecordingLookupState.Loading) {
+            _favoriteSongLookup.value = RecordingLookupState.Idle
+        }
+    }
+
+    fun openFavoriteSongSearchResult(track: EmbeddedTrack): Boolean {
+        val result = _favoriteSongLookup.value as? RecordingLookupState.Success ?: return false
+        if (result.query != _favoriteSongQuery.value.trim() || track !in result.candidates) return false
+        openFavorite(FavoriteSeed("song:${track.id}", trackId = track.id,
+            stableTrackSpanId = favoriteSongStableIds[track.id], title = track.title, artist = track.artist))
+        return true
+    }
+
+    fun queueFavoriteResults(sort: FavoriteMatchesSort): Boolean {
+        val state = _favoriteMatches.value
+        val binding = state.binding ?: return false
+        if (state.loading || state.error != null) return false
+        val queue = favoriteDisplayedQueue(state, sort)
+        return RadioService.queueDirectly(
+            context = getApplication(), tracks = queue.tracks, trackIdentities = queue.identities,
+            displayedBinding = binding.library, displayedProviderGenerationId = binding.providerGenerationId,
+            displayedOrderedActiveTrackIdsSha256 = binding.orderedActiveTrackIdsSha256,
+            displayedActiveTrackCount = binding.activeTrackCount,
+            label = queue.evidence.seed.label, origin = QueueOrigin.FAVORITE_RESULT_LIST,
+            favoriteQueueEvidence = queue.evidence,
+        ) == com.powerampstartradio.services.RadioRequestAdmission.ACCEPTED
     }
 
     fun cancelSearch() {
@@ -3120,6 +3297,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch(Dispatchers.Main.immediate) {
             startPendingSongSeedLookup()
+            pendingFavoriteSeed?.takeIf { it == _favoriteMatches.value.seed }?.let(::openFavorite)
+            pendingFavoriteSongQuery?.takeIf { it == _favoriteSongQuery.value.trim() }?.let(::searchFavoriteSongs)
         }
         startPendingSessionReplayEligibilityRefresh()
         refreshDisplayedQueueEligibility()
